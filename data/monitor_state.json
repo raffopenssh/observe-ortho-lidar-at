@@ -1,0 +1,18 @@
+{
+  "best_oob": 0.752703,
+  "best_n_kgs": 90,
+  "peak_oob": 0.7904688651732206,
+  "peak_n_kgs": 10,
+  "mature_peak_oob": 0.752703,
+  "mature_peak_n_kgs": 90,
+  "mature_n_classes": 20,
+  "consecutive_decline": 2,
+  "plateau_count": 0,
+  "last_oob": 0.6446590896539537,
+  "last_n_kgs": 130,
+  "last_n_classes": 20,
+  "last_status": "declining",
+  "kgs_since_peak": 40,
+  "should_stop": false,
+  "updated_at": "2026-04-16T06:15:01Z"
+}

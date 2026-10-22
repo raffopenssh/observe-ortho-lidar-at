@@ -1,0 +1,3257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Austrian Landscape Analysis</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;height:100vh;height:100dvh;background:#f5f5f5;overflow:hidden}
+
+/* ===== SIDEBAR ===== */
+#sidebar{width:380px;display:flex;flex-direction:column;background:#fff;border-right:1px solid #ddd;z-index:2000;overflow:hidden;transition:max-height .3s ease}
+#sidebar h1{font-size:15px;padding:10px 14px;background:#1a1a2e;color:#fff;flex-shrink:0;display:flex;align-items:center;gap:6px}
+#sidebar h1 span{color:#7fdbca}
+
+/* More options pill */
+.more-pill{display:inline-flex;align-items:center;gap:3px;padding:2px 10px;font-size:10px;font-weight:600;color:#0d7377;background:#e8f7f7;border:1px solid #b5e0e0;border-radius:12px;cursor:pointer;user-select:none;transition:all .15s;white-space:nowrap;margin-left:auto}
+.more-pill:hover{background:#d0eeee;border-color:#0d7377}
+.more-pill.open{background:#0d7377;color:#fff;border-color:#0d7377}
+.extra-params{display:none;padding-top:6px}
+.extra-params.open{display:block}
+
+/* Sidebar collapse bar (mobile) */
+.sidebar-collapse-bar{display:none;text-align:center;padding:3px 0;cursor:pointer;background:linear-gradient(to bottom,#e8e8e8,#f4f4f4);border-top:1px solid #ddd;user-select:none;flex-shrink:0;line-height:1}
+.sidebar-collapse-bar .collapse-arrow{font-size:10px;color:#888;display:inline-block;transition:transform .25s}
+#sidebar.collapsed .sidebar-collapse-bar .collapse-arrow{transform:rotate(180deg)}
+.controls{padding:10px 14px;flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch}
+label{display:block;font-size:12px;font-weight:600;color:#555;margin:6px 0 3px}
+select,input[type=number],input[type=text]{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font-size:13px;background:#fff}
+textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font-size:11px;font-family:monospace;height:60px;resize:none}
+.row{display:flex;gap:8px}.row>*{flex:1}
+.btn{padding:7px 14px;background:#0d7377;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:600;white-space:nowrap}
+.btn:hover{background:#14a3a8}.btn:disabled{opacity:.5;cursor:wait}
+.btn-sm{padding:5px 10px;font-size:11px}
+.btn-ghost{background:transparent;color:#0d7377;border:1px solid #0d7377}
+.btn-ghost:hover{background:#e8f7f7}
+.btn-danger{background:#c0392b}.btn-danger:hover{background:#e74c3c}
+.hint{font-size:11px;color:#999;margin-top:2px}
+.cb-row{display:flex;gap:10px;align-items:center;margin:4px 0;flex-wrap:wrap}
+.cb-row label{margin:0;display:flex;align-items:center;gap:4px;font-weight:500;cursor:pointer;font-size:12px}
+.status{padding:4px 14px;font-size:10px;color:#888;background:#f0f0f0;border-top:1px solid #ddd;flex-shrink:0;display:flex;align-items:center;gap:6px;min-height:28px}
+.doc-links{display:flex;gap:8px;flex-shrink:0}
+.doc-links a{color:#aaa;text-decoration:none;font-size:9px;letter-spacing:.3px;transition:color .15s}
+.doc-links a:hover{color:#0d7377}
+.spinner{display:inline-block;width:12px;height:12px;border:2px solid #ccc;border-top-color:#0d7377;border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Object type dropdown */
+.ot-wrap{position:relative}
+.ot-select{display:flex;align-items:center;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font-size:12px;cursor:pointer;background:#fff;min-height:28px;user-select:none}
+.ot-select:hover{border-color:#0d7377}
+.ot-dropdown{position:absolute;top:100%;left:0;right:0;background:#fff;border:1px solid #ccc;border-radius:0 0 4px 4px;box-shadow:0 4px 12px rgba(0,0,0,.15);z-index:9999;max-height:260px;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:4px 0;display:none}
+.ot-dropdown.open{display:block}
+.ot-dropdown .ot-group{font-size:10px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.5px;padding:6px 10px 2px;user-select:none}
+.ot-dropdown label{display:flex;align-items:center;gap:6px;padding:3px 10px;font-size:12px;font-weight:400;cursor:pointer;margin:0}
+.ot-dropdown label:hover{background:#f0f8f8}
+.ot-dropdown label .ot-swatch{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+.ot-dropdown .ot-actions{display:flex;gap:4px;padding:4px 10px;border-top:1px solid #eee;margin-top:2px}
+.ot-dropdown .ot-actions button{font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:3px;background:#fff;cursor:pointer}
+.ot-dropdown .ot-actions button:hover{background:#e8f7f7;border-color:#0d7377}
+
+/* ===== GEOMETRY INPUT ===== */
+.geo-input-wrap{position:relative}
+.geo-hidden-ta{position:absolute;width:0;height:0;opacity:0;pointer-events:none;overflow:hidden}
+.geo-input{display:flex;align-items:center;gap:6px;padding:7px 10px;border:1px solid #ddd;border-radius:6px;background:#f8f9fa;min-height:36px;cursor:default;transition:border-color .15s,background .15s}
+.geo-input:hover{border-color:#bbb}
+.geo-input.has-geo{background:#e8f7f7;border-color:#0d7377}
+.geo-input-icon{font-size:15px;flex-shrink:0}
+.geo-input-text{flex:1;font-size:12px;color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.geo-input.has-geo .geo-input-text{color:#1a1a2e;font-weight:500}
+.geo-attach-btn{display:inline-flex;align-items:center;cursor:pointer;font-size:14px;padding:2px 4px;border-radius:4px;flex-shrink:0;opacity:.5;transition:opacity .15s}
+.geo-attach-btn:hover{opacity:1;background:#e0e0e0}
+.geo-input-wrap.dragover .geo-input{border-color:#0d7377;background:#e8f7f7;border-style:dashed}
+.geo-drop-overlay{display:none;position:absolute;inset:0;background:rgba(13,115,119,.12);border:2px dashed #0d7377;border-radius:6px;align-items:center;justify-content:center;font-size:13px;font-weight:600;color:#0d7377;pointer-events:none;z-index:2}
+.geo-input-wrap.dragover .geo-drop-overlay{display:flex}
+/* Load dropdown */
+.load-dropdown{display:none;position:absolute;top:calc(100% + 4px);left:0;min-width:340px;background:#fff;border:1px solid #ddd;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.18);z-index:9999;max-height:380px;overflow:hidden;display:none;flex-direction:column}
+.load-dropdown.open{display:flex}
+.ld-search-wrap{padding:8px 10px 6px;border-bottom:1px solid #eee;flex-shrink:0;position:sticky;top:0;background:#fff;z-index:1;border-radius:8px 8px 0 0}
+.ld-search{width:100%;padding:6px 10px 6px 28px;border:1px solid #ddd;border-radius:6px;font-size:12px;background:#fafafa url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23999' stroke-width='2'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E") 8px center no-repeat;transition:border-color .15s}
+.ld-search:focus{border-color:#0d7377;background-color:#fff}
+.ld-search::placeholder{color:#bbb}
+.ld-scroll{overflow-y:auto;-webkit-overflow-scrolling:touch;flex:1}
+.load-dropdown .ld-empty{padding:16px;text-align:center;color:#999;font-size:12px}
+.load-dropdown .ld-item{display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;transition:background .1s;border-bottom:1px solid #f0f0f0}
+.load-dropdown .ld-item:last-child{border-bottom:none}
+.load-dropdown .ld-item:hover{background:#f0f8f8}
+.load-dropdown .ld-item .ld-icon{font-size:16px;flex-shrink:0;width:20px;text-align:center}
+.load-dropdown .ld-item .ld-info{flex:1;min-width:0}
+.load-dropdown .ld-item .ld-name{font-size:12px;font-weight:600;color:#1a1a2e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.load-dropdown .ld-item .ld-desc{font-size:10px;color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.load-dropdown .ld-item .ld-time{font-size:9px;color:#aaa;flex-shrink:0;white-space:nowrap}
+.load-dropdown .ld-item .ld-dl{font-size:16px;flex-shrink:0;width:44px;height:44px;display:flex;align-items:center;justify-content:center;cursor:pointer;opacity:.5;transition:opacity .15s;text-decoration:none;color:#1a1a2e;margin:-8px -8px -8px 0;border-radius:8px}
+.load-dropdown .ld-item .ld-dl:hover,.load-dropdown .ld-item .ld-dl:active{opacity:1;background:rgba(13,115,119,.1)}
+.load-dropdown .ld-section{font-size:10px;font-weight:700;color:#999;text-transform:uppercase;letter-spacing:.5px;padding:8px 12px 4px;user-select:none;border-bottom:1px solid #f0f0f0;display:flex;align-items:center}
+.ld-upload-btn{margin-left:auto;width:22px;height:22px;display:flex;align-items:center;justify-content:center;border-radius:50%;background:#e8f7f7;border:1px solid #b5e0e0;color:#0d7377;font-size:15px;font-weight:700;cursor:pointer;line-height:1;transition:all .15s;flex-shrink:0}
+.ld-upload-btn:hover{background:#0d7377;color:#fff;border-color:#0d7377}
+
+/* ===== MAP ===== */
+#map-area{flex:1;position:relative;min-width:0;min-height:0}
+#map{height:100%;width:100%}
+
+/* Layer panel */
+.layer-panel{position:absolute;top:10px;right:10px;z-index:1000;background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.25);padding:10px 14px;font-size:12px;min-width:200px;max-height:70vh;overflow-y:auto}
+.layer-panel h3{font-size:12px;margin-bottom:6px;color:#333;display:flex;align-items:center}
+.panel-toggle{margin-left:auto;width:22px;height:22px;display:flex;align-items:center;justify-content:center;border:none;background:#f0f0f0;border-radius:4px;cursor:pointer;font-size:14px;font-weight:700;color:#666;line-height:1;padding:0;flex-shrink:0;transition:background .15s}
+.panel-toggle:hover{background:#ddd;color:#333}
+.layer-panel.collapsed{padding:8px 10px;min-width:auto;overflow:hidden}
+.layer-panel.collapsed .lp-body{display:none}
+.layer-panel.collapsed h3{margin-bottom:0}
+.lp-group{margin:4px 0}
+.lp-group-header{font-size:10px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.5px;margin:8px 0 2px;cursor:pointer;user-select:none}
+.lp-group-header:hover{color:#333}
+.lp-group-body{display:none}
+.lp-group-body.open{display:block}
+.lyr{display:flex;align-items:center;gap:6px;margin:3px 0;min-height:32px}
+.lyr input[type=checkbox]{margin:0;width:20px;height:20px;flex-shrink:0}
+.lyr input[type=range]{width:55px;height:14px}
+.lyr-label{flex:1;font-size:11px}
+.basemap-switch{display:flex;gap:2px;margin-bottom:6px;background:#f0f0f0;border-radius:5px;padding:2px;user-select:none}
+.basemap-switch button{flex:1;font-size:10px;font-weight:600;padding:3px 6px;border:none;border-radius:4px;background:transparent;color:#888;cursor:pointer;transition:all .15s}
+.basemap-switch button.active{background:#fff;color:#333;box-shadow:0 1px 3px rgba(0,0,0,.15)}
+
+/* Legend */
+.legend{position:absolute;bottom:24px;right:10px;z-index:1000;background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.2);padding:10px 12px;font-size:11px;max-width:260px;max-height:50vh;overflow-y:auto}
+.legend-header{display:flex;align-items:center;margin-bottom:4px}
+.legend-header h4{font-size:11px;color:#333;margin:0}
+.legend-header .panel-toggle{margin-left:auto}
+.legend.collapsed{padding:8px 10px;overflow:hidden;max-height:none}
+.legend.collapsed .legend-body{display:none}
+.legend.collapsed .legend-header{margin-bottom:0}
+.legend h4{font-size:11px;margin-bottom:4px;color:#333}
+.legend-bar{height:14px;border-radius:3px;margin-bottom:2px}
+.legend-scale-wrap{position:relative;user-select:none}
+.legend-scale-wrap .legend-bar{margin-bottom:0;position:relative;overflow:visible}
+.legend-hf-overlay{position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;overflow:visible}
+.legend-hf-dim{position:absolute;top:0;bottom:0;background:rgba(255,255,255,.6);pointer-events:none}
+.legend-hf-dim.left{left:0;border-radius:3px 0 0 3px}
+.legend-hf-dim.right{right:0;border-radius:0 3px 3px 0}
+.legend-hf-thumb{position:absolute;top:-3px;width:12px;height:calc(100% + 6px);cursor:ew-resize;pointer-events:auto;touch-action:none;z-index:2;transform:translateX(-50%)}
+.legend-hf-thumb::after{content:'';position:absolute;top:0;left:50%;transform:translateX(-50%);width:3px;height:100%;background:#fff;border-radius:1.5px;box-shadow:0 0 2px rgba(0,0,0,.6)}
+.legend-hf-thumb:hover::after,.legend-hf-thumb:active::after{width:4px;box-shadow:0 0 4px rgba(0,0,0,.8)}
+.legend-labels{display:flex;justify-content:space-between;font-size:10px;color:#666;margin-bottom:6px}
+.legend-item{display:flex;align-items:center;gap:6px;margin:2px 0;font-size:11px;cursor:pointer;user-select:none;padding:4px 4px;border-radius:4px;min-height:28px}
+.legend-item:hover{background:#f0f0f0}
+.legend-item.hidden{opacity:.35;text-decoration:line-through}
+.legend-icon{width:16px;height:16px;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0}
+.legend-count{margin-left:auto;color:#999;font-size:9px}
+.color-mode-bar{display:flex;gap:2px;margin:4px 0}
+.color-mode-bar button{flex:1;font-size:10px;padding:3px 6px;border:1px solid #ccc;background:#f5f5f5;cursor:pointer;border-radius:3px}
+.color-mode-bar button.active{background:#0d7377;color:#fff;border-color:#0d7377}
+.meta-info{font-size:10px;color:#666;margin-bottom:4px;padding:3px 6px;background:#f0f8ff;border-radius:3px}
+
+/* ===== DOWNLOAD FAB on map ===== */
+.fab-download{position:absolute;bottom:24px;left:14px;z-index:1000;display:none;gap:8px;align-items:center}
+.fab-download .btn{padding:10px 16px;font-size:13px;border-radius:24px;box-shadow:0 2px 8px rgba(0,0,0,.25);display:flex;align-items:center;gap:6px}
+
+/* ===== SHARE LINK POPUP ===== */
+.share-toast{position:absolute;bottom:60px;left:14px;z-index:1001;background:#1a1a2e;color:#fff;padding:8px 14px;border-radius:8px;font-size:12px;white-space:nowrap;box-shadow:0 2px 12px rgba(0,0,0,.35);opacity:0;transform:translateY(4px);transition:opacity .2s,transform .2s;pointer-events:none;max-width:calc(100vw - 40px);overflow:hidden;text-overflow:ellipsis;user-select:all}
+.share-toast.show{opacity:1;transform:translateY(0);pointer-events:auto}
+.share-link-popup{display:none;position:absolute;bottom:60px;left:14px;z-index:1002;background:#1a1a2e;padding:10px 12px;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,.45);max-width:calc(100vw - 28px);min-width:240px}
+.share-link-popup.show{display:flex;flex-direction:column;gap:8px}
+.share-link-url{font-family:monospace;font-size:11px;color:#8af;word-break:break-all;line-height:1.6;user-select:all}
+.share-link-url .share-hash{color:#5fffb0;cursor:text;border-bottom:1px dashed rgba(95,255,176,.5);padding:2px 4px;border-radius:3px;min-width:20px;display:inline-block;background:rgba(95,255,176,.08);-webkit-tap-highlight-color:rgba(95,255,176,.2)}
+.share-link-url .share-hash:hover{background:rgba(95,255,176,.15)}
+.share-link-url .share-hash:focus{background:rgba(95,255,176,.18);border-bottom-style:solid;border-bottom-color:#5fffb0;box-shadow:0 0 0 1px rgba(95,255,176,.3)}
+.share-link-url .share-hash::selection{background:rgba(95,255,176,.3)}
+.share-link-bottom{display:flex;gap:8px;align-items:center}
+.share-link-bottom .btn-sm{padding:6px 12px;font-size:12px;border-radius:8px;display:flex;align-items:center;gap:4px}
+.share-copied{font-size:11px;color:#5fffb0;opacity:0;transition:opacity .2s}
+.share-copied.show{opacity:1}
+.share-saving{font-size:10px;color:#ff9;opacity:0;transition:opacity .3s}
+.share-saving.show{opacity:1}
+
+/* ===== FULLSCREEN LOADING OVERLAY ===== */
+.loading-overlay{display:none;position:fixed;inset:0;z-index:10000;background:rgba(255,255,255,.85);backdrop-filter:blur(2px);align-items:center;justify-content:center;flex-direction:column;gap:12px}
+.loading-overlay.show{display:flex}
+.loading-overlay .lo-spinner{width:36px;height:36px;border:3px solid #ddd;border-top-color:#0d7377;border-radius:50%;animation:spin .7s linear infinite}
+.loading-overlay .lo-text{font-size:14px;font-weight:600;color:#1a1a2e}
+.loading-overlay .lo-sub{font-size:11px;color:#888}
+
+/* ===== MODAL ===== */
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9000;display:none;align-items:center;justify-content:center;padding:16px}
+.modal-backdrop.open{display:flex}
+.modal{background:#fff;border-radius:12px;width:100%;max-width:600px;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,.3);overflow:hidden}
+.modal-header{display:flex;align-items:center;padding:14px 18px;border-bottom:1px solid #eee;gap:8px;flex-shrink:0}
+.modal-header h2{flex:1;font-size:16px;color:#1a1a2e}
+.modal-close{background:none;border:none;font-size:22px;cursor:pointer;color:#888;padding:4px 8px;border-radius:4px}
+.modal-close:hover{background:#f0f0f0;color:#333}
+.modal-tabs{display:flex;border-bottom:1px solid #eee;flex-shrink:0}
+.modal-tab{flex:1;padding:10px 12px;text-align:center;font-size:13px;font-weight:600;cursor:pointer;color:#888;border-bottom:2px solid transparent;transition:all .15s}
+.modal-tab:hover{color:#333;background:#f8f8f8}
+.modal-tab.active{color:#0d7377;border-bottom-color:#0d7377}
+.modal-body{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:0}
+.tab-pane{display:none;padding:16px 18px}
+.tab-pane.active{display:block}
+.tab-pane pre{font-family:'SF Mono',Monaco,Consolas,monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;background:#f6f8fa;padding:12px;border-radius:6px;border:1px solid #e1e4e8;max-height:50vh;overflow:auto;margin:0}
+.tab-pane .copy-bar{display:flex;justify-content:flex-end;margin-bottom:8px;gap:6px}
+/* Summary tab */
+.summary-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+.summary-card{background:#f6f8fa;padding:10px 12px;border-radius:6px;border:1px solid #e1e4e8}
+.summary-card .val{font-size:20px;font-weight:700;color:#1a1a2e}
+.summary-card .lbl{font-size:11px;color:#888;margin-top:2px}
+.summary-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
+.summary-table th{text-align:left;font-weight:600;color:#555;padding:4px 8px;border-bottom:1px solid #ddd}
+.summary-table td{padding:4px 8px;border-bottom:1px solid #f0f0f0}
+.summary-table .swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:middle}
+/* GeoPackage export tab */
+.gpkg-info{padding:4px 0}
+.gpkg-info>p{color:#666;font-size:12px;margin:2px 0 6px}
+.gpkg-info .btn{display:inline-flex;align-items:center;gap:6px;padding:12px 24px;font-size:14px;border-radius:8px;margin-top:6px}
+.gpkg-layers{margin:0 0 4px;font-size:12px}
+.gpkg-layers label{display:flex;align-items:center;gap:5px;cursor:pointer;padding:2px 0}
+.gpkg-layers label input{margin:0}
+.gpkg-layers .gpkg-lyr-group{display:none;grid-template-columns:1fr 1fr;gap:1px 12px;padding:2px 0 2px 4px}
+.gpkg-layers .gpkg-lyr-group.open{display:grid}
+.gpkg-layers .gpkg-group{font-weight:600;font-size:10px;color:#888;text-transform:uppercase;letter-spacing:.5px;padding:4px 0 2px;border-bottom:1px solid #f0f0f0;cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px}
+.gpkg-layers .gpkg-group:hover{color:#333}
+.gpkg-layers .gpkg-group .gpkg-arrow{font-size:8px;transition:transform .15s}
+.gpkg-layers .gpkg-group.expanded .gpkg-arrow{transform:rotate(90deg)}
+
+/* Export type selector (reuses ot-* pattern) */
+.export-ot-wrap{position:relative;margin:8px 0}
+.export-ot-select{display:flex;align-items:center;padding:6px 10px;border:1px solid #ccc;border-radius:6px;font-size:12px;cursor:pointer;background:#fff;min-height:32px;user-select:none}
+.export-ot-select:hover{border-color:#0d7377}
+.export-ot-dd{position:absolute;top:100%;left:0;right:0;background:#fff;border:1px solid #ccc;border-radius:0 0 6px 6px;box-shadow:0 4px 12px rgba(0,0,0,.15);z-index:9999;max-height:220px;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:4px 0;display:none}
+.export-ot-dd.open{display:block}
+.export-ot-dd .ot-group{font-size:10px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.5px;padding:6px 10px 2px;user-select:none}
+.export-ot-dd label{display:flex;align-items:center;gap:6px;padding:4px 10px;font-size:12px;font-weight:400;cursor:pointer;margin:0}
+.export-ot-dd label:hover{background:#f0f8f8}
+.export-ot-dd label .ot-swatch{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+.export-ot-dd .ot-actions{display:flex;gap:4px;padding:4px 10px;border-top:1px solid #eee;margin-top:2px}
+.export-ot-dd .ot-actions button{font-size:10px;padding:2px 8px;border:1px solid #ccc;border-radius:3px;background:#fff;cursor:pointer}
+.export-ot-dd .ot-actions button:hover{background:#e8f7f7;border-color:#0d7377}
+/* Height range slider */
+.height-range-wrap{margin:10px 0}
+.height-range-wrap label{font-size:12px;font-weight:600;color:#555;display:block;margin-bottom:4px}
+.height-range-track{position:relative;height:6px;background:#e0e0e0;border-radius:3px;margin:12px 4px 6px}
+.height-range-fill{position:absolute;height:100%;background:#0d7377;border-radius:3px}
+.height-range-thumb{position:absolute;top:50%;width:20px;height:20px;background:#fff;border:2px solid #0d7377;border-radius:50%;transform:translate(-50%,-50%);cursor:grab;touch-action:none;z-index:2;box-shadow:0 1px 4px rgba(0,0,0,.2)}
+.height-range-thumb:active{cursor:grabbing;transform:translate(-50%,-50%) scale(1.15)}
+.height-range-labels{display:flex;justify-content:space-between;font-size:11px;color:#666}
+
+/* ===== GPS CONTROL ===== */
+.leaflet-control-gps{display:none}
+.leaflet-control-gps a{width:30px;height:30px;display:flex;align-items:center;justify-content:center;color:#333;cursor:pointer;text-decoration:none}
+.leaflet-control-gps a:hover{background:#f4f4f4}
+.leaflet-control-gps a.active{background:#e8f7f7;color:#0d7377}
+.leaflet-control-gps a .gps-dot{fill:none;stroke:none}
+.leaflet-control-gps a.active .gps-dot{fill:currentColor;stroke:none}
+.leaflet-control-gps a.searching{animation:gps-pulse 1.2s ease infinite}
+@keyframes gps-pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.gps-hint{position:absolute;z-index:1001;background:#1a1a2e;color:#fff;padding:8px 14px;border-radius:8px;font-size:12px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.3);opacity:0;transition:opacity .5s;pointer-events:none;cursor:pointer}
+.gps-hint.show{opacity:1;pointer-events:auto}
+
+/* ===== MOBILE ===== */
+@media(max-width:900px){
+  .leaflet-control-gps{display:block}
+  body{flex-direction:column}
+  #sidebar{width:100%;flex:0 0 auto;max-height:none;border-right:none;border-bottom:none}
+  .sidebar-collapse-bar{display:block}
+  #sidebar.collapsed .controls,#sidebar.collapsed .status{display:none}
+  #sidebar.collapsed h1{display:none}
+  .controls{max-height:calc(38vh - 70px);padding:8px 12px}
+  #sidebar h1{font-size:14px;padding:8px 12px}
+  #map-area{flex:1;min-height:0}
+  .layer-panel{top:4px;right:4px;padding:8px 10px;font-size:11px;max-height:50vh;max-width:220px}
+  .lyr{min-height:36px;gap:8px}
+  .lyr input[type=checkbox]{width:22px;height:22px}
+  .legend{bottom:4px;right:4px;max-height:35vh;max-width:220px;font-size:10px}
+  .legend-item{min-height:32px;padding:5px 4px;gap:8px;font-size:11px}
+  .legend-icon{width:18px;height:18px;font-size:13px}
+  .panel-toggle{width:28px;height:28px;font-size:16px}
+  textarea{height:36px}
+  label{margin:4px 0 2px}
+  .btn{padding:6px 10px;font-size:12px}
+  .fab-download .btn{padding:8px 14px;font-size:12px}
+  .modal{max-height:92vh;border-radius:12px 12px 0 0;margin-top:auto;max-width:100%}
+  .modal-header{padding:10px 14px}
+  .modal-tabs{overflow-x:auto;-webkit-overflow-scrolling:touch;flex-wrap:nowrap}
+  .modal-tab{padding:8px 8px;font-size:11px;white-space:nowrap;min-width:0}
+  .tab-pane{padding:12px 14px}
+  .gpkg-layers{grid-template-columns:1fr;gap:4px 0;font-size:13px}
+  .gpkg-layers label{padding:6px 0;min-height:36px}
+  .gpkg-layers label input[type=checkbox]{width:20px;height:20px}
+  .gpkg-info .btn{width:100%;justify-content:center;padding:14px 20px;font-size:15px}
+  .summary-grid{grid-template-columns:1fr}
+  .hint{display:none}
+  .export-ot-select{min-height:38px;font-size:13px}
+  .export-ot-dd{max-height:45vh}
+  .export-ot-dd label{padding:6px 10px;font-size:13px;min-height:36px}
+  .height-range-thumb{width:24px;height:24px}
+}
+@media(max-width:600px){
+  .controls{max-height:calc(35vh - 60px)}
+  .extra-params .row{flex-direction:column;gap:4px}
+  .cb-row{gap:6px}
+  .export-ot-dd{position:fixed;top:auto;bottom:0;left:0;right:0;max-height:50vh;border-radius:12px 12px 0 0;box-shadow:0 -4px 20px rgba(0,0,0,.25)}
+  .ot-dropdown,.load-dropdown.open{position:fixed;top:auto;bottom:0;left:0;right:0;max-height:50vh;border-radius:12px 12px 0 0;box-shadow:0 -4px 20px rgba(0,0,0,.25);min-width:unset}
+}
+</style>
+</head>
+<body>
+<div class="loading-overlay" id="loading-overlay"><div class="lo-spinner"></div><div class="lo-text" id="lo-text">Loading…</div><div class="lo-sub" id="lo-sub"></div></div>
+<div id="sidebar">
+  <h1>🌍 Austrian <span>Landscape</span> Analysis</h1>
+  <div class="controls">
+    <div class="row">
+      <div><label>Endpoint</label>
+        <select id="endpoint">
+          <option value="elevation">Elevation</option>
+          <option value="terrain">Terrain</option>
+          <option value="segment" selected>Segment</option>
+        </select>
+      </div>
+      <div class="ot-wrap"><label>Object Types</label><div id="ot-select" class="ot-select"><span id="ot-label">All types</span><span style="margin-left:auto;font-size:10px">▾</span></div>
+        <div id="ot-dropdown" class="ot-dropdown"></div>
+      </div>
+    </div>
+    <div class="extra-params" id="extra-params">
+      <div class="row">
+        <div><label>Min Object Size (m²)</label><input id="min_area" type="number" value="30" step="1"></div>
+        <div><label>Min Height (m)</label><input id="min_height_m" type="number" placeholder="0" min="0" step="0.5"></div>
+      </div>
+      <div class="row">
+        <div><label>Top N Classes</label><input id="top_n_classes" type="number" placeholder="all" min="1" max="25" step="1"></div>
+        <div><label>Top N Objects</label><input id="top_n_objects" type="number" placeholder="all" min="1" step="1"></div>
+      </div>
+      <div class="cb-row">
+        <label><input id="include_ortho" type="checkbox" checked> Ortho</label>
+        <label><input id="include_temporal" type="checkbox" checked> Temporal</label>
+        <label><input id="include_copernicus" type="checkbox" checked> Copernicus</label>
+      </div>
+      <div class="row">
+        <div><label>Source</label>
+          <select id="source" title="auto: finished v2.x products from the fleet first, live BEV rasters only where none exists yet">
+            <option value="auto">Auto (products → live)</option>
+            <option value="product">Products only (precomputed)</option>
+            <option value="bev">Live (BEV rasters)</option>
+          </select>
+        </div>
+      </div>
+      <div class="cb-row">
+        <!--/*PRIVATE*/--><label><input id="include_cadastre" type="checkbox" checked> Cadastre</label><!--/*/PRIVATE*/-->
+        <label><input id="include_hansen" type="checkbox" checked> Hansen</label>
+        <label><input id="include_infra" type="checkbox" checked> Infra</label>
+        <label><input id="mark_uncertain" type="checkbox" checked> Mark uncertain</label>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin:4px 0 2px">
+      <label style="margin:0;flex-shrink:0">Area</label>
+      <button class="more-pill" id="more-toggle" onclick="document.getElementById('extra-params').classList.toggle('open');this.classList.toggle('open')">⚙ Options</button>
+    </div>
+    <div class="geo-input-wrap" id="geo-drop">
+      <textarea id="geometry" class="geo-hidden-ta"></textarea>
+      <div class="geo-input" id="geo-input">
+        <span class="geo-input-icon" id="geo-input-icon">📍</span>
+        <span class="geo-input-text" id="geo-input-text">Draw on map or load a share…</span>
+        <label class="geo-attach-btn" title="Upload geometry file">
+          📎 <input type="file" id="geo-file" accept=".geojson,.json,.kml,.kmz,.gpx,.shp,.zip,.gpkg,.wkt,.gml,.dxf" style="display:none">
+        </label>
+      </div>
+      <div class="geo-drop-overlay" id="geo-drop-overlay">📂 Drop file here</div>
+    </div>
+    <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
+      <div style="position:relative;flex:1">
+        <button class="btn btn-ghost" id="btn-load" style="width:100%">📂 Load</button>
+        <div class="load-dropdown" id="load-dropdown"></div>
+        <input type="file" id="ld-file-input" accept=".geojson,.json,.kml,.kmz,.gpx,.shp,.zip,.gpkg,.wkt,.gml,.dxf" style="display:none">
+      </div>
+      <button class="btn" id="btn-run" style="flex:1">🚀 Analyse</button>
+      <button class="btn btn-danger" id="btn-abort" style="display:none" title="Cancel running analysis">⏹ Stop</button>
+      <div id="area-hint" style="display:none;width:100%;font-size:11px;color:#b87700;background:#fff8e1;padding:5px 8px;border-radius:4px"></div>
+    </div>
+  </div>
+  <div class="status" id="status"><span id="status-text">Idle</span><span id="spinner" class="spinner" style="display:none"></span><span id="proc-status" style="margin-left:auto;font-size:10px;opacity:0.8"></span><span id="train-status" style="font-size:10px;opacity:0.8;margin-left:8px"></span><span class="doc-links"><!--/*PRIVATE*/--><a href="/process.html" title="Austria Landscape Processor">process</a><a href="/query.html" title="Query Explorer">query</a><a href="/training.html" title="RF Training Monitor">training</a><a href="/docs" title="API Documentation">docs</a><!--/*/PRIVATE*/--><a href="/api/v1/docs/llm.txt" title="Machine-readable API reference">llm.txt</a></span></div>
+  <div class="sidebar-collapse-bar" id="sidebar-collapse-bar"><span class="collapse-arrow">▲</span></div>
+</div>
+
+<div id="map-area">
+  <div id="map"></div>
+  <div class="gps-hint" id="gps-hint"></div>
+
+  <div class="layer-panel" id="layer-panel">
+    <h3>Layers <button class="panel-toggle" id="layer-panel-toggle" onclick="togglePanel('layer-panel')" title="Collapse">−</button></h3>
+    <div class="lp-body" id="layer-panel-body">
+    <div class="lp-group">
+      <div class="lp-group-header" onclick="this.nextElementSibling.classList.toggle('open')">LIDAR ▸</div>
+      <div class="lp-group-body">
+        <div class="lyr"><input type="checkbox" data-lyr="dtm-2024"><span class="lyr-label">DTM 2024</span><input type="range" data-op="dtm-2024" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="dtm-2023"><span class="lyr-label">DTM 2023</span><input type="range" data-op="dtm-2023" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="dtm-2022"><span class="lyr-label">DTM 2022</span><input type="range" data-op="dtm-2022" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="dsm-2024"><span class="lyr-label">nDSM 2024</span><input type="range" data-op="dsm-2024" min="0" max="100" value="70"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="dsm-2023"><span class="lyr-label">nDSM 2023</span><input type="range" data-op="dsm-2023" min="0" max="100" value="70"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="dsm-2022"><span class="lyr-label">nDSM 2022</span><input type="range" data-op="dsm-2022" min="0" max="100" value="70"></div>
+      </div>
+    </div>
+    <div class="lp-group">
+      <div class="lp-group-header" onclick="this.nextElementSibling.classList.toggle('open')">ORTHO & FOREST ▸</div>
+      <div class="lp-group-body">
+        <div class="lyr"><input type="checkbox" data-lyr="ortho-2024"><span class="lyr-label">Ortho ~2024</span><input type="range" data-op="ortho-2024" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="ortho-2023"><span class="lyr-label">Ortho ~2023</span><input type="range" data-op="ortho-2023" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="ortho-2020"><span class="lyr-label">Ortho ~2020</span><input type="range" data-op="ortho-2020" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="cir-2024"><span class="lyr-label">CIR ~2024</span><input type="range" data-op="cir-2024" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="cir-2023"><span class="lyr-label">CIR ~2023</span><input type="range" data-op="cir-2023" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="cir-2020"><span class="lyr-label">CIR ~2020</span><input type="range" data-op="cir-2020" min="0" max="100" value="80"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="hansen"><span class="lyr-label">Hansen Forest Δ</span><input type="range" data-op="hansen" min="0" max="100" value="70"></div>
+      </div>
+    </div>
+    <div class="lp-group">
+      <div class="lp-group-header" onclick="this.nextElementSibling.classList.toggle('open')">ANALYSIS ▸</div>
+      <div class="lp-group-body open">
+        <div class="lyr"><input type="checkbox" data-lyr="raster"><span class="lyr-label">Segment Raster</span><input type="range" data-op="raster" min="0" max="100" value="65"></div>
+        <div class="lyr"><input type="checkbox" data-lyr="segments" checked><span class="lyr-label">Segments</span><input type="range" data-op="segments" min="0" max="100" value="90"></div>
+      </div>
+    </div>
+    <div style="margin-top:6px;border-top:1px solid #eee;padding-top:4px">
+      <div class="basemap-switch" id="basemap-switch">
+        <button class="active" data-basemap="osm">Map</button>
+        <button data-basemap="satellite">Satellite</button>
+      </div>
+      <div class="lyr"><input type="checkbox" data-lyr="base" checked><span class="lyr-label">Base map</span><input type="range" data-op="base" min="0" max="100" value="100"></div>
+    </div>
+    </div><!-- /lp-body -->
+  </div>
+
+  <div class="legend" id="legend" style="display:none">
+    <div class="legend-header"><h4 id="legend-types-title">Object Types</h4><button class="panel-toggle" id="legend-panel-toggle" onclick="togglePanel('legend')" title="Collapse">−</button></div>
+    <div class="legend-body" id="legend-body">
+    <div id="meta-info" class="meta-info" style="display:none"></div>
+    <div class="color-mode-bar" id="color-mode-bar">
+      <button id="cm-type" class="active" onclick="setColorMode('type')">Type</button>
+      <button id="cm-height" onclick="setColorMode('height')">Height</button>
+    </div>
+    <div id="legend-scale"></div>
+    <div id="legend-types"></div>
+    <div id="summary-panel" style="display:none;margin-top:6px;padding-top:6px;border-top:1px solid #ddd">
+      <h4>Summary</h4>
+      <div id="summary-content" style="font-size:10px;margin-top:4px"></div>
+    </div>
+    </div><!-- /legend-body -->
+  </div>
+
+  <!-- Download FAB + Share -->
+  <div class="fab-download" id="fab-download">
+    <button class="btn" id="btn-share" title="Copy share link">🔗 Share</button>
+    <button class="btn" onclick="openResultModal()">📥 Download</button>
+  </div>
+  <div class="share-toast" id="share-toast">Link copied!</div>
+  <div class="share-link-popup" id="share-link-popup">
+    <div class="share-link-url" id="share-link-url"></div>
+    <div class="share-rename-hint" id="share-rename-hint" style="font-size:10px;color:rgba(95,255,176,.5);margin:-4px 0 0">tap <span style="color:#5fffb0">green name</span> to rename</div>
+    <div class="share-link-bottom">
+      <button class="btn btn-sm" id="share-copy-btn">🔗 Copy link</button>
+      <span class="share-copied" id="share-copied">✓ Copied</span>
+      <span class="share-saving" id="share-saving">Saving…</span>
+    </div>
+  </div>
+</div>
+
+<!-- ===== RESULT MODAL ===== -->
+<div class="modal-backdrop" id="result-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>📊 Analysis Results</h2>
+      <button class="modal-close" onclick="closeResultModal()">&times;</button>
+    </div>
+    <div class="modal-tabs">
+      <div class="modal-tab active" data-tab="summary" onclick="switchTab('summary')">Summary</div>
+      <div class="modal-tab" data-tab="json" onclick="switchTab('json')">JSON</div>
+      <div class="modal-tab" data-tab="gpkg" onclick="switchTab('gpkg')">GeoPackage</div>
+      <div class="modal-tab" data-tab="kml" onclick="switchTab('kml')">KML</div>
+      <div class="modal-tab" data-tab="mbtiles" onclick="switchTab('mbtiles')">MBTiles</div>
+    </div>
+    <div class="modal-body">
+      <div class="tab-pane active" id="tab-summary">
+        <div id="modal-summary">No results yet.</div>
+      </div>
+      <div class="tab-pane" id="tab-json">
+        <div class="copy-bar">
+          <button class="btn btn-sm btn-ghost" id="btn-copy-json">📋 Copy</button>
+          <button class="btn btn-sm btn-ghost" id="btn-dl-json">💾 Download .geojson</button>
+        </div>
+        <pre id="modal-json">No results yet.</pre>
+      </div>
+      <div class="tab-pane" id="tab-mbtiles">
+        <div class="gpkg-info">
+          <p style="font-size:24px;margin-bottom:4px">📱 MBTiles Export</p>
+          <p>Download individual raster layers as MBTiles for offline mobile use (e.g. in QField, Avenza Maps, OSMAND).</p>
+          <div id="mbtiles-list" style="margin:12px 0"></div>
+          <div id="mbt-raster-filters" style="display:none;margin:8px 0;padding:10px;border:1px solid #eee;border-radius:8px;background:#fafbfc">
+            <div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Segment Raster Filters</div>
+            <div class="export-ot-wrap">
+              <div class="gpkg-group" style="margin-bottom:4px">Object Types</div>
+              <div id="mbt-ot-select" class="export-ot-select"><span id="mbt-ot-label">All types</span><span style="margin-left:auto;font-size:10px">▾</span></div>
+              <div id="mbt-ot-dd" class="export-ot-dd"></div>
+            </div>
+            <div class="height-range-wrap" id="mbt-height-wrap">
+              <label>Object Height Range (m)</label>
+              <div class="height-range-track" id="mbt-hr-track">
+                <div class="height-range-fill" id="mbt-hr-fill"></div>
+                <div class="height-range-thumb" id="mbt-hr-min" tabindex="0"></div>
+                <div class="height-range-thumb" id="mbt-hr-max" tabindex="0"></div>
+              </div>
+              <div class="height-range-labels"><span id="mbt-hr-min-val">0 m</span><span id="mbt-hr-max-val">50 m</span></div>
+            </div>
+          </div>
+          <p class="hint" style="display:block;color:#888;font-size:11px">Each layer is downloaded as a separate .mbtiles file. Async download — runs in background.</p>
+        </div>
+      </div>
+      <div class="tab-pane" id="tab-gpkg">
+        <div class="gpkg-info">
+          <p style="font-size:18px;margin-bottom:2px">📦 GeoPackage Export</p>
+          <p>Active layers pre-selected. Click headers to expand.</p>
+          <div class="gpkg-layers" id="gpkg-layers">
+            <div class="gpkg-group expanded" onclick="this.classList.toggle('expanded');this.nextElementSibling.classList.toggle('open')"><span class="gpkg-arrow">▸</span> Core & Analysis</div>
+            <div class="gpkg-lyr-group open">
+              <label><input type="checkbox" data-gpkg="dtm"> DTM (terrain)</label>
+              <label><input type="checkbox" data-gpkg="dsm"> DSM / nDSM</label>
+              <label><input type="checkbox" data-gpkg="segments"> Segments (raster)</label>
+              <label><input type="checkbox" data-gpkg="segments-vector"> Polygons (vector)</label>
+              <label><input type="checkbox" data-gpkg="raster"> RGBA raster</label>
+              <label><input type="checkbox" data-gpkg="hansen"> Hansen Forest Δ</label>
+            </div>
+            <div class="gpkg-group" onclick="this.classList.toggle('expanded');this.nextElementSibling.classList.toggle('open')"><span class="gpkg-arrow">▸</span> Orthophoto</div>
+            <div class="gpkg-lyr-group">
+              <label><input type="checkbox" data-gpkg="ortho-2024"> Ortho ~2024</label>
+              <label><input type="checkbox" data-gpkg="ortho-2023"> Ortho ~2023</label>
+              <label><input type="checkbox" data-gpkg="ortho-2020"> Ortho ~2020</label>
+              <label><input type="checkbox" data-gpkg="cir-2024"> CIR ~2024</label>
+              <label><input type="checkbox" data-gpkg="cir-2023"> CIR ~2023</label>
+              <label><input type="checkbox" data-gpkg="cir-2020"> CIR ~2020</label>
+            </div>
+            <div class="gpkg-group" onclick="this.classList.toggle('expanded');this.nextElementSibling.classList.toggle('open')"><span class="gpkg-arrow">▸</span> LiDAR Overlays</div>
+            <div class="gpkg-lyr-group">
+              <label><input type="checkbox" data-gpkg="dtm-2024"> DTM 2024 hillshade</label>
+              <label><input type="checkbox" data-gpkg="dtm-2023"> DTM 2023 hillshade</label>
+              <label><input type="checkbox" data-gpkg="dtm-2022"> DTM 2022 hillshade</label>
+              <label><input type="checkbox" data-gpkg="dsm-2024"> nDSM 2024 overlay</label>
+              <label><input type="checkbox" data-gpkg="dsm-2023"> nDSM 2023 overlay</label>
+              <label><input type="checkbox" data-gpkg="dsm-2022"> nDSM 2022 overlay</label>
+            </div>
+          </div>
+          <div class="export-ot-wrap">
+            <div class="gpkg-group" style="margin-bottom:4px">Object Types</div>
+            <div id="gpkg-ot-select" class="export-ot-select"><span id="gpkg-ot-label">All types</span><span style="margin-left:auto;font-size:10px">▾</span></div>
+            <div id="gpkg-ot-dd" class="export-ot-dd"></div>
+          </div>
+          <div class="height-range-wrap" id="gpkg-height-wrap">
+            <label>Object Height Range (m)</label>
+            <div class="height-range-track" id="gpkg-hr-track">
+              <div class="height-range-fill" id="gpkg-hr-fill"></div>
+              <div class="height-range-thumb" id="gpkg-hr-min" tabindex="0"></div>
+              <div class="height-range-thumb" id="gpkg-hr-max" tabindex="0"></div>
+            </div>
+            <div class="height-range-labels"><span id="gpkg-hr-min-val">0 m</span><span id="gpkg-hr-max-val">50 m</span></div>
+          </div>
+          <button class="btn" id="btn-dl-gpkg" style="width:100%">📦 Download GeoPackage</button>
+        </div>
+      </div>
+      <div class="tab-pane" id="tab-kml">
+        <div class="gpkg-info">
+          <p style="font-size:18px;margin-bottom:2px">🌍 KML Export</p>
+          <p>Download analysis features as KML for Google Earth. Requires analysis results.</p>
+          <div style="margin:10px 0">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin:6px 0">
+              Group by:
+              <select id="kml-group-by" style="font-size:12px;padding:3px 6px;border-radius:4px;border:1px solid #ddd">
+                <option value="type">Object type</option>
+                <option value="height_class">Height class</option>
+              </select>
+            </label>
+          </div>
+          <div class="export-ot-wrap">
+            <div class="gpkg-group" style="margin-bottom:4px">Object Types</div>
+            <div id="kml-ot-select" class="export-ot-select"><span id="kml-ot-label">All types</span><span style="margin-left:auto;font-size:10px">▾</span></div>
+            <div id="kml-ot-dd" class="export-ot-dd"></div>
+          </div>
+          <div class="height-range-wrap" id="kml-height-wrap">
+            <label>Object Height Range (m)</label>
+            <div class="height-range-track" id="kml-hr-track">
+              <div class="height-range-fill" id="kml-hr-fill"></div>
+              <div class="height-range-thumb" id="kml-hr-min" tabindex="0"></div>
+              <div class="height-range-thumb" id="kml-hr-max" tabindex="0"></div>
+            </div>
+            <div class="height-range-labels"><span id="kml-hr-min-val">0 m</span><span id="kml-hr-max-val">50 m</span></div>
+          </div>
+          <button class="btn" id="btn-dl-kml" style="width:100%" disabled>🌍 Download KML</button>
+          <p id="kml-no-results" style="color:#999;font-size:11px;margin-top:6px">Run an analysis first to export features as KML.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+<script src="https://unpkg.com/@turf/turf@7/turf.min.js"></script>
+<script>
+// ============ PANEL COLLAPSE ============
+function togglePanel(panelId){
+  const panel=document.getElementById(panelId);
+  const btn=panel.querySelector('.panel-toggle');
+  const collapsed=panel.classList.toggle('collapsed');
+  btn.textContent=collapsed?'+':'\u2212';
+  btn.title=collapsed?'Expand':'Collapse';
+}
+
+// ============ COLORMAPS ============
+const VIRIDIS=[[68,1,84],[72,35,116],[64,67,135],[52,94,141],[41,120,142],[32,144,140],[34,167,132],[68,190,112],[121,209,81],[189,222,38],[253,231,37]];
+function viridis(t){t=Math.max(0,Math.min(1,t));const i=t*(VIRIDIS.length-1),lo=Math.floor(i),hi=Math.min(lo+1,VIRIDIS.length-1),f=i-lo;return VIRIDIS[lo].map((v,c)=>Math.round(v+f*(VIRIDIS[hi][c]-v)));}
+function viridisCSS(t){const c=viridis(t);return`rgb(${c[0]},${c[1]},${c[2]})`}
+function viridisGrad(){const s=[];for(let i=0;i<=10;i++)s.push(viridisCSS(i/10)+` ${i*10}%`);return`linear-gradient(to right,${s.join(',')})`}
+function divCSS(t){const n=(t+1)/2;let r,g,b;if(n<.5){const f=n*2;r=33+f*222;g=102+f*153;b=172+f*83}else{const f=(n-.5)*2;r=255-f*37;g=255-f*192;b=255-f*192}return`rgb(${Math.round(r)},${Math.round(g)},${Math.round(b)})`}
+function divGrad(){const s=[];for(let i=0;i<=10;i++)s.push(divCSS(-1+i*.2)+` ${i*10}%`);return`linear-gradient(to right,${s.join(',')})`}
+
+// ============ TYPE CONFIG ============
+const TYPE_SHAPES={tree:{s:'tri',l:'▲',c:'#006400'},shrub:{s:'tri',l:'▲',c:'#228B22'},grass:{s:'cir',l:'●',c:'#7CFC00'},hedge:{s:'dash',l:'—',c:'#2E8B57'},water:{s:'cir',l:'●',c:'#1E90FF'},wetland:{s:'cir',l:'●',c:'#00A896'},roof:{s:'sq',l:'■',c:'#DC143C'},greenhouse:{s:'sq',l:'□',c:'#FF69B4'},solar_panel:{s:'sq',l:'◫',c:'#4169E1'},fence:{s:'dash',l:'—',c:'#A0522D'},wall:{s:'dash',l:'—',c:'#8B4513'},mast:{s:'x',l:'✦',c:'#404040'},wind_turbine:{s:'x',l:'⚡',c:'#1565C0'},substation:{s:'sq',l:'⬡',c:'#FF6F00'},road:{s:'sq',l:'■',c:'#808080'},path:{s:'dash',l:'—',c:'#A9A9A9'},parking:{s:'sq',l:'▪',c:'#696969'},bridge:{s:'dia',l:'◆',c:'#708090'},rail:{s:'dash',l:'—',c:'#5A3C6E'},crop:{s:'cir',l:'●',c:'#DAA520'},orchard:{s:'tri',l:'▲',c:'#6B8E23'},vineyard:{s:'tri',l:'▲',c:'#9370DB'},garden:{s:'cir',l:'●',c:'#3CB371'},bare_soil:{s:'x',l:'×',c:'#D2B48C'},rock:{s:'x',l:'×',c:'#8B8682'},glacier:{s:'x',l:'×',c:'#C8EBFF'},excavation:{s:'dia',l:'◆',c:'#8B0000'},fill:{s:'dia',l:'◆',c:'#FF8C00'},tree_loss:{s:'dia',l:'◆',c:'#FF00FF'},construction:{s:'dia',l:'◆',c:'#FF4500'},unclassified:{s:'cir',l:'○',c:'#BEBEBE'}};
+const STATUS_COLORS={grown:{l:'▲',c:'#228B22'},felled:{l:'▼',c:'#DC143C'},new:{l:'★',c:'#00BFFF'},stable:{l:'●',c:'#888'},declined:{l:'▼',c:'#FF8C00'},dead:{l:'✖',c:'#8B0000'}};
+const EVENT_COLORS={tree_growth:{l:'▲',c:'#228B22'},tree_felling:{l:'▼',c:'#DC143C'},new_tree:{l:'★',c:'#00BFFF'},forest_clearcut:{l:'◆',c:'#FF00FF'},vegetation_growth:{l:'▲',c:'#7CFC00'},vegetation_loss:{l:'▼',c:'#FF8C00'},new_building:{l:'■',c:'#DC143C'},demolition:{l:'□',c:'#FF4500'},construction:{l:'■',c:'#FF6347'},earthwork_fill:{l:'◆',c:'#DAA520'},earthwork_cut:{l:'◇',c:'#8B4513'},earthwork_grading:{l:'◆',c:'#A0522D'},earthwork_dam:{l:'█',c:'#696969'},earthwork_trench:{l:'—',c:'#404040'},earthwork_pond:{l:'●',c:'#1E90FF'},road_new:{l:'—',c:'#808080'},road_resurfaced:{l:'—',c:'#A9A9A9'},road_widened:{l:'—',c:'#696969'},surface_change:{l:'×',c:'#D2B48C'},unknown_change:{l:'?',c:'#888'}};
+const DEF={l:'○',c:'#666'};
+function typeInfo(t,ep){return TYPE_SHAPES[t]||DEF;}
+
+// ============ OBJECT TYPE MULTI-SELECT ============
+const OT_GROUPS={
+  'Vegetation':['tree','shrub','grass','hedge'],
+  'Water':['water'],
+  'Buildings':['roof','greenhouse','solar_panel'],
+  'Infrastructure':['fence','wall','mast','wind_turbine','substation'],
+  'Transportation':['road','path','parking','bridge'],
+  'Agricultural':['crop','orchard','vineyard','garden'],
+  'Terrain':['bare_soil','rock'],
+  'Disturbance':['excavation','fill','tree_loss','construction'],
+  'Other':['unclassified']
+};
+const ALL_OBJ_TYPES=Object.values(OT_GROUPS).flat();
+const selectedTypes=new Set(ALL_OBJ_TYPES);
+
+(function initOTSelect(){
+  const dd=document.getElementById('ot-dropdown');
+  const lbl=document.getElementById('ot-label');
+  const sel=document.getElementById('ot-select');
+
+  let html='<div class="ot-actions"><button id="ot-all">All</button><button id="ot-none">None</button><button id="ot-invert">Invert</button></div>';
+  for(const[group,types]of Object.entries(OT_GROUPS)){
+    html+=`<div class="ot-group">${group}</div>`;
+    for(const t of types){
+      const c=TYPE_SHAPES[t]?.c||'#888';
+      const name=t.replace(/_/g,' ');
+      html+=`<label><input type="checkbox" value="${t}" checked><span class="ot-swatch" style="background:${c}"></span>${name}</label>`;
+    }
+  }
+  dd.innerHTML=html;
+
+  sel.onclick=e=>{e.stopPropagation();dd.classList.toggle('open');};
+  document.addEventListener('click',e=>{if(!dd.contains(e.target)&&!sel.contains(e.target))dd.classList.remove('open');});
+
+  dd.querySelectorAll('input[type=checkbox]').forEach(cb=>{
+    cb.onchange=()=>{if(cb.checked)selectedTypes.add(cb.value);else selectedTypes.delete(cb.value);updateOTLabel();};
+  });
+
+  dd.querySelector('#ot-all').onclick=()=>{dd.querySelectorAll('input').forEach(cb=>{cb.checked=true;selectedTypes.add(cb.value);});updateOTLabel();};
+  dd.querySelector('#ot-none').onclick=()=>{dd.querySelectorAll('input').forEach(cb=>{cb.checked=false;selectedTypes.delete(cb.value);});updateOTLabel();};
+  dd.querySelector('#ot-invert').onclick=()=>{dd.querySelectorAll('input').forEach(cb=>{cb.checked=!cb.checked;if(cb.checked)selectedTypes.add(cb.value);else selectedTypes.delete(cb.value);});updateOTLabel();};
+
+})();
+
+function updateOTLabel(){
+  const lbl=document.getElementById('ot-label');
+  if(selectedTypes.size===ALL_OBJ_TYPES.length)lbl.textContent='All types';
+  else if(selectedTypes.size===0)lbl.textContent='None selected';
+  else if(selectedTypes.size<=3)lbl.textContent=[...selectedTypes].map(t=>t.replace(/_/g,' ')).join(', ');
+  else lbl.textContent=`${selectedTypes.size} of ${ALL_OBJ_TYPES.length} types`;
+}
+
+function getSelectedTypes(){
+  if(selectedTypes.size===ALL_OBJ_TYPES.length)return '';
+  return [...selectedTypes].join(',');
+}
+
+function mkIcon(info,colorOvr){
+  const fill=colorOvr||info.c||'#666',r=5,d=10;
+  let svg;
+  const s=info.s||'cir';
+  if(s==='tri')svg=`<polygon points="${r},0 ${d},${d} 0,${d}" fill="${fill}" stroke="#000" stroke-width=".8"/>`;
+  else if(s==='sq')svg=`<rect x="1" y="1" width="${d-2}" height="${d-2}" fill="${fill}" stroke="#000" stroke-width=".8" rx="1"/>`;
+  else if(s==='dia')svg=`<polygon points="${r},0 ${d},${r} ${r},${d} 0,${r}" fill="${fill}" stroke="#000" stroke-width=".8"/>`;
+  else if(s==='x')svg=`<line x1="2" y1="2" x2="${d-2}" y2="${d-2}" stroke="${fill}" stroke-width="2.5"/><line x1="${d-2}" y1="2" x2="2" y2="${d-2}" stroke="${fill}" stroke-width="2.5"/>`;
+  else if(s==='dash')svg=`<rect x="1" y="${r-2}" width="${d-2}" height="4" fill="${fill}" stroke="#000" stroke-width=".5" rx="1"/>`;
+  else svg=`<circle cx="${r}" cy="${r}" r="${r-1}" fill="${fill}" stroke="#000" stroke-width=".8"/>`;
+  return L.divIcon({html:`<svg width="${d}" height="${d}" viewBox="0 0 ${d} ${d}" xmlns="http://www.w3.org/2000/svg">${svg}</svg>`,iconSize:[d,d],iconAnchor:[r,r],className:''});
+}
+
+// ============ MAP ============
+const map=L.map('map').setView([47.137,15.117],14);
+map.attributionControl.addAttribution('Daten: <a href="https://data.bev.gv.at">BEV</a> CC BY 4.0 (bearbeitet) · Contains modified Copernicus Sentinel data · <a href="/api/v1/attribution">Lizenzen</a>');
+const baseLayers={osm:L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',maxZoom:19}),satellite:L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{attribution:'Tiles &copy; Esri',maxZoom:19})};
+let baseLayer=baseLayers.osm.addTo(map);
+function switchBasemap(key){
+  if(baseLayers[key]===baseLayer)return;
+  const op=baseLayer.options.opacity||1;
+  map.removeLayer(baseLayer);
+  baseLayer=baseLayers[key].addTo(map);
+  baseLayer.setOpacity(op);
+  orderLayers();
+  document.querySelectorAll('#basemap-switch button').forEach(b=>b.classList.toggle('active',b.dataset.basemap===key));
+}
+document.addEventListener('click',function(e){if(e.target.matches&&e.target.matches('#basemap-switch button')){switchBasemap(e.target.dataset.basemap);}});
+
+// GPS control as Leaflet control (topleft, leaflet-bar style, mobile only)
+L.Control.GPS=L.Control.extend({
+  onAdd(){const c=L.DomUtil.create('div','leaflet-control-gps leaflet-bar leaflet-control');const a=L.DomUtil.create('a','',c);a.id='gps-btn';a.href='#';a.title='Use my location';a.role='button';a.innerHTML='<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3" class="gps-dot" stroke="none" fill="none"/><line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="2" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22" y2="12"/></svg>';L.DomEvent.disableClickPropagation(c);L.DomEvent.on(a,'click',function(e){L.DomEvent.preventDefault(e);toggleGPS();});return c;},
+  onRemove(){}
+});
+new L.Control.GPS({position:'topleft'}).addTo(map);
+const drawnItems=new L.FeatureGroup().addTo(map);
+const resultLayer=new L.FeatureGroup().addTo(map);
+
+const drawControl=new L.Control.Draw({edit:{featureGroup:drawnItems},draw:{polygon:true,polyline:false,marker:false,rectangle:true,circle:false,circlemarker:false}}).addTo(map);
+map.on(L.Draw.Event.CREATED,e=>{drawnItems.clearLayers();drawnItems.addLayer(e.layer);document.getElementById('geometry').value=JSON.stringify(e.layer.toGeoJSON().geometry,null,2);markShareDirty();_showFabIfGeometry();_checkAreaWarning(e.layer);});
+// moveend no longer invalidates share — viewpoint is cosmetic, not part of share identity
+map.on('moveend',_debouncedLayerAvailCheck);
+
+// Override delete button: intercept leaflet-draw's delete toolbar
+// Replace delete button click to clear EVERYTHING with a confirmation
+(function(){
+  // Wait for draw toolbar to render, then find the trash button
+  setTimeout(()=>{
+    const delBtn=document.querySelector('.leaflet-draw-edit-remove');
+    if(!delBtn)return;
+    // Clone to remove existing event listeners
+    const newBtn=delBtn.cloneNode(true);
+    delBtn.parentNode.replaceChild(newBtn,delBtn);
+    newBtn.title='Clear map & results';
+    newBtn.onclick=function(e){
+      e.preventDefault();e.stopPropagation();
+      if(!confirm('Clear the drawn area and all analysis results? This cannot be undone.'))return;
+      clearEverything();
+    };
+  },500);
+})();
+
+function clearEverything(){
+  // Clear drawn geometry
+  drawnItems.clearLayers();
+  document.getElementById('geometry').value='';
+  // Clear results
+  resultLayer.clearLayers();
+  markersByType={};allFeatureData=[];hiddenTypes.clear();
+  _lhfLo=0;_lhfHi=1;_lhfUpdateVisual();
+  lastResult=null;
+  _rasterOrigImg=null;_rasterOrigBounds=null;_rasterReloadSeq++;
+  // Remove all overlays
+  for(const[id,ovl]of Object.entries(overlays)){map.removeLayer(ovl);}
+  for(const k of Object.keys(overlays))delete overlays[k];
+  document.querySelectorAll('[data-lyr]').forEach(cb=>{if(cb.dataset.lyr!=='base')cb.checked=false;});
+  // Hide legend, download fab, share popup
+  document.getElementById('legend').style.display='none';
+  document.getElementById('fab-download').style.display='none';
+  document.getElementById('area-hint').style.display='none';
+  const sp=document.getElementById('share-link-popup');if(sp)sp.classList.remove('show');
+  // Reset legend
+  document.getElementById('legend-types').innerHTML='';
+  document.getElementById('legend-scale').innerHTML='';
+  const mi=document.getElementById('meta-info');if(mi){mi.style.display='none';mi.innerHTML='';}
+  // Reset share
+  markShareDirty();
+  // Reset geo display
+  if(typeof updateGeoInputDisplay==='function') updateGeoInputDisplay(null);
+  // Collapse textarea if visible
+  const _cta=document.getElementById('geometry');
+  if(_cta.classList.contains('geo-shown-ta')){_cta.classList.add('geo-hidden-ta');_cta.classList.remove('geo-shown-ta');_cta.style.cssText='';}
+  // Reset URL
+  history.replaceState(null,'',location.pathname);
+  // Reset status
+  setStatus('Idle');
+}
+
+// ============ FAB VISIBILITY + AREA WARNING ============
+function _showFabIfGeometry(){
+  const geo=document.getElementById('geometry').value.trim();
+  if(geo) document.getElementById('fab-download').style.display='flex';
+}
+function _checkAreaWarning(layer){
+  // Show soft hint if area > 100 ha
+  try{
+    if(!layer) return;
+    let gj = layer.toGeoJSON ? layer.toGeoJSON() : null;
+    if(!gj) return;
+    let area = turf.area(gj);  // m²
+    const ha = area / 10000;
+    const hint = document.getElementById('area-hint');
+    if(ha > MAX_AREA_KM2*100){
+      hint.textContent = `⛔ Too large (${(ha/100).toFixed(1)} km²) — the maximum is ${MAX_AREA_KM2} km²`;
+      hint.style.display = 'block';
+    } else if(ha > 100){
+      hint.textContent = `⚠️ Large area (${Math.round(ha)} ha) — analysis may take several minutes`;
+      hint.style.display = 'block';
+    } else {
+      hint.style.display = 'none';
+    }
+  }catch(e){}
+}
+function _checkAreaWarningFromGeometry(){
+  try{
+    const geo = JSON.parse(document.getElementById('geometry').value);
+    const area = turf.area({type:'Feature',geometry:geo,properties:{}});
+    const ha = area / 10000;
+    const hint = document.getElementById('area-hint');
+    if(ha > MAX_AREA_KM2*100){
+      hint.textContent = `⛔ Too large (${(ha/100).toFixed(1)} km²) — the maximum is ${MAX_AREA_KM2} km²`;
+      hint.style.display = 'block';
+    } else if(ha > 100){
+      hint.textContent = `⚠️ Large area (${Math.round(ha)} ha) — analysis may take several minutes`;
+      hint.style.display = 'block';
+    } else {
+      hint.style.display = 'none';
+    }
+  }catch(e){}
+}
+
+// ============ SOURCE (products vs live) ============
+function getSource(){const el=document.getElementById('source');return (el&&el.value)||'auto';}
+const MAX_AREA_KM2=window.SRTM_PUBLIC?(window.SRTM_PUBLIC_MAX_KM2||10):25;
+
+// ============ STATE ============
+let colorMode='type';
+const hiddenTypes=new Set();
+let markersByType={};
+let lastResult=null, lastEndpoint='segment', allFeatureData=[];
+const overlays={};
+
+// Client-side raster overlay filtering: cache original image + bounds for instant type toggling
+let _rasterOrigImg=null;  // HTMLImageElement of unfiltered overlay
+let _rasterOrigBounds=null; // LatLngBounds of the overlay
+let _rasterReloadSeq=0;  // sequence counter to discard stale async raster reloads
+let _rasterWanted=false;  // true if raster checkbox is checked (survives async reload gaps)
+
+// Segment overlay RGB colors (must match server SEGMENT_COLORS, alpha ignored — we match by RGB only)
+const SEGMENT_RGB={
+  tree:[0,100,0],shrub:[34,139,34],grass:[124,252,0],hedge:[46,139,87],water:[30,144,255],wetland:[0,168,150],rail:[90,60,110],glacier:[200,235,255],
+  roof:[220,20,60],greenhouse:[255,105,180],solar_panel:[65,105,225],fence:[160,82,45],
+  wall:[139,69,19],mast:[64,64,64],wind_turbine:[21,101,192],substation:[255,111,0],road:[128,128,128],path:[169,169,169],parking:[105,105,105],
+  bridge:[112,128,144],crop:[218,165,32],orchard:[107,142,35],vineyard:[147,112,219],
+  garden:[60,179,113],bare_soil:[210,180,140],rock:[139,134,130],excavation:[139,0,0],
+  fill:[255,140,0],tree_loss:[255,0,255],construction:[255,69,0],
+  unclassified:[190,190,190]
+};
+// Build reverse lookup: "R,G,B" -> type name
+const _rgbToType={};
+for(const[t,rgb] of Object.entries(SEGMENT_RGB)) _rgbToType[rgb.join(',')]=t;
+
+function _filterRasterClientSide(){
+  if(!_rasterOrigImg||!_rasterOrigBounds) return null;
+  // Collect all types that should be hidden (legend-hidden OR deselected in dropdown)
+  const allHidden=new Set();
+  for(const t of hiddenTypes) allHidden.add(t);
+  for(const t of Object.keys(TYPE_SHAPES)){if(!selectedTypes.has(t)) allHidden.add(t);}
+  if(allHidden.size===0){
+    // Redraw original to fresh canvas to get a new URL (Leaflet ignores setUrl with same URL)
+    const c0=document.createElement('canvas');
+    c0.width=_rasterOrigImg.naturalWidth; c0.height=_rasterOrigImg.naturalHeight;
+    c0.getContext('2d').drawImage(_rasterOrigImg,0,0);
+    return c0.toDataURL('image/png');
+  }
+  const c=document.createElement('canvas');
+  c.width=_rasterOrigImg.naturalWidth; c.height=_rasterOrigImg.naturalHeight;
+  const ctx=c.getContext('2d');
+  ctx.drawImage(_rasterOrigImg,0,0);
+  const imgData=ctx.getImageData(0,0,c.width,c.height);
+  const d=imgData.data;
+  // Build lookup: for each hidden type, store RGB with ±2 tolerance for premultiplied-alpha rounding
+  const hiddenArr=[];
+  for(const t of allHidden){const rgb=SEGMENT_RGB[t]; if(rgb) hiddenArr.push(rgb);}
+  // Pre-build a 3D boolean lookup (256^3 is too big, use hash set with tolerance)
+  const hiddenSet=new Set();
+  for(const[r,g,b] of hiddenArr){
+    for(let dr=-2;dr<=2;dr++) for(let dg=-2;dg<=2;dg++) for(let db=-2;db<=2;db++){
+      const rr=r+dr,gg=g+dg,bb=b+db;
+      if(rr>=0&&rr<=255&&gg>=0&&gg<=255&&bb>=0&&bb<=255) hiddenSet.add((rr<<16)|(gg<<8)|bb);
+    }
+  }
+  for(let i=0;i<d.length;i+=4){
+    if(d[i+3]===0) continue;
+    if(hiddenSet.has((d[i]<<16)|(d[i+1]<<8)|d[i+2])) d[i+3]=0;
+  }
+  ctx.putImageData(imgData,0,0);
+  return c.toDataURL('image/png');
+}
+
+const LAYER_DEFS={
+  'dtm-2024':{url:'/api/v1/dtm/overlay',ds:'20240915'},
+  'dtm-2023':{url:'/api/v1/dtm/overlay',ds:'20230915'},
+  'dtm-2022':{url:'/api/v1/dtm/overlay',ds:'20220915'},
+  'dsm-2024':{url:'/api/v1/lidar/overlay',ds:'20240915'},
+  'dsm-2023':{url:'/api/v1/lidar/overlay',ds:'20230915'},
+  'dsm-2022':{url:'/api/v1/lidar/overlay',ds:'20220915'},
+  'ortho-2024':{url:'/api/v1/ortho/overlay',ds:'20240915',ortho_year:2024},
+  'ortho-2023':{url:'/api/v1/ortho/overlay',ds:'20230915',ortho_year:2023},
+  'ortho-2020':{url:'/api/v1/ortho/overlay',ds:'20220915',ortho_year:2020},
+  'cir-2024':{url:'/api/v1/cir/overlay',ds:'20240915',ortho_year:2024},
+  'cir-2023':{url:'/api/v1/cir/overlay',ds:'20230915',ortho_year:2023},
+  'cir-2020':{url:'/api/v1/cir/overlay',ds:'20220915',ortho_year:2020},
+  'hansen':{url:'/api/v1/hansen/overlay',ds:'20240915'},
+  'raster':{url:null},
+};
+
+// ============ MODAL ============
+function openResultModal(){
+  document.getElementById('result-modal').classList.add('open');
+  updateModalContent();
+  syncGpkgCheckboxes();
+  buildExportTypeFilters();
+  updateKmlState();
+}
+function closeResultModal(){
+  document.getElementById('result-modal').classList.remove('open');
+}
+function switchTab(tab){
+  document.querySelectorAll('.modal-tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===tab));
+  document.querySelectorAll('.tab-pane').forEach(p=>p.classList.toggle('active',p.id==='tab-'+tab));
+  if(tab==='gpkg') syncGpkgCheckboxes();
+  if(tab==='kml') updateKmlState();
+}
+function syncGpkgCheckboxes(){
+  // Mirror map layer panel state into GeoPackage export checkboxes.
+  // Everything mirrors its map toggle. dtm/dsm match their hillshade/overlay counterparts.
+  document.querySelectorAll('[data-gpkg]').forEach(cb=>{
+    const id=cb.dataset.gpkg;
+    if(id==='dtm'){
+      const any=['dtm-2024','dtm-2023','dtm-2022'].some(lid=>{const mc=document.querySelector(`[data-lyr="${lid}"]`);return mc&&mc.checked;});
+      cb.checked=any; return;
+    }
+    if(id==='dsm'){
+      const any=['dsm-2024','dsm-2023','dsm-2022'].some(lid=>{const mc=document.querySelector(`[data-lyr="${lid}"]`);return mc&&mc.checked;});
+      cb.checked=any; return;
+    }
+    if(id==='segments-vector'){
+      const mc=document.querySelector('[data-lyr="segments"]'); cb.checked=mc&&mc.checked; return;
+    }
+    const mapCb=document.querySelector(`[data-lyr="${id}"]`);
+    if(mapCb) cb.checked=mapCb.checked;
+  });
+  // Auto-expand groups that have checked items
+  document.querySelectorAll('.gpkg-lyr-group').forEach(grp=>{
+    const any=[...grp.querySelectorAll('input[type=checkbox]')].some(c=>c.checked);
+    const hdr=grp.previousElementSibling;
+    if(any){grp.classList.add('open');hdr.classList.add('expanded');}
+    else{grp.classList.remove('open');hdr.classList.remove('expanded');}
+  });
+}
+
+// ============ EXPORT TYPE DROPDOWN + HEIGHT RANGE ============
+const _exportOTState={}; // {prefix: Set}
+function _initExportOT(prefix){
+  const dd=document.getElementById(prefix+'-ot-dd');
+  const sel=document.getElementById(prefix+'-ot-select');
+  const lbl=document.getElementById(prefix+'-ot-label');
+  if(!dd||dd.dataset.init) return;
+  dd.dataset.init='1';
+  _exportOTState[prefix]=new Set(ALL_OBJ_TYPES);
+  let html='<div class="ot-actions"><button data-act="all">All</button><button data-act="none">None</button><button data-act="invert">Invert</button></div>';
+  for(const[group,types]of Object.entries(OT_GROUPS)){
+    html+=`<div class="ot-group">${group}</div>`;
+    for(const t of types){
+      const c=TYPE_SHAPES[t]?.c||'#888';
+      html+=`<label><input type="checkbox" value="${t}" checked><span class="ot-swatch" style="background:${c}"></span>${t.replace(/_/g,' ')}</label>`;
+    }
+  }
+  dd.innerHTML=html;
+  sel.onclick=e=>{e.stopPropagation();dd.classList.toggle('open');};
+  document.addEventListener('click',e=>{if(!dd.contains(e.target)&&!sel.contains(e.target))dd.classList.remove('open');});
+  dd.querySelectorAll('input[type=checkbox]').forEach(cb=>{
+    cb.onchange=()=>{if(cb.checked)_exportOTState[prefix].add(cb.value);else _exportOTState[prefix].delete(cb.value);_updateExportOTLabel(prefix);};
+  });
+  dd.querySelector('[data-act=all]').onclick=()=>{dd.querySelectorAll('input').forEach(cb=>{cb.checked=true;_exportOTState[prefix].add(cb.value);});_updateExportOTLabel(prefix);};
+  dd.querySelector('[data-act=none]').onclick=()=>{dd.querySelectorAll('input').forEach(cb=>{cb.checked=false;_exportOTState[prefix].delete(cb.value);});_updateExportOTLabel(prefix);};
+  dd.querySelector('[data-act=invert]').onclick=()=>{dd.querySelectorAll('input').forEach(cb=>{cb.checked=!cb.checked;if(cb.checked)_exportOTState[prefix].add(cb.value);else _exportOTState[prefix].delete(cb.value);});_updateExportOTLabel(prefix);};
+}
+function _syncExportOTFromMap(prefix){
+  // Sync export type dropdown from the main map selectedTypes
+  const st=_exportOTState[prefix]; if(!st) return;
+  const dd=document.getElementById(prefix+'-ot-dd'); if(!dd) return;
+  st.clear();
+  selectedTypes.forEach(t=>st.add(t));
+  dd.querySelectorAll('input[type=checkbox]').forEach(cb=>{cb.checked=st.has(cb.value);});
+  _updateExportOTLabel(prefix);
+}
+function _updateExportOTLabel(prefix){
+  const st=_exportOTState[prefix]; if(!st) return;
+  const lbl=document.getElementById(prefix+'-ot-label'); if(!lbl) return;
+  if(st.size===ALL_OBJ_TYPES.length) lbl.textContent='All types';
+  else if(st.size===0) lbl.textContent='None selected';
+  else if(st.size<=3) lbl.textContent=[...st].map(t=>t.replace(/_/g,' ')).join(', ');
+  else lbl.textContent=`${st.size} of ${ALL_OBJ_TYPES.length} types`;
+}
+function _getExportTypeFilter(prefix){
+  const st=_exportOTState[prefix];
+  if(!st||st.size===ALL_OBJ_TYPES.length) return '';
+  return [...st].join(',');
+}
+
+// ============ HEIGHT RANGE DOUBLE SLIDER ============
+const HR_MIN=0, HR_MAX=50, HR_STEP=0.5;
+const _hrState={}; // {prefix: {min, max}}
+function _initHeightRange(prefix){
+  const track=document.getElementById(prefix+'-hr-track');
+  if(!track||track.dataset.init) return;
+  track.dataset.init='1';
+  _hrState[prefix]={min:HR_MIN,max:HR_MAX};
+  const tMin=document.getElementById(prefix+'-hr-min');
+  const tMax=document.getElementById(prefix+'-hr-max');
+  _updateHRVisual(prefix);
+  function snap(v){return Math.round(v/HR_STEP)*HR_STEP;}
+  function startDrag(thumb,isMax){
+    function onMove(ex){
+      const rect=track.getBoundingClientRect();
+      let ratio=Math.max(0,Math.min(1,(ex-rect.left)/rect.width));
+      let val=snap(HR_MIN+ratio*(HR_MAX-HR_MIN));
+      const s=_hrState[prefix];
+      if(isMax){s.max=Math.max(val,s.min+HR_STEP);}else{s.min=Math.min(val,s.max-HR_STEP);}
+      s.min=Math.max(HR_MIN,s.min); s.max=Math.min(HR_MAX,s.max);
+      _updateHRVisual(prefix);
+    }
+    function onPointerMove(e){e.preventDefault();onMove(e.clientX);}
+    function onTouchMove(e){e.preventDefault();onMove(e.touches[0].clientX);}
+    function stop(){document.removeEventListener('pointermove',onPointerMove);document.removeEventListener('pointerup',stop);document.removeEventListener('touchmove',onTouchMove);document.removeEventListener('touchend',stop);}
+    document.addEventListener('pointermove',onPointerMove);
+    document.addEventListener('pointerup',stop);
+    document.addEventListener('touchmove',onTouchMove,{passive:false});
+    document.addEventListener('touchend',stop);
+  }
+  tMin.addEventListener('pointerdown',e=>{e.preventDefault();startDrag(tMin,false);});
+  tMax.addEventListener('pointerdown',e=>{e.preventDefault();startDrag(tMax,true);});
+  tMin.addEventListener('touchstart',e=>{e.preventDefault();startDrag(tMin,false);},{passive:false});
+  tMax.addEventListener('touchstart',e=>{e.preventDefault();startDrag(tMax,true);},{passive:false});
+}
+function _getHeightFilter(prefix){
+  const s=_hrState[prefix];
+  if(!s) return {};
+  const params={};
+  if(s.min>HR_MIN) params.height_min=s.min.toFixed(1);
+  if(s.max<HR_MAX) params.height_max=s.max.toFixed(1);
+  return params;
+}
+
+function _syncHeightRangeFromLegend(prefix){
+  const s=_hrState[prefix]; if(!s) return;
+  const{lo,hi}=_lhfGetRange();
+  // Legend uses sqrt scale 0-45m; export slider is linear 0-50m
+  // If legend is full range, set export to full range too
+  s.min=(lo<=0)?HR_MIN:Math.min(lo,HR_MAX);
+  s.max=(hi===Infinity)?HR_MAX:Math.min(hi,HR_MAX);
+  // Re-render the slider visual
+  const track=document.getElementById(prefix+'-hr-track');
+  if(track&&track.dataset.init) _updateHRVisual(prefix);
+}
+function _updateHRVisual(prefix){
+  const s=_hrState[prefix]; if(!s) return;
+  const fill=document.getElementById(prefix+'-hr-fill');
+  const tMin=document.getElementById(prefix+'-hr-min');
+  const tMax=document.getElementById(prefix+'-hr-max');
+  const lMin=document.getElementById(prefix+'-hr-min-val');
+  const lMax=document.getElementById(prefix+'-hr-max-val');
+  if(!fill) return;
+  const pct=v=>((v-HR_MIN)/(HR_MAX-HR_MIN))*100;
+  const p1=pct(s.min), p2=pct(s.max);
+  fill.style.left=p1+'%'; fill.style.width=(p2-p1)+'%';
+  tMin.style.left=p1+'%'; tMax.style.left=p2+'%';
+  lMin.textContent=(s.min===HR_MIN?'0':s.min.toFixed(1))+' m';
+  lMax.textContent=(s.max>=HR_MAX?'50+ m':s.max.toFixed(1)+' m');
+}
+function buildExportTypeFilters(){
+  _initExportOT('gpkg'); _initExportOT('kml'); _initExportOT('mbt');
+  _initHeightRange('gpkg'); _initHeightRange('kml'); _initHeightRange('mbt');
+  // Sync from map selectedTypes
+  _syncExportOTFromMap('gpkg'); _syncExportOTFromMap('kml'); _syncExportOTFromMap('mbt');
+  // Sync height range from legend filter
+  _syncHeightRangeFromLegend('gpkg'); _syncHeightRangeFromLegend('kml'); _syncHeightRangeFromLegend('mbt');
+}
+function updateKmlState(){
+  const btn=document.getElementById('btn-dl-kml');
+  const msg=document.getElementById('kml-no-results');
+  if(lastResult && allFeatureData.length>0){
+    btn.disabled=false; msg.style.display='none';
+  }else{
+    btn.disabled=true; msg.style.display='block';
+  }
+}
+// Close on backdrop click
+document.getElementById('result-modal').onclick=e=>{if(e.target===e.currentTarget)closeResultModal();};
+// Esc key
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeResultModal();});
+
+function updateModalContent(){
+  const data=lastResult;
+  const jsonEl=document.getElementById('modal-json');
+  const sumEl=document.getElementById('modal-summary');
+
+  if(!data){
+    jsonEl.textContent='No results yet. Run an analysis first.';
+    sumEl.innerHTML='<p style="color:#888">No results yet. Run an analysis first.</p>';
+    return;
+  }
+
+  // JSON tab
+  const jsonStr=JSON.stringify(data,null,2);
+  jsonEl.textContent=jsonStr;
+
+  // Summary tab
+  const features=data.features||[];
+  const meta=data.meta||{};
+  let html='';
+
+  // Cards
+  html+='<div class="summary-grid">';
+  html+=`<div class="summary-card"><div class="val">${features.length}</div><div class="lbl">Objects detected</div></div>`;
+
+  if(lastEndpoint==='segment'){
+    let totalA=0,mmA=0;
+    for(const f of features){const a=f.properties.area_sqm||0;totalA+=a;if(f.properties.is_manmade)mmA+=a;}
+    html+=`<div class="summary-card"><div class="val">${totalA>0?(mmA/totalA*100).toFixed(1):'0'}%</div><div class="lbl">Manmade area</div></div>`;
+    html+=`<div class="summary-card"><div class="val">${(totalA/10000).toFixed(2)} ha</div><div class="lbl">Total area</div></div>`;
+  }
+  if(meta.processing_time_s)html+=`<div class="summary-card"><div class="val">${meta.processing_time_s}s</div><div class="lbl">Processing time</div></div>`;
+  if(meta.date_a)html+=`<div class="summary-card"><div class="val">${fmtDate(meta.date_a)} → ${fmtDate(meta.date_b)}</div><div class="lbl">Date range</div></div>`;
+  if(meta.dataset&&!meta.date_a)html+=`<div class="summary-card"><div class="val">${fmtDate(meta.dataset)}</div><div class="lbl">Dataset</div></div>`;
+  html+='</div>';
+
+  // Evaluation metrics
+  /*PRIVATE*/if(data.cadastre_evaluation){
+    const ev=data.cadastre_evaluation;
+    html+=`<div style="margin:8px 0;padding:8px 10px;background:#f0f8ff;border-radius:6px;font-size:12px"><b>Cadastre:</b> P=${ev.precision} R=${ev.recall} F1=${ev.f1}</div>`;
+  }/*/PRIVATE*/
+  if(meta.source==='product'){
+    html+=`<div style="margin:8px 0;padding:8px 10px;background:#f3f0ff;border-radius:6px;font-size:12px"><b>Source:</b> precomputed product ${meta.product_version||''} (${(meta.product_codes||[]).join(', ')})${meta.product_obs_year?' · ALS '+meta.product_obs_year:''}</div>`;
+  }else if(meta.source==='bev'){
+    html+=`<div style="margin:8px 0;padding:8px 10px;background:#f3f0ff;border-radius:6px;font-size:12px"><b>Source:</b> live BEV rasters</div>`;
+  }
+  if(data.hansen_evaluation){
+    const h=data.hansen_evaluation;
+    html+=`<div style="margin:8px 0;padding:8px 10px;background:#f0fff0;border-radius:6px;font-size:12px"><b>Hansen:</b> P=${h.precision} R=${h.recall} F1=${h.f1}</div>`;
+  }
+  if(meta.rf_trained_at){
+    html+=`<div style="margin:8px 0;padding:8px 10px;background:#fff8f0;border-radius:6px;font-size:12px"><b>RF Model:</b> ${meta.rf_trained_at} · ${meta.rf_n_kgs||'?'} KGs · OOB ${meta.rf_oob||'?'}</div>`;
+  }
+
+  // Type breakdown table
+  if(features.length>0){
+    const typeCounts={};
+    for(const f of features){
+      const t=f.properties.type||f.properties.obj_type||f.properties.event_type||f.properties.status||'unknown';
+      typeCounts[t]=(typeCounts[t]||0)+1;
+    }
+    const sorted=Object.entries(typeCounts).sort((a,b)=>b[1]-a[1]);
+    const total=sorted.reduce((s,[,n])=>s+n,0);
+    const tiMap=TYPE_SHAPES;
+
+    const typeAreas={};
+    for(const f of features){
+      const t=f.properties.type||f.properties.obj_type||f.properties.event_type||f.properties.status||'unknown';
+      typeAreas[t]=(typeAreas[t]||0)+(f.properties.area_sqm||0);
+    }
+    html+='<table class="summary-table"><thead><tr><th>Type</th><th style="text-align:right">Count</th><th style="text-align:right">Area</th><th style="text-align:right">%</th></tr></thead><tbody>';
+    for(const[t,count]of sorted){
+      const info=tiMap[t]||DEF;
+      const a=typeAreas[t]||0;
+      const aStr=a>=10000?(a/10000).toFixed(2)+' ha':Math.round(a)+' m²';
+      html+=`<tr><td><span class="swatch" style="background:${info.c}"></span>${t.replace(/_/g,' ')}</td><td style="text-align:right">${count}</td><td style="text-align:right">${aStr}</td><td style="text-align:right">${(count/total*100).toFixed(1)}%</td></tr>`;
+    }
+    html+='</tbody></table>';
+  }
+
+  sumEl.innerHTML=html;
+}
+
+// Copy & Download from modal
+document.getElementById('btn-copy-json').onclick=()=>{
+  if(!lastResult)return;
+  navigator.clipboard.writeText(JSON.stringify(lastResult,null,2));
+  setStatus('Copied!');
+  const btn=document.getElementById('btn-copy-json');
+  btn.textContent='✅ Copied!';
+  setTimeout(()=>btn.textContent='📋 Copy',1500);
+};
+document.getElementById('btn-dl-json').onclick=()=>{
+  if(!lastResult)return;
+  const b=new Blob([JSON.stringify(lastResult,null,2)],{type:'application/geo+json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='result.geojson';a.click();
+};
+document.getElementById('btn-dl-gpkg').onclick=async()=>{
+  const args=getPostArgs();
+  if(!args){alert('Provide geometry first');return;}
+  const btn=document.getElementById('btn-dl-gpkg');
+  btn.disabled=true;btn.textContent='⏳ Generating...';
+  try{
+    // Read selected layers from gpkg checkboxes
+    const sel={};
+    document.querySelectorAll('[data-gpkg]').forEach(cb=>{sel[cb.dataset.gpkg]=cb.checked;});
+    let url='/api/v1/export/geopackage?async=true';
+    url+='&include_dtm='+(sel.dtm||false);
+    url+='&include_dsm='+(sel.dsm||false);
+    url+='&include_segments='+(sel.segments||false);
+    url+='&include_segments_vector='+(sel['segments-vector']||false);
+    // Type filter from GPKG type dropdown
+    const gpkgTypes=_getExportTypeFilter('gpkg');
+    if(gpkgTypes) url+='&types='+encodeURIComponent(gpkgTypes);
+    // Height range filter
+    const gpkgHF=_getHeightFilter('gpkg');
+    if(gpkgHF.height_min) url+='&height_min='+gpkgHF.height_min;
+    if(gpkgHF.height_max) url+='&height_max='+gpkgHF.height_max;
+    // Ortho years
+    const orthoYears=[];
+    if(sel['ortho-2024'])orthoYears.push('2024');
+    if(sel['ortho-2023'])orthoYears.push('2023');
+    if(sel['ortho-2020'])orthoYears.push('2020');
+    if(orthoYears.length)url+='&ortho_years='+orthoYears.join(',');
+    // Raster overlays (rendered RGBA)
+    const rasterLayers=[];
+    ['dtm-2024','dtm-2023','dtm-2022','dsm-2024','dsm-2023','dsm-2022','cir-2024','cir-2023','cir-2020','hansen','raster'].forEach(id=>{
+      if(sel[id])rasterLayers.push(id);
+    });
+    if(rasterLayers.length)url+='&raster_layers='+rasterLayers.join(',');
+    // (type filter already applied above from gpkg-type-filter)
+    url+='&color_mode='+colorMode;
+    // Submit async export
+    const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
+    if(!resp.ok)throw new Error((await resp.json()).error);
+    const submit=await resp.json();
+    if(submit.error)throw new Error(submit.error);
+    const taskId=submit.task_id;
+    if(!taskId)throw new Error('No task_id returned');
+    // Poll for progress using the segment progress endpoint
+    btn.textContent='⏳ Exporting...';
+    const t0=Date.now(), maxWait=600000, interval=2000;
+    while(Date.now()-t0<maxWait){
+      await new Promise(r=>setTimeout(r,interval));
+      try{
+        const pr=await fetch(`/api/v1/segment/progress?task_id=${taskId}`);
+        const pj=await pr.json();
+        if(pj.error)throw new Error(pj.error);
+        if(pj.done){
+          // Download via browser-native navigation (no fetch blob)
+          window.location.href=`/api/v1/export/geopackage/download/${taskId}`;
+          setStatus('GeoPackage downloaded!');
+          return;
+        }
+        if(pj.active){
+          const el=pj.elapsed?` (${pj.elapsed}s)`:'';
+          const det=pj.detail?` — ${pj.detail}`:'';
+          const pct=(pj.progress!=null)?` ${Math.round(pj.progress*100)}%`:'';
+          btn.textContent=`⏳${pct} ${pj.step||'Exporting'}${det}${el}`;
+        }
+      }catch(e){
+        if(e.message&&!e.message.startsWith('Failed to fetch'))throw e;
+      }
+    }
+    throw new Error('Export timed out after 10 minutes');
+  }catch(e){alert('Error: '+e.message);}finally{btn.disabled=false;btn.textContent='📦 Download GeoPackage';}
+};
+
+// ============ KML DOWNLOAD ============
+document.getElementById('btn-dl-kml').onclick=async()=>{
+  if(!lastResult || !allFeatureData.length){alert('Run an analysis first');return;}
+  const btn=document.getElementById('btn-dl-kml');
+  btn.disabled=true;btn.textContent='⏳ Generating...';
+  try{
+    const args=getPostArgs();
+    if(!args){alert('Provide geometry first');return;}
+    const groupBy=document.getElementById('kml-group-by').value;
+    const kmlTypes=_getExportTypeFilter('kml');
+    const kmlHF=_getHeightFilter('kml');
+    // Build request body: include result JSON + geometry
+    const geo=JSON.parse(document.getElementById('geometry').value);
+    const body={geometry:geo, result_json:JSON.stringify(lastResult), group_by:groupBy};
+    if(kmlTypes) body.types=kmlTypes;
+    let kmlQS=[];
+    if(kmlTypes) kmlQS.push('types='+encodeURIComponent(kmlTypes));
+    if(kmlHF.height_min) kmlQS.push('height_min='+kmlHF.height_min);
+    if(kmlHF.height_max) kmlQS.push('height_max='+kmlHF.height_max);
+    const resp=await fetch('/api/v1/export/kml'+(kmlQS.length?'?'+kmlQS.join('&'):''),{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)
+    });
+    if(!resp.ok){const err=await resp.json();throw new Error(err.error||'Export failed');}
+    const blob=await resp.blob();
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download='landscape_export.kml';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }catch(e){alert('KML error: '+e.message);}
+  finally{btn.disabled=false;btn.textContent='🌍 Download KML';}
+};
+
+// ============ SPINNER ============
+let loadingCount=0;
+function showLoading(msg){loadingCount++;document.getElementById('spinner').style.display='';document.getElementById('status-text').textContent=msg||'Loading...';}
+function hideLoading(msg){loadingCount=Math.max(0,loadingCount-1);if(!loadingCount){document.getElementById('spinner').style.display='none';document.getElementById('status-text').textContent=msg||'Done.';}}
+function setStatus(msg){document.getElementById('status-text').textContent=msg;}
+function showFullscreenLoading(msg,sub){const o=document.getElementById('loading-overlay');document.getElementById('lo-text').textContent=msg||'Loading\u2026';document.getElementById('lo-sub').textContent=sub||'';o.classList.add('show');}
+function hideFullscreenLoading(){document.getElementById('loading-overlay').classList.remove('show');}
+
+// ============ TRAINING STATUS ============
+/*PRIVATE*/(function pollTrainingStatus(){
+  const el=document.getElementById('train-status');
+  async function update(){
+    try{
+      const r=await fetch('/api/v1/training/status');
+      const d=await r.json();
+      const svc=d.service_state||'';
+      const modelStr=d.model?`OOB=${d.model.oob_score}, ${d.model.n_train} samples, ${d.model.n_kgs} KGs (${d.model.trained_at})`:'no model yet';
+      const nDone=d.n_checkpoints||0;
+      const nFail=d.n_failed_kgs||0;
+      const failPart=nFail>0?`; ${nFail} fail`:'';
+      const toNext=d.to_next_model;
+      const cpPart=(typeof toNext==='number'&&toNext>0)?`; ${toNext} more to model cp ${d.next_model_checkpoint}`:'';
+      const progressStr=`${nDone}/${d.current_kg?d.current_kg.total:'4000'}${failPart}${cpPart}`;
+      if(d.credits_paused){
+        const kg=d.current_kg?` KG ${d.current_kg.kg_code}`:'';  
+        el.innerHTML=`🟠 RF training PAUSED — Copernicus credits exhausted${kg} · ${modelStr}`;
+        el.style.color='#d80';
+      } else if(d.running){  
+        const kg=d.current_kg?` KG ${d.current_kg.kg_code} (${d.current_kg.kg_name})`:'';
+        const step=d.current_step?` · ${d.current_step}`:'';
+        const res=d.ram_mb?` · ${d.ram_mb}MB`:'';
+        el.innerHTML=`🟢 RF training: ${progressStr}${kg}${step}${res} · ${modelStr}`;
+        el.style.color='#2a7';
+      } else if(svc==='activating'){
+        el.innerHTML=`🟡 RF training restarting...${failStr} · ${modelStr}`;
+        el.style.color='#b90';
+      } else if(d.n_checkpoints>0){
+        const ckpt=` ${progressStr}`;
+        const stopped=(svc==='failed'||svc==='inactive')?` (${svc})`:''; 
+        el.innerHTML=`🔴 RF training stopped${stopped} ·${ckpt}${failStr} · ${modelStr}`;
+        el.style.color='#c44';
+      } else if(d.model){
+        el.innerHTML=`⚪ RF model: ${modelStr}`;
+        el.style.color='#888';
+      } else {
+        el.textContent='⚪ No RF model';
+        el.style.color='#888';
+      }
+    }catch(e){/* keep previous display on transient fetch error */}
+  }
+  update();
+  setInterval(update,10000);
+})();/*/PRIVATE*/
+
+// ============ PROCESSOR STATUS ============
+/*PRIVATE*/(function pollProcessorStatus(){
+  const el=document.getElementById('proc-status');
+  async function update(){
+    try{
+      const [rs,rd]=await Promise.all([
+        fetch('/api/v1/processing/status').then(r=>r.json()).catch(()=>null),
+        fetch('/api/v1/director/status').then(r=>r.json()).catch(()=>null)
+      ]);
+      const d=rs||{};
+      const s=d.state||'idle';
+      // Prefer DB-sourced count (aggregates all peers via Zenodo manifest sync,
+      // matches the "TOTAL" count/area numbers).  Fall back to peer sum or local.
+      const totalDone=(d.db_processed!=null)?d.db_processed
+        :(rd?(rd.peers||[]).reduce((a,p)=>a+(p.completed||0),0):(d.completed||0));
+      const activePeer=rd?rd.active_peer:null;
+      const ap=activePeer&&rd?(rd.peers||[]).find(p=>p.id===activePeer):null;
+      const kgName=ap&&ap.current_kg_name?ap.current_kg_name:(d.current_kg?d.current_kg.name||d.current_kg.code:'');
+      const kgCode=ap&&ap.current_kg?ap.current_kg:(d.current_kg?d.current_kg.code:'');
+      if(s==='running'||s==='processing'||(activePeer&&ap&&ap.processor_state==='running')){
+        const pct=d.total_kgs?((totalDone/d.total_kgs)*100).toFixed(1)+'%':'0%';
+        let txt=`🗺️ Proc: ${totalDone}/${d.total_kgs||7850}`;
+        if(kgCode)txt+=` · ${kgCode}`;
+        if(kgName&&kgName!==kgCode)txt+=` ${kgName}`;
+        el.innerHTML=txt;
+        el.style.color='#3fb950';
+      } else if(s==='paused'){
+        el.innerHTML=`⏸ Proc paused: ${totalDone}/${d.total_kgs||0}`;
+        el.style.color='#d29922';
+      } else if(totalDone>0){
+        el.innerHTML=`■ Proc done: ${d.success||0}✓ ${d.failed||0}✗`;
+        el.style.color='#8b949e';
+      } else {
+        el.textContent='';
+      }
+    }catch(e){}
+  }
+  update();
+  setInterval(update,10000);
+})();/*/PRIVATE*/
+
+// ============ SIDEBAR COLLAPSE BAR (MOBILE) ============
+(function(){
+  const bar=document.getElementById('sidebar-collapse-bar');
+  const sidebar=document.getElementById('sidebar');
+  if(!bar||!sidebar) return;
+  bar.onclick=()=>{
+    sidebar.classList.toggle('collapsed');
+    setTimeout(()=>{if(typeof map!=='undefined')map.invalidateSize()},350);
+  };
+})();
+
+// ============ COLOR MODE ============
+function setColorMode(m){
+  colorMode=m;
+  document.querySelectorAll('.color-mode-bar button').forEach(b=>b.classList.remove('active'));
+  document.getElementById('cm-'+m).classList.add('active');
+  updateLegendScale();
+  reRenderMarkers();
+  // Use _rasterWanted to detect if raster should be shown, not overlays.raster
+  // (overlays.raster may be temporarily null during an in-flight reload)
+  const rasterCb=document.querySelector('[data-lyr=raster]');
+  if(rasterCb&&rasterCb.checked) reloadRasterOverlay();
+}
+function updateLegendScale(){
+  const d=document.getElementById('legend-scale');
+  if(colorMode==='height'){
+    d.innerHTML=`<div class="legend-scale-wrap"><div class="legend-bar" style="background:${viridisGrad()}"><div class="legend-hf-overlay"><div class="legend-hf-dim left" id="lhf-dim-l"></div><div class="legend-hf-dim right" id="lhf-dim-r"></div><div class="legend-hf-thumb" id="lhf-lo" style="left:0%"></div><div class="legend-hf-thumb" id="lhf-hi" style="left:100%"></div></div></div></div><div class="legend-labels" style="position:relative;height:14px"><span style="position:absolute;left:0" id="lhf-lo-lbl">0 m</span><span style="position:absolute;left:47%;transform:translateX(-50%)">10</span><span style="position:absolute;left:67%;transform:translateX(-50%)">20</span><span style="position:absolute;right:0" id="lhf-hi-lbl">45+ m</span></div>`;
+    _initLegendHeightFilter();
+  } else d.innerHTML='';
+}
+// ============ LEGEND HEIGHT FILTER ============
+const LHF_MAX_M=45; // viridis scale max
+let _lhfLo=0, _lhfHi=1; // 0..1 normalised positions
+let _lhfDebounce=null;
+function _lhfHeightAt(pct){return pct*pct*LHF_MAX_M;} // matches sqrt mapping: pct=sqrt(h/45)
+function _lhfPctAt(h){return Math.sqrt(Math.max(0,h)/LHF_MAX_M);}
+function _initLegendHeightFilter(){
+  const wrap=document.querySelector('.legend-scale-wrap');
+  if(!wrap) return;
+  const bar=wrap.querySelector('.legend-bar');
+  const lo=document.getElementById('lhf-lo'), hi=document.getElementById('lhf-hi');
+  _lhfUpdateVisual();
+  function startDrag(thumb,isHi){
+    function onMove(cx){
+      const rect=bar.getBoundingClientRect();
+      let pct=Math.max(0,Math.min(1,(cx-rect.left)/rect.width));
+      if(isHi){_lhfHi=Math.max(pct,_lhfLo+.02);}else{_lhfLo=Math.min(pct,_lhfHi-.02);}
+      _lhfUpdateVisual();
+      clearTimeout(_lhfDebounce);
+      _lhfDebounce=setTimeout(_applyLegendHeightFilter,120);
+    }
+    function onPtr(e){e.preventDefault();onMove(e.clientX);}
+    function onTouch(e){e.preventDefault();onMove(e.touches[0].clientX);}
+    function stop(){document.removeEventListener('pointermove',onPtr);document.removeEventListener('pointerup',stop);document.removeEventListener('touchmove',onTouch);document.removeEventListener('touchend',stop);}
+    document.addEventListener('pointermove',onPtr);
+    document.addEventListener('pointerup',stop);
+    document.addEventListener('touchmove',onTouch,{passive:false});
+    document.addEventListener('touchend',stop);
+  }
+  lo.addEventListener('pointerdown',e=>{e.preventDefault();startDrag(lo,false);});
+  hi.addEventListener('pointerdown',e=>{e.preventDefault();startDrag(hi,true);});
+  lo.addEventListener('touchstart',e=>{e.preventDefault();startDrag(lo,false);},{passive:false});
+  hi.addEventListener('touchstart',e=>{e.preventDefault();startDrag(hi,true);},{passive:false});
+}
+function _lhfUpdateVisual(){
+  const dimL=document.getElementById('lhf-dim-l'), dimR=document.getElementById('lhf-dim-r');
+  const lo=document.getElementById('lhf-lo'), hi=document.getElementById('lhf-hi');
+  const lblLo=document.getElementById('lhf-lo-lbl'), lblHi=document.getElementById('lhf-hi-lbl');
+  if(!dimL) return;
+  dimL.style.width=(_lhfLo*100)+'%';
+  dimR.style.width=((1-_lhfHi)*100)+'%';
+  lo.style.left=(_lhfLo*100)+'%';
+  hi.style.left=(_lhfHi*100)+'%';
+  const hLo=_lhfHeightAt(_lhfLo), hHi=_lhfHeightAt(_lhfHi);
+  if(lblLo) lblLo.textContent=(_lhfLo<.01?'0':hLo.toFixed(0))+' m';
+  if(lblHi) lblHi.textContent=(_lhfHi>.98?'45+ m':hHi.toFixed(0)+' m');
+}
+function _lhfGetRange(){
+  const lo=_lhfLo<.01?0:_lhfHeightAt(_lhfLo);
+  const hi=_lhfHi>.98?Infinity:_lhfHeightAt(_lhfHi);
+  return{lo,hi};
+}
+function _applyLegendHeightFilter(){
+  const segCb=document.querySelector('[data-lyr="segments"]');
+  const segOn=segCb&&segCb.checked&&layerOpacity('segments')>0;
+  const{lo:hLo,hi:hHi}=_lhfGetRange();
+  const fullRange=hLo===0&&hHi===Infinity;
+  // Filter markers
+  for(const[t,markers]of Object.entries(markersByType)){
+    const typeVis=segOn&&!hiddenTypes.has(t)&&selectedTypes.has(t);
+    for(const m of markers){
+      const el=m._icon||m.getElement?.();
+      if(!el) continue;
+      if(!typeVis){el.style.display='none';continue;}
+      if(fullRange){el.style.display='';continue;}
+      const h=m._fHeight||0;
+      el.style.display=(h>=hLo&&h<=hHi)?'':'none';
+    }
+  }
+  // Filter raster overlay in height color mode
+  const rasterCb=document.querySelector('[data-lyr=raster]');
+  if(colorMode==='height'&&rasterCb&&rasterCb.checked&&_rasterOrigImg){
+    if(fullRange){_restoreRasterFromOrig();}
+    else{_filterRasterByHeight(hLo,hHi);}
+  }
+}
+function _restoreRasterFromOrig(){
+  if(!_rasterOrigImg||!overlays.raster) return;
+  const c=document.createElement('canvas');
+  c.width=_rasterOrigImg.naturalWidth;c.height=_rasterOrigImg.naturalHeight;
+  c.getContext('2d').drawImage(_rasterOrigImg,0,0);
+  overlays.raster.setUrl(c.toDataURL('image/png'));
+}
+function _filterRasterByHeight(hLo,hHi){
+  if(!_rasterOrigImg||!overlays.raster) return;
+  // Build set of allowed RGB keys from viridis in the height range
+  // Height mapping: t = sqrt(h/45), so h = t²*45
+  const tLo=Math.sqrt(Math.max(0,hLo)/LHF_MAX_M);
+  const tHi=Math.min(1,hHi===Infinity?1:Math.sqrt(hHi/LHF_MAX_M));
+  const allowed=new Set();
+  // Sample viridis at fine resolution across full range, keep those in [tLo,tHi]
+  for(let i=0;i<=500;i++){
+    const t=i/500;
+    if(t>=tLo-0.005&&t<=tHi+0.005){
+      const[r,g,b]=viridis(t);
+      // Add with ±2 tolerance for rounding
+      for(let dr=-2;dr<=2;dr++)for(let dg=-2;dg<=2;dg++)for(let db=-2;db<=2;db++){
+        const rr=r+dr,gg=g+dg,bb=b+db;
+        if(rr>=0&&rr<=255&&gg>=0&&gg<=255&&bb>=0&&bb<=255)
+          allowed.add((rr<<16)|(gg<<8)|bb);
+      }
+    }
+  }
+  const c=document.createElement('canvas');
+  c.width=_rasterOrigImg.naturalWidth;c.height=_rasterOrigImg.naturalHeight;
+  const ctx=c.getContext('2d');
+  ctx.drawImage(_rasterOrigImg,0,0);
+  const imgData=ctx.getImageData(0,0,c.width,c.height);
+  const d=imgData.data;
+  for(let i=0;i<d.length;i+=4){
+    if(d[i+3]===0) continue;
+    if(!allowed.has((d[i]<<16)|(d[i+1]<<8)|d[i+2])) d[i+3]=0;
+  }
+  ctx.putImageData(imgData,0,0);
+  overlays.raster.setUrl(c.toDataURL('image/png'));
+}
+function markerColor(f){
+  const p=f.properties;
+  if(colorMode==='height'){const h=p.height_max_m||p.height_after_m||p.height_max||0;return viridisCSS(Math.min(Math.sqrt(Math.max(h,0)/45),1));}
+  return null;
+}
+function reRenderMarkers(){resultLayer.clearLayers();markersByType={};if(allFeatureData.length)showFeaturesOnMap({features:allFeatureData});}
+
+// ============ LEGEND ============
+function buildLegend(typeCounts,tiMap){
+  const d=document.getElementById('legend-types');
+  d.innerHTML='';
+  const sorted=Object.entries(typeCounts).sort((a,b)=>b[1]-a[1]);
+  const total=sorted.reduce((s,[,n])=>s+n,0);
+  for(const[t,count]of sorted){
+    const info=tiMap[t]||DEF;
+    const el=document.createElement('div');
+    el.className='legend-item'+(hiddenTypes.has(t)?' hidden':'');
+    el.innerHTML=`<span class="legend-icon" style="color:${info.c}">${info.l}</span><span>${t.replace(/_/g,' ')}</span><span class="legend-count">${count} (${(count/total*100).toFixed(0)}%)</span>`;
+    el.onclick=()=>{if(hiddenTypes.has(t)){hiddenTypes.delete(t);el.classList.remove('hidden')}else{hiddenTypes.add(t);el.classList.add('hidden')}applyVis();if(overlays.raster&&document.querySelector('[data-lyr=raster]').checked)applyRasterTypeFilter();};
+    d.appendChild(el);
+  }
+}
+function applyVis(){
+  // Respect the Segments layer checkbox — if unchecked, keep all markers hidden
+  const segCb=document.querySelector('[data-lyr="segments"]');
+  const segOn=segCb&&segCb.checked&&layerOpacity('segments')>0;
+  const{lo:hLo,hi:hHi}=_lhfGetRange();
+  const fullRange=hLo===0&&hHi===Infinity;
+  const hFilter=colorMode==='height'&&!fullRange;
+  for(const[t,layers]of Object.entries(markersByType)){
+    const typeVis=segOn&&!hiddenTypes.has(t);
+    for(const lyr of layers){
+      const el=lyr._icon||lyr.getElement?.();
+      if(!el)continue;
+      if(!typeVis){el.style.display='none';continue;}
+      if(hFilter){const h=lyr._fHeight||0;el.style.display=(h>=hLo&&h<=hHi)?'':'none';}
+      else el.style.display='';
+    }
+  }
+}
+
+// ============ LAYER CONTROLS ============
+function layerOpacity(id){
+  const sl=document.querySelector(`[data-op="${id}"]`);
+  const cb=document.querySelector(`[data-lyr="${id}"]`);
+  if(!sl||!cb)return 0;
+  return cb.checked?sl.value/100:0;
+}
+function applyOpacity(id){
+  if(id==='base'){baseLayer.setOpacity(layerOpacity('base'));return;}
+  if(id==='segments'){
+    const op=layerOpacity('segments');
+    const vis=op>0;
+    resultLayer.eachLayer(function walk(l){
+      if(l._icon)l._icon.style.display=vis?'':'none';
+      if(l._shadow)l._shadow.style.display=vis?'':'none';
+      if(l.eachLayer)l.eachLayer(walk);
+    });
+    if(vis)resultLayer.eachLayer(function walkOp(l){
+      if(l._icon)l._icon.style.opacity=op;
+      if(l.eachLayer)l.eachLayer(walkOp);
+    });
+    return;
+  }
+  const ovl=overlays[id];
+  if(ovl&&ovl.setOpacity)ovl.setOpacity(layerOpacity(id));
+}
+function orderLayers(){
+  baseLayer.bringToBack();
+  ['ortho-2020','ortho-2023','ortho-2024','cir-2020','cir-2023','cir-2024','dtm-2022','dtm-2023','dtm-2024','dsm-2022','dsm-2023','dsm-2024','hansen','raster'].forEach(id=>{
+    if(overlays[id])overlays[id].bringToFront();
+  });
+}
+
+document.querySelectorAll('[data-lyr]').forEach(cb=>{
+  const id=cb.dataset.lyr;
+  cb.onchange=()=>handleLayerToggle(id);
+  const sl=document.querySelector(`[data-op="${id}"]`);
+  if(sl)sl.oninput=()=>applyOpacity(id);
+});
+
+function getPostArgs(){
+  const raw=document.getElementById('geometry').value.trim();
+  if(!raw)return null;
+  try{const p=JSON.parse(raw);return{ct:'application/json',body:JSON.stringify({geometry:p})};}catch(e){return{ct:'text/plain',body:raw};}
+}
+
+async function handleLayerToggle(id){
+  const cb=document.querySelector(`[data-lyr="${id}"]`);
+  if(id==='base'||id==='segments'){applyOpacity(id);return;}
+  if(!cb.checked){applyOpacity(id);return;}
+  if(overlays[id]){applyOpacity(id);return;}
+  const args=getPostArgs();
+  if(!args){cb.checked=false;return;}
+  showLoading(`Loading ${id}...`);
+  try{
+    let ovl;
+    if(id==='raster'){ovl=await loadRasterOverlay(getVisibleTypes(), currentShareId||undefined);}
+    else{
+      const def=LAYER_DEFS[id];
+      let url=def.url+'?dataset='+def.ds;
+      if(def.ortho_year)url+='&ortho_year='+def.ortho_year;
+      const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
+      if(!resp.ok)throw new Error((await resp.json()).error);
+      const bs=resp.headers.get('X-Bounds');
+      if(!bs)throw new Error('No bounds');
+      const[s,w,n,e]=bs.split(',').map(Number);
+      const blob=await resp.blob();
+      ovl=L.imageOverlay(URL.createObjectURL(blob),[[s,w],[n,e]],{opacity:.7,interactive:false});
+    }
+    if(ovl){overlays[id]=ovl;ovl.addTo(map);orderLayers();applyOpacity(id);_showFabIfGeometry();}
+    else cb.checked=false;
+    hideLoading();
+  }catch(e){hideLoading(`${id} failed: ${e.message}`);cb.checked=false;}
+}
+
+// ============ DYNAMIC LAYER AVAILABILITY ============
+let _layerAvailTimer=null;
+function _debouncedLayerAvailCheck(){
+  if(_layerAvailTimer)clearTimeout(_layerAvailTimer);
+  _layerAvailTimer=setTimeout(checkLayerAvailability,2000);
+}
+async function checkLayerAvailability(){
+  const b=map.getBounds();
+  const bbox=`${b.getWest().toFixed(6)},${b.getSouth().toFixed(6)},${b.getEast().toFixed(6)},${b.getNorth().toFixed(6)}`;
+  try{
+    const resp=await fetch(`/api/v1/layers?bbox=${bbox}`);
+    if(!resp.ok)return;
+    const avail=await resp.json();
+    // Build a flat map: "ortho-2024" -> true/false, "cir-2020" -> true/false, etc.
+    const flat={};
+    for(const[group,val]of Object.entries(avail)){
+      if(typeof val==='object'){
+        for(const[year,ok]of Object.entries(val)){
+          flat[`${group}-${year}`]=!!ok;
+        }
+      }else{
+        flat[group]=!!val;
+      }
+    }
+    // Apply to layer panel checkboxes
+    document.querySelectorAll('[data-lyr]').forEach(cb=>{
+      const id=cb.dataset.lyr;
+      if(!(id in flat))return; // analysis layers etc. — leave as-is
+      const lyrDiv=cb.closest('.lyr');
+      if(flat[id]){
+        // Available — show the layer div
+        if(lyrDiv)lyrDiv.style.display='';
+      }else{
+        // Not available — hide, uncheck, remove tile layer
+        if(lyrDiv)lyrDiv.style.display='none';
+        if(cb.checked){
+          cb.checked=false;
+          if(overlays[id]){map.removeLayer(overlays[id]);delete overlays[id];}
+        }
+      }
+    });
+    // Apply to GPKG download checkboxes
+    document.querySelectorAll('[data-gpkg]').forEach(cb=>{
+      const id=cb.dataset.gpkg;
+      if(!(id in flat))return;
+      const lbl=cb.closest('label');
+      if(flat[id]){
+        if(lbl)lbl.style.display='';
+      }else{
+        if(lbl)lbl.style.display='none';
+        cb.checked=false;
+      }
+    });
+    // Disable Copernicus checkbox when processor is running
+    const copCb=document.getElementById('include_copernicus');
+    const copLbl=copCb?.parentElement;
+    if(avail.copernicus_disabled){
+      copCb.checked=false;copCb.disabled=true;
+      if(copLbl)copLbl.title='Disabled — Austria processor is using openEO credentials';
+      if(copLbl)copLbl.style.opacity='0.5';
+    }else{
+      copCb.disabled=false;
+      if(copLbl){copLbl.title='';copLbl.style.opacity='';}
+    }
+  }catch(e){console.warn('Layer availability check failed:',e);}
+}
+
+function getVisibleTypes(){
+  // Combine selectedTypes (dropdown) and hiddenTypes (legend) filters
+  // A type is visible only if it's in selectedTypes AND not in hiddenTypes
+  const vis=Object.keys(TYPE_SHAPES).filter(t=>selectedTypes.has(t)&&!hiddenTypes.has(t));
+  // If all types visible, return null (no filter needed)
+  if(vis.length===Object.keys(TYPE_SHAPES).length) return null;
+  return vis;
+}
+
+async function loadRasterOverlay(typeFilter, shareId){
+  const args=getPostArgs();
+  if(!args)return null;
+  let url='/api/v1/segment/overlay?include_ortho=true&color_mode='+colorMode;
+  if(document.getElementById('include_copernicus').checked)url+='&include_copernicus=true';
+  /*PRIVATE*/if(document.getElementById('include_cadastre').checked)url+='&include_cadastre=true';/*/PRIVATE*/
+  url+='&source='+encodeURIComponent(getSource());
+  if(document.getElementById('include_hansen').checked)url+='&include_hansen=true';
+  if(document.getElementById('include_infra').checked)url+='&include_infra=true';
+  if(document.getElementById('mark_uncertain').checked)url+='&mark_uncertain=true';
+  const topNC=document.getElementById('top_n_classes').value;
+  if(topNC)url+='&top_n_classes='+topNC;
+  if(typeFilter&&typeFilter.length)url+='&types='+typeFilter.join(',');
+  if(shareId)url+='&share_id='+encodeURIComponent(shareId);
+  const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
+  if(!resp.ok)throw new Error((await resp.json()).error);
+  const bs=resp.headers.get('X-Bounds');
+  if(!bs)throw new Error('No bounds');
+  const[s,w,n,e]=bs.split(',').map(Number);
+  const blob=await resp.blob();
+  const blobUrl=URL.createObjectURL(blob);
+  const bounds=[[s,w],[n,e]];
+  // Cache original image for client-side type filtering (legend toggles)
+  const img=new Image();
+  img.crossOrigin='anonymous';
+  img.src=blobUrl;
+  await new Promise(r=>{img.onload=r;img.onerror=r;});
+  _rasterOrigImg=img;
+  _rasterOrigBounds=bounds;
+  return L.imageOverlay(blobUrl,bounds,{opacity:.65,interactive:false});
+}
+
+function applyRasterTypeFilter(){
+  // In height mode, apply height filter instead of type filter
+  if(colorMode==='height'&&_rasterOrigImg){
+    const{lo,hi}=_lhfGetRange();
+    if(lo===0&&hi===Infinity) _restoreRasterFromOrig();
+    else _filterRasterByHeight(lo,hi);
+    return;
+  }
+  // Client-side instant filtering: redraw cached overlay with hidden types transparent
+  if(colorMode!=='type'||!_rasterOrigImg){
+    // Fall back to server-side for height mode or if no cached image
+    reloadRasterOverlay(); return;
+  }
+  const url=_filterRasterClientSide();
+  if(!url||!overlays.raster) return;
+  // Swap the overlay image URL in-place
+  overlays.raster.setUrl(url);
+}
+
+async function reloadRasterOverlay(){
+  const seq=++_rasterReloadSeq;  // bump sequence to invalidate any prior in-flight reload
+  const filter=getVisibleTypes();
+  if(overlays.raster){map.removeLayer(overlays.raster);delete overlays.raster;}
+  _rasterOrigImg=null;_rasterOrigBounds=null;
+  showLoading('Re-rendering raster...');
+  try{
+    const ovl=await loadRasterOverlay(filter, currentShareId||undefined);
+    if(seq!==_rasterReloadSeq){console.log('Discarding stale raster reload',seq,'current',_rasterReloadSeq);hideLoading();return;}
+    if(ovl){overlays.raster=ovl;ovl.addTo(map);orderLayers();applyOpacity('raster');}
+  }catch(e){
+    if(seq!==_rasterReloadSeq){hideLoading();return;}
+    console.error('reloadRasterOverlay failed:',e);
+  }
+  hideLoading();
+}
+
+// ============ SHARE ============
+let currentShareId=null;  // ID of current share (if loaded from or just created)
+let shareStateHash=null;  // hash of state when share was created/loaded
+
+function computeShareHash(state,result){
+  // Hash of full state (including viewpoint) + result presence
+  const s=JSON.stringify({s:state,r:result?'y':'n',fc:result?result.features?.length:0},null,0);
+  let h=0;for(let i=0;i<s.length;i++){h=((h<<5)-h)+s.charCodeAt(i);h|=0;}
+  return h;
+}
+
+// Mark share dirty on any state change
+function markShareDirty(){currentShareId=null;shareStateHash=null;}
+function getShareState(){
+  const c=map.getCenter(),z=map.getZoom();
+  const layers=[];
+  document.querySelectorAll('[data-lyr]').forEach(cb=>{if(cb.checked)layers.push(cb.dataset.lyr);});
+  const opacities={};
+  document.querySelectorAll('[data-op]').forEach(r=>{opacities[r.dataset.op]=parseInt(r.value);});
+  return {
+    v:1,
+    center:[+c.lat.toFixed(6),+c.lng.toFixed(6)],
+    zoom:z,
+    endpoint:document.getElementById('endpoint').value,
+    min_area:parseInt(document.getElementById('min_area').value)||30,
+    ortho:document.getElementById('include_ortho').checked,
+    temporal:document.getElementById('include_temporal').checked,
+    copernicus:document.getElementById('include_copernicus').checked,
+    /*PRIVATE*/cadastre:document.getElementById('include_cadastre').checked,/*/PRIVATE*/
+    source:getSource(),
+    hansen:document.getElementById('include_hansen').checked,
+    infra:document.getElementById('include_infra').checked,
+    mark_uncertain:document.getElementById('mark_uncertain').checked,
+    top_n_classes:document.getElementById('top_n_classes').value,
+    top_n_objects:document.getElementById('top_n_objects').value,
+    min_height_m:document.getElementById('min_height_m').value,
+    colorMode:colorMode,
+    heightFilterLo:_lhfLo,
+    heightFilterHi:_lhfHi,
+    hidden:[...hiddenTypes],
+    layers:layers,
+    opacities:opacities,
+    geometry:document.getElementById('geometry').value,
+    selectedTypes:[...selectedTypes],
+  };
+}
+
+// Collect active overlay image blobs + bounds for share caching
+async function collectOverlayBlobs(){
+  const blobs={};
+  for(const[id,ovl] of Object.entries(overlays)){
+    if(!ovl||!ovl._url||!ovl._bounds) continue;
+    try{
+      // ovl._url is a blob: URL or data: URL
+      const resp=await fetch(ovl._url);
+      const blob=await resp.blob();
+      // Convert to base64 for JSON transport
+      const b64=await new Promise(resolve=>{
+        const reader=new FileReader();
+        reader.onloadend=()=>resolve(reader.result);
+        reader.readAsDataURL(blob);
+      });
+      const b=ovl._bounds;// LatLngBounds
+      blobs[id]={data:b64,bounds:[b.getSouth(),b.getWest(),b.getNorth(),b.getEast()]};
+    }catch(e){console.warn('overlay capture failed for',id,e);}
+  }
+  return blobs;
+}
+
+function restoreShareState(s){
+  // Map view
+  if(s.center&&s.zoom) map.setView(s.center,s.zoom);
+  // Sidebar controls
+  if(s.endpoint) document.getElementById('endpoint').value=s.endpoint;
+  if(s.min_area) document.getElementById('min_area').value=s.min_area;
+  if(s.ortho!==undefined) document.getElementById('include_ortho').checked=s.ortho;
+  if(s.temporal!==undefined) document.getElementById('include_temporal').checked=s.temporal;
+  if(s.copernicus!==undefined) document.getElementById('include_copernicus').checked=s.copernicus;
+  /*PRIVATE*/if(s.cadastre!==undefined) document.getElementById('include_cadastre').checked=s.cadastre;/*/PRIVATE*/
+  if(s.source) document.getElementById('source').value=s.source;
+  if(s.hansen!==undefined) document.getElementById('include_hansen').checked=s.hansen;
+  if(s.infra!==undefined) document.getElementById('include_infra').checked=s.infra;
+  if(s.mark_uncertain!==undefined) document.getElementById('mark_uncertain').checked=s.mark_uncertain;
+  if(s.rf_only!==undefined) document.getElementById('mark_uncertain').checked=s.rf_only; // backwards compat
+  if(s.top_n_classes) document.getElementById('top_n_classes').value=s.top_n_classes;
+  if(s.top_n_objects) document.getElementById('top_n_objects').value=s.top_n_objects;
+  if(s.min_height_m) document.getElementById('min_height_m').value=s.min_height_m;
+  // Geometry
+  if(s.geometry){
+    document.getElementById('geometry').value=s.geometry;
+    try{
+      const g=JSON.parse(s.geometry);
+      drawnItems.clearLayers();
+      const style={color:'#0d7377',weight:2,fillOpacity:.05};
+      if(g.type==='MultiPolygon'){
+        g.coordinates.forEach(poly=>{
+          const coords=poly[0].map(c=>[c[1],c[0]]);
+          if(coords.length) L.polygon(coords,style).addTo(drawnItems);
+        });
+      }else if(g.type==='Polygon'){
+        const coords=(g.coordinates||[[]])[0].map(c=>[c[1],c[0]]);
+        if(coords.length) L.polygon(coords,style).addTo(drawnItems);
+      }else if(g.type==='MultiLineString'){
+        g.coordinates.forEach(line=>{
+          const coords=line.map(c=>[c[1],c[0]]);
+          if(coords.length>=2) L.polyline(coords,style).addTo(drawnItems);
+        });
+      }else{
+        // Fallback: use Leaflet GeoJSON layer
+        L.geoJSON(g,{style:()=>style}).eachLayer(l=>drawnItems.addLayer(l));
+      }
+    }catch(e){}
+  }
+  // Object type filter
+  if(s.selectedTypes){
+    selectedTypes.clear();
+    s.selectedTypes.forEach(t=>selectedTypes.add(t));
+    document.querySelectorAll('#ot-dropdown input[type=checkbox]').forEach(cb=>{
+      cb.checked=selectedTypes.has(cb.value);
+    });
+    updateOTLabel();
+  }
+  // Color mode
+  if(s.colorMode&&s.colorMode!==colorMode) setColorMode(s.colorMode);
+  // Height filter on legend
+  if(s.heightFilterLo!==undefined) _lhfLo=s.heightFilterLo;
+  if(s.heightFilterHi!==undefined) _lhfHi=s.heightFilterHi;
+  _lhfUpdateVisual();
+  // Hidden legend types
+  hiddenTypes.clear();
+  if(s.hidden) s.hidden.forEach(t=>hiddenTypes.add(t));
+  // Layer opacities
+  if(s.opacities){
+    for(const[id,val] of Object.entries(s.opacities)){
+      const r=document.querySelector(`[data-op="${id}"]`);
+      if(r) r.value=val;
+    }
+  }
+}
+
+async function restoreShareResult(data){
+  // data has {state, result, overlays?}
+  restoreShareState(data.state);
+  // Set hiddenTypes BEFORE showResultOnMap so buildLegend respects them
+  if(data.state.hidden) data.state.hidden.forEach(t=>hiddenTypes.add(t));
+  if(data.result&&data.result.features){
+    lastResult=data.result;
+    lastEndpoint=data.state.endpoint||'segment';
+    allFeatureData=data.result.features;
+    showResultOnMap(data.result);
+    document.getElementById('fab-download').style.display='flex';
+    applyVis();
+  }
+  // Restore layer checkboxes and load overlays
+  // First: uncheck any default-on layers NOT in saved state
+  const savedLayers=new Set(data.state.layers||[]);
+  document.querySelectorAll('[data-lyr]').forEach(cb=>{
+    if(cb.checked && !savedLayers.has(cb.dataset.lyr)){
+      cb.checked=false;
+      handleLayerToggle(cb.dataset.lyr);  // apply hide
+    }
+  });
+  // Then restore cached overlay images (instant), or fall back to re-fetch
+  const cachedOverlays=data.overlays||{};
+  if(data.state.layers){
+    for(const id of data.state.layers){
+      const cb=document.querySelector(`[data-lyr="${id}"]`);
+      if(!cb||cb.checked) continue;
+      cb.checked=true;
+      if(id==='base'||id==='segments'){applyOpacity(id);continue;}
+      // Try cached overlay first
+      const cached=cachedOverlays[id];
+      if(cached&&cached.data&&cached.bounds){
+        try{
+          const[s,w,n,e]=cached.bounds;
+          const ovl=L.imageOverlay(cached.data,[[s,w],[n,e]],{opacity:.65,interactive:false});
+          overlays[id]=ovl;
+          ovl.addTo(map);
+          orderLayers();
+          applyOpacity(id);
+          // Cache raster overlay image for client-side type filtering
+          if(id==='raster'){
+            const img=new Image();
+            img.crossOrigin='anonymous';
+            img.src=cached.data;
+            img.onload=()=>{_rasterOrigImg=img;_rasterOrigBounds=[[s,w],[n,e]];};
+          }
+          continue;
+        }catch(err){console.warn('cached overlay restore failed for',id,err);}
+      }
+      // Fall back to re-fetch from server
+      // For raster layer, pass share_id so the server uses the share's stored
+      // type assignments instead of the current model's classification
+      if(id==='raster' && currentShareId){
+        (async()=>{
+          showLoading('Loading raster...');
+          try{
+            const ovl=await loadRasterOverlay(getVisibleTypes(), currentShareId);
+            if(ovl){overlays.raster=ovl;ovl.addTo(map);orderLayers();applyOpacity('raster');}
+          }catch(e){console.error('share raster overlay failed:',e);}
+          hideLoading();
+        })();
+      } else {
+        handleLayerToggle(id);
+      }
+    }
+  }
+}
+
+async function copyToClipboard(text){
+  // 1. Clipboard API with timeout (hangs in some contexts)
+  try{
+    await Promise.race([
+      navigator.clipboard.writeText(text),
+      new Promise((_,rej)=>setTimeout(()=>rej('timeout'),1000))
+    ]);
+    return true;
+  }catch(e){}
+  // 2. execCommand fallback (synchronous)
+  try{
+    const ta=document.createElement('textarea');
+    ta.value=text;
+    ta.style.cssText='position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0';
+    document.body.appendChild(ta);
+    ta.focus();ta.select();
+    const ok=document.execCommand('copy');
+    document.body.removeChild(ta);
+    if(ok) return true;
+  }catch(e){}
+  return false;
+}
+
+let currentShareName=null;
+let _shareUrl=null;         // Always the real copyable URL (null until save done)
+let _renamePromise=null;    // Pending rename, so Copy Link can wait for it
+
+function _buildShareUrl(id){return location.origin+location.pathname+'?share='+encodeURIComponent(id);}
+function _esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+function _showSharePopup(id, saving){
+  const popup=document.getElementById('share-link-popup');
+  const urlEl=document.getElementById('share-link-url');
+  const savingEl=document.getElementById('share-saving');
+  const copiedEl=document.getElementById('share-copied');
+  const base=location.origin+location.pathname+'?share=';
+  if(saving){
+    // Non-editable saving state
+    urlEl.innerHTML='<span style="color:#ff9">Saving link…</span>';
+  }else{
+    // Show base (dim) + editable hash (green, contenteditable)
+    urlEl.innerHTML=_esc(base)+
+      '<span class="share-hash" id="share-hash" contenteditable="true" spellcheck="false" inputmode="url">'+
+      _esc(id)+'</span>';
+    _wireHashEditing();
+  }
+  copiedEl.classList.remove('show');
+  savingEl.classList.remove('show');
+  popup.classList.add('show');
+}
+
+function _wireHashEditing(){
+  const el=document.getElementById('share-hash');
+  if(!el) return;
+  // Select all on focus
+  el.addEventListener('focus',()=>{
+    const r=document.createRange();r.selectNodeContents(el);
+    const s=window.getSelection();s.removeAllRanges();s.addRange(r);
+  });
+  // Prevent newlines, handle Enter/Escape
+  el.addEventListener('keydown',(e)=>{
+    if(e.key==='Enter'){e.preventDefault();el.blur();}
+    if(e.key==='Escape'){e.preventDefault();el.textContent=currentShareId||'';el.blur();}
+  });
+  // Paste as plain text
+  el.addEventListener('paste',(e)=>{
+    e.preventDefault();
+    const text=(e.clipboardData||window.clipboardData).getData('text/plain').replace(/\s+/g,'-');
+    document.execCommand('insertText',false,text);
+  });
+  // On blur = commit rename
+  el.addEventListener('blur',()=>{_renamePromise=_commitRename();});
+}
+
+async function _commitRename(){
+  const el=document.getElementById('share-hash');
+  if(!el||!currentShareId) return;
+  let newId=el.textContent.trim().replace(/[^A-Za-z0-9_-]+/g,'-').replace(/^-+|-+$/g,'').slice(0,80);
+  if(!newId||newId===currentShareId){
+    el.textContent=currentShareId;
+    return;
+  }
+  const savingEl=document.getElementById('share-saving');
+  savingEl.classList.add('show');
+  try{
+    const resp=await fetch('/api/v1/share/'+encodeURIComponent(currentShareId)+'/rename',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({new_id:newId})
+    });
+    const d=await resp.json();
+    if(d.error){
+      el.textContent=currentShareId;
+      const toast=document.getElementById('share-toast');
+      toast.textContent=d.error==='Name already taken'?'Name taken \u2014 try another':'Rename failed: '+d.error;
+      toast.classList.add('show');
+      setTimeout(()=>toast.classList.remove('show'),3000);
+      savingEl.classList.remove('show');
+      return;
+    }
+    // Update everything to new ID
+    currentShareId=d.id;
+    _shareUrl=_buildShareUrl(d.id);
+    history.replaceState(null,'',`?share=${encodeURIComponent(d.id)}`);
+    el.textContent=d.id;
+    // Auto-copy the fresh renamed URL
+    copyToClipboard(_shareUrl).then(ok=>{if(ok)_flashCopied();});
+  }catch(e){
+    el.textContent=currentShareId;
+    console.warn('rename failed:',e);
+  }finally{savingEl.classList.remove('show');}
+}
+
+function _hideSharePopup(){document.getElementById('share-link-popup').classList.remove('show');}
+function _flashCopied(){
+  const el=document.getElementById('share-copied');
+  el.classList.add('show');setTimeout(()=>el.classList.remove('show'),2000);
+}
+
+// Fast save: state+result only (no overlay blobs).
+// Kicks off background re-save with overlays after.
+async function _doShareSave(){
+  const state=getShareState();
+  const payload={state:state};
+  // Only include result on first save — reuse_id means server already has it
+  if(lastResult && !currentShareId) payload.result=lastResult;
+  if(currentShareId) payload.reuse_id=currentShareId;
+  const resp=await fetch('/api/v1/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const d=await resp.json();
+  if(d.error) throw new Error(d.error);
+  // Backfill overlays in background (never blocks)
+  if(!currentShareId) _backfillOverlays(d.id);
+  return d;
+}
+async function _backfillOverlays(shareId){
+  try{
+    const ovlBlobs=await collectOverlayBlobs();
+    if(!Object.keys(ovlBlobs).length) return;
+    const payload={state:getShareState(),reuse_id:shareId,overlays:ovlBlobs};
+    if(lastResult) payload.result=lastResult;
+    await fetch('/api/v1/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  }catch(e){console.warn('overlay backfill failed:',e);}
+}
+
+document.getElementById('btn-share').onclick=()=>{
+  const btn=document.getElementById('btn-share');
+  if(btn.disabled)return;
+  const state=getShareState();
+  const stateH=computeShareHash(state,lastResult);
+  // Already have a share for this exact state — show popup + copy
+  if(currentShareId && shareStateHash===stateH){
+    _shareUrl=_buildShareUrl(currentShareId);
+    _showSharePopup(currentShareId, false);
+    copyToClipboard(_shareUrl).then(ok=>{if(ok)_flashCopied();});
+    return;
+  }
+  // New share: save in background, show saving state
+  btn.disabled=true;
+  _shareUrl=null;  // No URL yet — don't let Copy copy garbage
+  _showSharePopup(null, true);
+  (async()=>{
+    try{
+      const d=await _doShareSave();
+      currentShareId=d.id;
+      currentShareName=d.name||null;
+      shareStateHash=computeShareHash(state,lastResult);
+      _shareUrl=_buildShareUrl(d.id);
+      history.replaceState(null,'',`?share=${encodeURIComponent(d.id)}`);
+      // Update popup with real ID (editable)
+      const popup=document.getElementById('share-link-popup');
+      if(popup.classList.contains('show')){
+        _showSharePopup(d.id, false);
+      }
+      copyToClipboard(_shareUrl).then(ok=>{if(ok)_flashCopied();});
+    }catch(e){
+      const toast=document.getElementById('share-toast');
+      toast.textContent='\u274c '+e.message;
+      toast.classList.add('show');
+      setTimeout(()=>toast.classList.remove('show'),4000);
+      _hideSharePopup();
+    }finally{btn.disabled=false;}
+  })();
+};
+
+// Copy button in popup — always reads latest _shareUrl
+document.getElementById('share-copy-btn').onclick=async()=>{
+  // Wait for any pending rename to finish so we copy the fresh URL
+  if(_renamePromise) await _renamePromise;
+  if(!_shareUrl){
+    const el=document.getElementById('share-saving');
+    el.classList.add('show');setTimeout(()=>el.classList.remove('show'),1500);
+    return;
+  }
+  copyToClipboard(_shareUrl).then(ok=>{if(ok)_flashCopied();});
+};
+
+// Close popup on outside click
+document.addEventListener('click',(e)=>{
+  const popup=document.getElementById('share-link-popup');
+  if(popup.classList.contains('show')&&!popup.contains(e.target)&&e.target.id!=='btn-share'){
+    _hideSharePopup();
+  }
+});
+
+
+// Restore from share link on page load
+(async function checkShareParam(){
+  const p=new URLSearchParams(location.search);
+  const shareId=p.get('share');
+  if(!shareId) return;
+  showLoading('Loading shared view...');
+  showFullscreenLoading('Loading shared view','Fetching data and restoring map\u2026');
+  try{
+    const resp=await fetch('/api/v1/share/'+encodeURIComponent(shareId));
+    if(!resp.ok) throw new Error('Share not found');
+    const data=await resp.json();
+    // Use resolved ID from server (follows rename redirects)
+    const resolvedId=resp.headers.get('X-Share-Id')||shareId;
+    currentShareId=resolvedId;  // Set before restore so overlay can use share_id
+    await restoreShareResult(data);
+    currentShareName=data.name||null;
+    shareStateHash=computeShareHash(data.state,data.result);
+    // Update URL bar if the share was redirected to a new name
+    if(resolvedId!==shareId) history.replaceState(null,'',`?share=${encodeURIComponent(resolvedId)}`);
+    const displayName=currentShareName||resolvedId;
+    updateGeoInputDisplay(displayName,'share');
+    hideLoading('Shared view restored "'+displayName+'".');
+  }catch(e){
+    hideLoading('Failed to load share: '+e.message);
+    console.error('Share restore failed:',e);
+  }finally{
+    hideFullscreenLoading();
+  }
+})();
+
+// Recover from page refresh during long-running analysis
+(async function recoverActiveTask(){
+  const raw = localStorage.getItem('_activeTask');
+  if(!raw) return;
+  try{
+    const task = JSON.parse(raw);
+    if(!task.taskId || Date.now() - task.ts > 14400000) { // 4 hours max
+      localStorage.removeItem('_activeTask');
+      return;
+    }
+    // Don't recover if we're loading a share
+    if(new URLSearchParams(location.search).get('share')){
+      localStorage.removeItem('_activeTask');
+      return;
+    }
+
+    // Check if task is still running or has completed
+    const pr = await fetch(`/api/v1/segment/progress?task_id=${task.taskId}`);
+    const pj = await pr.json();
+
+    if(pj.done){
+      // Task completed while we were away — try to load auto-save share
+      if(pj.auto_share_id){
+        showLoading('Recovering auto-saved result...');
+        showFullscreenLoading('Recovering result','Loading auto-saved analysis\u2026');
+        const resp = await fetch('/api/v1/share/'+encodeURIComponent(pj.auto_share_id));
+        if(resp.ok){
+          const data = await resp.json();
+          currentShareId = pj.auto_share_id;  // Set before restore so overlay can use share_id
+          await restoreShareResult(data);
+          currentShareName = data.name || null;
+          shareStateHash = computeShareHash(data.state, data.result);
+          history.replaceState(null,'',`?share=${encodeURIComponent(pj.auto_share_id)}`);
+          hideLoading();
+          hideFullscreenLoading();
+          setStatus('Recovered auto-saved result.');
+          localStorage.removeItem('_activeTask');
+          localStorage.removeItem('_autoShareId');
+          return;
+        }
+      }
+      // Fallback: try result endpoint
+      try{
+        const rr = await fetch(`/api/v1/segment/result?task_id=${task.taskId}`);
+        if(rr.ok){
+          showLoading('Recovering result...');
+          const data = await rr.json();
+          if(task.geometry) document.getElementById('geometry').value = task.geometry;
+          lastResult = data;
+          if(data.features){allFeatureData=data.features;showResultOnMap(data);}
+          document.getElementById('fab-download').style.display='flex';
+          hideLoading();
+          setStatus('Recovered completed result.');
+        }
+      }catch(e){}
+      localStorage.removeItem('_activeTask');
+      return;
+    }
+
+    if(pj.active){
+      // Task still running — resume polling
+      showLoading('Resuming analysis...');
+      _showAbortBtn(true);
+      _activeTaskId = task.taskId;
+      if(task.geometry) document.getElementById('geometry').value = task.geometry;
+      setStatus(`Resuming: ${pj.step}${pj.detail?' \u2014 '+pj.detail:''}${pj.elapsed?' ('+pj.elapsed+'s)':''}`);
+      try{
+        const data = await _pollForResult(task.taskId);
+        if(data.error) throw new Error(data.error);
+        lastResult = data;
+        markShareDirty();
+        if(data.features){allFeatureData=data.features;showResultOnMap(data);}
+        document.getElementById('fab-download').style.display='flex';
+        hideLoading();
+        hideFullscreenLoading();
+        const autoId=localStorage.getItem('_autoShareId');
+        if(autoId){
+          currentShareId=autoId;
+          currentShareName=null;
+          history.replaceState(null,'',`?share=${encodeURIComponent(autoId)}`);
+          localStorage.removeItem('_autoShareId');
+          setStatus('Analysis complete \u2014 auto-saved as share.');
+        }
+      }catch(e){
+        setStatus('Recovery error: '+e.message);
+        hideLoading('Error');
+        hideFullscreenLoading();
+      }finally{
+        _showAbortBtn(false);
+        _activeTaskId = null;
+        localStorage.removeItem('_activeTask');
+      }
+      return;
+    }
+
+    // Task not found / expired
+    localStorage.removeItem('_activeTask');
+  }catch(e){
+    localStorage.removeItem('_activeTask');
+  }finally{
+    hideFullscreenLoading();
+  }
+})();
+
+// ============ BUILT-IN SAMPLE ============
+const SAMPLE={"type":"Polygon","coordinates":[[[15.114269,47.136928],[15.116909,47.141511],[15.125663,47.138607],[15.12841,47.133863],[15.124848,47.133192],[15.116136,47.134082],[15.114806,47.135002],[15.114269,47.136928]]]};
+function loadSampleGeometry(){
+  document.getElementById('geometry').value=JSON.stringify(SAMPLE,null,2);
+  drawnItems.clearLayers();
+  const coords=SAMPLE.coordinates[0].map(c=>[c[1],c[0]]);
+  const poly=L.polygon(coords,{color:'#0d7377',weight:2,fillOpacity:.05}).addTo(drawnItems);
+  map.fitBounds(poly.getBounds().pad(.1));
+  updateGeoInputDisplay('Sample area','drawn');
+}
+
+// ============ GEO INPUT DISPLAY ============
+let _geoDisplayLock=0;
+function updateGeoInputDisplay(label, source){
+  const now=Date.now();
+  // If this is an auto-update (no label) and a recent explicit update happened, skip
+  if(!label && !source && now-_geoDisplayLock<200) return;
+  if(label || source) _geoDisplayLock=now;
+  const el=document.getElementById('geo-input');
+  const txt=document.getElementById('geo-input-text');
+  const ico=document.getElementById('geo-input-icon');
+  const geo=document.getElementById('geometry').value.trim();
+  if(!geo && !label){
+    el.classList.remove('has-geo');
+    txt.textContent='Draw on map or load a share\u2026';
+    ico.textContent='\ud83d\udccd';
+    return;
+  }
+  el.classList.add('has-geo');
+  if(label){
+    txt.textContent=label;
+  } else {
+    try{
+      const g=JSON.parse(geo);
+      const t=g.type||'Geometry';
+      if(t==='Polygon'){
+        const c=g.coordinates?.[0];
+        txt.textContent=c?`Polygon (${c.length-1} points)`:'Polygon';
+      } else if(t==='MultiPolygon'){
+        txt.textContent=`MultiPolygon (${g.coordinates?.length||0} parts)`;
+      } else txt.textContent=t;
+    }catch(e){txt.textContent='Custom geometry';}
+  }
+  // Append area estimate
+  try{
+    const geoJ=JSON.parse(geo);
+    const areaM2=turf.area({type:'Feature',geometry:geoJ,properties:{}});
+    if(areaM2>0){
+      const ha=areaM2/10000;
+      const areaStr=ha>=1?`${ha.toFixed(1)} ha`:`${Math.round(areaM2)} m²`;
+      txt.textContent+=`, ${areaStr}`;
+    }
+  }catch(e){/* ignore */}
+  if(source==='share') ico.textContent='\ud83d\udd17';
+  else if(source==='file') ico.textContent='\ud83d\udcc4';
+  else if(source==='drawn') ico.textContent='\u270f\ufe0f';
+  else if(geo) ico.textContent='\ud83d\udccd';
+  else ico.textContent='\ud83d\udccd';
+  // Show download/share FAB as soon as geometry exists
+  _showFabIfGeometry();
+  _checkAreaWarningFromGeometry();
+}
+// Keep display synced with geometry changes
+const _geoTA=document.getElementById('geometry');
+// Watch drawn items
+map.on(L.Draw.Event.CREATED, ()=>setTimeout(()=>updateGeoInputDisplay(null,'drawn'),50));
+// Watch textarea changes (programmatic)
+const _origGeoDesc2=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value');
+Object.defineProperty(_geoTA,'value',{get(){return _origGeoDesc2.get.call(this)},set(v){_origGeoDesc2.set.call(this,v);setTimeout(()=>updateGeoInputDisplay(null),0);}});
+
+// Click on geo-input opens a paste dialog or just focuses
+document.getElementById('geo-input').addEventListener('click',(e)=>{
+  // Don't interfere with the attach button
+  if(e.target.closest('.geo-attach-btn'))return;
+  // Toggle showing the hidden textarea for manual paste
+  const ta=document.getElementById('geometry');
+  if(ta.classList.contains('geo-hidden-ta')){
+    ta.classList.remove('geo-hidden-ta');
+    ta.classList.add('geo-shown-ta');
+    ta.style.cssText='width:100%;height:60px;margin-top:4px;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font-size:11px;font-family:monospace;resize:none';
+    ta.focus();
+  } else {
+    ta.classList.add('geo-hidden-ta');
+    ta.classList.remove('geo-shown-ta');
+    ta.style.cssText='';
+  }
+});
+
+// ============ LOAD DROPDOWN ============
+let _loadDropOpen=false;
+let _ldAllShares=[];  // cached share list for filtering
+const _loadBtn=document.getElementById('btn-load');
+const _loadDrop=document.getElementById('load-dropdown');
+
+function _ldItemHtml(s){
+  const name=s.name||s.id;
+  const icon=s.has_result?'\ud83d\udfe2':'\u26aa';
+  const desc=s.description||'saved share';
+  const ago=_timeAgo(s.updated);
+  const dlIcon=s.onestop?`<a class="ld-dl" data-dl-share="${_escAttr(s.id)}" title="Download GeoPackage">⬇</a>`:'';
+  return `<div class="ld-item" data-share-id="${_escAttr(s.id)}"><span class="ld-icon">${icon}</span><div class="ld-info"><div class="ld-name">${_escHtml(name)}</div><div class="ld-desc">${_escHtml(desc)}</div></div><span class="ld-time">${ago}</span>${dlIcon}</div>`;
+}
+function _isNamedShare(s){return !s.id.startsWith('auto-')&&!/^[0-9a-f]{12}$/.test(s.id)&&s.size_kb>1;}
+function _renderShareItems(shares,query){
+  const q=(query||'').toLowerCase().trim();
+  const words=q?q.split(/\s+/):[];
+  const match=s=>{
+    if(!words.length)return true;
+    const hay=((s.name||'')+' '+(s.id||'')+' '+(s.description||'')).toLowerCase();
+    return words.every(w=>hay.includes(w));
+  };
+  const named=shares.filter(s=>_isNamedShare(s));
+  const auto=shares.filter(s=>!_isNamedShare(s));
+  const fNamed=named.filter(match),fAuto=auto.filter(match);
+  let sh='';
+  if(!q||'sample kohlschwarz forest'.includes(q)){
+    sh+='<div class="ld-section">Built-in<span class="ld-upload-btn" id="ld-upload-btn" title="Upload geometry file">+</span></div>';
+    sh+='<div class="ld-item" data-action="sample"><span class="ld-icon">\ud83d\uddfa\ufe0f</span><div class="ld-info"><div class="ld-name">Sample</div><div class="ld-desc">Forest area near Kohlschwarz</div></div></div>';
+  }
+  if(fNamed.length){
+    sh+='<div class="ld-section">Saved</div>';
+    for(const s of fNamed) sh+=_ldItemHtml(s);
+  }
+  const showAuto=q?fAuto:fAuto.slice(0,10);
+  if(showAuto.length){
+    sh+='<div class="ld-section">Recent</div>';
+    for(const s of showAuto) sh+=_ldItemHtml(s);
+  }
+  if(!sh) sh='<div class="ld-empty">No matches</div>';
+  return sh;
+}
+_loadBtn.onclick=async()=>{
+  if(_loadDropOpen){_closeLoadDrop();return;}
+  _loadDrop.innerHTML=
+    '<div class="ld-search-wrap"><input class="ld-search" id="ld-search" type="text" placeholder="Search shares\u2026" autocomplete="off"></div>'+
+    '<div class="ld-scroll" id="ld-scroll"><div class="ld-section">Built-in<span class="ld-upload-btn" id="ld-upload-btn" title="Upload geometry file">+</span></div>'+
+    '<div class="ld-item" data-action="sample"><span class="ld-icon">\ud83d\uddfa\ufe0f</span><div class="ld-info"><div class="ld-name">Sample</div><div class="ld-desc">Forest area near Kohlschwarz</div></div></div>'+
+    '<div id="ld-shares-area"><div class="ld-empty">Loading shares\u2026</div></div></div>';
+  _attachLoadHandlers();
+  _loadDrop.classList.add('open');
+  _loadDropOpen=true;
+  const searchInput=document.getElementById('ld-search');
+  searchInput.addEventListener('input',()=>{
+    const scroll=document.getElementById('ld-scroll');
+    if(!scroll||!_ldAllShares.length)return;
+    scroll.innerHTML=_renderShareItems(_ldAllShares,searchInput.value);
+    _attachLoadHandlers();
+  });
+  searchInput.addEventListener('click',e=>e.stopPropagation());
+  searchInput.addEventListener('keydown',e=>{if(e.key==='Escape'){_closeLoadDrop();e.preventDefault();}});
+  setTimeout(()=>searchInput.focus(),50);
+  const ac=new AbortController();
+  const tid=setTimeout(()=>ac.abort(),5000);
+  try{
+    const resp=await fetch('/api/v1/shares?limit=50',{signal:ac.signal});
+    clearTimeout(tid);
+    _ldAllShares=await resp.json();
+    const scroll=document.getElementById('ld-scroll');
+    if(!scroll)return;
+    const q=document.getElementById('ld-search')?.value||'';
+    scroll.innerHTML=_renderShareItems(_ldAllShares,q);
+    _attachLoadHandlers();
+  }catch(e){
+    clearTimeout(tid);
+    const area=document.getElementById('ld-shares-area')||document.getElementById('ld-scroll');
+    if(area) area.innerHTML=e.name==='AbortError'?'':'<div class="ld-empty">Failed to load shares</div>';
+  }
+};
+function _attachLoadHandlers(){
+  _loadDrop.querySelectorAll('.ld-item').forEach(el=>{
+    el.onclick=()=>{
+      _closeLoadDrop();
+      if(el.dataset.action==='sample'){
+        loadSampleGeometry();
+      } else if(el.dataset.shareId){
+        _loadShareById(el.dataset.shareId, el.querySelector('.ld-name')?.textContent||'');
+      }
+    };
+  });
+  // Download buttons
+  _loadDrop.querySelectorAll('.ld-dl[data-dl-share]').forEach(dl=>{
+    dl.onclick=(e)=>{
+      e.stopPropagation();
+      const sid=dl.dataset.dlShare;
+      _closeLoadDrop();
+      const url=`/api/v1/share/${encodeURIComponent(sid)}/download.gpkg?layers=segments&include_segments_vector=true`;
+      setStatus(`Downloading ${sid}.gpkg…`);
+      const a=document.createElement('a');
+      a.href=url; a.download=sid+'.gpkg'; a.style.display='none';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=>setStatus('Download started.'),1500);
+    };
+  });
+  const upBtn=document.getElementById('ld-upload-btn');
+  if(upBtn) upBtn.onclick=(e)=>{
+    e.stopPropagation();
+    document.getElementById('ld-file-input').click();
+  };
+}
+// Wire load-dropdown file input to the existing geo file handler
+document.getElementById('ld-file-input').addEventListener('change',function(){
+  if(this.files.length){
+    _closeLoadDrop();
+    // Reuse the geo-file handler
+    const dt=new DataTransfer();
+    for(const f of this.files) dt.items.add(f);
+    const geoInput=document.getElementById('geo-file');
+    geoInput.files=dt.files;
+    geoInput.dispatchEvent(new Event('change'));
+  }
+  this.value='';
+});
+function _closeLoadDrop(){_loadDrop.classList.remove('open');_loadDropOpen=false;}
+document.addEventListener('pointerdown',(e)=>{if(_loadDropOpen&&!_loadBtn.contains(e.target)&&!_loadDrop.contains(e.target))_closeLoadDrop();});
+
+async function _loadShareById(id, name){
+  showLoading('Loading '+name+'\u2026');
+  showFullscreenLoading('Loading \u201c'+name+'\u201d','Restoring map layers and analysis results\u2026');
+  try{
+    const resp=await fetch('/api/v1/share/'+encodeURIComponent(id));
+    if(!resp.ok) throw new Error('Share not found');
+    const data=await resp.json();
+    const resolvedId=resp.headers.get('X-Share-Id')||id;
+    currentShareId=resolvedId;  // Set before restore so overlay can use share_id
+    await restoreShareResult(data);
+    currentShareName=data.name||null;
+    shareStateHash=computeShareHash(data.state,data.result);
+    const displayName=currentShareName||resolvedId;
+    updateGeoInputDisplay(displayName,'share');
+    history.replaceState(null,'',`?share=${encodeURIComponent(resolvedId)}`);
+    hideLoading('Loaded: '+displayName);
+  }catch(e){
+    hideLoading('Failed: '+e.message);
+  }finally{
+    hideFullscreenLoading();
+  }
+}
+
+function _timeAgo(ts){
+  const s=Math.floor((Date.now()/1000)-ts);
+  if(s<60)return 'just now';
+  if(s<3600)return Math.floor(s/60)+'m ago';
+  if(s<86400)return Math.floor(s/3600)+'h ago';
+  if(s<604800)return Math.floor(s/86400)+'d ago';
+  return new Date(ts*1000).toLocaleDateString();
+}
+function _escHtml(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+function _escAttr(s){return s.replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+
+function fmtDate(d){if(!d||d.length<8)return d||'';return d.slice(0,4)+'-'+d.slice(4,6)+'-'+d.slice(6,8);}
+
+// ============ GEOMETRY FILE DROP/UPLOAD ============
+(function initGeoDrop(){
+  const drop=document.getElementById('geo-drop');
+  const ta=document.getElementById('geometry');
+  const fileInput=document.getElementById('geo-file');
+  const TEXT_EXTS=['.geojson','.json','.kml','.xml','.gpx','.wkt','.gml','.txt'];
+  const BIN_EXTS=['.shp','.zip','.gpkg','.kmz','.dxf'];
+
+  // Prevent default drag on whole page
+  ['dragenter','dragover','dragleave','drop'].forEach(ev=>{
+    document.addEventListener(ev,e=>{e.preventDefault();e.stopPropagation();});
+  });
+
+  // Highlight drop zone
+  drop.addEventListener('dragenter',()=>drop.classList.add('dragover'));
+  drop.addEventListener('dragover',()=>drop.classList.add('dragover'));
+  drop.addEventListener('dragleave',e=>{if(!drop.contains(e.relatedTarget))drop.classList.remove('dragover');});
+  drop.addEventListener('drop',e=>{drop.classList.remove('dragover');handleFiles(e.dataTransfer.files);});
+
+  // File picker
+  fileInput.addEventListener('change',()=>{if(fileInput.files.length)handleFiles(fileInput.files);fileInput.value='';});
+
+  async function handleFiles(files){
+    if(!files.length)return;
+    const file=files[0];
+    const name=file.name.toLowerCase();
+    const ext='.'+name.split('.').pop();
+    setStatus('Reading '+file.name+'...');
+
+    // Text-based formats: parse client-side (GeoJSON) or upload to server
+    if(TEXT_EXTS.includes(ext)){
+      try{
+        const text=await file.text();
+        const geojson=textToGeoJSON(text,ext);
+        if(geojson){applyGeoJSON(geojson,file.name);return;}
+        // KML/GPX/GML/WKT/TXT: gzip text and upload to server
+        showLoading('Parsing '+file.name+'...');
+        const blob=new Blob([text],{type:'text/plain'});
+        const gzBlob=typeof CompressionStream!=='undefined'
+          ?await new Response(blob.stream().pipeThrough(new CompressionStream('gzip'))).blob()
+          :blob;
+        const fd=new FormData();
+        fd.append('file',gzBlob,file.name+(gzBlob!==blob?'.gz':''));
+        const resp=await fetch('/api/v1/parse-geometry',{method:'POST',body:fd});
+        if(!resp.ok){let msg='Server error ('+resp.status+')';try{const j=await resp.json();if(j.error)msg=j.error;}catch(e){}throw new Error(msg);}
+        const data=await resp.json();
+        if(data.error)throw new Error(data.error);
+        applyGeoJSON(data,file.name);
+        hideLoading('Parsed '+file.name);
+      }catch(e){hideLoading?.(null);setStatus('Error reading '+file.name+': '+e.message);}
+      return;
+    }
+
+    // Binary formats: upload to server
+    if(BIN_EXTS.includes(ext)||!TEXT_EXTS.includes(ext)){
+      try{
+        showLoading('Parsing '+file.name+'...');
+        const fd=new FormData();
+        fd.append('file',file);
+        const resp=await fetch('/api/v1/parse-geometry',{method:'POST',body:fd});
+        const data=await resp.json();
+        if(data.error)throw new Error(data.error);
+        applyGeoJSON(data,file.name);
+        hideLoading('Parsed '+file.name);
+      }catch(e){hideLoading('Error: '+e.message);}
+      return;
+    }
+  }
+
+  function textToGeoJSON(text,ext){
+    text=text.trim();
+    // GeoJSON
+    if(ext==='.geojson'||ext==='.json'||(text.startsWith('{')&&text.includes('"type"'))){
+      try{
+        const obj=JSON.parse(text);
+        if(obj.type==='FeatureCollection')return obj;
+        if(obj.type==='Feature')return{type:'FeatureCollection',features:[obj]};
+        if(obj.coordinates||obj.geometries)return{type:'FeatureCollection',features:[{type:'Feature',geometry:obj,properties:{}}]};
+      }catch(e){}
+    }
+    // KML/GPX/GML — set as text, backend parses via geo_parse
+    if(ext==='.kml'||ext==='.xml'||ext==='.gpx'||ext==='.gml')return null;
+    // WKT
+    if(ext==='.wkt')return null; // let server handle
+    return null;
+  }
+
+  // --- Geometry reconstruction via turf.polygonize + buffer + union ---
+
+  // Build polygon from uploaded features.
+  // Lines: polygonize the network, union, buffer to close gaps, simplify.
+  // Points/mixed: buffer each 10m, union.
+  function _buildPolygon(fc){
+    try{
+      // Separate lines from other geometry
+      const lineFeats=[],polyFeats=[];
+      for(const f of fc.features){
+        if(!f.geometry)continue;
+        const t=f.geometry.type;
+        if(t==='Polygon'||t==='MultiPolygon')polyFeats.push(turf.feature(f.geometry));
+        else if(t==='LineString'||t==='MultiLineString')lineFeats.push(turf.feature(f.geometry));
+        else{
+          // Points etc: buffer 10m
+          const buf=turf.buffer(turf.feature(f.geometry),0.01,{units:'kilometers'});
+          if(buf)polyFeats.push(buf);
+        }
+      }
+      // Polygonize line network
+      if(lineFeats.length){
+        const lineFc=turf.featureCollection(lineFeats);
+        const pgons=turf.polygonize(lineFc);
+        if(pgons?.features?.length){
+          for(const p of pgons.features)polyFeats.push(p);
+        }else{
+          // Polygonize failed — buffer lines as fallback
+          for(const lf of lineFeats){
+            const buf=turf.buffer(lf,0.01,{units:'kilometers'});
+            if(buf)polyFeats.push(buf);
+          }
+        }
+      }
+      if(!polyFeats.length)return null;
+      // Union all polygons
+      let merged=polyFeats[0];
+      for(let i=1;i<polyFeats.length;i++){
+        try{merged=turf.union(turf.featureCollection([merged,polyFeats[i]]));}catch(e){}
+      }
+      if(!merged)return null;
+      // Buffer +10m then -8m to close micro-gaps between adjacent polygons
+      merged=turf.buffer(merged,0.01,{units:'kilometers'});
+      if(merged)merged=turf.buffer(merged,-0.008,{units:'kilometers'});
+      // Remove small holes and sliver polygons
+      if(merged){
+        let g=merged.geometry||merged;
+        if(g.type==='Polygon'){
+          // Remove holes < ~500m² (≈0.000005 deg²)
+          g={type:'Polygon',coordinates:[g.coordinates[0],...g.coordinates.slice(1).filter(h=>{
+            let a=0;for(let i=0;i<h.length-1;i++)a+=(h[i][0]*h[i+1][1]-h[i+1][0]*h[i][1]);return Math.abs(a/2)>0.000005;
+          })]};
+        }else if(g.type==='MultiPolygon'){
+          // Remove tiny polygons and their small holes
+          const kept=g.coordinates.filter(p=>{
+            let a=0;const r=p[0];for(let i=0;i<r.length-1;i++)a+=(r[i][0]*r[i+1][1]-r[i+1][0]*r[i][1]);return Math.abs(a/2)>0.000001;
+          }).map(p=>[p[0],...p.slice(1).filter(h=>{
+            let a=0;for(let i=0;i<h.length-1;i++)a+=(h[i][0]*h[i+1][1]-h[i+1][0]*h[i][1]);return Math.abs(a/2)>0.000005;
+          })]);
+          g=kept.length===1?{type:'Polygon',coordinates:kept[0]}:{type:'MultiPolygon',coordinates:kept};
+        }
+        merged=turf.feature(g);
+      }
+      // Simplify (~1m tolerance)
+      if(merged)merged=turf.simplify(merged,{tolerance:0.00001,highQuality:true});
+      return merged?.geometry||null;
+    }catch(e){
+      console.warn('_buildPolygon turf error:',e);
+      return null;
+    }
+  }
+
+  function applyGeoJSON(fc,fname){
+    if(!fc.features||!fc.features.length){setStatus('No features in '+fname);return;}
+    // Reconstruct exact polygon boundary from uploaded features
+    drawnItems.clearLayers();
+    let geom=null;
+    const polys=fc.features.filter(f=>f.geometry&&(f.geometry.type==='Polygon'||f.geometry.type==='MultiPolygon'));
+    if(polys.length===1 && fc.features.length===1){
+      geom=polys[0].geometry;
+    }else{
+      // Stitch lines into polygon, or convex hull as fallback
+      geom=_buildPolygon(fc);
+    }
+    if(!geom){setStatus('No geometry found in '+fname);return;}
+    ta.value=JSON.stringify(geom,null,2);
+    // Draw on map
+    try{
+      const layer=L.geoJSON(geom,{style:{color:'#0d7377',weight:2,fillOpacity:.05}});
+      layer.eachLayer(l=>drawnItems.addLayer(l));
+      map.fitBounds(drawnItems.getBounds().pad(.1));
+    }catch(e){}
+    setStatus('Loaded '+fc.features.length+' feature'+(fc.features.length>1?'s':'')+' from '+fname);
+    updateGeoInputDisplay(fname,'file');
+    // Collapse textarea if visible
+    const _ta2=document.getElementById('geometry');
+    if(_ta2.classList.contains('geo-shown-ta')){_ta2.classList.add('geo-hidden-ta');_ta2.classList.remove('geo-shown-ta');_ta2.style.cssText='';}
+  }
+
+  // Also handle paste of files (e.g. from file manager)
+  ta.addEventListener('paste',e=>{
+    const items=e.clipboardData?.items;
+    if(!items)return;
+    for(const item of items){
+      if(item.kind==='file'){e.preventDefault();handleFiles([item.getAsFile()]);return;}
+    }
+  });
+})();
+
+// ============ ANALYSE ============
+let _activeTaskId=null;
+let _aborted=false;
+
+document.getElementById('btn-abort').onclick=async()=>{
+  if(!_activeTaskId)return;
+  _aborted=true;
+  try{await fetch(`/api/v1/segment/abort?task_id=${_activeTaskId}`,{method:'POST'});}catch(e){}
+  setStatus('Cancelled');
+  hideLoading('Cancelled');
+  _showAbortBtn(false);
+  document.getElementById('btn-run').disabled=false;
+};
+
+function _showAbortBtn(show){
+  document.getElementById('btn-abort').style.display=show?'inline-block':'none';
+}
+
+document.getElementById('btn-run').onclick=async()=>{
+  const btn=document.getElementById('btn-run');
+  const endpoint=document.getElementById('endpoint').value;
+  const geometry=document.getElementById('geometry').value.trim();
+  if(!geometry){setStatus('Provide geometry first.');return;}
+
+  btn.disabled=true;
+  _aborted=false;
+  showLoading('Starting...');
+  resultLayer.clearLayers();
+  markersByType={};allFeatureData=[];hiddenTypes.clear();
+  _rasterOrigImg=null;_rasterOrigBounds=null;_rasterReloadSeq++;
+  document.getElementById('legend-types').innerHTML='';
+  for(const[id,ovl]of Object.entries(overlays)){map.removeLayer(ovl);}
+  for(const k of Object.keys(overlays))delete overlays[k];
+  document.querySelectorAll('[data-lyr]').forEach(cb=>{if(cb.dataset.lyr!=='segments'&&cb.dataset.lyr!=='base')cb.checked=false;});
+
+  lastEndpoint=endpoint;
+  const isSeg=endpoint==='segment';
+  const params=new URLSearchParams();
+  if(isSeg)params.set('min_object_size',parseInt(document.getElementById('min_area').value)||30);
+  const ot=getSelectedTypes();
+  if(ot)params.set(isSeg?'types':'object_types',ot);
+  const topNC=document.getElementById('top_n_classes').value;
+  if(topNC)params.set('top_n_classes',topNC);
+  const topNO=document.getElementById('top_n_objects').value;
+  if(topNO)params.set('top_n_objects',topNO);
+  const minH=document.getElementById('min_height_m').value;
+  if(minH)params.set('min_height_m',minH);
+  if(document.getElementById('include_ortho').checked)params.set('include_ortho','true');
+  if(document.getElementById('include_temporal').checked)params.set('include_temporal','true');
+  if(document.getElementById('include_copernicus').checked)params.set('include_copernicus','true');
+  /*PRIVATE*/if(document.getElementById('include_cadastre').checked)params.set('include_cadastre','true');/*/PRIVATE*/
+  if(isSeg)params.set('source',getSource());
+  if(document.getElementById('include_hansen').checked)params.set('include_hansen','true');
+  if(document.getElementById('include_infra').checked)params.set('include_infra','true');
+  if(document.getElementById('mark_uncertain').checked)params.set('mark_uncertain','true');
+
+  const taskId=isSeg?crypto.randomUUID():'';
+  if(taskId)params.set('task_id',taskId);
+  _activeTaskId=taskId;
+  if(isSeg && taskId) localStorage.setItem('_activeTask', JSON.stringify({taskId, geometry, ts:Date.now()}));
+
+  // Always use async mode for segment endpoint — survives mobile screen-off
+  if(isSeg)params.set('async','true');
+
+  // Show abort button for async tasks
+  if(isSeg)_showAbortBtn(true);
+
+  let ct='text/plain',body=geometry;
+  try{const p=JSON.parse(geometry);ct='application/json';body=JSON.stringify({geometry:p});}catch(e){}
+
+  try{
+    // Submit the request
+    const resp=await fetch(`/api/v1/${endpoint}?${params}`,{method:'POST',headers:{'Content-Type':ct},body});
+    const submitData=await resp.json();
+    if(submitData.error)throw new Error(submitData.error);
+
+    if(isSeg && submitData.task_id){
+      // Async mode: poll for progress and result
+      const tid=submitData.task_id;
+      if(tid!==taskId){ // server replaced our id (public tier never accepts an existing one)
+        _activeTaskId=tid;
+        localStorage.setItem('_activeTask', JSON.stringify({taskId:tid, geometry, ts:Date.now()}));
+      }
+      setStatus('Submitted, waiting...');
+      const data=await _pollForResult(tid);
+      if(_aborted)return;
+      if(data.error)throw new Error(data.error);
+      lastResult=data;
+      markShareDirty();
+      if(data.features){allFeatureData=data.features;showResultOnMap(data);}
+      document.getElementById('fab-download').style.display='flex';
+      hideLoading();
+      // Auto-saved share: set as current so user can access via Share button
+      const autoId=localStorage.getItem('_autoShareId');
+      if(autoId){
+        currentShareId=autoId;
+        currentShareName=null;
+        history.replaceState(null,'',`?share=${encodeURIComponent(autoId)}`);
+        localStorage.removeItem('_autoShareId');
+        setStatus('Analysis complete \u2014 auto-saved as share.');
+      }
+    }else{
+      // Sync mode (non-segment endpoints)
+      if(submitData.error)throw new Error(submitData.error);
+      lastResult=submitData;
+      markShareDirty();
+      if(submitData.features){allFeatureData=submitData.features;showResultOnMap(submitData);}
+      document.getElementById('fab-download').style.display='flex';
+      hideLoading();
+    }
+  }catch(e){
+    if(_aborted)return;
+    setStatus('Error: '+e.message);
+    hideLoading('Error');
+    lastResult=null;
+  }finally{btn.disabled=false;_showAbortBtn(false);_activeTaskId=null;localStorage.removeItem('_activeTask');}
+};
+
+// Poll progress + fetch result when done. Resilient to screen-off / network blips.
+async function _pollForResult(taskId, intervalMs=2000, maxWaitMs=3600000){
+  const t0=Date.now();
+  while(Date.now()-t0<maxWaitMs){
+    if(_aborted)throw new Error('Cancelled');
+    await new Promise(r=>setTimeout(r,intervalMs));
+    if(_aborted)throw new Error('Cancelled');
+    try{
+      const pr=await fetch(`/api/v1/segment/progress?task_id=${taskId}`);
+      const pj=await pr.json();
+      if(pj.error){
+        throw new Error(pj.error);
+      }
+      if(pj.done){
+        setStatus('Loading results...');
+        if(pj.auto_share_id){
+          localStorage.setItem('_autoShareId', pj.auto_share_id);
+        }
+        const rr=await fetch(`/api/v1/segment/result?task_id=${taskId}`);
+        return await rr.json();
+      }
+      if(pj.active){
+        const el=pj.elapsed?` (${pj.elapsed}s)`:'';
+        const det=pj.detail?` — ${pj.detail}`:'';
+        // byte-level Zenodo download progress (pj.fetch) → leading percentage
+        const pct=(pj.progress!=null)?`${Math.round(pj.progress*100)}% · `:'';
+        setStatus(`${pct}${pj.step}${det}${el}`);
+      }
+    }catch(e){
+      // Network blip — just retry on next poll
+      if(e.message && !e.message.startsWith('Failed to fetch'))throw e;
+    }
+  }
+  throw new Error('Analysis timed out after 60 minutes');
+}
+
+function showResultOnMap(data){
+  document.getElementById('legend').style.display='';
+  const mi=document.getElementById('meta-info');
+  const meta=data.meta||{};
+  let mh='';
+  if(meta.date_a)mh+=`<b>${fmtDate(meta.date_a)}</b> → <b>${fmtDate(meta.date_b)}</b>`;
+  if(meta.dataset&&!meta.date_a)mh+=`<b>Dataset:</b> ${fmtDate(meta.dataset)}`;
+  if(meta.processing_time_s)mh+=(mh?' &nbsp; ':'')+`${meta.processing_time_s}s`;
+  if(meta.model==='v2'){
+    mh+=`<br><b>Model:</b> v2 ${meta.model_classifier||'lgbm_v2'}`;
+    if(meta.v2_trained_at)mh+=` &nbsp; ${meta.v2_trained_at}`;
+    if(meta.v2_cv_macro_f1)mh+=` &nbsp; CV macro-F1 ${meta.v2_cv_macro_f1}`;
+  }else if(meta.rf_trained_at||meta.rf_n_kgs){
+    mh+='<br><b>RF model:</b> ';
+    if(meta.rf_trained_at)mh+=meta.rf_trained_at;
+    if(meta.rf_n_kgs)mh+=` &nbsp; ${meta.rf_n_kgs} KGs`;
+    if(meta.rf_oob)mh+=` &nbsp; OOB ${meta.rf_oob}`;
+  }
+  if(data.warnings&&data.warnings.length){
+    mh+='<br><span style="color:#fa0">⚠ '+data.warnings.join('; ')+'</span>';
+  }
+  mi.innerHTML=mh;mi.style.display=mh?'':'none';
+
+  const cmBar=document.getElementById('color-mode-bar');
+  cmBar.style.display=lastEndpoint==='segment'?'':'none';
+  updateLegendScale();
+
+  const typeCounts={};
+  let tiMap=TYPE_SHAPES;
+  for(const f of data.features){
+    const t=f.properties.type||f.properties.obj_type||f.properties.event_type||f.properties.status||'unknown';
+    typeCounts[t]=(typeCounts[t]||0)+1;
+  }
+  document.getElementById('legend-types-title').textContent='Object Types';
+  buildLegend(typeCounts,tiMap);
+  buildSummary(data);
+  showFeaturesOnMap(data);
+  // Recheck layer availability for the new view
+  _debouncedLayerAvailCheck();
+}
+
+function showFeaturesOnMap(data){
+  resultLayer.clearLayers();markersByType={};
+  L.geoJSON(data,{
+    pointToLayer:(f,ll)=>{
+      const p=f.properties;
+      const t=p.type||p.obj_type||p.event_type||p.status||'unknown';
+      const info=typeInfo(t,lastEndpoint);
+      const col=markerColor(f);
+      const m=L.marker(ll,{icon:mkIcon(info,col)});
+      m._fHeight=p.height_max_m||p.height_after_m||p.height_max||0;
+      if(!markersByType[t])markersByType[t]=[];
+      markersByType[t].push(m);
+      return m;
+    },
+    onEachFeature:(f,layer)=>{
+      const p=f.properties,rows=[];
+      const keys=['type','status','group_type','event_type','detail','is_manmade','confidence','height_before_m','height_after_m','height_change_m','height_change_mean_m','height_max_m','height_mean_m','area_sqm','crown_area_before_sqm','crown_area_after_sqm','ndvi_fused','ndvi_mean','roughness','compactness','elongation','height_change','dtm_change','dtm_change_mean_m','dsm_change_mean_m','temporal_stability','dsm_elevation_m','dtm_elevation_m','object_height_m'];
+      const seen=new Set();
+      for(const k of keys){if(p[k]!==undefined&&p[k]!==null){seen.add(k);let v=p[k];if(typeof v==='boolean')v=v?'✅':'❌';else if(typeof v==='number')v=Number.isInteger(v)?v:v.toFixed(3);else if(typeof v==='object')v=JSON.stringify(v);rows.push(`<b>${k}:</b> ${v}`);}}
+      for(const[k,v]of Object.entries(p)){if(seen.has(k)||k==='elevation_profile')continue;rows.push(`<b>${k}:</b> ${typeof v==='object'?JSON.stringify(v):v}`);}
+      layer.bindPopup(`<div style="max-height:300px;overflow:auto;font-size:12px">${rows.join('<br>')}</div>`);
+    }
+  }).addTo(resultLayer);
+  if(resultLayer.getLayers().length)map.fitBounds(resultLayer.getBounds().pad(.05));
+  applyOpacity('segments');
+  setTimeout(()=>applyVis(),50);
+}
+
+function buildSummary(data){
+  const panel=document.getElementById('summary-panel'),content=document.getElementById('summary-content');
+  if(!data.features||!data.features.length){panel.style.display='none';return;}
+  panel.style.display='';const n=data.features.length;let html='';
+  {
+    let totalA=0,mmA=0;
+    for(const f of data.features){const a=f.properties.area_sqm||0;totalA+=a;if(f.properties.is_manmade)mmA+=a;}
+    html=`<b>${n}</b> objects &nbsp; <b>${totalA>0?(mmA/totalA*100).toFixed(1):'0'}%</b> manmade`;
+    /*PRIVATE*/const ev=data.cadastre_evaluation;if(ev)html+=`<br><b>Cadastre:</b> P=${ev.precision} R=${ev.recall} F1=${ev.f1}`;/*/PRIVATE*/
+    if(data.meta&&data.meta.source==='product')html+=`<br><b>Source:</b> product ${data.meta.product_version||''}`;
+    if(data.hansen_evaluation){const h=data.hansen_evaluation;html+=`<br><b>Hansen:</b> P=${h.precision} R=${h.recall} F1=${h.f1}`;}
+  }
+  content.innerHTML=html;
+}
+
+// ============ GPS LOCATION ============
+let gpsActive=false, gpsWatchId=null, gpsMarker=null, gpsCircle=null, gpsFlewTo=false, gpsHeadingMarker=null;
+let _gpsLatLng=null; // last known position for hint-tap
+function toggleGPS(){
+  const btn=document.getElementById('gps-btn');
+  if(gpsActive){stopGPS();return;}
+  if(!navigator.geolocation){alert('Geolocation not available');return;}
+  gpsActive=true;gpsFlewTo=false;_gpsLatLng=null;
+  btn.classList.add('active','searching');
+  gpsWatchId=navigator.geolocation.watchPosition(onGPSPos,onGPSErr,{enableHighAccuracy:true,maximumAge:5000,timeout:15000});
+  // Listen for device orientation
+  if(window.DeviceOrientationEvent){
+    window.addEventListener('deviceorientation',onDeviceOrientation,true);
+    if(typeof DeviceOrientationEvent.requestPermission==='function'){
+      DeviceOrientationEvent.requestPermission().catch(()=>{});
+    }
+  }
+}
+function stopGPS(){
+  gpsActive=false;_gpsLatLng=null;
+  const btn=document.getElementById('gps-btn');
+  btn.classList.remove('active','searching');
+  document.getElementById('gps-hint').classList.remove('show');
+  if(gpsWatchId!==null){navigator.geolocation.clearWatch(gpsWatchId);gpsWatchId=null;}
+  if(gpsMarker){map.removeLayer(gpsMarker);gpsMarker=null;}
+  if(gpsCircle){map.removeLayer(gpsCircle);gpsCircle=null;}
+  if(gpsHeadingMarker){map.removeLayer(gpsHeadingMarker);gpsHeadingMarker=null;}
+  window.removeEventListener('deviceorientation',onDeviceOrientation,true);
+}
+let _lastHeading=null;
+function onDeviceOrientation(e){
+  if(e.alpha!==null)_lastHeading=e.alpha;
+  if(!gpsMarker||!_lastHeading)return;
+  const ll=gpsMarker.getLatLng();
+  if(!gpsHeadingMarker){
+    gpsHeadingMarker=L.marker(ll,{icon:L.divIcon({html:'<div style="width:0;height:0;border-left:6px solid transparent;border-right:6px solid transparent;border-bottom:18px solid #0d7377;transform-origin:center bottom;opacity:.7" id="gps-heading-arrow"></div>',iconSize:[12,18],iconAnchor:[6,18],className:''})}).addTo(map);
+  }
+  gpsHeadingMarker.setLatLng(ll);
+  const arrow=document.getElementById('gps-heading-arrow');
+  if(arrow)arrow.style.transform=`rotate(${360-_lastHeading}deg)`;
+}
+function onGPSPos(pos){
+  const btn=document.getElementById('gps-btn');
+  btn.classList.remove('searching');
+  const lat=pos.coords.latitude,lng=pos.coords.longitude;
+  const acc=pos.coords.accuracy||50;
+  _gpsLatLng=[lat,lng];
+  if(!gpsMarker){
+    gpsMarker=L.circleMarker([lat,lng],{radius:7,fillColor:'#0d7377',fillOpacity:1,color:'#fff',weight:2}).addTo(map);
+    gpsCircle=L.circle([lat,lng],{radius:acc,color:'#0d7377',fillColor:'#0d7377',fillOpacity:.1,weight:1,dashArray:'4'}).addTo(map);
+  }else{
+    gpsMarker.setLatLng([lat,lng]);
+    gpsCircle.setLatLng([lat,lng]).setRadius(acc);
+  }
+  if(!gpsFlewTo){
+    gpsFlewTo=true;
+    map.flyTo([lat,lng],map.getZoom(),{duration:1.5});
+    // Show hint near GPS button — user taps it to set area
+    const hint=document.getElementById('gps-hint');
+    const gpsBtnEl=document.getElementById('gps-btn');
+    if(gpsBtnEl){
+      const r=gpsBtnEl.getBoundingClientRect();
+      const mr=document.getElementById('map').getBoundingClientRect();
+      hint.style.top=(r.bottom-mr.top+6)+'px';
+      hint.style.left=(r.left-mr.left)+'px';
+    }
+    hint.textContent='Tap here to select 1 km around you';
+    hint.classList.add('show');
+    setTimeout(()=>hint.classList.remove('show'),6000);
+  }
+}
+function onGPSErr(e){
+  console.warn('GPS error:',e);
+  const btn=document.getElementById('gps-btn');
+  btn.classList.remove('searching');
+  if(e.code===1)stopGPS();
+}
+// Hint tap → set 1km circle geometry
+document.getElementById('gps-hint').addEventListener('click',function(){
+  if(!_gpsLatLng)return;
+  const[lat,lng]=_gpsLatLng;
+  const circle=turf_circle([lng,lat],1,{units:'kilometers',steps:64});
+  if(circle){
+    document.getElementById('geometry').value=JSON.stringify(circle.geometry,null,2);
+    drawnItems.clearLayers();
+    const coords=circle.geometry.coordinates[0].map(c=>[c[1],c[0]]);
+    L.polygon(coords,{color:'#0d7377',weight:2,fillOpacity:.05}).addTo(drawnItems);
+    showFABIfGeometry();
+  }
+  this.classList.remove('show');
+});
+// Simple turf circle helper
+function turf_circle(center,radiusKm,opts){
+  const steps=opts.steps||64;
+  const coords=[];
+  for(let i=0;i<=steps;i++){
+    const angle=(i/steps)*Math.PI*2;
+    const dx=radiusKm*Math.cos(angle);
+    const dy=radiusKm*Math.sin(angle);
+    const lat=center[1]+dy/111.32;
+    const lng=center[0]+dx/(111.32*Math.cos(center[1]*Math.PI/180));
+    coords.push([lng,lat]);
+  }
+  return{type:'Feature',geometry:{type:'Polygon',coordinates:[coords]},properties:{}};
+}
+
+// ============ FAB VISIBILITY: show when geometry present ============
+function showFABIfGeometry(){
+  const geo=document.getElementById('geometry').value.trim();
+  // Only show fab if there are actual results, not just geometry
+  // (the fab was already shown by analyse handler when results arrive)
+}
+// Already monitoring via property descriptor in geo input display section above
+
+// ============ MBTILES DOWNLOAD ============
+const MBTILES_LAYERS=[
+  {id:'raster',name:'Segment Raster',group:'Analysis'},
+  {id:'hansen',name:'Hansen Forest Δ',group:'Analysis'},
+  {id:'dtm-2024',name:'DTM 2024',group:'LiDAR'},
+  {id:'dtm-2023',name:'DTM 2023',group:'LiDAR'},
+  {id:'dtm-2022',name:'DTM 2022',group:'LiDAR'},
+  {id:'dsm-2024',name:'nDSM 2024',group:'LiDAR'},
+  {id:'dsm-2023',name:'nDSM 2023',group:'LiDAR'},
+  {id:'dsm-2022',name:'nDSM 2022',group:'LiDAR'},
+  {id:'ortho-2024',name:'Ortho ~2024',group:'Ortho'},
+  {id:'ortho-2023',name:'Ortho ~2023',group:'Ortho'},
+  {id:'ortho-2020',name:'Ortho ~2020',group:'Ortho'},
+  {id:'cir-2024',name:'CIR ~2024',group:'Ortho'},
+  {id:'cir-2023',name:'CIR ~2023',group:'Ortho'},
+  {id:'cir-2020',name:'CIR ~2020',group:'Ortho'},
+];
+async function buildMBTilesList(){
+  const el=document.getElementById('mbtiles-list');
+  // Check layer availability via /api/v1/layers
+  let flat={};
+  try{
+    const b=map.getBounds();
+    const bbox=`${b.getWest().toFixed(6)},${b.getSouth().toFixed(6)},${b.getEast().toFixed(6)},${b.getNorth().toFixed(6)}`;
+    const resp=await fetch(`/api/v1/layers?bbox=${bbox}`);
+    if(resp.ok){
+      const avail=await resp.json();
+      for(const[group,val]of Object.entries(avail)){
+        if(typeof val==='object'){
+          for(const[year,ok]of Object.entries(val))flat[`${group}-${year}`]=!!ok;
+        }else flat[group]=!!val;
+      }
+    }
+  }catch(e){console.warn('MBTiles layer check failed:',e);}
+  let html='';let lastGroup='';let anyShown=false;
+  for(const ly of MBTILES_LAYERS){
+    // Skip unavailable data layers; analysis layers (raster) shown if we have results,
+    // but hansen respects availability since it's a data layer
+    const isRaster=ly.id==='raster';
+    if(!isRaster && Object.keys(flat).length>0 && flat[ly.id]===false)continue;
+    if(isRaster && !lastResult)continue; // raster needs analysis results
+    if(ly.group!==lastGroup){html+=`<div style="font-weight:600;font-size:11px;color:#999;text-transform:uppercase;letter-spacing:.5px;margin:8px 0 4px;padding-bottom:2px;border-bottom:1px solid #eee">${ly.group}</div>`;lastGroup=ly.group;}
+    html+=`<div style="display:flex;align-items:center;gap:8px;margin:4px 0;font-size:13px" id="mbt-row-${ly.id}"><span style="flex:1">${ly.name}</span><button class="btn btn-sm btn-ghost" onclick="downloadMBTiles('${ly.id}','${ly.name}',this)">Download</button></div>`;
+    anyShown=true;
+  }
+  if(!anyShown)html='<p style="color:#999;font-size:12px">No layers available for the current map view.</p>';
+  el.innerHTML=html;
+  // Move raster filter panel right after the Segment Raster row
+  const rasterFilterPanel=document.getElementById('mbt-raster-filters');
+  const rasterRow=document.getElementById('mbt-row-raster');
+  if(rasterFilterPanel){
+    if(rasterRow){
+      rasterRow.after(rasterFilterPanel);
+      rasterFilterPanel.style.display='block';
+    } else {
+      rasterFilterPanel.style.display='none';
+    }
+  }
+}
+async function downloadMBTiles(layerId,layerName,btn){
+  const args=getPostArgs();
+  if(!args){alert('Provide geometry first');return;}
+  const origText=btn.textContent;
+  btn.disabled=true;btn.textContent='⏳ Starting...';
+  try{
+    let qs=`layer=${layerId}&async=true`;
+    // For raster layer, pass object type + height filters
+    if(layerId==='raster'){
+      const mbtTypes=_getExportTypeFilter('mbt');
+      if(mbtTypes) qs+='&types='+encodeURIComponent(mbtTypes);
+      const mbtHF=_getHeightFilter('mbt');
+      if(mbtHF.height_min) qs+='&height_min='+mbtHF.height_min;
+      if(mbtHF.height_max) qs+='&height_max='+mbtHF.height_max;
+    }
+    const url=`/api/v1/export/mbtiles?${qs}`;
+    const resp=await fetch(url,{method:'POST',headers:{'Content-Type':args.ct},body:args.body});
+    if(!resp.ok)throw new Error((await resp.json()).error);
+    const submit=await resp.json();
+    const taskId=submit.task_id;
+    if(!taskId)throw new Error('No task_id');
+    btn.textContent='⏳ Generating...';
+    const t0=Date.now();
+    while(Date.now()-t0<600000){
+      await new Promise(r=>setTimeout(r,2000));
+      try{
+        const pr=await fetch(`/api/v1/segment/progress?task_id=${taskId}`);
+        const pj=await pr.json();
+        if(pj.error)throw new Error(pj.error);
+        if(pj.done){
+          window.location.href=`/api/v1/export/mbtiles/download/${taskId}?layer=${layerId}`;
+          btn.textContent='✅ Done';setTimeout(()=>{btn.textContent=origText;btn.disabled=false;},3000);
+          return;
+        }
+        if(pj.active)btn.textContent=`⏳ ${pj.detail||pj.step||'Working...'}`;
+      }catch(e){if(!e.message?.startsWith('Failed to fetch'))throw e;}
+    }
+    throw new Error('Timed out');
+  }catch(e){alert('MBTiles error: '+e.message);}finally{btn.disabled=false;btn.textContent=origText;}
+}
+
+// ============ SHARE URL PREVIEW ============
+// (Removed: MutationObserver was overwriting editable share-hash span
+//  with plain textContent. _showSharePopup already builds the popup.)
+
+// Init MBTiles list on modal open
+const _origOpenModal=openResultModal;
+openResultModal=function(){
+  buildMBTilesList();
+  _origOpenModal();
+};
+</script>
+</body>
+</html>

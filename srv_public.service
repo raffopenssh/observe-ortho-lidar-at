@@ -1,0 +1,31 @@
+[Unit]
+Description=srtm-lidar-at public API (parcel-free tier + token-gated /k proxy to srv)
+After=network.target srv.service
+Wants=srv.service
+
+[Service]
+User=exedev
+WorkingDirectory=/home/exedev/srtm-lidar
+# --max-requests: recycle workers periodically (slow-leak insurance; the in-process
+# memory watchdog in service_guard.py handles the fast case).
+ExecStart=/home/exedev/.local/bin/gunicorn -w 2 --threads 24 -b 0.0.0.0:8100 --timeout 620 --graceful-timeout 60 --keep-alive 15 --max-requests 20000 --max-requests-jitter 2000 --control-socket /home/exedev/.gunicorn/public.ctl public_api:app
+Restart=on-failure
+RestartSec=3
+# Memory: 2 workers × (PUBLIC_RSS_HARD_MB=1100) stays under MemoryHigh, so the kernel
+# reclaim-throttle (which parked the workers in D state for hours in Oct 2026) can
+# never engage before the worker recycles itself.  :8000 (srv) is now almost
+# exclusively fleet traffic, so the public tier gets the larger share.
+MemoryHigh=2400M
+MemoryMax=2800M
+Environment=PUBLIC_RSS_SOFT_MB=850
+Environment=PUBLIC_RSS_HARD_MB=1100
+Environment=HILLSHADE_GRID_MB=96
+Environment=LQ_GRID_MB=128
+Environment=TILE_PNG_MB=32
+Environment=TILE_DISK_CACHE_MB=2048
+Environment=TILE_MAX_CONCURRENT=3
+Environment=TILE_RATE_PER_S=25
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

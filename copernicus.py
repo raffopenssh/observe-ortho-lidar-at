@@ -1,0 +1,3021 @@
+"""Copernicus openEO interface for Sentinel-2 NDVI, ESA WorldCover, and Sentinel-1 SAR.
+
+Provides cloud-free NDVI composites, monthly NDVI time series, land cover
+classification, and SAR backscatter data via the Copernicus Data Space
+openEO API.  Results are cached locally with LRU eviction (max 2 GB).
+
+Usage::
+
+    from copernicus import get_ndvi_composite, get_ndvi_timeseries
+    result = get_ndvi_composite({"west": 16.3, "south": 48.2, "east": 16.4, "north": 48.3})
+    ndvi = result["ndvi"]  # np.ndarray (H, W)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import pathlib
+import random
+import tempfile
+import threading
+import time
+from typing import Any, Dict, Optional, Tuple, Union
+
+import numpy as np
+
+try:
+    import openeo
+    # The openeo client waits DEFAULT_TIMEOUT_SYNCHRONOUS_EXECUTE (30 min)
+    # on every synchronous ``/result`` POST and DataCube.download() offers
+    # no per-call override.  Our sync path gives up after
+    # SYNC_DOWNLOAD_TIMEOUT (180 s) and falls back to a batch job — but the
+    # ``with ThreadPoolExecutor`` that ran the download joined the worker
+    # thread on exit, so the "180 s" fallback really took up to 30 min per
+    # month while the request sat in the server's queue.  During the
+    # 2026-09-21/22 openEO degradation (Spark "runaway job" cancellations,
+    # RemoteDisconnected after ~25 min) that turned every frontier KG into a
+    # 2–7 h copernicus step.  Cap the server-side wait just above our own
+    # fallback threshold; the batch path is unaffected (its polling uses
+    # short requests, result download streams per chunk).
+    try:
+        import openeo.rest.connection as _oeo_conn
+        _oeo_conn.DEFAULT_TIMEOUT_SYNCHRONOUS_EXECUTE = 240
+    except Exception:  # noqa: BLE001
+        pass
+except ImportError:
+    openeo = None  # type: ignore[assignment]
+
+try:
+    import rasterio
+    from rasterio.transform import Affine
+    from rasterio.crs import CRS
+except ImportError:
+    rasterio = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
+
+# Silence noisy openeo client lib warnings about unparseable error bodies.
+# Every 503/502 produces a 'Failed to parse API error response' WARNING
+# line that doubles the signal feeding the director's copernicus EMA.
+# The retry layer below already handles the response correctly.
+try:
+    logging.getLogger('openeo.rest._connection').setLevel(logging.ERROR)
+    logging.getLogger('openeo.rest.connection').setLevel(logging.ERROR)
+except Exception:
+    pass
+
+# === SECTION: Credentials & configuration (multi-account rotation) ===
+# Credentials — multiple accounts for rotation when rate-limited (429) or overloaded.
+#
+# All credentials live in data/austria_processor/copernicus_credentials.json
+# (gitignored). They are added/managed at runtime via /api/v1/credentials
+# and synced to peers via the HA snapshot mechanism (director_ha.py).
+# Nothing is hardcoded here — the repo is public.
+#
+# Optional bootstrap seed (env-only, never committed): set
+# ``COPERNICUS_BOOTSTRAP_CREDS`` to a JSON list of
+# ``[{"client_id":"sh-...","client_secret":"..."}, ...]`` (or just
+# ``[["sh-...","..."], ...]``). These are merged into the in-memory
+# credential list at module import so a freshly-bootstrapped peer with
+# an empty JSON store still has *something* to work with even if the
+# director’s fan-out is broken (as in the 2026-05-08 incident). Values
+# are NOT written to ``copernicus_credentials.json`` — the env var stays
+# the source of truth, so rotating it propagates on restart.
+def _bootstrap_creds_from_env() -> list:
+    raw = os.environ.get("COPERNICUS_BOOTSTRAP_CREDS", "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    out: list = []
+    for entry in data or []:
+        if isinstance(entry, dict):
+            cid = (entry.get("client_id") or "").strip()
+            sec = (entry.get("client_secret") or "").strip()
+        elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            cid = str(entry[0]).strip()
+            sec = str(entry[1]).strip()
+        else:
+            continue
+        if cid and sec:
+            out.append((cid, sec))
+    return out
+
+_BUILTIN_CREDENTIALS: list = _bootstrap_creds_from_env()
+
+# === Canonical credential ordering ===
+# Across the fleet, credentials may be added in different orders on
+# different peers (env-bootstrap order, fan-out arrival race, restarts).
+# The director addresses credentials by *index* (e.g. ``cred_indices=[3]``),
+# so peers MUST agree on the index→client_id mapping. We enforce a
+# deterministic order by sorting on ``client_id`` (lexicographic) at
+# every load / reload / add / remove. Index 0 is therefore always the
+# alphabetically-smallest client_id on every peer.
+def _canonical_sort(creds: list) -> list:
+    return sorted(creds, key=lambda c: c[0])
+
+
+# Credentials store path (instance-local; not in git)
+_CRED_STORE = pathlib.Path("data/austria_processor/copernicus_credentials.json")
+# Per-credential usage stats (success/error counts + per-minute buckets).
+# Written by every process that uses Copernicus, read by the dashboard.
+_USAGE_STORE = pathlib.Path("data/austria_processor/copernicus_credential_usage.json")
+_USAGE_BUCKET_HOURS = 24 * 7  # keep last 7 days of per-hour buckets
+# Per-credential metadata: label, added_at, last_validated_at, last_status,
+# notes. Indexed by client_id.
+_cred_meta: Dict[str, Dict[str, Any]] = {}
+# Forward-declared so _load_credentials_from_disk can rehydrate it; the
+# canonical declaration (with comment) appears below.
+_exhausted_cred_indices: set = set()
+
+# A credential confirmed exhausted by a *data-request* 402 (see
+# ``_probe_credential``) stays excluded for this long before it is
+# eligible for one re-probe. CDSE PU quotas renew monthly, so re-testing
+# daily costs one tiny probe/day instead of one failed 402 round-trip
+# every rotation (Oct 2026: the flag was lost on every save, so every
+# peer re-confirmed the same dead creds every ~10 min and the
+# ``n_exhausted == 0`` check misfiled genuine exhaustion as IP-throttle).
+_EXHAUSTED_TTL_S = 24 * 3600.0
+
+
+def _exhausted_at_epoch(meta: dict) -> float:
+    """``exhausted_at`` as epoch seconds (tolerates the legacy ISO form)."""
+    v = meta.get("exhausted_at")
+    if not v:
+        return 0.0
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        pass
+    try:
+        import datetime as _dt
+        return _dt.datetime.fromisoformat(str(v).rstrip("Z")).replace(
+            tzinfo=_dt.timezone.utc).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _exhaustion_live(meta: dict, now: float | None = None) -> bool:
+    """True when *meta* carries a data-confirmed exhaustion younger than
+    ``_EXHAUSTED_TTL_S``. An un-stamped ``exhausted=True`` is treated as
+    live (conservative)."""
+    if not meta or not meta.get("exhausted"):
+        return False
+    at = _exhausted_at_epoch(meta)
+    if at <= 0:
+        return True
+    return ((now if now is not None else time.time()) - at) < _EXHAUSTED_TTL_S
+
+# Tombstones: client_ids that have been explicitly removed. Persisted to
+# the credentials JSON store so a deletion survives:
+#   * sibling gunicorn workers that still have the cred in their
+#     in-memory ``_CREDENTIALS`` list and would otherwise resurrect it on
+#     their next ``_save_credentials_to_disk()`` via the union-merge in
+#     ``_reload_credentials_from_disk()``;
+#   * HA snapshot fan-out from a stale director that hasn't seen the
+#     delete yet (``director_ha.install_snapshot`` unions creds, so
+#     without tombstones a stale snapshot would re-add the deleted cred).
+# A subsequent ``add_credential(cid, ...)`` clears the tombstone, so
+# deletion-then-re-add works as expected.
+_cred_tombstones: set = set()
+
+def _load_credentials_from_disk() -> list:
+    """Merge built-ins with persisted credentials. Built-ins always come first.
+
+    Also rehydrates ``_exhausted_cred_indices`` from any ``exhausted=True``
+    flags persisted in the meta, so a fresh subprocess starts with the
+    same exhaustion state the parent already discovered.
+    """
+    global _cred_meta
+    creds = list(_BUILTIN_CREDENTIALS)
+    seen = {c[0] for c in creds}
+    _cred_meta = {}
+    _cred_tombstones.clear()
+    for cid, _csec in _BUILTIN_CREDENTIALS:
+        _cred_meta[cid] = {"source": "builtin"}
+    if _CRED_STORE.exists():
+        try:
+            data = json.loads(_CRED_STORE.read_text())
+            for t in (data.get("tombstones") or []):
+                t = (t or "").strip()
+                if t:
+                    _cred_tombstones.add(t)
+            # Builtins cannot be tombstoned (env-supplied; would reappear).
+            for cid, _csec in _BUILTIN_CREDENTIALS:
+                _cred_tombstones.discard(cid)
+            # Drop any builtins that are tombstoned via a side channel —
+            # actually we already kept builtins above; ensure they survive.
+            for entry in data.get("credentials", []):
+                cid = entry.get("client_id")
+                csec = entry.get("client_secret")
+                if not cid or not csec or cid in seen:
+                    # Update metadata even for builtins so we keep last_validated_at etc.
+                    if cid in _cred_meta:
+                        for k, v in entry.items():
+                            if k not in ("client_secret",):
+                                _cred_meta[cid][k] = v
+                    continue
+                if cid in _cred_tombstones:
+                    continue  # explicitly deleted; do not resurrect
+                creds.append((cid, csec))
+                seen.add(cid)
+                _cred_meta[cid] = {k: v for k, v in entry.items() if k != "client_secret"}
+        except Exception as e:
+            logger.warning("Failed to load credentials store %s: %s", _CRED_STORE, e)
+    creds = _canonical_sort(creds)
+    # Apply persisted (still-live) exhaustion to in-memory set.
+    for i, (cid, _) in enumerate(creds):
+        if _exhaustion_live(_cred_meta.get(cid) or {}):
+            _exhausted_cred_indices.add(i)
+    return creds
+
+# Meta keys that represent freshly-probed runtime state. When merging
+# a stale on-disk snapshot into in-memory meta we MUST NOT clobber
+# these — otherwise a re-save right after revalidate_all_credentials()
+# (which calls _save_credentials_to_disk -> _reload_credentials_from_disk)
+# overwrites the just-probed status with the stale value we're about
+# to overwrite on disk anyway. That bug stuck cred #8 on "error" for
+# days even though OIDC probes were succeeding.
+_VOLATILE_META_KEYS = {
+    "last_status", "last_validated_at", "last_error",
+    "exhausted", "exhausted_at",
+}
+
+def _reload_credentials_from_disk():
+    """Re-read on-disk store and merge any user creds we don't know about
+    into the in-memory pool. Necessary because gunicorn runs multiple
+    workers, each with its own ``_CREDENTIALS`` list — without this,
+    worker B will save its stale view and overwrite worker A's additions.
+
+    Volatile probe-result keys (see ``_VOLATILE_META_KEYS``) are only
+    pulled in for credentials we don't already track in memory; for
+    known credentials, in-memory values win so a freshly-probed status
+    is never clobbered by a stale on-disk snapshot.
+    """
+    global _CREDENTIALS
+    if not _CRED_STORE.exists():
+        return
+    try:
+        data = json.loads(_CRED_STORE.read_text())
+    except Exception as e:
+        logger.warning("Failed to re-read credentials store: %s", e)
+        return
+    # Refresh tombstones first — deletions made by sibling workers
+    # propagate via this set. Builtins are immune (env-supplied).
+    builtin_ids = {c[0] for c in _BUILTIN_CREDENTIALS}
+    for t in (data.get("tombstones") or []):
+        t = (t or "").strip()
+        if t and t not in builtin_ids:
+            _cred_tombstones.add(t)
+    # Evict any in-memory creds that are now tombstoned (another worker
+    # just deleted them). Without this we'd resurrect them on our next
+    # _save_credentials_to_disk().
+    if _cred_tombstones:
+        _CREDENTIALS = [(cid, sec) for (cid, sec) in _CREDENTIALS
+                        if cid not in _cred_tombstones or cid in builtin_ids]
+        for t in list(_cred_tombstones):
+            _cred_meta.pop(t, None)
+    seen = {c[0] for c in _CREDENTIALS}
+    for entry in data.get("credentials", []):
+        cid = entry.get("client_id")
+        csec = entry.get("client_secret")
+        if not cid or not csec:
+            continue
+        if cid in _cred_tombstones and cid not in builtin_ids:
+            continue
+        # Pull latest non-volatile meta (label, source, notes, added_at,
+        # usage, ...). For volatile keys (last_status etc.) trust the
+        # in-memory copy if we already know this credential — it may
+        # have just been refreshed by revalidate_all_credentials().
+        if cid in _cred_meta:
+            for k, v in entry.items():
+                if k == "client_secret":
+                    continue
+                if k in _VOLATILE_META_KEYS:
+                    continue
+                _cred_meta[cid][k] = v
+            # Exception to the volatile-key rule: a *data-confirmed*
+            # exhaustion written by another process (the KG subprocess
+            # persists it in ``_check_credits_error``) is stronger
+            # evidence than anything this process holds, so it is
+            # merged in when live and newer. Clearing is TTL-driven
+            # (``_exhaustion_live``) or via reset/remove, never by a
+            # stale snapshot.
+            if _exhaustion_live(entry) and (
+                    _exhausted_at_epoch(entry)
+                    >= _exhausted_at_epoch(_cred_meta[cid])):
+                _cred_meta[cid]["exhausted"] = True
+                _cred_meta[cid]["exhausted_at"] = _exhausted_at_epoch(entry) or time.time()
+                if entry.get("last_status") == "exhausted":
+                    _cred_meta[cid]["last_status"] = "exhausted"
+        else:
+            _cred_meta[cid] = {k: v for k, v in entry.items() if k != "client_secret"}
+        if cid not in seen:
+            _CREDENTIALS.append((cid, csec))
+            seen.add(cid)
+    # Re-canonicalise (sort by client_id) so the index→cred mapping
+    # matches every other peer regardless of arrival order. Re-derive
+    # the exhausted set from persisted meta after the sort.
+    new_creds = _canonical_sort(_CREDENTIALS)
+    if new_creds != _CREDENTIALS:
+        _CREDENTIALS = new_creds
+    _exhausted_cred_indices.clear()
+    for i, (cid, _) in enumerate(_CREDENTIALS):
+        if _exhaustion_live(_cred_meta.get(cid) or {}):
+            _exhausted_cred_indices.add(i)
+
+def _save_credentials_to_disk():
+    """Persist non-builtin credentials + meta for all creds to disk.
+
+    Also persists per-credential ``exhausted`` + ``exhausted_at`` so a
+    fresh subprocess (and the director) inherits the state.
+    """
+    # Snapshot our own exhaustion verdicts by client_id *before* the
+    # reload below — it re-derives ``_exhausted_cred_indices`` from
+    # ``_cred_meta`` and would otherwise drop an index that was just
+    # added in ``_check_credits_error`` (the Oct 2026 forget-on-save bug).
+    now_ts = time.time()
+    exh_cids = {_CREDENTIALS[i][0] for i in _exhausted_cred_indices
+                if 0 <= i < len(_CREDENTIALS)}
+    for cid in exh_cids:
+        m = _cred_meta.setdefault(cid, {})
+        if not m.get("exhausted"):
+            m["exhausted"] = True
+            m["exhausted_at"] = now_ts
+    # Refresh from disk first so we don't drop creds another worker added.
+    _reload_credentials_from_disk()
+    for i, (cid, _) in enumerate(_CREDENTIALS):
+        if cid in exh_cids:
+            _exhausted_cred_indices.add(i)
+    builtin_ids = {c[0] for c in _BUILTIN_CREDENTIALS}
+    out = {"credentials": [],
+           "tombstones": sorted(t for t in _cred_tombstones
+                                if t not in builtin_ids)}
+    for i, (cid, csec) in enumerate(_CREDENTIALS):
+        if cid in _cred_tombstones and cid not in builtin_ids:
+            continue  # belt-and-braces: never persist a tombstoned cred
+        live = _cred_meta.setdefault(cid, {})   # real reference, not a copy
+        is_exh = i in _exhausted_cred_indices
+        if is_exh:
+            if not live.get("exhausted") or not _exhausted_at_epoch(live):
+                live["exhausted_at"] = now_ts
+            live["exhausted"] = True
+        else:
+            live["exhausted"] = False
+            live.pop("exhausted_at", None)
+        meta = dict(live)
+        meta["client_id"] = cid
+        meta["client_secret"] = csec
+        meta.setdefault("source", "builtin" if cid in builtin_ids else "user")
+        out["credentials"].append(meta)
+    try:
+        _CRED_STORE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CRED_STORE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(out, indent=2))
+        os.replace(tmp, _CRED_STORE)
+    except Exception as e:
+        logger.warning("Failed to save credentials store: %s", e)
+
+_CREDENTIALS = _load_credentials_from_disk()
+_credential_index = 0  # current credential pair
+# Cache-only peers may import this module before any credentials have
+# synced from the director (HA snapshot). Don't crash at import time —
+# any actual API call will trip CacheMissError or surface a clear error.
+if _CREDENTIALS:
+    CLIENT_ID = _CREDENTIALS[0][0]
+    CLIENT_SECRET = _CREDENTIALS[0][1]
+else:
+    CLIENT_ID = ""
+    CLIENT_SECRET = ""
+OPENEO_URL = "openeo.dataspace.copernicus.eu"
+_CDSE_TOKEN_URL = ("https://identity.dataspace.copernicus.eu/auth/realms/CDSE"
+                   "/protocol/openid-connect/token")
+
+# Permanent cache survives /tmp cleanup and service restarts.
+# LRU eviction keeps total size under CACHE_MAX_BYTES.
+CACHE_DIR = pathlib.Path("/home/exedev/srtm-lidar/rf_training_data/copernicus_cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+
+# Maximum bbox extent in degrees.  The tile_cache grid snaps outward
+# to 0.1° steps, so tiles can reach 0.2° span.  0.25° gives headroom.
+MAX_BBOX_SPAN_DEG = 0.25
+
+# Synchronous download size threshold (area in sq-degrees).
+# Below this we use direct download(); above we use batch jobs.
+SYNC_AREA_THRESHOLD = 0.012  # ~0.1° × 0.1° cells fit in sync path
+
+# ESA WorldCover class legend
+WORLDCOVER_CLASSES: Dict[int, str] = {
+    10: "tree_cover",
+    20: "shrubland",
+    30: "grassland",
+    40: "cropland",
+    50: "built_up",
+    60: "bare_sparse_vegetation",
+    70: "snow_ice",
+    80: "permanent_water",
+    90: "herbaceous_wetland",
+    95: "mangroves",
+    100: "moss_lichen",
+}
+
+# === SECTION: Internal helpers (connection, cache, retry) ===
+
+_connection: Optional[Any] = None
+
+# Per-credential connection pool — keyed by credential index.
+# Used by _get_connection_for_cred() for parallel workers that each
+# need their own openEO session (1 sync download per client_id).
+_connections: Dict[int, Any] = {}
+
+# Global flag: set when Copernicus returns 402 PaymentRequired on ALL credentials.
+# Callers (e.g. rf_train) can check this to pause gracefully.
+credits_exhausted: bool = False
+_credits_exhausted_at: Optional[str] = None  # ISO timestamp
+# tracks which credential indices got 402 (rehydrated from disk on import)
+
+# IP-level throttle: all credentials return 402 but probes pass.
+# Unlike credits_exhausted (monthly cap), this recovers in ~2 hours.
+ip_throttled: bool = False
+_ip_throttled_at: float = 0  # monotonic timestamp
+_IP_THROTTLE_COOLDOWN = 7200  # 2 hours — observed recovery time
+
+# --- openEO outage circuit breaker (Jul 2026) ---------------------------
+# During CDSE-side outages ('[503] no available server', batch jobs failing
+# inside their Spark cluster) credential rotation can't help — every retry
+# burns a ~1h batch wait + PUs. Track consecutive outage-signature failures
+# process-wide; at threshold raise IPThrottledError so the existing
+# copernicus_paused path parks this peer and the director backs off.
+# Bracketed 5xx forms only — bare '503' would false-positive on job ids /
+# byte counts embedded in error strings.
+_OUTAGE_SIGNS = ('no available server', '[503]', '[502]', '[504]',
+                 '502 Server Error', '503 Server Error', '504 Server Error',
+                 'Bad Gateway', 'Gateway Time', 'Service Unavailable',
+                 'GDAL Exception Code', 'MalformedProjectionException',
+                 'MalformedDataTypeException',
+                 # batch failures reach _outage_note only after 402/credits
+                 # + missing-product were already ruled out — what remains
+                 # is a server-side (Spark cluster) failure.
+                 "didn't finish successfully", 'Status: error')
+_OUTAGE_BREAKER_THRESHOLD = 3
+_outage_streak = 0
+_outage_lock = threading.Lock()
+
+
+def _outage_note(exc_str: str) -> None:
+    """Record an openEO failure; raise IPThrottledError on outage cascade."""
+    global _outage_streak, ip_throttled, _ip_throttled_at
+    if not any(s in exc_str for s in _OUTAGE_SIGNS):
+        with _outage_lock:
+            _outage_streak = 0
+        return
+    with _outage_lock:
+        _outage_streak += 1
+        streak = _outage_streak
+    logger.warning("openEO outage signature (%d/%d consecutive): %s",
+                   streak, _OUTAGE_BREAKER_THRESHOLD, exc_str[:160])
+    if streak >= _OUTAGE_BREAKER_THRESHOLD:
+        ip_throttled = True
+        _ip_throttled_at = time.monotonic()
+        with _outage_lock:
+            _outage_streak = 0
+        raise IPThrottledError(
+            f"openEO outage circuit breaker: {streak} consecutive "
+            f"server-side failures — backing off")
+
+
+def _outage_ok() -> None:
+    global _outage_streak
+    with _outage_lock:
+        _outage_streak = 0
+
+# Short-term memory for NDVI months that recently failed with 500 (Spark timeout)
+# or persistent 402.  Key = (bbox_hash, month_label), value = expiry timestamp.
+# Skips re-downloading the same month for the same area within the cooldown period.
+_FAILED_MONTH_COOLDOWNS: Dict[tuple, float] = {}
+_FAILED_MONTH_COOLDOWN_SECS = 1800  # 30 minutes for 500 (Spark timeout)
+_FAILED_MONTH_402_COOLDOWN_SECS = 1800  # 30 minutes — 402 is IP-level, recovery takes ~2h
+
+# --- Adaptive sync-request splitting (Sep 2026) ----------------------------
+# When openEO's synchronous path is slow (Spark backlog), a full 0.1° NDVI
+# month hits our 240 s read timeout while a 0.05° quadrant of the same cell
+# still completes in ~2 min (measured 2026-09-23: 0.1° → timeout at 240 s
+# for 2023 *and* 2024; 0.05° → 124 s; 0.03° → 64-109 s). Before this, every
+# timed-out month was simply "skipped": 8 months × 240 s = 32 min per cell
+# for zero data, and the tile ended without harmonics. Fleet-wide that was
+# ~1000 month-timeouts / 30 h ≈ 67 peer-hours burned and ~200 tiles with
+# no NDVI series at all.
+#
+# Now: the first read-timeout arms "split mode" (file-backed so every KG
+# subprocess on this peer sees it; TTL 1 h, re-armed on each new timeout).
+# In split mode a month is fetched as 2×2 quadrants (sequential — openEO
+# allows one sync job per client_id) and mosaicked into the same month
+# cache file, so nothing downstream changes. A quadrant timing out still
+# fails the month, and two consecutive timeout-failed months trip the
+# existing upstream-stress cascade (IPThrottledError → KG deferred for
+# retry, peer copernicus paused 15 min) instead of baking a degraded
+# product.
+_SYNC_SPLIT_TTL_SECS = 3600
+_SYNC_SPLIT_FILE = pathlib.Path("data/austria_processor/openeo_sync_split_until")
+_TIMEOUT_SIGNS = ('Read timed out', 'read timeout', 'ReadTimeout')
+
+# Per-request sync timeouts for the NDVI *month* path (2026-09-23 evening).
+# The global DEFAULT_TIMEOUT_SYNCHRONOUS_EXECUTE=240 cap (929413f) was
+# sized for `_download_with_fallback`, whose sync attempt is only a
+# 180 s probe before a batch job.  The month path has NO batch fallback,
+# and peer logs show 0.1° months have *always* been slow on openEO's sync
+# path: 09-19..09-21 successes took 5-35 min (avg 600-1500 s).  The 240 s
+# cap turned that slow-but-working path into ~100 %% timeouts from 22T13
+# on ("Read timed out" 4/h → 100/h), every frontier tile lost harmonics
+# and the -partial backlog grew to ~985 KGs.  A client-side abandon does
+# not cancel the server-side Spark job either, so re-requesting after
+# 240 s *doubles* our load on openEO — patience is the gentler option
+# (peer compute / wall-time is not the constraint; openEO is).
+_MONTH_SYNC_TIMEOUT_FULL = 1200   # 0.1° cell, first attempt
+_MONTH_SYNC_TIMEOUT_QUAD = 600    # 0.05° quadrant in split mode
+_RELAY_FILE = pathlib.Path("data/austria_processor/subprocess_warnings.jsonl")
+
+
+def _relay_info(msg: str) -> None:
+    """Mirror an INFO line into the processor's warning relay so it reaches
+    the fleet merged log (subprocess INFO is otherwise local-only — the
+    dashboard's ``quad_mosaics_ok`` counter read 0 all day while peers had
+    mosaicked fine).  No-op outside a processor subprocess."""
+    try:
+        if not _RELAY_FILE.exists():
+            return
+        with open(_RELAY_FILE, "a") as fh:
+            from datetime import datetime as _dt, timezone as _tz
+            fh.write(json.dumps({
+                "ts": _dt.now(_tz.utc).isoformat(),
+                "level": "info", "msg": f"copernicus: {msg}", "step": "",
+            }) + "\n")
+    except Exception:
+        pass
+
+
+def _is_read_timeout(exc_str: str) -> bool:
+    return any(s in exc_str for s in _TIMEOUT_SIGNS)
+
+
+def _sync_split_active() -> bool:
+    try:
+        until = float(_SYNC_SPLIT_FILE.read_text().strip() or 0)
+    except (OSError, ValueError):
+        return False
+    return time.time() < until
+
+
+def _sync_split_arm(reason: str) -> None:
+    was = _sync_split_active()
+    try:
+        _SYNC_SPLIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _SYNC_SPLIT_FILE.write_text(f"{time.time() + _SYNC_SPLIT_TTL_SECS:.0f}\n")
+    except OSError:
+        pass
+    if not was:
+        logger.warning("openEO sync path slow (%s) — NDVI months will be fetched "
+                       "as 2×2 quadrants for the next %dm",
+                       reason[:80], _SYNC_SPLIT_TTL_SECS // 60)
+
+
+def _sync_split_status() -> dict:
+    """For /api/v1/info + process.txt: {'active': bool, 'remaining_s': int}."""
+    try:
+        until = float(_SYNC_SPLIT_FILE.read_text().strip() or 0)
+    except (OSError, ValueError):
+        until = 0.0
+    rem = int(until - time.time())
+    return {"active": rem > 0, "remaining_s": max(0, rem)}
+
+
+def _mosaic_tiffs(parts: list, dst: pathlib.Path) -> None:
+    """Merge quadrant GeoTIFFs into *dst*, reprojecting to the first part's
+    CRS when openEO returned mixed UTM zones (cells straddling 12°E)."""
+    from rasterio.merge import merge as rio_merge
+    from rasterio.vrt import WarpedVRT
+    opened, vrts = [], []
+    try:
+        for p in parts:
+            opened.append(rasterio.open(str(p)))
+        ref_crs = opened[0].crs
+        srcs = []
+        for ds in opened:
+            if ds.crs != ref_crs:
+                v = WarpedVRT(ds, crs=ref_crs)
+                vrts.append(v)
+                srcs.append(v)
+            else:
+                srcs.append(ds)
+        arr, tf = rio_merge(srcs, nodata=np.nan)
+        prof = opened[0].profile.copy()
+        prof.update(driver="GTiff", height=arr.shape[1], width=arr.shape[2],
+                    count=arr.shape[0], transform=tf, crs=ref_crs,
+                    dtype=str(arr.dtype), nodata=np.nan)
+        prof.pop("blockxsize", None); prof.pop("blockysize", None)
+        prof.pop("tiled", None)
+        with rasterio.open(str(dst), "w", **prof) as out:
+            out.write(arr)
+    finally:
+        for v in vrts:
+            try: v.close()
+            except Exception: pass
+        for ds in opened:
+            try: ds.close()
+            except Exception: pass
+
+# Threading lock for credential state — protects _credential_index,
+# _exhausted_cred_indices, credits_exhausted, CLIENT_ID, CLIENT_SECRET,
+# and _connection during concurrent access from parallel download workers.
+_cred_lock = threading.Lock()
+
+
+# Per-process credential whitelist. Set via COPERNICUS_CRED_INDICES env
+# (e.g. "0,2,3") to restrict the workers in this process to a subset of
+# the credential pool. The director uses this so different peers use
+# disjoint credential pairs and don't collide on rate limits.
+_ALLOWED_CRED_INDICES: Optional[set] = None
+
+
+def _init_allowed_cred_indices():
+    global _ALLOWED_CRED_INDICES, _credential_index, CLIENT_ID, CLIENT_SECRET
+    raw = os.environ.get("COPERNICUS_CRED_INDICES", "").strip()
+    if not raw:
+        return
+    try:
+        idxs = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            i = int(part)
+            if 0 <= i < len(_CREDENTIALS):
+                idxs.append(i)
+        if idxs:
+            _ALLOWED_CRED_INDICES = set(idxs)
+            with _cred_lock:
+                _credential_index = idxs[0]
+                CLIENT_ID, CLIENT_SECRET = _CREDENTIALS[_credential_index]
+            logger.info("COPERNICUS_CRED_INDICES=%s -> using credentials %s (start=%d)",
+                        raw, sorted(_ALLOWED_CRED_INDICES), idxs[0])
+    except Exception as e:
+        logger.warning("Bad COPERNICUS_CRED_INDICES=%r: %s", raw, e)
+
+_init_allowed_cred_indices()
+
+
+def FUNCTIONING_CREDENTIALS() -> list:
+    """Return the list of credential indices that haven't been exhausted (402).
+
+    If COPERNICUS_CRED_INDICES is set, the result is intersected with the
+    whitelist so this process only ever uses its assigned credentials.
+    """
+    with _cred_lock:
+        idxs = [i for i in range(len(_CREDENTIALS)) if i not in _exhausted_cred_indices]
+    if _ALLOWED_CRED_INDICES is not None:
+        idxs = [i for i in idxs if i in _ALLOWED_CRED_INDICES]
+    return idxs
+
+
+# === SECTION: Credential usage telemetry ===
+# Lightweight per-credential usage tracking: success/error counts +
+# per-minute buckets for a sparkline. Written atomically; multi-process
+# safe via best-effort merge (concurrent writers may briefly overwrite
+# each other but the buckets are coarse enough that this is fine).
+
+_usage_lock = threading.Lock()
+
+def _product_from_title(title: str) -> str:
+    t = (title or "").lower()
+    if "ndvi" in t and ("composite" in t or "compose" in t):
+        return "ndvi"
+    if "ndvi" in t:
+        return "ndvi"
+    if "worldcover" in t or "land cover" in t or "esa worldcover" in t:
+        return "worldcover"
+    if "sar" in t or "backscatter" in t:
+        return "sar"
+    if "harmonic" in t:
+        return "harmonics"
+    return ""
+
+def _load_usage() -> dict:
+    try:
+        if _USAGE_STORE.exists():
+            with _USAGE_STORE.open() as f:
+                return json.load(f) or {}
+    except Exception:
+        pass
+    return {}
+
+def _save_usage(data: dict) -> None:
+    try:
+        _USAGE_STORE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _USAGE_STORE.with_suffix(".tmp")
+        with tmp.open("w") as f:
+            json.dump(data, f)
+        tmp.replace(_USAGE_STORE)
+    except Exception as e:
+        logger.debug("usage save failed: %s", e)
+
+def _prune_buckets(buckets: dict, now_h: int) -> dict:
+    cutoff = now_h - _USAGE_BUCKET_HOURS
+    return {k: v for k, v in buckets.items() if int(k) >= cutoff}
+
+def record_credential_usage(cred_index: int, kind: str, product: str = "") -> None:
+    """Record one credential request outcome.
+
+    Parameters
+    ----------
+    cred_index : int
+        Credential index in ``_CREDENTIALS``.
+    kind : str
+        ``success``, ``error``, or ``rotated`` (transient 402).
+    product : str
+        Optional product label (ndvi, sar, worldcover, harmonics).
+    """
+    if cred_index < 0 or cred_index >= len(_CREDENTIALS):
+        return
+    cid = _CREDENTIALS[cred_index][0]
+    now = int(time.time())
+    now_h = now // 3600
+    with _usage_lock:
+        data = _load_usage()
+        entry = data.setdefault(cid, {
+            "success": 0, "error": 0, "rotated": 0,
+            "last_use": 0, "last_success": 0, "last_error": 0,
+            "buckets": {},
+            "by_product": {},
+        })
+        if kind in ("success", "error", "rotated"):
+            entry[kind] = int(entry.get(kind, 0)) + 1
+        entry["last_use"] = now
+        if kind == "success":
+            entry["last_success"] = now
+        elif kind == "error":
+            entry["last_error"] = now
+        if product:
+            bp = entry.setdefault("by_product", {}).setdefault(product, {"success": 0, "error": 0, "rotated": 0})
+            if kind in bp:
+                bp[kind] += 1
+        # Per-hour bucket: "<hour_epoch>": {s, e, r}
+        buckets = entry.setdefault("buckets", {})
+        bk = str(now_h)
+        bb = buckets.setdefault(bk, {"s": 0, "e": 0, "r": 0})
+        if kind == "success":
+            bb["s"] += 1
+        elif kind == "error":
+            bb["e"] += 1
+        elif kind == "rotated":
+            bb["r"] += 1
+        entry["buckets"] = _prune_buckets(buckets, now_h)
+        _save_usage(data)
+
+def _read_usage_for(cid: str) -> dict:
+    with _usage_lock:
+        data = _load_usage()
+    e = data.get(cid) or {}
+    if not e:
+        return {"success": 0, "error": 0, "rotated": 0, "buckets": [], "by_product": {}}
+    # Return buckets as a sorted list for the last 7 days (per-hour)
+    now_h = int(time.time()) // 3600
+    cutoff = now_h - _USAGE_BUCKET_HOURS
+    out_buckets = []
+    s7 = e7 = r7 = 0
+    for h in range(cutoff + 1, now_h + 1):
+        bb = e.get("buckets", {}).get(str(h), {"s": 0, "e": 0, "r": 0})
+        s = int(bb.get("s", 0)); er = int(bb.get("e", 0)); ro = int(bb.get("r", 0))
+        out_buckets.append({"h": h, "s": s, "e": er, "r": ro})
+        s7 += s; e7 += er; r7 += ro
+    return {
+        "success": int(e.get("success", 0)),
+        "error": int(e.get("error", 0)),
+        "rotated": int(e.get("rotated", 0)),
+        "last_use": int(e.get("last_use", 0)),
+        "last_success": int(e.get("last_success", 0)),
+        "last_error": int(e.get("last_error", 0)),
+        "by_product": e.get("by_product", {}),
+        "buckets": out_buckets,
+        "window_hours": _USAGE_BUCKET_HOURS,
+        "success_7d": s7,
+        "error_7d": e7,
+        "rotated_7d": r7,
+    }
+
+
+def score_credential_health(meta: dict, *, now: float | None = None) -> dict:
+    """Score a credential's recent health & freshness for assignment.
+
+    Higher score = better candidate for *new* frontier work. Combines
+    five signals into a value in [0, 1] plus a structured breakdown so
+    the dashboard can explain *why* a particular score landed:
+
+    * **status** — penalises ``invalid`` / ``error`` from the last OIDC
+      probe; ``exhausted`` zeroes the score.
+    * **error_recency** — recent ``last_error`` timestamps lower the
+      score on a ramp from 1 h (heavy) to 24 h (mild).
+    * **error_rate** — ``error_7d / (success_7d + error_7d)``; raw
+      errors over the last week.
+    * **rotation** — ``rotated_7d`` (in-peer credential swaps after
+      402/throttle) shaves off a small penalty since the cred just
+      caused a rotation event.
+    * **exhausted_at** — recent exhaustion (within 7 days) leaves
+      a residual penalty even after recovery.
+    * **freshness** — credentials *not* used recently get a positive
+      bonus, so the director rotates the warm/hot set across peers
+      instead of always reloading the same indices.
+
+    Result fields:
+      * ``score`` — final value in [0, 1] used for ordering.
+      * ``components`` — per-signal contribution (negative = penalty,
+        positive = bonus). Frontend renders this in the tooltip.
+      * ``label`` — "healthy" / "warm" / "hot" / "degraded" /
+        "stalled" / "exhausted". ``stalled`` is the recency circuit
+        breaker: many recent attempts, zero recent successes → the
+        credential is presumed dead (expired account / revoked secret /
+        hard quota) and clamped below every fresh candidate, ignoring
+        last week's now-stale successes. This is what stops a
+        just-expired cred from oscillating back into the warm set every
+        time its ``error_recency`` penalty ages out. A complementary
+        **week-long** gate (zero successes across the full 7d window
+        with ≥3 errors) catches creds that died days ago and are now
+        retried too rarely to trip the 24h gate.
+    """
+    if now is None:
+        now = time.time()
+    u = meta.get("usage") or {}
+    s7 = int(u.get("success_7d") or 0)
+    e7 = int(u.get("error_7d") or 0)
+    r7 = int(u.get("rotated_7d") or 0)
+    last_use = float(u.get("last_use") or 0)
+    last_err = float(u.get("last_error") or 0)
+    last_ok = float(u.get("last_success") or 0)
+
+    # Recent-window (last RECENT_WINDOW_H hours) success/error tally,
+    # summed from the per-hour buckets. This is what catches a
+    # credential that has *recently gone dead* (90d account expiry,
+    # revoked secret, hard quota cap) — its 7d totals are still
+    # dominated by last week's successes, but the last 24h are all
+    # errors. Without this, a dead cred's error_recency penalty ages
+    # out within 6h and the score climbs back into "warm", so it gets
+    # re-preferred for frontier work, fails, gets evicted, recovers,
+    # and oscillates forever while never actually fetching anything.
+    RECENT_WINDOW_H = 24
+    now_h = int(now // 3600)
+    s_recent = e_recent = 0
+    for b in (u.get("buckets") or []):
+        try:
+            age_h = now_h - int(b.get("h"))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= age_h < RECENT_WINDOW_H:
+            s_recent += int(b.get("s", 0) or 0)
+            e_recent += int(b.get("e", 0) or 0)
+
+    components: dict[str, float] = {}
+    score = 1.0
+
+    # Hard zero for exhausted (cred shouldn't be picked at all).
+    if meta.get("exhausted"):
+        return {
+            "score": 0.0,
+            "label": "exhausted",
+            "components": {"status": -1.0},
+            "signals": {
+                "success_7d": s7, "error_7d": e7, "rotated_7d": r7,
+                "last_use_age_s": (now - last_use) if last_use else None,
+                "last_error_age_s": (now - last_err) if last_err else None,
+            },
+        }
+
+    # 1) last_status
+    st = (meta.get("last_status") or "").lower()
+    if st in ("invalid",):
+        score -= 0.6
+        components["status"] = -0.6
+    elif st == "error":
+        score -= 0.25
+        components["status"] = -0.25
+    elif st == "valid":
+        components["status"] = 0.0
+
+    # 2) last_error recency (only counts if there was one)
+    if last_err and last_err > 0:
+        age_h = max(0.0, (now - last_err) / 3600.0)
+        if age_h < 1.0:
+            pen = -0.50
+        elif age_h < 6.0:
+            pen = -0.30
+        elif age_h < 24.0:
+            pen = -0.15
+        elif age_h < 72.0:
+            pen = -0.05
+        else:
+            pen = 0.0
+        if pen:
+            score += pen
+            components["error_recency"] = pen
+
+    # 3) error rate over the 7d window
+    denom = s7 + e7
+    if denom > 0 and e7 > 0:
+        er = e7 / denom
+        pen = -0.4 * er
+        score += pen
+        components["error_rate"] = pen
+
+    # 4) rotation churn — small per-event penalty, capped
+    if r7 > 0:
+        pen = -min(0.2, r7 / 200.0)
+        score += pen
+        components["rotation"] = pen
+
+    # 5) recent exhaustion residual (recovers but lingers)
+    exh_at = float(meta.get("exhausted_at") or 0)
+    if exh_at > 0:
+        age_h = (now - exh_at) / 3600.0
+        if age_h < 24.0:
+            pen = -0.4
+        elif age_h < 24.0 * 7:
+            pen = -0.15
+        else:
+            pen = 0.0
+        if pen:
+            score += pen
+            components["exhausted_recently"] = pen
+
+    # 6) freshness bonus — under-used creds rotate in.
+    if last_use <= 0:
+        bonus = 0.25
+    else:
+        age_h = (now - last_use) / 3600.0
+        if age_h >= 24.0 * 7:
+            bonus = 0.25
+        elif age_h >= 24.0:
+            bonus = 0.15
+        elif age_h >= 6.0:
+            bonus = 0.05
+        else:
+            bonus = 0.0
+    if bonus:
+        score += bonus
+        components["freshness"] = bonus
+
+    # 7) Hot-cred mild de-prioritisation: peers that have absorbed
+    # a lot of work over the last 7d get bumped down a touch so we
+    # rotate the warm/hot set across peers rather than always landing
+    # on the same handful.
+    if s7 > 0:
+        pen = -min(0.2, s7 / 5000.0)
+        if pen <= -0.02:
+            score += pen
+            components["workload"] = pen
+
+    # 8) RECENT-STALL GATE (the dead-credential circuit breaker).
+    #
+    # A credential that has made a meaningful number of attempts in the
+    # last 24h with ZERO successes is presumed dead (expired account,
+    # revoked secret, hard quota wall). Hard-clamp it below every fresh
+    # candidate so the director stops handing it frontier work. This is
+    # recency-true: it ignores last week's stale successes entirely and
+    # keys only on "is this credential producing data RIGHT NOW?".
+    #
+    # Robust to transient IP-throttle: a real throttle recovers within
+    # the ~2h cooldown, so within one 24h window the cred lands at least
+    # one success and the gate releases. Sustained zero-success over a
+    # full day is not a blip — it is a dead credential.
+    STALL_MIN_RECENT_ERR = 8     # need real evidence, not 1-2 blips
+    stalled = False
+    if s_recent == 0 and e_recent >= STALL_MIN_RECENT_ERR:
+        stalled = True
+        # Scale the clamp by how long since the last *success*: the
+        # longer it's been dead, the lower it sits. >48h dead → ~0.03.
+        ok_age_h = ((now - last_ok) / 3600.0) if last_ok > 0 else 1e9
+        if ok_age_h >= 48.0:
+            cap = 0.03
+        elif ok_age_h >= 24.0:
+            cap = 0.08
+        else:
+            cap = 0.15
+        if score > cap:
+            components["recent_stall"] = round(cap - score, 4)
+            score = cap
+
+    # 8b) WEEK-LONG STALL GATE (low-retry dead-credential breaker).
+    #
+    # The 24h gate above keys on RECENT error volume, so it only fires
+    # for creds that are still being hammered. A credential that died
+    # days ago and has since sunk in the ordering gets retried rarely
+    # (a handful of probes spread across the week), so its 24h error
+    # count never reaches STALL_MIN_RECENT_ERR — yet it climbs back to
+    # "hot"/"warm" purely on the freshness bonus and out-ranks nothing
+    # it should. The 7d totals make the verdict unambiguous: ZERO
+    # successes across the entire week with a meaningful error count is
+    # a dead credential, not a transient blip (a real IP-throttle or
+    # quota window recovers within hours and lands at least one success
+    # somewhere in 7 days). Clamp it below every fresh candidate too.
+    #
+    # Note: a brand-new, never-yet-successful cred has e7==0 here (it is
+    # picked up by the freshness path, not retried-to-failure), so the
+    # evidence floor leaves genuinely-untested creds untouched.
+    STALL_MIN_7D_ERR = 3
+    if not stalled and s7 == 0 and e7 >= STALL_MIN_7D_ERR:
+        stalled = True
+        ok_age_h = ((now - last_ok) / 3600.0) if last_ok > 0 else 1e9
+        if ok_age_h >= 48.0:
+            cap = 0.03
+        elif ok_age_h >= 24.0:
+            cap = 0.08
+        else:
+            cap = 0.15
+        if score > cap:
+            components["week_stall"] = round(cap - score, 4)
+            score = cap
+
+    score = max(0.0, min(1.0, score))
+
+    if stalled:
+        label = "stalled"
+    elif score >= 0.85:
+        label = "healthy"
+    elif score >= 0.65:
+        label = "warm"
+    elif score >= 0.40:
+        label = "hot"
+    elif score > 0:
+        label = "degraded"
+    else:
+        label = "unusable"
+
+    return {
+        "score": round(score, 4),
+        "label": label,
+        "components": {k: round(v, 4) for k, v in components.items()},
+        "signals": {
+            "success_7d": s7,
+            "error_7d": e7,
+            "rotated_7d": r7,
+            "last_use_age_s": int(now - last_use) if last_use else None,
+            "last_error_age_s": int(now - last_err) if last_err else None,
+            "last_status": meta.get("last_status"),
+            "exhausted_at_age_s": int(now - exh_at) if exh_at else None,
+            "success_recent_24h": s_recent,
+            "error_recent_24h": e_recent,
+            "stalled": stalled,
+        },
+    }
+
+
+def list_credentials_with_secrets() -> list:
+    """Return full credential records including ``client_secret``.
+
+    For director-internal use only (peer bootstrap on /peers/add). The
+    public ``list_credentials()`` strips secrets; this one is gated
+    behind admin-token-only routes that already have access to the
+    on-disk store.
+    """
+    with _cred_lock:
+        _reload_credentials_from_disk()
+        creds = list(_CREDENTIALS)
+    out = []
+    for cid, csec in creds:
+        meta = dict(_cred_meta.get(cid, {}))
+        meta['client_id'] = cid
+        meta['client_secret'] = csec
+        out.append(meta)
+    return out
+
+
+def list_credentials() -> list:
+    """Return public credential metadata (client_id, source, last_validated_at,
+    last_status, exhausted, label). Never returns secrets.
+
+    Each entry also includes a ``health`` block with the score and
+    components used by ``peer_director._assign_cred_indices`` — see
+    :func:`score_credential_health`."""
+    with _cred_lock:
+        # Pick up creds added by sibling gunicorn workers.
+        _reload_credentials_from_disk()
+        exhausted = set(_exhausted_cred_indices)
+        creds = list(_CREDENTIALS)
+    out = []
+    for i, (cid, _csec) in enumerate(creds):
+        meta = dict(_cred_meta.get(cid, {}))
+        meta.pop("client_secret", None)
+        meta["index"] = i
+        meta["client_id"] = cid
+        meta["client_id_short"] = cid[:16] + "..."
+        meta["exhausted"] = i in exhausted
+        if _ALLOWED_CRED_INDICES is not None:
+            meta["allowed_in_process"] = i in _ALLOWED_CRED_INDICES
+        try:
+            meta["usage"] = _read_usage_for(cid)
+        except Exception:
+            meta["usage"] = {"success": 0, "error": 0, "rotated": 0, "buckets": []}
+        try:
+            meta["health"] = score_credential_health(meta)
+        except Exception:
+            meta["health"] = {"score": 0.5, "label": "unknown",
+                              "components": {}, "signals": {}}
+        out.append(meta)
+    return out
+
+
+def validate_credential(client_id: str, client_secret: str) -> dict:
+    """Probe a (client_id, client_secret) pair. Returns dict with ok, status,
+    error. Performs an OIDC client-credentials auth — same shape as
+    _probe_credential() but for arbitrary creds (used before adding)."""
+    # Fast path (Oct 2026 bandwidth pass): hit the CDSE token endpoint
+    # directly. openeo.connect + authenticate_oidc_client_credentials
+    # costs 4 round-trips per cred (openeo root, /credentials/oidc,
+    # openid-configuration, token) — ~12 KB × 107 creds every 30 min on
+    # the primary. The token endpoint alone answers the only question
+    # asked here (does this client_id/secret mint a token?). Anything
+    # other than a clean 200 / 401 falls through to the openeo path so
+    # error classification stays byte-identical to before.
+    try:
+        import requests as _rq
+        _r = _rq.post(_CDSE_TOKEN_URL, data={
+            'grant_type': 'client_credentials',
+            'client_id': client_id, 'client_secret': client_secret},
+            timeout=(5, 20))
+        if _r.status_code == 200 and (_r.json() or {}).get('access_token'):
+            return {"ok": True, "status": "valid"}
+        if _r.status_code == 401:
+            return {"ok": False, "status": "invalid",
+                    "error": (f"Failed to retrieve access token at '{_CDSE_TOKEN_URL}': "
+                              f"401 'Unauthorized' '{_r.text[:200]}'")}
+    except Exception:
+        pass
+    if openeo is None:
+        return {"ok": False, "status": "openeo_missing",
+                "error": "openeo package not installed"}
+    try:
+        conn = openeo.connect(OPENEO_URL)
+        conn.authenticate_oidc_client_credentials(
+            client_id=client_id, client_secret=client_secret)
+        return {"ok": True, "status": "valid"}
+    except Exception as e:
+        msg = str(e)
+        if '402' in msg and 'PaymentRequired' in msg:
+            return {"ok": False, "status": "exhausted", "error": msg[:300]}
+        if '401' in msg or 'invalid_client' in msg:
+            return {"ok": False, "status": "invalid", "error": msg[:300]}
+        return {"ok": False, "status": "error", "error": msg[:300]}
+
+
+def add_credential(client_id: str, client_secret: str, label: str = "",
+                   notes: str = "", validate: bool = True) -> dict:
+    """Add a new credential to the runtime pool and persist to disk.
+
+    If *validate* is True, probe before adding. Returns the new index +
+    validation result. Idempotent: re-adding an existing client_id
+    updates label/notes only.
+    """
+    global _CREDENTIALS
+    client_id = (client_id or "").strip()
+    client_secret = (client_secret or "").strip()
+    if not client_id or not client_secret:
+        return {"ok": False, "error": "client_id and client_secret required"}
+
+    val = {"ok": True, "status": "unchecked"}
+    if validate:
+        val = validate_credential(client_id, client_secret)
+
+    now = __import__('datetime').datetime.utcnow().isoformat() + "Z"
+    with _cred_lock:
+        # Re-adding a previously-deleted cred clears its tombstone so it
+        # actually sticks (otherwise _reload_credentials_from_disk would
+        # evict it on the next save).
+        _cred_tombstones.discard(client_id)
+        # If the credential is already known, just update meta
+        existing_idx = None
+        for i, (cid, _) in enumerate(_CREDENTIALS):
+            if cid == client_id:
+                existing_idx = i
+                break
+        if existing_idx is None:
+            _CREDENTIALS.append((client_id, client_secret))
+            # Re-canonicalise so the new cred lands at its lex-sorted
+            # position; otherwise peers would disagree on the index of
+            # this client_id (director addresses by index).
+            new_creds = _canonical_sort(_CREDENTIALS)
+            # Reindex exhausted set across the permutation.
+            old_to_new = {old_i: new_creds.index((cid, sec))
+                          for old_i, (cid, sec) in enumerate(_CREDENTIALS)}
+            _CREDENTIALS = new_creds  # type: ignore[name-defined]
+            new_exh = {old_to_new[i] for i in _exhausted_cred_indices
+                       if i in old_to_new}
+            _exhausted_cred_indices.clear()
+            _exhausted_cred_indices.update(new_exh)
+            existing_idx = next(i for i, (cid, _) in enumerate(_CREDENTIALS)
+                                if cid == client_id)
+        meta = _cred_meta.setdefault(client_id, {})
+        if label:
+            meta["label"] = label
+        if notes:
+            meta["notes"] = notes
+        meta.setdefault("source", "user")
+        meta.setdefault("added_at", now)
+        meta["last_validated_at"] = now
+        meta["last_status"] = val.get("status", "unchecked")
+        if not val.get("ok"):
+            meta["last_error"] = val.get("error", "")
+        else:
+            meta.pop("last_error", None)
+        _save_credentials_to_disk()
+    return {"ok": True, "index": existing_idx, "client_id": client_id,
+            "validation": val}
+
+
+def remove_credential(client_id: str) -> dict:
+    """Remove a credential by client_id. Built-ins cannot be removed via API
+    (would reappear on restart) — but we still drop the in-memory entry so
+    the running process stops using them."""
+    global _CREDENTIALS, _credential_index, CLIENT_ID, CLIENT_SECRET
+    with _cred_lock:
+        idx = None
+        for i, (cid, _) in enumerate(_CREDENTIALS):
+            if cid == client_id:
+                idx = i
+                break
+        builtin_ids = {c[0] for c in _BUILTIN_CREDENTIALS}
+        if idx is None:
+            # Even if we don't currently have it in-memory, record a
+            # tombstone so a stale sibling worker / HA snapshot can't
+            # resurrect it. (No-op for builtins — they'd reappear on
+            # restart anyway.)
+            if client_id and client_id not in builtin_ids:
+                _cred_tombstones.add(client_id)
+                _save_credentials_to_disk()
+                return {"ok": True, "removed": client_id,
+                        "note": "not in local pool; tombstone recorded"}
+            return {"ok": False, "error": "not found"}
+        _CREDENTIALS.pop(idx)
+        _exhausted_cred_indices.discard(idx)
+        if client_id not in builtin_ids:
+            _cred_tombstones.add(client_id)
+        # Reindex exhausted set to account for shift
+        _exhausted_cred_indices_old = set(_exhausted_cred_indices)
+        _exhausted_cred_indices.clear()
+        for j in _exhausted_cred_indices_old:
+            if j > idx:
+                _exhausted_cred_indices.add(j - 1)
+            elif j < idx:
+                _exhausted_cred_indices.add(j)
+        if _credential_index >= len(_CREDENTIALS):
+            _credential_index = 0
+        if _CREDENTIALS:
+            CLIENT_ID, CLIENT_SECRET = _CREDENTIALS[_credential_index]
+        _cred_meta.pop(client_id, None)
+        _save_credentials_to_disk()
+    return {"ok": True, "removed": client_id}
+
+
+def revalidate_all_credentials(max_workers: int = 6) -> list:
+    """Probe every credential in parallel, update meta. Returns a list
+    parallel to list_credentials() but with fresh probe results.
+
+    Parallelised 2026-05-?? after the 21:00–22:30 UTC director storm:
+    a serial 12-credential OIDC sweep stalled the director loop ~30 s
+    every 10 min. Probes are I/O bound on the OIDC endpoint, so a 6-
+    worker pool collapses wall-clock to ~one probe's worth (~2–5 s).
+    ``_cred_lock`` semantics are preserved: each worker only takes the
+    lock for the brief meta-update around its own probe result, the
+    snapshot of ``_CREDENTIALS`` is taken once up front, and the final
+    disk save is single-shot under the lock.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    out: list = []
+    now = __import__('datetime').datetime.utcnow().isoformat() + "Z"
+    with _cred_lock:
+        creds = list(_CREDENTIALS)
+    if not creds:
+        return out
+
+    def _probe(item):
+        i, (cid, csec) = item
+        val = validate_credential(cid, csec)
+        with _cred_lock:
+            meta = _cred_meta.setdefault(cid, {})
+            meta["last_validated_at"] = now
+            meta["last_status"] = val.get("status", "unchecked")
+            if val.get("ok"):
+                meta.pop("last_error", None)
+                # Auth-only OK is NOT a quota signal (exhausted CDSE
+                # accounts still mint OIDC tokens). Keep a live data-
+                # confirmed exhaustion; it expires via _EXHAUSTED_TTL_S.
+                if not _exhaustion_live(meta):
+                    _exhausted_cred_indices.discard(i)
+                    meta["exhausted"] = False
+                    meta.pop("exhausted_at", None)
+            else:
+                meta["last_error"] = val.get("error", "")
+                if val.get("status") == "exhausted":
+                    _exhausted_cred_indices.add(i)
+        return {"index": i, "client_id": cid, **val}
+
+    workers = max(1, min(int(max_workers or 1), len(creds)))
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix='cop-reval') as ex:
+        results = list(ex.map(_probe, list(enumerate(creds))))
+    # Preserve index order in the returned list.
+    results.sort(key=lambda r: r["index"])
+    out.extend(results)
+    with _cred_lock:
+        _save_credentials_to_disk()
+    return out
+
+
+class CreditsExhaustedError(Exception):
+    """Raised when ALL Copernicus credentials return 402 PaymentRequired."""
+    pass
+
+
+class IPThrottledError(RuntimeError):
+    """Raised when Copernicus API is IP-level rate-limited (all credentials 402)."""
+    pass
+
+
+class UpstreamStressError(IPThrottledError):
+    """openEO origin is overloaded (consecutive 5xx / sync read-timeouts).
+
+    Subclass of ``IPThrottledError`` so every "never swallow" guard in
+    tile_cache / austria_processor still propagates it, but the tile loop
+    routes it to the *defer* path (``copernicus_failed`` — KG re-queued
+    with checkpoints, peer moves on to the next KG) instead of the
+    15-min ``copernicus_paused`` loop.  A slow openEO is not a credit
+    problem: pausing 15 min + probing burned ~15 peers/h fleet-wide on
+    2026-09-24 while credits were fine (creds=98/107 healthy).
+    """
+    pass
+
+
+class CredentialRotatedError(Exception):
+    """Raised when a 402 was handled by rotating to a fresh credential.
+    Callers should rebuild their connection/datacube and retry."""
+    pass
+
+
+class MissingProductError(RuntimeError):
+    """Raised when openEO reports a source scene is absent from the CDSE
+    EODATA cluster (``FileNotFoundError ... does not exist on the
+    cluster``).
+
+    Distinct from a transient 5xx: rotating credentials or retrying the
+    *same* time window will never help — the scene is simply not staged.
+    Callers that have a sensible alternative (e.g. SAR backscatter, which
+    is seasonally stable) may catch this and fall back to a different
+    temporal window. Subclasses ``RuntimeError`` so existing
+    ``except Exception`` handlers still treat it as a normal failure.
+    """
+    pass
+
+
+def _is_missing_product_error(exc: Exception) -> bool:
+    """True if *exc* (or its cause) is a CDSE 'product not on cluster'
+    error — the openEO backend couldn't find the source scene file.
+
+    These are NOT transient: the scene is missing for *every* credential,
+    so the credential-rotation / 5xx-retry machinery just burns time and
+    PUs re-hitting the same dead window.
+    """
+    msg = f"{exc} {getattr(exc, '__cause__', '') or ''}"
+    return (
+        "does not exist on the cluster" in msg
+        or "FileNotFoundError: sar_backscatter" in msg
+        or "path to SAR product" in msg
+    )
+
+
+def _probe_credential(cred_index: int) -> bool:
+    """Probe whether a credential still has *processing-unit quota*.
+
+    CRITICAL: authentication is NOT a quota test. A CDSE service account
+    with zero credits still authenticates successfully via OIDC — the
+    402 ``PaymentRequired`` only surfaces on a PU-consuming request. An
+    auth-only probe therefore reports every exhausted credential as
+    "healthy", which makes ``_retry_on_rotation`` conclude ``n_exhausted
+    == 0`` and mislabel genuine credit exhaustion as IP-level throttling
+    (see the 2026-06-19 incident: 10 creds on a depleted account, every
+    one auth-OK, every data call 402, classifier shouted "IP-throttled"
+    and the fleet sat parked behind a 2 h cooldown for the wrong reason).
+
+    So we issue the smallest possible real request (single-band, ~0.01°
+    extent, one time step) and only treat a 402 on *that* as exhaustion.
+    Auth/network/5xx failures get the benefit of the doubt (transient).
+    """
+    try:
+        cid, csecret = _CREDENTIALS[cred_index]
+        logger.info("Probing credential %d (client_id=%s) ...", cred_index + 1, cid[:16] + "...")
+        conn = openeo.connect(OPENEO_URL)
+        conn.authenticate_oidc_client_credentials(client_id=cid, client_secret=csecret)
+    except Exception as auth_exc:
+        # Auth itself failed (network, OIDC outage, bad secret). Not a
+        # quota signal — give the benefit of the doubt so we don't mark
+        # a credential exhausted over a transient connectivity blip.
+        logger.info("Probe inconclusive for credential %d (auth: %s) — treating as healthy",
+                    cred_index + 1, auth_exc)
+        return True
+    try:
+        # Minimal PU-consuming request — this is the ONLY thing that can
+        # distinguish a credit-exhausted credential from a healthy one.
+        cube = conn.load_collection(
+            'SENTINEL2_L2A',
+            spatial_extent={'west': 15, 'south': 47,
+                            'east': 15.01, 'north': 47.01},
+            temporal_extent=['2024-06-01', '2024-06-15'],
+            bands=['B04'],
+        )
+        cube.max_time().download()
+        logger.info("Probe OK — credential %d has quota", cred_index + 1)
+        _connections[cred_index] = conn
+        return True
+    except Exception as probe_exc:
+        probe_msg = str(probe_exc)
+        if '402' in probe_msg and 'PaymentRequired' in probe_msg:
+            logger.warning("Probe confirmed credential %d is exhausted (402 on data request)",
+                           cred_index + 1)
+            return False
+        # Non-402 (network, 5xx, timeout) — give benefit of the doubt.
+        logger.info("Probe inconclusive for credential %d (%s) — treating as healthy",
+                    cred_index + 1, probe_exc)
+        _connections[cred_index] = conn
+        return True
+
+
+def _check_credits_error(exc: Exception, cred_index: int | None = None) -> None:
+    """If *exc* is a 402 PaymentRequired, handle credential rotation.
+
+    Parameters
+    ----------
+    exc : Exception
+        The exception to inspect.
+    cred_index : int or None
+        The credential index that caused the 402.  If None, uses the
+        global ``_credential_index``.
+
+    Probes the credential to distinguish transient rate-limits from
+    genuine credit exhaustion:
+
+    - **Probe passes** (transient 402): rotate to the next credential
+      and raise ``CredentialRotatedError`` so the ``@_retry_on_rotation``
+      decorator rebuilds the connection + datacube with a fresh credential.
+      The credential is NOT marked exhausted.
+    - **Probe fails** (genuine exhaustion): mark the credential exhausted,
+      rotate, and raise ``CredentialRotatedError``.
+    - **All credentials exhausted**: raise ``CreditsExhaustedError``.
+    - **Not a 402**: return silently.
+    """
+    global credits_exhausted, _credits_exhausted_at, _credential_index
+    msg = str(exc)
+    if '402' not in msg or 'PaymentRequired' not in msg:
+        return
+
+    # Determine which credential hit the 402
+    with _cred_lock:
+        idx = cred_index if cred_index is not None else _credential_index
+
+    # Probe OUTSIDE the lock (network call — don't block other threads)
+    if openeo is not None and _probe_credential(idx):
+        # Credential is still healthy — transient rate-limit.
+        # Rotate to next credential so the decorator retries with it.
+        with _cred_lock:
+            _connections.pop(idx, None)
+            rotate_credentials(_locked=True)
+        logger.info("Credential %d probe passed — transient 402, rotated to %d/%d",
+                    idx + 1, _credential_index + 1, len(_CREDENTIALS))
+        raise CredentialRotatedError(
+            f"Transient 402 on credential {idx + 1}, "
+            f"rotated to {_credential_index + 1}/{len(_CREDENTIALS)}"
+        ) from exc
+
+    # Probe failed — mark as exhausted under the lock
+    with _cred_lock:
+        _exhausted_cred_indices.add(idx)
+        logger.warning("Credential %d/%d confirmed exhausted (402 PaymentRequired, client_id=%s)",
+                       idx + 1, len(_CREDENTIALS),
+                       _CREDENTIALS[idx][0][:16] + "...")
+        # Persist so the director and other workers see it.
+        meta = _cred_meta.setdefault(_CREDENTIALS[idx][0], {})
+        meta["last_status"] = "exhausted"
+        meta["last_error"] = msg[:300]
+        meta["exhausted"] = True
+        meta["exhausted_at"] = time.time()
+        try:
+            _save_credentials_to_disk()
+        except Exception as _se:
+            logger.debug("persist exhaustion failed: %s", _se)
+
+        if len(_exhausted_cred_indices) >= len(_CREDENTIALS):
+            # ALL credentials exhausted
+            credits_exhausted = True
+            _credits_exhausted_at = __import__('datetime').datetime.utcnow().isoformat()
+            logger.error("ALL %d Copernicus credentials exhausted", len(_CREDENTIALS))
+            raise CreditsExhaustedError(msg) from exc
+        else:
+            # Rotate to a non-exhausted credential
+            for _ in range(len(_CREDENTIALS)):
+                rotate_credentials(_locked=True)
+                if _credential_index not in _exhausted_cred_indices:
+                    logger.info("Rotated to fresh credential %d/%d (client_id=%s)",
+                                _credential_index + 1, len(_CREDENTIALS),
+                                CLIENT_ID[:16] + "...")
+                    raise CredentialRotatedError(
+                        f"Rotated to credential {_credential_index + 1}/{len(_CREDENTIALS)}"
+                    ) from exc
+            # Shouldn't reach here but just in case
+            credits_exhausted = True
+            _credits_exhausted_at = __import__('datetime').datetime.utcnow().isoformat()
+            raise CreditsExhaustedError(msg) from exc
+
+
+def reset_exhausted_credentials():
+    """Clear the exhausted-credential tracking.  Call after providing new
+    credentials or when credits have been replenished."""
+    global credits_exhausted, _credits_exhausted_at
+    with _cred_lock:
+        _exhausted_cred_indices.clear()
+        credits_exhausted = False
+        _credits_exhausted_at = None
+        # Clear persisted exhaustion flags too.
+        for cid, meta in _cred_meta.items():
+            if meta.get("exhausted"):
+                meta["exhausted"] = False
+                meta.pop("exhausted_at", None)
+                if meta.get("last_status") == "exhausted":
+                    meta["last_status"] = "unchecked"
+        try:
+            _save_credentials_to_disk()
+        except Exception:
+            pass
+    logger.info("Reset exhausted-credential tracking for %d credentials",
+                len(_CREDENTIALS))
+
+
+def _retry_on_rotation(fn):
+    """Decorator: retry the whole function when credentials are rotated on 402.
+
+    Catches ``CredentialRotatedError`` (meaning a fresh credential is now
+    active) and reruns the function from scratch so it builds a new
+    connection + datacube with the fresh credential.  Gives up after
+    ``len(_CREDENTIALS)`` rotations.
+
+    After exhausting all credentials, checks whether any were genuinely
+    exhausted (probe failed).  If none were — all 402s were transient,
+    meaning IP-level rate-limiting — raises ``IPThrottledError`` and
+    sets the module-level ``ip_throttled`` flag.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        global _connection, ip_throttled, _ip_throttled_at
+        for attempt in range(len(_CREDENTIALS) + 1):
+            try:
+                return fn(*args, **kwargs)
+            except CredentialRotatedError:
+                _connection = None  # force new connection on retry
+                logger.info("Credential rotated — retrying %s (attempt %d/%d)",
+                            fn.__name__, attempt + 2, len(_CREDENTIALS) + 1)
+                continue
+            except (CreditsExhaustedError, IPThrottledError):
+                raise  # propagate immediately
+        # All credential rotation attempts exhausted.
+        # Check: were any credentials genuinely exhausted (probe-failed)?
+        with _cred_lock:
+            n_exhausted = len(_exhausted_cred_indices)
+        if n_exhausted == 0:
+            # All probes passed — every credential is healthy but 402'd.
+            # This is IP-level (or account-level) rate-limiting.
+            import time as _ip_time
+            ip_throttled = True
+            _ip_throttled_at = _ip_time.monotonic()
+            logger.warning(
+                "All %d credentials returned transient 402 for %s — "
+                "IP-throttled, pausing for %d min",
+                len(_CREDENTIALS), fn.__name__,
+                _IP_THROTTLE_COOLDOWN // 60)
+            raise IPThrottledError(
+                f"All {len(_CREDENTIALS)} credentials returned transient 402 "
+                f"for {fn.__name__} — IP-level rate limit"
+            )
+        raise CreditsExhaustedError("All credential rotation attempts failed")
+    return wrapper
+
+
+def _pick_next_credential_index(current: int) -> int | None:
+    """Pick the next credential index: weighted-random, preferring health.
+
+    Replaces the old ``(current + 1) % N`` round-robin, which deterministically
+    handed work to low-index credentials first — including *stalled* (dead /
+    expired) ones whose score has collapsed but whose ``last_status`` is still
+    ``valid`` (they auth fine, only 402 on data). Round-robin meant a peer that
+    rotated off a dead cred frequently landed on the *next* dead cred, churning
+    instead of escaping.
+
+    Selection (caller must hold ``_cred_lock``):
+      * candidate set = all indices except ``current``, ``_exhausted_cred_indices``
+        and (if set) those outside ``_ALLOWED_CRED_INDICES``;
+      * each candidate is scored via ``score_credential_health`` over its local
+        usage (the peer process *is* the one making the calls, so its buckets
+        are authoritative);
+      * weight = max(score, floor)**2 so a healthy cred is strongly preferred
+        but a stalled one still has a small non-zero chance (avoids a hard
+        starve if scoring is momentarily wrong), and the **random** draw spreads
+        load across all the healthy creds instead of always the lowest index.
+
+    Returns the chosen index, or ``None`` if there is no other candidate.
+    """
+    n = len(_CREDENTIALS)
+    if n <= 1:
+        return None
+    candidates = [i for i in range(n)
+                  if i != current and i not in _exhausted_cred_indices]
+    if _ALLOWED_CRED_INDICES is not None:
+        candidates = [i for i in candidates if i in _ALLOWED_CRED_INDICES]
+    if not candidates:
+        return None
+    weights: list[float] = []
+    for i in candidates:
+        cid = _CREDENTIALS[i][0]
+        try:
+            meta = dict(_cred_meta.get(cid, {}))
+            meta['client_id'] = cid
+            meta['usage'] = _read_usage_for(cid)
+            score = float((score_credential_health(meta) or {}).get('score') or 0.0)
+        except Exception:
+            score = 0.5
+        # Quadratic weighting with a small floor: healthy creds dominate,
+        # stalled creds keep a residual chance so they're never hard-starved.
+        weights.append(max(score, 0.02) ** 2)
+    try:
+        return random.choices(candidates, weights=weights, k=1)[0]
+    except Exception:
+        # Defensive: degenerate weights → uniform random.
+        return random.choice(candidates)
+
+
+def rotate_credentials(_locked: bool = False) -> bool:
+    """Switch to another credential pair. Returns True if rotated, False if none.
+
+    Picks a **weighted-random, health-preferring** next credential (see
+    :func:`_pick_next_credential_index`) rather than a deterministic
+    ``+1 mod N`` walk. This stops a peer from repeatedly rotating onto the
+    *next* stalled credential and instead spreads work across the healthy pool.
+
+    Parameters
+    ----------
+    _locked : bool
+        If True, the caller already holds ``_cred_lock`` — skip acquiring it.
+    """
+    global _credential_index, _connection, CLIENT_ID, CLIENT_SECRET
+
+    def _do_rotate():
+        global _credential_index, _connection, CLIENT_ID, CLIENT_SECRET
+        nxt = _pick_next_credential_index(_credential_index)
+        if nxt is None:
+            return False  # no other usable credential
+        _credential_index = nxt
+        CLIENT_ID, CLIENT_SECRET = _CREDENTIALS[_credential_index]
+        _connection = None  # force re-auth with new credentials
+        logger.info("Rotated to credential set %d/%d (client_id=%s)",
+                    _credential_index + 1, len(_CREDENTIALS), CLIENT_ID[:16] + "...")
+        return True
+
+    if _locked:
+        return _do_rotate()
+    else:
+        with _cred_lock:
+            return _do_rotate()
+
+
+def _get_connection() -> Any:
+    """Return a cached, authenticated openEO connection."""
+    global _connection
+    if _connection is not None:
+        return _connection
+
+    if openeo is None:
+        raise ImportError("The 'openeo' package is required. Install with: pip install openeo")
+
+    logger.info("Connecting to openEO backend at %s", OPENEO_URL)
+    conn = openeo.connect(OPENEO_URL)
+    conn.authenticate_oidc_client_credentials(
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+    )
+    logger.info("Authenticated successfully (client_id=%s)", CLIENT_ID[:16] + "...")
+    _connection = conn
+    return conn
+
+
+def _get_connection_for_cred(cred_index: int) -> Any:
+    """Return a cached connection for a specific credential index.
+
+    Each credential gets its own openEO session, allowing parallel sync
+    downloads (openEO limits 1 concurrent sync job per client_id).
+    """
+    if cred_index in _connections:
+        return _connections[cred_index]
+
+    if openeo is None:
+        raise ImportError("The 'openeo' package is required.")
+
+    cid, csecret = _CREDENTIALS[cred_index]
+    logger.info("Connecting to openEO for cred %d/%d (client_id=%s)",
+                cred_index + 1, len(_CREDENTIALS), cid[:16] + "...")
+    conn = openeo.connect(OPENEO_URL)
+    conn.authenticate_oidc_client_credentials(
+        client_id=cid, client_secret=csecret,
+    )
+    logger.info("Authenticated cred %d (client_id=%s)", cred_index + 1, cid[:16] + "...")
+    _connections[cred_index] = conn
+    return conn
+
+
+def _bbox_hash(bbox: Dict[str, float], **extra: Any) -> str:
+    """Deterministic hash for a bbox + extra parameters (for cache keys)."""
+    payload = json.dumps({"bbox": bbox, **extra}, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def _cache_path(prefix: str, bbox: Dict[str, float], **extra: Any) -> pathlib.Path:
+    """Return the cache file path for a given request."""
+    h = _bbox_hash(bbox, **extra)
+    return CACHE_DIR / f"{prefix}_{h}.tif"
+
+
+def _touch_cache(path: pathlib.Path):
+    """Update atime/mtime on a cache file (for LRU tracking)."""
+    try:
+        path.touch()
+    except Exception:
+        pass
+
+
+def _validate_cache(path: pathlib.Path) -> bool:
+    """Return True if *path* looks like a valid (non-empty) cache file.
+
+    Deletes the file and returns False when it is 0-byte or unreadable,
+    which can happen when a previous download was interrupted mid-write.
+    """
+    try:
+        if path.stat().st_size == 0:
+            logger.warning("Removing corrupt (0-byte) cache file: %s", path)
+            path.unlink(missing_ok=True)
+            return False
+    except OSError:
+        return False
+    return True
+
+
+def _enforce_cache_limit():
+    """Evict oldest cache files if total size exceeds CACHE_MAX_BYTES."""
+    try:
+        files = []
+        for f in CACHE_DIR.iterdir():
+            if f.is_file():
+                st = f.stat()
+                files.append((st.st_mtime, st.st_size, f))
+        total = sum(s for _, s, _ in files)
+        if total <= CACHE_MAX_BYTES:
+            return
+        # Sort oldest first, evict until under limit
+        files.sort()
+        for mtime, size, f in files:
+            if total <= CACHE_MAX_BYTES:
+                break
+            try:
+                f.unlink()
+                total -= size
+                logger.debug("Cache evict: %s (%d KB)", f.name, size // 1024)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _validate_bbox(bbox: Dict[str, float], *, warn_large: bool = True) -> Dict[str, float]:
+    """Validate and normalise a WGS-84 bounding box dict.
+
+    Parameters
+    ----------
+    warn_large : bool
+        Log a warning when the bbox exceeds ``MAX_BBOX_SPAN_DEG``.
+        Set to False for pre-tiled requests (e.g. from tile_cache)
+        where the caller already controls the extent.
+    """
+    required = {"west", "south", "east", "north"}
+    if not required.issubset(bbox.keys()):
+        raise ValueError(f"bbox must contain keys {required}, got {set(bbox.keys())}")
+
+    w, s, e, n = bbox["west"], bbox["south"], bbox["east"], bbox["north"]
+    if w >= e or s >= n:
+        raise ValueError(f"Invalid bbox extents: west={w} >= east={e} or south={s} >= north={n}")
+
+    span_lon = e - w
+    span_lat = n - s
+    if warn_large and (span_lon > MAX_BBOX_SPAN_DEG or span_lat > MAX_BBOX_SPAN_DEG):
+        logger.warning(
+            "Bbox span (%.4f° × %.4f°) exceeds recommended max %.4f°. "
+            "Large requests may be slow or fail.",
+            span_lon, span_lat, MAX_BBOX_SPAN_DEG,
+        )
+
+    return {"west": w, "south": s, "east": e, "north": n}
+
+
+def _bbox_area_deg(bbox: Dict[str, float]) -> float:
+    return (bbox["east"] - bbox["west"]) * (bbox["north"] - bbox["south"])
+
+
+def _read_geotiff(path: Union[str, pathlib.Path]) -> Tuple[np.ndarray, Any, Any]:
+    """Read a GeoTIFF and return (data, transform, crs).
+
+    Returns data with shape (bands, H, W) or (H, W) if single-band.
+    """
+    if rasterio is None:
+        raise ImportError("The 'rasterio' package is required. Install with: pip install rasterio")
+
+    path = pathlib.Path(path)
+    # If path is a directory (batch job output), find the first .tif inside
+    if path.is_dir():
+        tifs = sorted(path.glob("*.tif")) + sorted(path.glob("*.tiff"))
+        if not tifs:
+            raise FileNotFoundError(f"No GeoTIFF files found in {path}")
+        path = tifs[0]
+        logger.debug("Using GeoTIFF from directory: %s", path)
+
+    import logging as _logging
+    # Suppress harmless GDAL warnings about Photometric/ExtraSamples mismatch
+    # in Copernicus-produced multi-band TIFFs (VV+VH SAR, etc.)
+    _rasterio_logger = _logging.getLogger('rasterio._env')
+    _prev_level = _rasterio_logger.level
+    _rasterio_logger.setLevel(_logging.ERROR)
+    try:
+        with rasterio.open(str(path)) as ds:
+            data = ds.read()  # (bands, H, W)
+            transform = ds.transform
+            crs = ds.crs
+    finally:
+        _rasterio_logger.setLevel(_prev_level)
+
+    if data.shape[0] == 1:
+        data = data[0]  # squeeze to (H, W)
+
+    return data, transform, crs
+
+
+def _run_datacube(
+    datacube: Any,
+    output_path: pathlib.Path,
+    title: str = "copernicus_job",
+    format: str = "GTiff",
+    bbox: Optional[Dict[str, float]] = None,
+) -> pathlib.Path:
+    """Download a datacube result to *output_path*.
+
+    Uses synchronous ``download()`` for small cubes and batch-job
+    ``execute_batch()`` for larger ones.  When *bbox* is provided,
+    sync is skipped if the area exceeds ``SYNC_AREA_THRESHOLD``
+    (avoids a 3-minute timeout that always fails for grid tiles).
+
+    Downloads go to a temp file first and are atomically renamed on
+    success.  This prevents 0-byte / partial files from poisoning
+    the cache when a download times out or fails mid-write.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Atomic write: download to a temp sibling, rename on success
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+
+    def _cleanup_tmp():
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # Bail immediately if we're IP-throttled (all creds 402, recovers in ~2h)
+    global ip_throttled, _ip_throttled_at
+    import time as _time_check
+    if ip_throttled:
+        elapsed = _time_check.monotonic() - _ip_throttled_at
+        if elapsed < _IP_THROTTLE_COOLDOWN:
+            remaining_min = int((_IP_THROTTLE_COOLDOWN - elapsed) / 60)
+            raise IPThrottledError(
+                f"Copernicus IP-throttled ({remaining_min}m remaining) — skipping")
+        else:
+            ip_throttled = False
+            logger.info("IP throttle cooldown expired — resuming Copernicus requests")
+
+    # Skip sync for large areas — always times out, wastes 3 minutes
+    skip_sync = False
+    if bbox is not None:
+        area = _bbox_area_deg(bbox)
+        if area > SYNC_AREA_THRESHOLD:
+            logger.info("Bbox area %.4f° > threshold %.4f° — skipping sync, going straight to batch for %s",
+                        area, SYNC_AREA_THRESHOLD, title)
+            skip_sync = True
+
+    # Try synchronous download first (faster for small areas).
+    # On 402, _check_credits_error raises CredentialRotatedError which
+    # propagates to @_retry_on_rotation — that rebuilds the connection +
+    # datacube with the next credential and retries.  After cycling all
+    # credentials it raises IPThrottledError (transient) or
+    # CreditsExhaustedError (genuine).  No manual rotation needed here.
+    import time as _time
+    import concurrent.futures
+    SYNC_DOWNLOAD_TIMEOUT = 180  # 3 minutes max for synchronous download
+
+    if not skip_sync:
+        logger.info("Downloading datacube synchronously → %s (timeout=%ds)",
+                    output_path, SYNC_DOWNLOAD_TIMEOUT)
+        try:
+            _cleanup_tmp()
+            # shutdown(wait=False): do NOT join the download thread — with
+            # ``with ThreadPoolExecutor`` the fallback only happened once
+            # the HTTP request itself gave up (30 min, see the import-time
+            # cap above).  The orphaned thread dies with its request.
+            import threading as _threading
+            _abandoned = _threading.Event()
+
+            def _sync_download(_dst=tmp_path, _fmt=format):
+                try:
+                    datacube.download(str(_dst), _fmt)
+                finally:
+                    # We gave up on this attempt (batch fallback is running
+                    # or done): never leave a late/partial file behind that
+                    # a later call could mistake for its own.
+                    if _abandoned.is_set():
+                        try:
+                            _dst.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
+                future = pool.submit(_sync_download)
+                try:
+                    future.result(timeout=SYNC_DOWNLOAD_TIMEOUT)
+                except concurrent.futures.TimeoutError:
+                    _abandoned.set()
+                    raise
+            finally:
+                pool.shutdown(wait=False)
+            # Verify non-empty before committing
+            if tmp_path.exists() and tmp_path.stat().st_size > 0:
+                tmp_path.rename(output_path)
+                _outage_ok()
+                logger.info("Synchronous download complete: %s", output_path)
+                try:
+                    record_credential_usage(_credential_index, "success", _product_from_title(title))
+                except Exception:
+                    pass
+                return output_path
+            else:
+                _cleanup_tmp()
+                logger.warning("Synchronous download produced empty file, falling back to batch job")
+        except concurrent.futures.TimeoutError:
+            _cleanup_tmp()
+            logger.warning("Synchronous download timed out after %ds, falling back to batch job",
+                          SYNC_DOWNLOAD_TIMEOUT)
+        except Exception as exc:
+            _cleanup_tmp()
+            try:
+                record_credential_usage(_credential_index, "error", _product_from_title(title))
+            except Exception:
+                pass
+            # 402 → CredentialRotatedError (propagates to decorator) or
+            #        CreditsExhaustedError/IPThrottledError (propagates out)
+            _check_credits_error(exc)
+            # CDSE source scene missing from the cluster — a batch job will
+            # fail identically (and waste 3 min + PUs). Surface it so the
+            # caller can fall back to a different temporal window instead.
+            if _is_missing_product_error(exc):
+                logger.warning(
+                    "Source product missing on CDSE cluster for %s (%s) — "
+                    "not retrying via batch", title, str(exc)[:200])
+                raise MissingProductError(str(exc)) from exc
+            # Not a 402 — note outage signature (raises IPThrottledError on
+            # cascade so we stop burning batch-job hours during CDSE outages),
+            # else fall back to batch
+            _outage_note(str(exc))
+            logger.warning("Synchronous download failed (%s), falling back to batch job", exc)
+
+    # Batch job fallback
+    logger.info("Submitting batch job: %s", title)
+    output_dir = output_path.parent / f"{output_path.stem}_batch"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        job = datacube.execute_batch(
+            outputfile=str(output_dir),
+            out_format=format,
+            title=title,
+            max_poll_interval=30,
+            print=lambda msg: logger.info("[batch] %s", msg),
+        )
+    except Exception as batch_exc:
+        _check_credits_error(batch_exc)  # raises CredentialRotatedError on 402
+        # Source scene missing from the cluster — batch fails the same way
+        # for every credential and window. Surface as MissingProductError
+        # so a seasonal product can fall back to a different year.
+        if _is_missing_product_error(batch_exc):
+            logger.warning(
+                "Batch job for %s failed: source product missing on CDSE "
+                "cluster (%s) — not rotating", title, str(batch_exc)[:200])
+            raise MissingProductError(str(batch_exc)) from batch_exc
+        # Batch job failed (status: error) — this is often transient or
+        # credential-specific.  Rotate to the next credential and let
+        # @_retry_on_rotation retry the whole function from scratch.
+        batch_msg = str(batch_exc)
+        if "didn't finish successfully" in batch_msg or "Status: error" in batch_msg:
+            # Outage breaker first: a batch job that failed with server-side
+            # signatures (Spark GDAL read errors, 5xx) fails identically on
+            # every credential — rotation just wastes ~1h/attempt.
+            _outage_note(batch_msg + ' ' + getattr(batch_exc, '_error_logs_str', ''))
+            logger.warning("Batch job failed (%s) — rotating credential for retry", batch_msg)
+            if rotate_credentials():
+                raise CredentialRotatedError(
+                    f"Batch job failed, rotated credential for retry: {batch_msg}"
+                )
+        raise
+    _outage_ok()
+    logger.info("Batch job %s finished", job.job_id)
+
+    # Find the result file
+    tifs = sorted(output_dir.glob("*.tif")) + sorted(output_dir.glob("*.tiff"))
+    if tifs:
+        import shutil
+        shutil.copy2(str(tifs[0]), str(output_path))
+    elif output_dir.is_file():
+        import shutil
+        shutil.copy2(str(output_dir), str(output_path))
+
+    _enforce_cache_limit()
+    try:
+        record_credential_usage(_credential_index, "success", _product_from_title(title))
+    except Exception:
+        pass
+    return output_path
+
+
+# === SECTION: Public API (NDVI, WorldCover, SAR, harmonics) ===
+
+
+@_retry_on_rotation
+def get_ndvi_composite(
+    bbox_wgs84: Dict[str, float],
+    year: int = 2023,
+    _conn: Any = None,
+) -> Dict[str, Any]:
+    """Fetch a cloud-free NDVI composite for a bounding box.
+
+    Uses the growing season (April–September) of *year* and computes
+    the temporal **median** NDVI after cloud masking with SCL dilation.
+
+    Parameters
+    ----------
+    bbox_wgs84 : dict
+        ``{"west": float, "south": float, "east": float, "north": float}``
+        in EPSG:4326.
+    year : int
+        Year to process (default 2023).
+
+    Returns
+    -------
+    dict
+        ``{"ndvi": np.ndarray (H,W), "transform": Affine, "crs": CRS,
+        "date_range": str}``
+    """
+    # Short-circuit if all credentials are already exhausted
+    if credits_exhausted:
+        logger.warning("Skipping NDVI composite — all Copernicus credentials exhausted")
+        return None
+
+    bbox = _validate_bbox(bbox_wgs84)
+    start_date = f"{year}-04-01"
+    end_date = f"{year}-09-30"
+    date_range = f"{start_date}/{end_date}"
+
+    cache_file = _cache_path("ndvi_composite", bbox, year=year)
+    if cache_file.exists() and _validate_cache(cache_file):
+        logger.info("Cache hit for NDVI composite: %s", cache_file)
+        _touch_cache(cache_file)
+        data, transform, crs = _read_geotiff(cache_file)
+        return {
+            "ndvi": data.astype(np.float32),
+            "transform": transform,
+            "crs": crs,
+            "date_range": date_range,
+        }
+
+    logger.info("Fetching NDVI composite for bbox=%s, year=%d", bbox, year)
+    conn = _conn or _get_connection()
+
+    # Load Sentinel-2 L2A with B04 (Red), B08 (NIR), and SCL (Scene Classification)
+    s2 = conn.load_collection(
+        "SENTINEL2_L2A",
+        spatial_extent=bbox,
+        temporal_extent=[start_date, end_date],
+        bands=["B04", "B08", "SCL"],
+    )
+
+    # Cloud masking using SCL dilation (removes clouds, cloud shadows, etc.)
+    s2_masked = s2.process(
+        "mask_scl_dilation",
+        data=s2,
+        scl_band_name="SCL",
+    )
+
+    # Compute NDVI: (B08 - B04) / (B08 + B04)
+    ndvi_cube = s2_masked.ndvi(nir="B08", red="B04")
+
+    # Temporal median composite
+    ndvi_composite = ndvi_cube.reduce_dimension(
+        dimension="t",
+        reducer="median",
+    )
+
+    # Download
+    try:
+        _run_datacube(ndvi_composite, cache_file, title=f"NDVI composite {year}", bbox=bbox)
+    except (CredentialRotatedError, CreditsExhaustedError, IPThrottledError):
+        raise  # let @_retry_on_rotation handle these
+    except Exception as exc:
+        logger.error("Failed to download NDVI composite: %s", exc)
+        raise RuntimeError(f"NDVI composite download failed: {exc}") from exc
+
+    data, transform, crs = _read_geotiff(cache_file)
+    return {
+        "ndvi": data.astype(np.float32),
+        "transform": transform,
+        "crs": crs,
+        "date_range": date_range,
+    }
+
+
+@_retry_on_rotation
+def get_ndvi_timeseries(
+    bbox_wgs84: Dict[str, float],
+    start_date: str,
+    end_date: str,
+    progress_fn: Any = None,
+) -> Dict[str, Any]:
+    """Fetch monthly NDVI aggregates over a period.
+
+    Downloads one NDVI composite per month and stacks them locally.
+    This avoids the openEO aggregate_temporal_period bug where
+    sync download collapses multi-band temporal output to 1 band.
+
+    Parameters
+    ----------
+    bbox_wgs84 : dict
+        Bounding box in EPSG:4326.
+    start_date, end_date : str
+        ISO date strings, e.g. ``"2023-01-01"`` and ``"2023-12-31"``.
+
+    Returns
+    -------
+    dict
+        ``{"monthly_ndvi": {"2023-01": ndarray, ...},
+        "transform": Affine, "crs": CRS}``
+    """
+    # Short-circuit if all credentials are already exhausted
+    if credits_exhausted:
+        logger.warning("Skipping NDVI time series — all Copernicus credentials exhausted")
+        return None
+
+    from datetime import datetime
+    import calendar
+
+    bbox = _validate_bbox(bbox_wgs84)
+
+    # Check for stacked cache (new format)
+    cache_file = _cache_path("ndvi_ts_v2", bbox, start=start_date, end=end_date)
+    if cache_file.exists() and _validate_cache(cache_file):
+        logger.info("Cache hit for NDVI time series v2: %s", cache_file)
+        _touch_cache(cache_file)
+        return _parse_timeseries_tiff(cache_file, start_date, end_date)
+
+    logger.info(
+        "Fetching NDVI time series (per-month) for bbox=%s, %s → %s",
+        bbox, start_date, end_date,
+    )
+
+    # Build month list — skip winter months (Nov-Feb) which often have
+    # zero cloud-free scenes in Austria, causing openEO EmptyBounds errors
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    SKIP_MONTHS = {11, 12, 1, 2}  # Nov-Feb: snow/clouds, no usable NDVI
+    months = []
+    current = start_dt.replace(day=1)
+    while current <= end_dt:
+        if current.month not in SKIP_MONTHS:
+            months.append(current)
+        if current.month == 12:
+            current = current.replace(year=current.year + 1, month=1)
+        else:
+            current = current.replace(month=current.month + 1)
+    logger.info("NDVI months to fetch: %s", [m.strftime('%Y-%m') for m in months])
+
+    # Fetch each month as a separate NDVI composite — sequential downloads
+    monthly_ndvi: Dict[str, np.ndarray] = {}
+    transform = None
+    crs = None
+
+    conn = _get_connection()
+
+    # Build download tasks: (label, cache_path, datacube_or_None)
+    tasks = []
+    for m in months:
+        label = m.strftime("%Y-%m")
+        last_day = calendar.monthrange(m.year, m.month)[1]
+        m_start = m.strftime("%Y-%m-%d")
+        m_end = m.replace(day=last_day).strftime("%Y-%m-%d")
+        month_cache = _cache_path("ndvi_month", bbox, start=m_start, end=m_end)
+        tasks.append((label, m_start, m_end, month_cache))
+
+    # Check which months need downloading
+    to_download = []
+    for label, m_start, m_end, month_cache in tasks:
+        if month_cache.exists() and _validate_cache(month_cache):
+            logger.debug("Cache hit for %s: %s", label, month_cache)
+            _touch_cache(month_cache)
+        else:
+            to_download.append((label, m_start, m_end, month_cache))
+
+    # Download missing months in parallel (one credential per worker)
+    # Tracks consecutive 402 hits per credential to distinguish transient
+    # rate-limits from genuine credit exhaustion.
+    _consecutive_402: Dict[int, int] = {}  # cred_idx -> consecutive 402 count
+    _402_THRESHOLD = 3  # mark exhausted only after this many consecutive 402s
+
+    def _download_month_sequential(label, m_start, m_end, month_cache):
+        """Download a single month's NDVI using the current credential.
+        Returns (label, error_or_None).
+
+        On transient 402 errors (credential probes OK but download fails),
+        retries up to 3 times with backoff, then rotates to a different
+        credential and retries again.  Gives up only after all credentials
+        have been tried."""
+        import time as _time
+        max_retries_per_cred = 3
+        tried_creds: set[int] = set()  # credentials already exhausted via retries
+        attempt = 0
+        last_exc: Exception | None = None
+        _download_month_sequential._proxy_tried = False
+
+        while True:
+            if credits_exhausted:
+                return label, CreditsExhaustedError("all exhausted")
+            try:
+                cred_idx = _credential_index
+                c = _get_connection()
+
+                def _dl_cube(part_bbox, dst, timeout=_MONTH_SYNC_TIMEOUT_FULL):
+                    s2 = c.load_collection(
+                        "SENTINEL2_L2A",
+                        spatial_extent=part_bbox,
+                        temporal_extent=[m_start, m_end],
+                        bands=["B04", "B08", "SCL"],
+                    )
+                    s2_masked = s2.process(
+                        "mask_scl_dilation", data=s2, scl_band_name="SCL",
+                    )
+                    ndvi_cube = s2_masked.ndvi(nir="B08", red="B04")
+                    ndvi_median = ndvi_cube.reduce_dimension(
+                        dimension="t", reducer="median",
+                    )
+                    # Connection.download() takes an explicit per-request
+                    # timeout; DataCube.download() does not (falls back
+                    # to the 240 s global cap).
+                    c.download(ndvi_median.save_result(format="GTiff").flat_graph(),
+                               str(dst), timeout=timeout)
+                    if not (dst.exists() and dst.stat().st_size > 0):
+                        dst.unlink(missing_ok=True)
+                        raise RuntimeError("download produced empty file")
+
+                def _dl_quadrants(dst):
+                    """Fetch the month as 2×2 sub-cells and mosaic into *dst*.
+                    Empty (overcast) quadrants are tolerated as long as at
+                    least one returns data; a timeout propagates."""
+                    w, s = bbox["west"], bbox["south"]
+                    e, n = bbox["east"], bbox["north"]
+                    mx, my = (w + e) / 2, (s + n) / 2
+                    quads = [
+                        {"west": w, "south": s, "east": mx, "north": my},
+                        {"west": mx, "south": s, "east": e, "north": my},
+                        {"west": w, "south": my, "east": mx, "north": n},
+                        {"west": mx, "south": my, "east": e, "north": n},
+                    ]
+                    parts = []
+                    try:
+                        for qi, qb in enumerate(quads):
+                            qp = dst.with_suffix(f".q{qi}.tif")
+                            qp.unlink(missing_ok=True)
+                            try:
+                                _dl_cube(qb, qp, timeout=_MONTH_SYNC_TIMEOUT_QUAD)
+                                parts.append(qp)
+                            except Exception as qe:
+                                if 'download produced empty file' in str(qe):
+                                    logger.info("NDVI %s q%d: empty (overcast)", label, qi)
+                                    continue
+                                raise
+                        if not parts:
+                            raise RuntimeError("download produced empty file")
+                        _mosaic_tiffs(parts, dst)
+                        logger.info("NDVI %s: mosaicked %d/4 quadrants", label, len(parts))
+                        _relay_info(f"NDVI {label}: mosaicked {len(parts)}/4 quadrants")
+                    finally:
+                        for qp in parts:
+                            qp.unlink(missing_ok=True)
+
+                month_cache.parent.mkdir(parents=True, exist_ok=True)
+                tmp_month = month_cache.with_suffix(month_cache.suffix + ".tmp")
+                try:
+                    if _sync_split_active():
+                        _dl_quadrants(tmp_month)
+                    else:
+                        try:
+                            _dl_cube(bbox, tmp_month)
+                        except Exception as fe:
+                            if not _is_read_timeout(str(fe)):
+                                raise
+                            # Full cell too slow for openEO right now —
+                            # arm split mode and retry this month as
+                            # quadrants straight away.
+                            _sync_split_arm(str(fe))
+                            tmp_month.unlink(missing_ok=True)
+                            _dl_quadrants(tmp_month)
+                    tmp_month.rename(month_cache)
+                except Exception:
+                    tmp_month.unlink(missing_ok=True)
+                    raise
+                logger.info("NDVI %s downloaded OK%s", label,
+                            " (via proxy)" if getattr(_download_month_sequential, '_proxy_tried', False) else "")
+                _relay_info(f"NDVI {label} downloaded OK")  # feeds openeo: months_ok
+                try:
+                    record_credential_usage(cred_idx, "success", "ndvi_ts")
+                except Exception:
+                    pass
+                # Clear proxy on success
+                try:
+                    c.session.proxies.clear()
+                except Exception:
+                    pass
+                return label, None
+            except CredentialRotatedError:
+                try:
+                    record_credential_usage(cred_idx, "rotated", "ndvi_ts")
+                except Exception:
+                    pass
+                tried_creds.add(cred_idx)
+                if len(tried_creds) >= len(_CREDENTIALS):
+                    logger.warning("NDVI %s: 402 on all %d credentials — IP-throttled",
+                                   label, len(tried_creds))
+                    return label, IPThrottledError(
+                        f"NDVI {label}: all {len(_CREDENTIALS)} credentials 402")
+                logger.info("NDVI %s: credential rotated to %d, retrying",
+                            label, _credential_index + 1)
+                attempt = 0  # reset attempts for fresh credential
+                continue
+            except CreditsExhaustedError as exc:
+                logger.error("NDVI %s: all credentials exhausted", label)
+                return label, exc
+            except IPThrottledError as exc:
+                logger.warning("NDVI %s: IP-throttled", label)
+                return label, exc
+            except Exception as exc:
+                last_exc = exc
+                exc_str = str(exc)
+
+                try:
+                    record_credential_usage(cred_idx, "error", "ndvi_ts")
+                except Exception:
+                    pass
+
+                # --- No data / overcast month detection ---
+                is_nodata = False
+                nodata_patterns = [
+                    'EmptyBounds', 'empty collection', 'no data available',
+                    'NoDataAvailable', 'ResultTooLarge',
+                ]
+                for pat in nodata_patterns:
+                    if pat.lower() in exc_str.lower():
+                        is_nodata = True
+                        break
+                if 'download produced empty file' in exc_str:
+                    is_nodata = True
+
+                if is_nodata:
+                    logger.info(
+                        "NDVI %s: no cloud-free data available (likely overcast) — skipping",
+                        label,
+                    )
+                    return label, None
+
+                # --- Handle 402 PaymentRequired ---
+                if '402' in exc_str and 'PaymentRequired' in exc_str:
+                    try:
+                        # _check_credits_error probes the credential, then:
+                        #   probe passes → CredentialRotatedError (transient 402)
+                        #   probe fails  → CredentialRotatedError (rotated to next)
+                        #   all exhausted → CreditsExhaustedError
+                        _check_credits_error(exc)
+                    except CredentialRotatedError:
+                        tried_creds.add(cred_idx)
+                        if len(tried_creds) >= len(_CREDENTIALS):
+                            # All credentials tried — IP-level throttle
+                            logger.warning(
+                                "NDVI %s: 402 on all %d credentials — "
+                                "IP-throttled", label, len(tried_creds))
+                            return label, IPThrottledError(
+                                f"NDVI {label}: all {len(_CREDENTIALS)} "
+                                f"credentials returned 402")
+                        logger.info("NDVI %s: 402, rotated to credential %d",
+                                    label, _credential_index + 1)
+                        attempt = 0
+                        continue
+                    except CreditsExhaustedError as ce:
+                        return label, ce
+                    # Should not reach here (402 always raises above)
+                    return label, exc
+
+                # --- Handle 429 / 500 / 503 with backoff ---
+                _retryable = (
+                    "429" in exc_str
+                    or "500" in exc_str
+                    or "502" in exc_str
+                    or "503" in exc_str
+                    or "504" in exc_str
+                    or "Internal" in exc_str
+                    or "Bad Gateway" in exc_str
+                    or "Gateway Time" in exc_str
+                    or "Service Unavailable" in exc_str
+                    or "Server error" in exc_str
+                    or "max connections" in exc_str
+                )
+                if _retryable and attempt < max_retries_per_cred:
+                    attempt += 1
+                    wait_secs = 15 * attempt
+                    _reason = (
+                        '429' if '429' in exc_str
+                        else '502' if ('502' in exc_str or 'Bad Gateway' in exc_str)
+                        else '504' if ('504' in exc_str or 'Gateway Time' in exc_str)
+                        else '500' if ('500' in exc_str or 'Internal' in exc_str or 'Server error' in exc_str)
+                        else '503'
+                    )
+                    # Interim retries log at INFO so they don't feed the
+                    # fleet-wide copernicus throttle counter — one bad
+                    # NDVI month would otherwise emit 3 WARNING lines
+                    # plus library noise. Final-attempt exhaustion is
+                    # logged as WARNING by the 'failed: ... — skipping
+                    # month' path below.
+                    logger.info(
+                        "NDVI %s: server error (%s), retry %d/%d in %ds...",
+                        label, _reason,
+                        attempt, max_retries_per_cred, wait_secs,
+                    )
+                    _time.sleep(wait_secs)
+                    continue
+                # --- Other errors — skip month ---
+                logger.warning("NDVI %s failed: %s — skipping month", label, exc)
+                return label, exc
+        # Should not reach here, but safety net
+        return label, last_exc or Exception(f"NDVI {label}: retries exhausted")
+
+    if to_download:
+        import time as _time
+        n_total = len(tasks)
+        n_done = n_total - len(to_download)  # already cached
+
+        # Compute a bbox hash for failed-month cooldown tracking
+        _bbox_hash = f"{bbox.get('west',0):.4f}_{bbox.get('south',0):.4f}_{bbox.get('east',0):.4f}_{bbox.get('north',0):.4f}"
+
+        # Prune expired cooldowns
+        _now = _time.time()
+        expired = [k for k, v in _FAILED_MONTH_COOLDOWNS.items() if v < _now]
+        for k in expired:
+            _FAILED_MONTH_COOLDOWNS.pop(k, None)
+
+        # Filter out months in cooldown (recently failed with 500 or persistent 402)
+        actually_download = []
+        for label, m_start, m_end, month_cache in to_download:
+            cooldown_key = (_bbox_hash, label)
+            if cooldown_key in _FAILED_MONTH_COOLDOWNS:
+                remaining = int(_FAILED_MONTH_COOLDOWNS[cooldown_key] - _now)
+                logger.info(
+                    "NDVI %s: skipping (failed recently, cooldown %dm remaining)",
+                    label, remaining // 60,
+                )
+                n_done += 1  # count as processed for progress
+            else:
+                actually_download.append((label, m_start, m_end, month_cache))
+
+        if actually_download:
+            logger.info("Downloading %d NDVI months (sequential, single credential)...",
+                        len(actually_download))
+        consecutive_402 = 0  # track 402 cascade
+        consecutive_5xx = 0  # track upstream-stress cascade (503/502/500)
+        for label, m_start, m_end, month_cache in actually_download:
+            lbl, exc = _download_month_sequential(label, m_start, m_end, month_cache)
+            if exc is None:
+                n_done += 1
+                consecutive_402 = 0  # reset on success
+                consecutive_5xx = 0
+                logger.info("Month %s done (%d/%d)", lbl, n_done, n_total)
+                if progress_fn:
+                    try:
+                        progress_fn(n_done, n_total)
+                    except Exception:
+                        pass
+            elif isinstance(exc, (CreditsExhaustedError, IPThrottledError)):
+                logger.warning("Stopping NDVI downloads — %s",
+                               "IP-throttled" if isinstance(exc, IPThrottledError)
+                               else "credits exhausted")
+                break
+            else:
+                n_done += 1  # count failed months too for progress
+                exc_str = str(exc)
+                # Determine cooldown duration based on error type
+                if '500' in exc_str or 'Spark' in exc_str or 'Server error' in exc_str:
+                    cooldown = _FAILED_MONTH_COOLDOWN_SECS  # 30 min for Spark timeout
+                    logger.warning("NDVI %s failed (server error) — cooldown %dm",
+                                   lbl, cooldown // 60)
+                elif '402' in exc_str:
+                    cooldown = _FAILED_MONTH_402_COOLDOWN_SECS  # 5 min for 402
+                    consecutive_402 += 1
+                else:
+                    cooldown = _FAILED_MONTH_402_COOLDOWN_SECS
+                    consecutive_402 = 0
+                # Track upstream-stress cascade (503/502/500/504, and sync
+                # read-timeouts that survived quadrant splitting) separately
+                # from 402: it indicates the openeo origin is overloaded,
+                # not that our credential is exhausted.
+                if any(s in exc_str for s in ('500', '502', '503', '504',
+                                              'Bad Gateway', 'Gateway Time',
+                                              'Service Unavailable',
+                                              'Server error',
+                                              'too many 503',
+                                              'no available server')) \
+                        or _is_read_timeout(exc_str):
+                    consecutive_5xx += 1
+                else:
+                    consecutive_5xx = 0
+                _FAILED_MONTH_COOLDOWNS[(_bbox_hash, lbl)] = _time.time() + cooldown
+
+                if progress_fn:
+                    try:
+                        progress_fn(n_done, n_total)
+                    except Exception:
+                        pass
+
+                # 5xx cascade breaker: if 2+ consecutive months fail with
+                # upstream errors, the openeo origin is sick. Stop hammering
+                # it — raise IPThrottledError so the parent process pauses
+                # this peer for 15 min via the existing copernicus_paused
+                # path. The director will switch to another peer.
+                if consecutive_5xx >= 2:
+                    logger.warning(
+                        "Upstream-stress cascade detected (%d consecutive 5xx) — "
+                        "aborting NDVI downloads to give openeo origin a break",
+                        consecutive_5xx,
+                    )
+                    raise UpstreamStressError(
+                        f"openeo origin returned {consecutive_5xx} consecutive 5xx "
+                        f"— backing off"
+                    )
+
+                # 402 cascade breaker: if 2+ consecutive months fail with 402,
+                # the credential is rate-limited. Stop wasting time on remaining months.
+                if consecutive_402 >= 2:
+                    remaining_count = len(actually_download) - actually_download.index(
+                        (label, m_start, m_end, month_cache)) - 1
+                    if remaining_count > 0:
+                        logger.warning(
+                            "402 cascade detected (%d consecutive) — skipping "
+                            "%d remaining months (cooldown %dm)",
+                            consecutive_402, remaining_count,
+                            _FAILED_MONTH_402_COOLDOWN_SECS // 60,
+                        )
+                        # Put remaining months into cooldown too
+                        idx = actually_download.index(
+                            (label, m_start, m_end, month_cache))
+                        for rl, rm_s, rm_e, rmc in actually_download[idx + 1:]:
+                            _FAILED_MONTH_COOLDOWNS[(_bbox_hash, rl)] = (
+                                _time.time() + _FAILED_MONTH_402_COOLDOWN_SECS
+                            )
+                            n_done += 1
+                    break
+            _time.sleep(2)  # gentle pacing between sequential downloads
+
+    # Read all cached months
+    for label, m_start, m_end, month_cache in tasks:
+        if not month_cache.exists() or not _validate_cache(month_cache):
+            continue
+        try:
+            with rasterio.open(str(month_cache)) as ds:
+                data = ds.read(1).astype(np.float32)
+                if transform is None:
+                    transform = ds.transform
+                    crs = ds.crs
+                monthly_ndvi[label] = data
+        except Exception as exc:
+            logger.warning("Failed to read NDVI %s: %s", label, exc)
+
+    if not monthly_ndvi:
+        raise RuntimeError("No monthly NDVI data retrieved")
+
+    logger.info("NDVI time series: %d/%d months retrieved", len(monthly_ndvi), len(months))
+
+    # Stack into multi-band cache for future use
+    try:
+        ref_shape = next(iter(monthly_ndvi.values())).shape
+        sorted_labels = sorted(monthly_ndvi.keys())
+        stack = np.stack([monthly_ndvi[l] for l in sorted_labels], axis=0)
+        with rasterio.open(
+            str(cache_file), "w", driver="GTiff",
+            height=ref_shape[0], width=ref_shape[1],
+            count=len(sorted_labels), dtype="float32",
+            crs=crs, transform=transform,
+        ) as dst:
+            for i, label in enumerate(sorted_labels):
+                dst.write(stack[i], i + 1)
+                dst.set_band_description(i + 1, label)
+        logger.info("Saved stacked NDVI TS cache: %s (%d bands)", cache_file, len(sorted_labels))
+    except Exception as exc:
+        logger.warning("Failed to write stacked cache: %s", exc)
+
+    return {
+        "monthly_ndvi": monthly_ndvi,
+        "transform": transform,
+        "crs": crs,
+    }
+
+
+def _parse_timeseries_tiff(
+    path: pathlib.Path,
+    start_date: str,
+    end_date: str,
+) -> Dict[str, Any]:
+    """Parse a multi-band GeoTIFF where each band is a monthly aggregate."""
+    if rasterio is None:
+        raise ImportError("rasterio is required")
+
+    with rasterio.open(str(path)) as ds:
+        data = ds.read()  # (bands, H, W)
+        transform = ds.transform
+        crs = ds.crs
+        band_count = ds.count
+        descriptions = [ds.descriptions[i] if ds.descriptions[i] else None for i in range(band_count)]
+
+    # Build month labels from date range
+    from datetime import datetime
+
+    start = datetime.strptime(start_date, "%Y-%m-%d")
+    end = datetime.strptime(end_date, "%Y-%m-%d")
+
+    months = []
+    current = start.replace(day=1)
+    while current <= end:
+        months.append(current.strftime("%Y-%m"))
+        if current.month == 12:
+            current = current.replace(year=current.year + 1, month=1)
+        else:
+            current = current.replace(month=current.month + 1)
+
+    monthly_ndvi: Dict[str, np.ndarray] = {}
+    for i in range(band_count):
+        # Prefer band description (set by our stacked cache writer)
+        if descriptions[i]:
+            label = descriptions[i]
+        elif i < len(months):
+            label = months[i]
+        else:
+            label = f"band_{i+1}"
+        monthly_ndvi[label] = data[i].astype(np.float32)
+
+    return {
+        "monthly_ndvi": monthly_ndvi,
+        "transform": transform,
+        "crs": crs,
+    }
+
+
+@_retry_on_rotation
+def get_land_cover(
+    bbox_wgs84: Dict[str, float],
+    _conn: Any = None,
+) -> Dict[str, Any]:
+    """Fetch ESA WorldCover 10 m land-use classification.
+
+    Parameters
+    ----------
+    bbox_wgs84 : dict
+        Bounding box in EPSG:4326.
+
+    Returns
+    -------
+    dict
+        ``{"map": np.ndarray (H,W), "transform": Affine, "crs": CRS,
+        "classes": dict}``
+    """
+    # Short-circuit if all credentials are already exhausted
+    if credits_exhausted:
+        logger.warning("Skipping land cover — all Copernicus credentials exhausted")
+        return None
+
+    bbox = _validate_bbox(bbox_wgs84)
+
+    cache_file = _cache_path("landcover", bbox)
+    if cache_file.exists() and _validate_cache(cache_file):
+        logger.info("Cache hit for land cover: %s", cache_file)
+        _touch_cache(cache_file)
+        data, transform, crs = _read_geotiff(cache_file)
+        return {
+            "map": data.astype(np.uint8),
+            "transform": transform,
+            "crs": crs,
+            "classes": WORLDCOVER_CLASSES.copy(),
+        }
+
+    logger.info("Fetching ESA WorldCover for bbox=%s", bbox)
+    conn = _conn or _get_connection()
+
+    # ESA WorldCover 10m 2021 v2 — single band "MAP"
+    # Temporal extent is required by openEO even for static datasets
+    lc = conn.load_collection(
+        "ESA_WORLDCOVER_10M_2021_V2",
+        spatial_extent=bbox,
+        temporal_extent=["2021-01-01", "2021-12-31"],
+        bands=["MAP"],
+    )
+
+    # Reduce the (trivial) temporal dimension
+    lc_flat = lc.reduce_dimension(dimension="t", reducer="first")
+
+    try:
+        _run_datacube(lc_flat, cache_file, title="ESA WorldCover", bbox=bbox)
+    except (CredentialRotatedError, CreditsExhaustedError, IPThrottledError):
+        raise  # let @_retry_on_rotation handle these
+    except Exception as exc:
+        logger.error("Failed to download land cover: %s", exc)
+        raise RuntimeError(f"Land cover download failed: {exc}") from exc
+
+    data, transform, crs = _read_geotiff(cache_file)
+    return {
+        "map": data.astype(np.uint8),
+        "transform": transform,
+        "crs": crs,
+        "classes": WORLDCOVER_CLASSES.copy(),
+    }
+
+
+@_retry_on_rotation
+def get_sar_backscatter(
+    bbox_wgs84: Dict[str, float],
+    start_date: str,
+    end_date: str,
+    _conn: Any = None,
+) -> Dict[str, Any]:
+    """Fetch Sentinel-1 SAR VV+VH backscatter composite.
+
+    SAR penetrates clouds and can distinguish built structures from
+    vegetation regardless of season.
+
+    Parameters
+    ----------
+    bbox_wgs84 : dict
+        Bounding box in EPSG:4326.
+    start_date, end_date : str
+        ISO date strings.
+
+    Returns
+    -------
+    dict
+        ``{"vv": np.ndarray (H,W), "vh": np.ndarray (H,W),
+        "vv_vh_ratio": np.ndarray (H,W),
+        "transform": Affine, "crs": CRS,
+        "date_range": str}``
+    """
+    # Short-circuit if all credentials are already exhausted
+    if credits_exhausted:
+        logger.warning("Skipping SAR backscatter — all Copernicus credentials exhausted")
+        return None
+
+    bbox = _validate_bbox(bbox_wgs84)
+
+    cache_file = _cache_path("sar", bbox, start=start_date, end=end_date)
+    if cache_file.exists() and _validate_cache(cache_file):
+        try:
+            logger.info("Cache hit for SAR backscatter: %s", cache_file)
+            _touch_cache(cache_file)
+            return _parse_sar_tiff(cache_file, start_date, end_date)
+        except Exception as exc:
+            logger.warning("Corrupt SAR cache %s (%s), deleting and re-fetching",
+                          cache_file, exc)
+            cache_file.unlink(missing_ok=True)
+
+    logger.info(
+        "Fetching SAR backscatter for bbox=%s, %s → %s",
+        bbox, start_date, end_date,
+    )
+    conn = _conn or _get_connection()
+
+    def _run_window(w_start: str, w_end: str) -> None:
+        """Build + download the SAR composite for one temporal window.
+        Writes to the (year-of-request) *cache_file* on success."""
+        s1 = conn.load_collection(
+            "SENTINEL1_GRD",
+            spatial_extent=bbox,
+            temporal_extent=[w_start, w_end],
+            bands=["VV", "VH"],
+        )
+        # Apply SAR backscatter processing (terrain correction)
+        s1_processed = s1.sar_backscatter(
+            coefficient="sigma0-ellipsoid",
+        )
+        # Temporal median composite
+        sar_composite = s1_processed.reduce_dimension(
+            dimension="t",
+            reducer="median",
+        )
+        _run_datacube(sar_composite, cache_file, title="SAR backscatter", bbox=bbox)
+
+    # SAR backscatter is seasonally stable year-over-year, so when CDSE
+    # has not staged the requested summer's Sentinel-1 scenes on its
+    # EODATA cluster (MissingProductError), fall back to the *previous*
+    # summer rather than deferring the whole KG. This keeps products
+    # complete (a SAR-less KG downgrades classification) without
+    # re-hitting the dead window or disturbing the fleet. The window is
+    # tagged in the result so consumers can see it differs from the
+    # nominal observation year.
+    windows = [(start_date, end_date)]
+    try:
+        _y = int(start_date[:4])
+        windows.append((f"{_y - 1}-06-01", f"{_y - 1}-09-30"))
+    except (ValueError, IndexError):
+        pass
+
+    last_missing: Optional[Exception] = None
+    for i, (w_start, w_end) in enumerate(windows):
+        try:
+            if i > 0:
+                logger.warning(
+                    "SAR backscatter: %s–%s missing on CDSE cluster — "
+                    "falling back to prior summer %s–%s",
+                    start_date, end_date, w_start, w_end)
+            _run_window(w_start, w_end)
+            result = _parse_sar_tiff(cache_file, w_start, w_end)
+            if i > 0 and isinstance(result, dict):
+                result["fallback_year"] = int(w_start[:4])
+            return result
+        except (CredentialRotatedError, CreditsExhaustedError, IPThrottledError):
+            raise  # let @_retry_on_rotation handle these
+        except MissingProductError as exc:
+            last_missing = exc
+            continue  # try the next (earlier) summer window
+        except Exception as exc:
+            logger.error("Failed to download SAR backscatter: %s", exc)
+            raise RuntimeError(f"SAR backscatter download failed: {exc}") from exc
+
+    logger.error(
+        "Failed to download SAR backscatter: source scenes missing on CDSE "
+        "cluster for all candidate summers (%s)",
+        ", ".join(f"{w[0][:4]}" for w in windows))
+    raise RuntimeError(
+        f"SAR backscatter download failed: source product missing on cluster "
+        f"for all candidate years: {last_missing}") from last_missing
+
+
+def _parse_sar_tiff(
+    path: pathlib.Path,
+    start_date: str,
+    end_date: str,
+) -> Dict[str, Any]:
+    """Parse a 2-band SAR GeoTIFF (VV, VH)."""
+    if rasterio is None:
+        raise ImportError("rasterio is required")
+
+    import logging as _logging
+    _rasterio_logger = _logging.getLogger('rasterio._env')
+    _prev_level = _rasterio_logger.level
+    _rasterio_logger.setLevel(_logging.ERROR)
+    try:
+        with rasterio.open(str(path)) as ds:
+            data = ds.read()  # (bands, H, W)
+            transform = ds.transform
+            crs = ds.crs
+    finally:
+        _rasterio_logger.setLevel(_prev_level)
+
+    # Bands: VV=0, VH=1
+    vv = data[0].astype(np.float32) if data.ndim == 3 and data.shape[0] >= 1 else data.astype(np.float32)
+    vh = data[1].astype(np.float32) if data.ndim == 3 and data.shape[0] >= 2 else np.zeros_like(vv)
+
+    # VV/VH ratio (useful for distinguishing land cover types)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(vh != 0, vv / vh, 0.0).astype(np.float32)
+
+    return {
+        "vv": vv,
+        "vh": vh,
+        "vv_vh_ratio": ratio,
+        "transform": transform,
+        "crs": crs,
+        "date_range": f"{start_date}/{end_date}",
+    }
+
+
+# === SECTION: Utility helpers ===
+
+
+def clear_cache() -> int:
+    """Remove all cached files. Returns the number of files deleted."""
+    count = 0
+    for f in CACHE_DIR.iterdir():
+        try:
+            f.unlink()
+            count += 1
+        except OSError:
+            pass
+    logger.info("Cleared %d cached files", count)
+    return count
+
+
+def bbox_from_center(
+    lon: float,
+    lat: float,
+    size_m: float = 5000.0,
+) -> Dict[str, float]:
+    """Create a WGS-84 bbox centred on (lon, lat) with *size_m* half-width.
+
+    Useful for quick queries around a point of interest.
+    """
+    import math
+
+    # Approximate degree offsets
+    dlat = size_m / 111_320.0
+    dlon = size_m / (111_320.0 * math.cos(math.radians(lat)))
+    return {
+        "west": lon - dlon,
+        "south": lat - dlat,
+        "east": lon + dlon,
+        "north": lat + dlat,
+    }
+
+
+def ndvi_quality_mask(
+    ndvi: np.ndarray,
+    min_val: float = -1.0,
+    max_val: float = 1.0,
+) -> np.ndarray:
+    """Return a boolean mask where NDVI values are within a valid range."""
+    return (ndvi >= min_val) & (ndvi <= max_val) & np.isfinite(ndvi)
+
+
+# === SECTION: CLI smoke test ===
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    # Small test area in Vienna
+    test_bbox = bbox_from_center(16.37, 48.21, size_m=2000)
+    print(f"Test bbox: {test_bbox}")
+
+    print("\n--- NDVI Composite ---")
+    try:
+        result = get_ndvi_composite(test_bbox, year=2023)
+        print(f"  Shape: {result['ndvi'].shape}")
+        print(f"  NDVI range: [{np.nanmin(result['ndvi']):.3f}, {np.nanmax(result['ndvi']):.3f}]")
+        print(f"  CRS: {result['crs']}")
+        print(f"  Date range: {result['date_range']}")
+    except Exception as e:
+        print(f"  Error: {e}")
+
+    print("\n--- Land Cover ---")
+    try:
+        lc = get_land_cover(test_bbox)
+        print(f"  Shape: {lc['map'].shape}")
+        unique, counts = np.unique(lc["map"], return_counts=True)
+        for u, c in zip(unique, counts):
+            name = lc["classes"].get(int(u), "unknown")
+            print(f"  Class {u:3d} ({name:25s}): {c:6d} px")
+    except Exception as e:
+        print(f"  Error: {e}")
+
+    print("\n--- SAR Backscatter ---")
+    try:
+        sar = get_sar_backscatter(test_bbox, "2023-06-01", "2023-08-31")
+        print(f"  VV shape: {sar['vv'].shape}")
+        print(f"  VH shape: {sar['vh'].shape}")
+    except Exception as e:
+        print(f"  Error: {e}")

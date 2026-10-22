@@ -1,0 +1,3477 @@
+"""search_index.py — SQLite FTS5 + R-tree search index for Austrian landscape analysis.
+
+Builds a fast queryable index over all 7850 KGs from kg_list.json,
+enriched with landscape summary data from processed JSON files and
+Zenodo download links from the manifest.
+
+Tables: kg, kg_landcover, kg_hansen, kg_rtree (R-tree), fts_kg (FTS5), index_meta
+"""
+import fcntl
+import json
+import math
+import os
+import sqlite3
+import threading
+import time
+import logging
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+STATE_CODES = {
+    '1': 'Burgenland', '2': 'Kärnten', '3': 'Niederösterreich',
+    '4': 'Oberösterreich', '5': 'Salzburg', '6': 'Steiermark',
+    '7': 'Tirol', '8': 'Vorarlberg', '9': 'Wien',
+}
+
+DISTRICT_NAMES = {
+    "101": "Eisenstadt (Stadt)", "102": "Rust (Stadt)", "103": "Eisenstadt-Umgebung",
+    "104": "Güssing", "105": "Jennersdorf", "106": "Mattersburg",
+    "107": "Neusiedl am See", "108": "Oberpullendorf", "109": "Oberwart",
+    "201": "Klagenfurt (Stadt)", "202": "Villach (Stadt)", "203": "Hermagor",
+    "204": "Klagenfurt-Land", "205": "Sankt Veit an der Glan",
+    "206": "Spittal an der Drau", "207": "Villach-Land", "208": "Völkermarkt",
+    "209": "Wolfsberg", "210": "Feldkirchen",
+    "301": "Krems an der Donau (Stadt)", "302": "Sankt Pölten (Stadt)",
+    "303": "Waidhofen an der Ybbs (Stadt)", "304": "Wiener Neustadt (Stadt)",
+    "305": "Amstetten", "306": "Baden", "307": "Bruck an der Leitha",
+    "308": "Gänserndorf", "309": "Gmünd", "310": "Hollabrunn",
+    "311": "Horn", "312": "Korneuburg", "313": "Krems (Land)",
+    "314": "Lilienfeld", "315": "Melk", "316": "Mistelbach",
+    "317": "Mödling", "318": "Neunkirchen", "319": "Sankt Pölten (Land)",
+    "320": "Scheibbs", "321": "Tulln", "322": "Waidhofen an der Thaya",
+    "323": "Wiener Neustadt (Land)", "324": "Zwettl",
+    "401": "Linz (Stadt)", "402": "Steyr (Stadt)", "403": "Wels (Stadt)",
+    "404": "Braunau am Inn", "405": "Eferding", "406": "Freistadt",
+    "407": "Gmunden", "408": "Grieskirchen", "409": "Kirchdorf an der Krems",
+    "410": "Linz-Land", "411": "Perg", "412": "Ried im Innkreis",
+    "413": "Rohrbach", "414": "Schärding", "415": "Steyr-Land",
+    "416": "Urfahr-Umgebung", "417": "Vöcklabruck", "418": "Wels-Land",
+    "501": "Salzburg (Stadt)", "502": "Hallein", "503": "Salzburg-Umgebung",
+    "504": "Sankt Johann im Pongau", "505": "Tamsweg", "506": "Zell am See",
+    "601": "Graz (Stadt)", "603": "Deutschlandsberg", "606": "Graz-Umgebung",
+    "610": "Leibnitz", "611": "Leoben", "612": "Liezen",
+    "614": "Murau", "616": "Voitsberg", "617": "Weiz",
+    "620": "Murtal", "621": "Bruck-Mürzzuschlag", "622": "Hartberg-Fürstenfeld",
+    "623": "Südoststeiermark",
+    "701": "Innsbruck (Stadt)", "702": "Imst", "703": "Innsbruck-Land",
+    "704": "Kitzbühel", "705": "Kufstein", "706": "Landeck",
+    "707": "Lienz", "708": "Reutte", "709": "Schwaz",
+    "801": "Bludenz", "802": "Bregenz", "803": "Dornbirn", "804": "Feldkirch",
+    "900": "Wien", "901": "Wien",
+}
+
+BASE_URL = 'https://example.invalid/k'   # private tier (api_tiers.py); public API = https://example.invalid
+
+# Minimum apex height kept in ``kg_trees`` (disk budget: ~1.1M rows at 20 m
+# fleet-wide vs ~3.3M parcels; the siedler contract defaults min_height=20).
+KG_TREES_MIN_H = 20.0
+
+
+
+def _sar_db(v):
+    """Normalise a KG-JSON ``sar.*_mean_db`` value to real decibels.
+
+    The producer stores *linear* sigma0 under a ``_db`` key (see
+    docs/cross-cutting-concerns.md → SAR quirk). Linear sigma0 means are
+    always > 0; genuine dB values of a sigma0 mean are always < 0, so the
+    sign disambiguates old and (if ever fixed) new products.
+    """
+    if v is None:
+        return None
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    if v > 0:
+        import math
+        return round(10.0 * math.log10(v), 2)
+    return v
+
+# NOTE (Kataster purge, 2026-10-13): the per-parcel ingest helpers
+# (_slim_parcel_fields / _parcel_tree_rows) are gone — 2.4 products carry
+# no cadastre, see docs/kataster-purge.md.
+
+
+class SearchIndex:
+    """SQLite FTS5 + R-tree search index for Austrian landscape KGs."""
+
+    def __init__(self, db_path='data/search_index.db'):
+        os.makedirs(os.path.dirname(db_path) or '.', exist_ok=True)
+        self.db_path = db_path
+        self._write_lock = threading.Lock()
+        self._file_lock_path = db_path + '.lock'
+        self._local = threading.local()
+        self._migrate()
+
+    def _conn(self):
+        """Thread-local connection."""
+        c = getattr(self._local, 'conn', None)
+        if c is None:
+            c = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
+            c.row_factory = sqlite3.Row
+            c.execute('PRAGMA journal_mode=WAL')
+            c.execute('PRAGMA synchronous=NORMAL')
+            c.execute('PRAGMA cache_size=-64000')
+            c.execute('PRAGMA foreign_keys=ON')
+            c.execute('PRAGMA busy_timeout=30000')
+            self._local.conn = c
+        return c
+
+    def _schema_stmts(self):
+        """Return list of CREATE statements for current schema."""
+        return [
+            # === Core KG table ===
+            '''CREATE TABLE IF NOT EXISTS kg (
+                kg_code TEXT PRIMARY KEY,
+                kg_name TEXT NOT NULL,
+                gemeinde_code TEXT,
+                gemeinde_name TEXT,
+                district_code TEXT,
+                district_name TEXT,
+                state_code TEXT,
+                state_name TEXT,
+                min_lon REAL, min_lat REAL, max_lon REAL, max_lat REAL,
+                centroid_lon REAL, centroid_lat REAL,
+                building_count INTEGER DEFAULT 0,
+                total_area_sqm REAL DEFAULT 0,
+                processed INTEGER DEFAULT 0,
+                generated_at TEXT,
+                primary_year INTEGER,
+                dominant_type TEXT,
+                vegetated_fraction REAL,
+                shannon_diversity REAL,
+                n_segments INTEGER DEFAULT 0,
+                elevation_min_m REAL,
+                elevation_max_m REAL,
+                elevation_mean_m REAL,
+                slope_mean_deg REAL,
+                aspect_dominant TEXT,
+                roughness_mean REAL,
+                steepness_max_deg REAL,
+                elevation_range_m REAL,
+                tri_mean REAL,
+                terrain_class TEXT,
+                ndvi_mean REAL,
+                tree_count INTEGER DEFAULT 0,
+                tree_canopy_sqm REAL DEFAULT 0,
+                tree_mean_height_m REAL,
+                tree_stem_volume_m3 REAL DEFAULT 0,
+                net_volume_change_m3 REAL,
+                temporal_stability REAL,
+                new_building_count INTEGER DEFAULT 0,
+                infrastructure_count INTEGER DEFAULT 0,
+                -- building aggregates (from building_footprints + new_buildings)
+                building_mean_height_m REAL,
+                building_max_height_m REAL,
+                building_stories_mean REAL,
+                building_stories_max INTEGER,
+                building_pitched_pct REAL,
+                new_building_mean_height_m REAL,
+                new_building_stories_mean REAL,
+                -- SAR
+                sar_vv_mean_db REAL,
+                sar_vh_mean_db REAL,
+                -- NDVI harmonics
+                ndvi_harm_mean REAL,
+                ndvi_harm_amplitude REAL,
+                ndvi_harm_phase REAL,
+                -- temporal change
+                dtm_change_mean_m REAL,
+                n_changed_segments INTEGER,
+                total_disturbed_volume_m3 REAL,
+                -- phenology
+                phenology_dominant TEXT,
+                -- coverage
+                n_tiles INTEGER,
+                building_height_coverage_pct REAL,
+                -- classification
+                mean_confidence REAL,
+                rf_classified_pct REAL,
+                rf_mean_confidence REAL,
+                rf_diverged_count INTEGER DEFAULT 0,
+                rf_diverged_pct REAL,
+                --
+                quality_score REAL,
+                quality_grade TEXT,
+                zenodo_json_url TEXT,
+                zenodo_json_size INTEGER,
+                zenodo_light_gpkg_url TEXT,
+                zenodo_light_gpkg_size INTEGER,
+                zenodo_full_gpkg_url TEXT,
+                zenodo_full_gpkg_size INTEGER,
+                zenodo_depo_id INTEGER,
+                -- v2 products (segv2 upgrade / fresh v2 KGs)
+                product_version TEXT,
+                zenodo_json_v2_url TEXT,
+                zenodo_json_v2_size INTEGER,
+                zenodo_light_gpkg_v2_url TEXT,
+                zenodo_light_gpkg_v2_size INTEGER
+            )''',
+            # === Per-type landcover breakdown ===
+            '''CREATE TABLE IF NOT EXISTS kg_landcover (
+                kg_code TEXT NOT NULL,
+                object_type TEXT NOT NULL,
+                area_sqm REAL DEFAULT 0,
+                fraction REAL DEFAULT 0,
+                n_objects INTEGER DEFAULT 0,
+                height_min REAL, height_max REAL, height_mean REAL, height_p90 REAL,
+                PRIMARY KEY (kg_code, object_type)
+            )''',
+            # === Hansen forest loss by year ===
+            '''CREATE TABLE IF NOT EXISTS kg_hansen (
+                kg_code TEXT NOT NULL,
+                loss_year INTEGER NOT NULL,
+                loss_pixels INTEGER DEFAULT 0,
+                PRIMARY KEY (kg_code, loss_year)
+            )''',
+            # === Per-type classification stats (RF vs final) ===
+            '''CREATE TABLE IF NOT EXISTS kg_classification (
+                kg_code TEXT NOT NULL,
+                object_type TEXT NOT NULL,
+                rf_mean_confidence REAL,
+                rf_min_confidence REAL,
+                rf_count INTEGER DEFAULT 0,
+                diverged_count INTEGER DEFAULT 0,
+                area_sqm REAL DEFAULT 0,
+                PRIMARY KEY (kg_code, object_type)
+            )''',
+            # === RF divergence pairs (rf_type→final_type) ===
+            '''CREATE TABLE IF NOT EXISTS kg_divergence (
+                kg_code TEXT NOT NULL,
+                rf_type TEXT NOT NULL,
+                final_type TEXT NOT NULL,
+                count INTEGER DEFAULT 0,
+                PRIMARY KEY (kg_code, rf_type, final_type)
+            )''',
+            # === Per-type top segments (top 50 per type per KG) ===
+            '''CREATE TABLE IF NOT EXISTS kg_type_top (
+                kg_code TEXT NOT NULL,
+                object_type TEXT NOT NULL,
+                rank INTEGER NOT NULL,
+                lon REAL,
+                lat REAL,
+                area_sqm REAL,
+                height_max_m REAL,
+                height_mean_m REAL,
+                volume_change_m3 REAL,
+                rf_confidence REAL,
+                confidence REAL,
+                PRIMARY KEY (kg_code, object_type, rank)
+            )''',
+            # === Per-building detail (from JSON building_footprints.details) ===
+            '''CREATE TABLE IF NOT EXISTS kg_buildings (
+                kg_code TEXT NOT NULL,
+                ns INTEGER,
+                roof_type_hint TEXT,
+                max_height_m REAL,
+                mean_height_m REAL,
+                stories_est INTEGER,
+                centroid_lon REAL,
+                centroid_lat REAL,
+                centroid_dtm_m REAL
+            )''',
+            'CREATE INDEX IF NOT EXISTS idx_bld_kg ON kg_buildings(kg_code)',
+            'CREATE INDEX IF NOT EXISTS idx_bld_roof ON kg_buildings(roof_type_hint)',
+            'CREATE INDEX IF NOT EXISTS idx_bld_stories ON kg_buildings(stories_est)',
+            'CREATE INDEX IF NOT EXISTS idx_bld_height ON kg_buildings(max_height_m)',
+            'CREATE INDEX IF NOT EXISTS idx_bld_kg_roof_stories ON kg_buildings(kg_code, roof_type_hint, stories_est)',
+            'CREATE INDEX IF NOT EXISTS idx_bld_kg_loc ON kg_buildings(kg_code, centroid_lon, centroid_lat)',
+            # (kg_parcels / kg_fp_match dropped 2026-10-13 —
+            #  Kataster purge, docs/kataster-purge.md)
+            # === Sampled tree apices (legacy, frozen) ===
+            # Sampled apices (≤5 tallest per former cadastre parcel, h >=
+            # KG_TREES_MIN_H) ingested before the Kataster purge. No longer
+            # written; the full apex set lives in the light GPKG / cells API.
+            '''CREATE TABLE IF NOT EXISTS kg_trees (
+                kg_code TEXT NOT NULL,
+                lon REAL NOT NULL,
+                lat REAL NOT NULL,
+                h_m REAL NOT NULL,
+                crown_d_m REAL,
+                rf_conf REAL
+            )''',
+            'CREATE INDEX IF NOT EXISTS idx_trees_kg_lon ON kg_trees(kg_code, lon)',
+            # === Index metadata ===
+            '''CREATE TABLE IF NOT EXISTS index_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )''',
+            # === R-tree spatial index ===
+            '''CREATE VIRTUAL TABLE IF NOT EXISTS kg_rtree USING rtree(
+                id, min_lon, max_lon, min_lat, max_lat
+            )''',
+            # === FTS5 text search ===
+            '''CREATE VIRTUAL TABLE IF NOT EXISTS fts_kg USING fts5(
+                kg_code, kg_name, gemeinde_name, district_name, state_name,
+                tokenize="unicode61 remove_diacritics 2"
+            )''',
+            # === Indexes ===
+            'CREATE INDEX IF NOT EXISTS idx_kg_gemeinde ON kg(gemeinde_code)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_district ON kg(district_code)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_state ON kg(state_code)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_processed ON kg(processed)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_dominant ON kg(dominant_type)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_quality ON kg(quality_score)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_year ON kg(primary_year)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_tree_count ON kg(tree_count)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_new_bldg ON kg(new_building_count)',
+            'CREATE INDEX IF NOT EXISTS idx_lc_type ON kg_landcover(object_type)',
+            'CREATE INDEX IF NOT EXISTS idx_hansen_year ON kg_hansen(loss_year)',
+            'CREATE INDEX IF NOT EXISTS idx_cls_type ON kg_classification(object_type)',
+            'CREATE INDEX IF NOT EXISTS idx_div_rf ON kg_divergence(rf_type)',
+            'CREATE INDEX IF NOT EXISTS idx_div_final ON kg_divergence(final_type)',
+            # === Per-type top segment indexes ===
+            'CREATE INDEX IF NOT EXISTS idx_ktt_type ON kg_type_top(object_type)',
+            'CREATE INDEX IF NOT EXISTS idx_ktt_type_height ON kg_type_top(object_type, height_max_m DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_ktt_type_area ON kg_type_top(object_type, area_sqm DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_ktt_type_volume ON kg_type_top(object_type, volume_change_m3)',
+            'CREATE INDEX IF NOT EXISTS idx_ktt_type_rf_conf ON kg_type_top(object_type, rf_confidence DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_ktt_type_conf ON kg_type_top(object_type, confidence DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_diverged ON kg(rf_diverged_pct)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_confidence ON kg(mean_confidence)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_rf_confidence ON kg(rf_mean_confidence)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_roughness ON kg(roughness_mean)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_steepness_max ON kg(steepness_max_deg)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_elev_range ON kg(elevation_range_m)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_tri ON kg(tri_mean)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_terrain_class ON kg(terrain_class)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_bldg_max_height ON kg(building_max_height_m)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_bldg_stories ON kg(building_stories_mean)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_bldg_pitched ON kg(building_pitched_pct)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_infrastructure ON kg(infrastructure_count)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_tree_volume ON kg(tree_stem_volume_m3)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_vol_change ON kg(net_volume_change_m3)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_changed_segs ON kg(n_changed_segments)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_disturbed_vol ON kg(total_disturbed_volume_m3)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_temporal_stab ON kg(temporal_stability)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_ndvi ON kg(ndvi_mean)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_ndvi_harm ON kg(ndvi_harm_mean)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_sar_vv ON kg(sar_vv_mean_db)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_sar_vh ON kg(sar_vh_mean_db)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_phenology ON kg(phenology_dominant)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_total_area ON kg(total_area_sqm)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_n_segments ON kg(n_segments)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_elev_min ON kg(elevation_min_m)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_elev_max ON kg(elevation_max_m)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_rf_classified ON kg(rf_classified_pct)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_bldg_ht_cov ON kg(building_height_coverage_pct)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_shannon ON kg(shannon_diversity)',
+            'CREATE INDEX IF NOT EXISTS idx_kg_veg_frac ON kg(vegetated_fraction)',
+        ]
+
+    def _migrate(self):
+        c = self._conn()
+        for s in self._schema_stmts():
+            try:
+                c.execute(s)
+            except Exception as e:
+                log.warning('migrate: %s: %s', s[:60], e)
+        # Add classification columns to existing kg table (idempotent)
+        for col, ctype, default in [
+            ('mean_confidence', 'REAL', None),
+            ('rf_classified_pct', 'REAL', None),
+            ('rf_mean_confidence', 'REAL', None),
+            ('rf_diverged_count', 'INTEGER', 0),
+            ('rf_diverged_pct', 'REAL', None),
+        ]:
+            try:
+                dflt = f' DEFAULT {default}' if default is not None else ''
+                c.execute(f'ALTER TABLE kg ADD COLUMN {col} {ctype}{dflt}')
+            except Exception:
+                pass  # column already exists
+        # Add terrain detail columns (idempotent)
+        for col, ctype, default in [
+            ('roughness_mean', 'REAL', None),
+            ('steepness_max_deg', 'REAL', None),
+            ('elevation_range_m', 'REAL', None),
+        ]:
+            try:
+                dflt = f' DEFAULT {default}' if default is not None else ''
+                c.execute(f'ALTER TABLE kg ADD COLUMN {col} {ctype}{dflt}')
+            except Exception:
+                pass  # column already exists
+        # Add area_sqm to kg_classification (idempotent)
+        for col, ctype, default in [
+            ('area_sqm', 'REAL', 0),
+        ]:
+            try:
+                dflt = f' DEFAULT {default}' if default is not None else ''
+                c.execute(f'ALTER TABLE kg_classification ADD COLUMN {col} {ctype}{dflt}')
+            except Exception:
+                pass
+        # Add terrain enrichment columns (idempotent)
+        for col, ctype, default in [
+            ('tri_mean', 'REAL', None),
+            ('terrain_class', 'TEXT', None),
+        ]:
+            try:
+                dflt = f' DEFAULT {default}' if default is not None else ''
+                c.execute(f'ALTER TABLE kg ADD COLUMN {col} {ctype}{dflt}')
+            except Exception:
+                pass  # column already exists
+        # v2 product columns (idempotent)
+        for col, ctype in [
+            ('product_version', 'TEXT'),
+            ('zenodo_json_v2_url', 'TEXT'),
+            ('zenodo_json_v2_size', 'INTEGER'),
+            ('zenodo_light_gpkg_v2_url', 'TEXT'),
+            ('zenodo_light_gpkg_v2_size', 'INTEGER'),
+            # Upload timestamps (ISO, from the Zenodo manifest) so the
+            # progress indicators can derive fresh-completion and
+            # upgrade rates from the index instead of re-scanning the
+            # manifest (and double-counting split blocks / re-upgrades).
+            ('json_uploaded_at', 'TEXT'),
+            ('json_v2_uploaded_at', 'TEXT'),
+        ]:
+            try:
+                c.execute(f'ALTER TABLE kg ADD COLUMN {col} {ctype}')
+            except Exception:
+                pass  # column already exists
+        # Re-run indexes that may have failed before ALTER TABLE
+        for s in self._schema_stmts():
+            if 'CREATE INDEX' in s:
+                try:
+                    c.execute(s)
+                except Exception:
+                    pass
+        c.commit()
+
+    # ── Kataster purge (docs/kataster-purge.md Step 3) ───────────────
+    KATASTER_PURGE_KEY = 'kataster_purge'
+    KATASTER_PURGE_VERSION = '2026-10-13'
+
+    def apply_kataster_purge(self):
+        """Drop the parcel-keyed tables / columns in ONE write transaction
+        (WAL readers keep their snapshot). Idempotent: skips objects that
+        are already gone. Records ``index_meta[kataster_purge]``. Does NOT
+        touch ``schema_version`` — a full rebuild is neither needed nor
+        wanted (it would take hours). Call once, from the primary, after
+        the Step-2 code (no writers) is live. Returns a summary dict.
+        """
+        c = self._conn()
+        with self._write_lock:
+            tables = {r[0] for r in c.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            def cols(t):
+                return {r[1] for r in c.execute(f'PRAGMA table_info({t})')}
+            dropped = {'tables': [], 'columns': []}
+            c.execute('BEGIN IMMEDIATE')
+            try:
+                for t in ('kg_parcels', 'kg_fp_match'):
+                    if t in tables:
+                        c.execute(f'DROP TABLE {t}')
+                        dropped['tables'].append(t)
+                # indexes on the doomed columns must go first (DROP COLUMN
+                # refuses otherwise)
+                for ix in ('idx_kg_parcel_count', 'idx_kg_bldg_footprint',
+                           'idx_kg_new_bldg_fp'):
+                    c.execute(f'DROP INDEX IF EXISTS {ix}')
+                for t, cs in (('kg_trees', ('parcel_id',)),
+                              ('kg_buildings', ('building_id', 'footprint_id', 'footprint_area_sqm')),
+                              ('kg', ('parcel_count', 'building_footprint_sqm',
+                                      'new_building_footprint_sqm'))):
+                    if t not in tables:
+                        continue
+                    have = cols(t)
+                    for col in cs:
+                        if col in have:
+                            c.execute(f'ALTER TABLE {t} DROP COLUMN {col}')
+                            dropped['columns'].append(f'{t}.{col}')
+                c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                          (self.KATASTER_PURGE_KEY, self.KATASTER_PURGE_VERSION))
+                c.execute('COMMIT')
+            except Exception:
+                c.execute('ROLLBACK')
+                raise
+        log.info('search index: kataster purge applied: %s', dropped)
+        return dropped
+
+    # ════════════════════════════════════════════════════════════════
+    # Build / Update
+    # ════════════════════════════════════════════════════════════════
+
+    # Bumping this string forces a full rebuild on the next call to
+    # build() — use it when the schema or enrichment logic changes.
+    SCHEMA_VERSION = '2026-10-06-sar-db'
+
+    def build(self, kg_list_path='data/austria_processor/kg_list.json',
+              json_dir='data/austria_processor/json',
+              manifest_path='data/austria_processor/zenodo_manifest.json',
+              force=False):
+        """Build or refresh the index.
+
+        Default is **incremental**: if the on-disk index already has
+        the current schema version and roughly the right KG row count,
+        we only re-enrich JSONs whose mtime changed since the last
+        sweep. The full drop-and-recreate path runs only when:
+
+        * ``force=True`` (admin-triggered ``/api/v1/index/rebuild``),
+        * the schema version on disk doesn't match ``SCHEMA_VERSION``,
+        * the ``kg`` table is empty / missing, or
+        * the kg-list file size has grown by >10% since last build
+          (new KGs added to the corpus).
+
+        This avoids the multi-GB memory spike on every srv restart
+        that historically tripped MemoryMax=4G and recycled workers.
+        Completes in <2s for a full rebuild of 7850 KGs.
+        """
+        t0 = time.time()
+        # File lock prevents concurrent rebuilds across gunicorn workers
+        lock_fd = open(self._file_lock_path, 'w')
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            if not force and self._can_skip_full_rebuild(kg_list_path):
+                return self._build_incremental(
+                    kg_list_path, json_dir, manifest_path, t0)
+            return self._build_inner(kg_list_path, json_dir, manifest_path, t0)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+
+    def _can_skip_full_rebuild(self, kg_list_path: str) -> bool:
+        """Decide whether the on-disk index is good enough to skip the
+        full DROP+CREATE pass. See ``build()`` for the rules."""
+        try:
+            c = self._conn()
+            # Tables must exist
+            row = c.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='index_meta'").fetchone()
+            if not row:
+                return False
+            meta = {r[0]: r[1] for r in
+                    c.execute('SELECT key, value FROM index_meta')}
+            if meta.get('schema_version') != self.SCHEMA_VERSION:
+                log.info('🔍 Search index: schema_version mismatch '
+                         '(%s != %s) — forcing full rebuild',
+                         meta.get('schema_version'), self.SCHEMA_VERSION)
+                return False
+            row_count = c.execute('SELECT COUNT(*) FROM kg').fetchone()[0]
+            if row_count == 0:
+                return False
+            # Detect kg_list growth (new KGs appended) — use file size as
+            # a cheap proxy. Force rebuild if size grew by >10%.
+            try:
+                sz = Path(kg_list_path).stat().st_size if Path(kg_list_path).exists() else 0
+            except Exception:
+                sz = 0
+            prev_sz = int(meta.get('kg_list_size') or 0)
+            if sz and prev_sz and sz > prev_sz * 1.10:
+                log.info('🔍 Search index: kg_list size grew %d → %d bytes '
+                         '(>10%%) — forcing full rebuild', prev_sz, sz)
+                return False
+            return True
+        except Exception as e:
+            log.warning('Search index: could not inspect existing db (%s); '
+                        'falling back to full rebuild', e)
+            return False
+
+    def _build_incremental(self, kg_list_path, json_dir, manifest_path, t0):
+        """Incremental refresh: only re-enrich JSONs whose mtime changed
+        since the last sweep. Schema/tables are left intact — this is the
+        common case on srv restarts and it costs ~0 RAM/CPU when no
+        JSONs changed.
+
+        State: ``index_meta['json_mtimes_at']`` stores the wall-clock
+        time of the last sweep; we treat that as a high-water mark and
+        re-enrich any JSON whose mtime is newer.
+        """
+        from pathlib import Path as _Path
+        import json as _json
+        c = self._conn()
+        meta = {r[0]: r[1] for r in
+                c.execute('SELECT key, value FROM index_meta')}
+        last_sweep = float(meta.get('json_mtimes_at') or 0)
+        json_dir_p = _Path(json_dir)
+        n_changed = 0
+        max_mtime = last_sweep
+        if json_dir_p.exists():
+            manifest = {}
+            mp = _Path(manifest_path)
+            if mp.exists():
+                try:
+                    md = _json.loads(mp.read_text())
+                    manifest = md.get('entries', md)
+                except Exception:
+                    pass
+            # Group changed files by parent KG so split-KG retries refresh
+            # the parent row exactly once — not once per block.
+            _changed_parents = {}  # parent_code -> changed_block_code
+            for jf in json_dir_p.glob('*.json'):
+                try:
+                    mt = jf.stat().st_mtime
+                except OSError:
+                    continue
+                if mt > max_mtime:
+                    max_mtime = mt
+                if mt <= last_sweep:
+                    continue
+                code = jf.stem
+                base = code.split('-', 1)[0] if '-' in code else code
+                if not base.isdigit():
+                    continue
+                # Remember the most-specific code for manifest URL writing.
+                _changed_parents[base] = code
+            for base, code in _changed_parents.items():
+                try:
+                    jp = json_dir_p / f'{code}.json'
+                    self.update_kg(code, json_path=str(jp), manifest=manifest)
+                    n_changed += 1
+                except Exception as e:
+                    log.warning('incremental update %s: %s', code, e)
+        # Update sweep timestamp + bookkeeping
+        with self._write_lock:
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      ('json_mtimes_at', str(max_mtime)))
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      ('last_incremental_at',
+                       time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
+            c.commit()
+        elapsed = time.time() - t0
+        log.info('🔍 Search index: incremental refresh — %d KG(s) '
+                 're-enriched in %.2fs (skipped full rebuild)',
+                 n_changed, elapsed)
+        return None
+
+    def _build_inner(self, kg_list_path, json_dir, manifest_path, t0):
+        with self._write_lock:
+            c = self._conn()
+            # Explicit BEGIN: Python's legacy transaction control would
+            # otherwise autocommit the DDL below (DROP/CREATE) and expose
+            # an empty index to every reader for the whole build.
+            c.execute('BEGIN')
+            # Drop and recreate — ensures schema changes are picked up
+            for t in ('kg', 'kg_landcover', 'kg_hansen', 'kg_classification', 'kg_divergence', 'kg_type_top', 'kg_buildings', 'kg_trees', 'index_meta'):
+                c.execute(f'DROP TABLE IF EXISTS {t}')
+            for t in ('kg_rtree', 'fts_kg'):
+                c.execute(f'DROP TABLE IF EXISTS {t}')
+            # NO commit here: the whole rebuild (drop → schema → rows →
+            # enrichment) is ONE WAL transaction, so every other reader
+            # (other threads, the other gunicorn worker, srv_public) keeps
+            # the previous snapshot until the final commit. Committing
+            # right after DROP made the public tier 500 for the full
+            # 20-min rebuild (2026-10-04). Enrichment helpers must not
+            # commit either (they don't — only update_kg/sync do, and
+            # those are serialised behind _write_lock).
+            # Recreate tables with current schema (inline, same connection)
+            for s in self._schema_stmts():
+                try:
+                    c.execute(s)
+                except Exception as e:
+                    log.warning('build schema: %s: %s', s[:60], e)
+
+            # Load sources
+            kg_list = json.loads(Path(kg_list_path).read_text()) if Path(kg_list_path).exists() else []
+            manifest = {}
+            if Path(manifest_path).exists():
+                md = json.loads(Path(manifest_path).read_text())
+                manifest = md.get('entries', md)
+
+            # Index all KGs from kg_list
+            kg_rows = []
+            fts_rows = []
+            rtree_rows = []
+
+            for i, kg in enumerate(kg_list):
+                code = kg['kg_code']
+                gc = kg.get('gemeinde_code', '')
+                sc = gc[:1] if gc else ''
+                dc = gc[:3] if len(gc) >= 3 else ''
+                sn = kg.get('state_name', STATE_CODES.get(sc, ''))
+                dn = kg.get('district_name', DISTRICT_NAMES.get(dc, ''))
+                bb = kg.get('bbox', {})
+                mn_lon = bb.get('min_lon', 0)
+                mn_lat = bb.get('min_lat', 0)
+                mx_lon = bb.get('max_lon', 0)
+                mx_lat = bb.get('max_lat', 0)
+                cx = kg.get('lon', (mn_lon + mx_lon) / 2 if mn_lon else 0)
+                cy = kg.get('lat', (mn_lat + mx_lat) / 2 if mn_lat else 0)
+
+                # Zenodo links
+                zj = manifest.get(f'{code}_json', {})
+                zl = manifest.get(f'{code}_light_gpkg', {})
+                zf = manifest.get(f'{code}_full_gpkg', {})
+                zj2 = manifest.get(f'{code}_json_v2', {})
+                zl2 = manifest.get(f'{code}_light_gpkg_v2', {})
+
+                kg_rows.append((
+                    code, kg.get('kg_name', ''), gc, kg.get('gemeinde_name', ''),
+                    dc, dn, sc, sn,
+                    mn_lon, mn_lat, mx_lon, mx_lat, cx, cy,
+                    kg.get('building_count', 0),
+                    kg.get('total_area_sqm', 0),
+                    0, None, None,  # processed, generated_at, primary_year
+                    None, None, None, 0,  # landscape
+                    None, None, None, None, None,  # terrain (elev min/max/mean, slope, aspect)
+                    None, None, None,  # terrain detail (roughness, steepness, elev_range)
+                    None, None,  # tri_mean, terrain_class
+                    None,  # ndvi
+                    0, 0, None, 0,  # tree_stats
+                    None, None,  # temporal
+                    0, 0,  # new_building, infrastructure
+                    None, None, None, None, None,  # building aggregates
+                    None, None,  # new_building aggregates
+                    None, None,  # sar
+                    None, None, None,  # ndvi harmonics
+                    None, None, None,  # temporal change
+                    None,  # phenology
+                    None, None,  # coverage
+                    None, None, None, 0, None,  # classification (mean_conf, rf_pct, rf_mean_conf, div_count, div_pct)
+                    None, None,  # quality
+                    _zenodo_url(zj), zj.get('size'),
+                    _zenodo_url(zl), zl.get('size'),
+                    _zenodo_url(zf), zf.get('size'),
+                    zj.get('depo_id') or zl.get('depo_id') or zf.get('depo_id'),
+                    _product_version(zj, zj2),
+                    _zenodo_url(zj2), zj2.get('size'),
+                    _zenodo_url(zl2), zl2.get('size'),
+                ))
+                fts_rows.append((code,
+                    self._normalize_name(kg.get('kg_name', '')),
+                    self._normalize_name(kg.get('gemeinde_name', '')),
+                    self._normalize_name(dn),
+                    self._normalize_name(sn)))
+                rowid = i + 1
+                if mn_lon and mx_lon and mn_lat and mx_lat:
+                    rtree_rows.append((rowid, mn_lon, mx_lon, mn_lat, mx_lat))
+
+            c.executemany(
+                '''INSERT OR REPLACE INTO kg VALUES (
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ''', kg_rows)
+            c.executemany('INSERT INTO fts_kg VALUES (?,?,?,?,?)', fts_rows)
+            c.executemany('INSERT INTO kg_rtree VALUES (?,?,?,?,?)', rtree_rows)
+
+            # Enrich processed KGs from JSON files
+            json_dir_p = Path(json_dir)
+            n_processed = 0
+            _by_parent = {}  # parent_code -> True
+            if json_dir_p.exists():
+                # Group all on-disk JSONs by parent KG so split / maybe-split
+                # KGs (plain + blocks coexisting) get a single coherent row.
+                for jf in json_dir_p.glob('*.json'):
+                    code = jf.stem
+                    _base = code.split('-', 1)[0] if '-' in code else code
+                    if not _base.isdigit():
+                        continue
+                    _by_parent[_base] = True
+            # v2-ingested parents live ONLY in kg_v2_store (their local
+            # JSON was deleted after ingest) — the selector below reads
+            # the store, but we must enumerate them too or a full rebuild
+            # silently drops ~75 % of processed KGs (2026-10-04).
+            try:
+                import kg_v2_store as _kvs
+                for _p in _kvs.all_parents():
+                    if str(_p).isdigit():
+                        _by_parent[str(_p)] = True
+            except Exception as e:
+                log.warning('full build: kg_v2_store parents unavailable: %s', e)
+            if _by_parent:
+                for parent_code in _by_parent:
+                    try:
+                        plain_path, block_list = self._select_kg_files_for_parent(
+                            parent_code, json_dir_p, manifest=manifest)
+                        if not block_list and plain_path is None:
+                            continue
+                        if len(block_list) == 1 and plain_path is not None:
+                            # Single plain file — fast path, avoid aggregator.
+                            self._enrich_kg(c, parent_code, block_list[0][1])
+                        else:
+                            self._enrich_kg_from_blocks(
+                                c, parent_code, block_list)
+                        # Write freshest Zenodo URLs across plain + blocks.
+                        _codes = [parent_code] + [bc for bc, _ in block_list
+                                                   if bc != parent_code]
+                        _write_zenodo_links(c, parent_code, _codes, manifest)
+                        n_processed += 1
+                    except Exception as e:
+                        log.warning('enrich %s: %s', parent_code, e)
+
+            elapsed = time.time() - t0
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      ('built_at', time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      ('build_time_ms', str(int(elapsed * 1000))))
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      ('kg_count', str(len(kg_rows))))
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      ('processed_count', str(n_processed)))
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      ('schema_version', self.SCHEMA_VERSION))
+            try:
+                _kg_size = Path(kg_list_path).stat().st_size if Path(kg_list_path).exists() else 0
+            except Exception:
+                _kg_size = 0
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      ('kg_list_size', str(_kg_size)))
+            # Bump the incremental high-water so subsequent restarts
+            # only re-enrich KGs whose JSONs are newer than "now".
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      ('json_mtimes_at', str(time.time())))
+            c.commit()
+            log.info('🔍 Search index built: %d KGs (%d processed) in %.1fs',
+                     len(kg_rows), n_processed, elapsed)
+
+    @staticmethod
+    def _tri_class(tri):
+        if tri is None: return None
+        if tri < 0.1: return 'level'
+        if tri < 0.3: return 'nearly_level'
+        if tri < 0.8: return 'slightly_rugged'
+        if tri < 1.5: return 'intermediately_rugged'
+        if tri < 3.0: return 'moderately_rugged'
+        if tri < 6.0: return 'highly_rugged'
+        return 'extremely_rugged'
+
+    def _enrich_kg(self, c, code, data):
+        """Enrich a KG row with data from its JSON summary."""
+        ls = data.get('landscape', {})
+        tr = data.get('terrain', {})
+        ts = data.get('tree_stats', {})
+        tc = data.get('temporal_change', {})
+        nd = data.get('ndvi', {})
+        dq = data.get('data_quality', {})
+        op = data.get('observation_period', {})
+        nb = data.get('new_buildings', {})
+        inf = data.get('infrastructure', {})
+        bf = data.get('building_footprints', {})
+        sar = data.get('sar', {})
+        harm = data.get('ndvi_harmonics', {})
+        phen = data.get('phenology', {})
+        cov = data.get('coverage', {})
+        cls = data.get('classification', {})
+
+        # --- Building aggregate stats ---
+        bf_details = bf.get('details', [])
+        bf_heights = [b['max_height_m'] for b in bf_details if b.get('max_height_m')]
+        bf_stories = [b['stories_est'] for b in bf_details if b.get('stories_est')]
+        bf_roofs = [b.get('roof_type_hint') for b in bf_details if b.get('roof_type_hint')]
+
+        nb_features = nb.get('features', [])
+        nb_heights = [b['max_height_m'] for b in nb_features if b.get('max_height_m')]
+        nb_stories = [b['stories_est'] for b in nb_features if b.get('stories_est')]
+
+        # Phenology dominant class
+        phen_dist = phen.get('distribution', {})
+        phen_dominant = max(phen_dist, key=phen_dist.get) if phen_dist else None
+
+        c.execute('''UPDATE kg SET
+            processed=1, generated_at=?, primary_year=?,
+            total_area_sqm=?,
+            dominant_type=?, vegetated_fraction=?, shannon_diversity=?, n_segments=?,
+            building_count=?,
+            elevation_min_m=?, elevation_max_m=?, elevation_mean_m=?,
+            slope_mean_deg=?, aspect_dominant=?,
+            roughness_mean=?, steepness_max_deg=?, elevation_range_m=?,
+            tri_mean=?, terrain_class=?,
+            ndvi_mean=?,
+            tree_count=?, tree_canopy_sqm=?, tree_mean_height_m=?, tree_stem_volume_m3=?,
+            net_volume_change_m3=?, temporal_stability=?,
+            new_building_count=?, infrastructure_count=?,
+            building_mean_height_m=?, building_max_height_m=?,
+            building_stories_mean=?, building_stories_max=?, building_pitched_pct=?,
+            new_building_mean_height_m=?, new_building_stories_mean=?,
+            sar_vv_mean_db=?, sar_vh_mean_db=?,
+            ndvi_harm_mean=?, ndvi_harm_amplitude=?, ndvi_harm_phase=?,
+            dtm_change_mean_m=?, n_changed_segments=?, total_disturbed_volume_m3=?,
+            phenology_dominant=?,
+            n_tiles=?, building_height_coverage_pct=?,
+            mean_confidence=?, rf_classified_pct=?, rf_mean_confidence=?,
+            rf_diverged_count=?, rf_diverged_pct=?,
+            quality_score=?, quality_grade=?
+            WHERE kg_code=?''',
+            (
+                data.get('generated_at'), op.get('primary_year'),
+                data.get('total_area_sqm', 0),
+                ls.get('dominant_type'), ls.get('vegetated_fraction'),
+                ls.get('shannon_diversity'), ls.get('n_segments'),
+                bf.get('count', 0),
+                tr.get('elevation_min_m'), tr.get('elevation_max_m'), tr.get('elevation_mean_m'),
+                tr.get('steepness_mean_deg'), tr.get('aspect_dominant'),
+                tr.get('roughness_mean'), tr.get('steepness_max_deg'), tr.get('elevation_range_m'),
+                tr.get('roughness_mean'), tr.get('terrain_class') or self._tri_class(tr.get('roughness_mean')),
+                nd.get('copernicus_mean') or nd.get('bev_nir_mean'),
+                ts.get('count', 0), ts.get('total_canopy_sqm', 0),
+                ts.get('mean_height_m'), ts.get('est_stem_volume_m3', 0),
+                tc.get('net_volume_change_m3'), tc.get('mean_stability'),
+                nb.get('count', 0), inf.get('total', 0),
+                # building aggregates
+                (sum(bf_heights) / len(bf_heights)) if bf_heights else None,
+                max(bf_heights) if bf_heights else None,
+                (sum(bf_stories) / len(bf_stories)) if bf_stories else None,
+                max(bf_stories) if bf_stories else None,
+                (sum(1 for r in bf_roofs if r == 'pitched') / len(bf_roofs) * 100) if bf_roofs else None,
+                # new building aggregates
+                (sum(nb_heights) / len(nb_heights)) if nb_heights else None,
+                (sum(nb_stories) / len(nb_stories)) if nb_stories else None,
+                # sar
+                _sar_db(sar.get('vv_mean_db')), _sar_db(sar.get('vh_mean_db')),
+                # ndvi harmonics
+                harm.get('mean_mean'), harm.get('amplitude_mean'), harm.get('phase_mean'),
+                # temporal change
+                tc.get('dtm_change_mean_m'), tc.get('n_changed_segments'), tc.get('total_disturbed_volume_m3'),
+                # phenology
+                phen_dominant,
+                # coverage
+                cov.get('n_tiles'), cov.get('building_height_coverage_pct'),
+                # classification
+                cls.get('mean_confidence'), cls.get('rf_classified_pct'),
+                cls.get('rf_mean_confidence'),
+                cls.get('diverged_count', 0), cls.get('diverged_pct'),
+                # quality
+                dq.get('quality_score'), dq.get('quality_grade'),
+                code,
+            ))
+
+        # Landcover breakdown
+        area_sum = data.get('area_summary', {})
+        height_dist = data.get('height_distribution', {})
+        lc_rows = []
+        for otype, info in area_sum.items():
+            hd = height_dist.get(otype, {})
+            lc_rows.append((
+                code, otype,
+                info.get('area_sqm', 0), info.get('fraction', 0), info.get('n_objects', 0),
+                hd.get('min'), hd.get('max'), hd.get('mean'), hd.get('p90'),
+            ))
+        if lc_rows:
+            c.execute('DELETE FROM kg_landcover WHERE kg_code=?', (code,))
+            c.executemany(
+                'INSERT INTO kg_landcover VALUES (?,?,?,?,?,?,?,?,?)', lc_rows)
+
+        # Hansen loss
+        hansen = data.get('hansen', {})
+        loss_by_year = hansen.get('loss_by_year', {})
+        if loss_by_year:
+            c.execute('DELETE FROM kg_hansen WHERE kg_code=?', (code,))
+            h_rows = []
+            for yr, val in loss_by_year.items():
+                try:
+                    px = val.get('pixels', val) if isinstance(val, dict) else val
+                    h_rows.append((code, int(yr), int(px)))
+                except (ValueError, TypeError):
+                    pass
+            if h_rows:
+                c.executemany('INSERT INTO kg_hansen VALUES (?,?,?)', h_rows)
+
+        # Classification per-type confidence + divergence
+        if cls:
+            ptc = cls.get('per_type_confidence', {})
+            if ptc:
+                c.execute('DELETE FROM kg_classification WHERE kg_code=?', (code,))
+                cls_rows = []
+                for otype, info in ptc.items():
+                    cls_rows.append((
+                        code, otype,
+                        info.get('mean'), info.get('min'),
+                        info.get('count', 0),
+                        info.get('diverged_count', 0),
+                        info.get('area_sqm', 0),
+                    ))
+                if cls_rows:
+                    c.executemany(
+                        'INSERT INTO kg_classification VALUES (?,?,?,?,?,?,?)', cls_rows)
+
+            top_div = cls.get('top_divergences', [])
+            if top_div:
+                c.execute('DELETE FROM kg_divergence WHERE kg_code=?', (code,))
+                div_rows = [(code, d['rf_type'], d['final_type'], d['count'])
+                            for d in top_div if d.get('rf_type') and d.get('final_type')]
+                if div_rows:
+                    c.executemany(
+                        'INSERT INTO kg_divergence VALUES (?,?,?,?)', div_rows)
+
+        # Per-type top segments (for cross-KG power queries)
+        top_by_type = data.get('top_by_type', {})
+        if top_by_type:
+            c.execute('DELETE FROM kg_type_top WHERE kg_code=?', (code,))
+            top_rows = []
+            for otype, entries in top_by_type.items():
+                for rank, entry in enumerate(entries, 1):
+                    coord = entry.get('coordinate') or {}
+                    top_rows.append((
+                        code, otype, rank,
+                        coord.get('lon'), coord.get('lat'),
+                        entry.get('area_sqm'),
+                        entry.get('height_max_m'),
+                        entry.get('height_mean_m'),
+                        entry.get('volume_change_m3'),
+                        entry.get('rf_confidence'),
+                        entry.get('confidence'),
+                    ))
+            if top_rows:
+                c.executemany(
+                    'INSERT INTO kg_type_top VALUES (?,?,?,?,?,?,?,?,?,?,?)', top_rows)
+
+        # Per-building details
+        bf = data.get('building_footprints', {})
+        bf_details = bf.get('details', [])
+        if bf_details:
+            c.execute('DELETE FROM kg_buildings WHERE kg_code=?', (code,))
+            bld_rows = []
+            for b in bf_details:
+                centroid = b.get('centroid', {})
+                bld_rows.append((
+                    code,
+                    b.get('ns'),
+                    b.get('roof_type_hint', ''),
+                    b.get('max_height_m'),
+                    b.get('mean_height_m'),
+                    b.get('stories_est'),
+                    centroid.get('lon'),
+                    centroid.get('lat'),
+                    b.get('centroid_dtm_m'),
+                ))
+            if bld_rows:
+                c.executemany(
+                    'INSERT INTO kg_buildings (kg_code, ns, roof_type_hint, '
+                    'max_height_m, mean_height_m, stories_est, '
+                    'centroid_lon, centroid_lat, centroid_dtm_m) '
+                    'VALUES (?,?,?,?,?,?,?,?,?)', bld_rows)
+
+        # Per-parcel ingest (kg_parcels / kg_trees) removed 2026-10-13 —
+        # Kataster purge, docs/kataster-purge.md.
+
+    @staticmethod
+    def _select_kg_files_for_parent(parent_code, json_dir, manifest=None):
+        """Choose the freshest set of JSON files representing this KG.
+
+        Split / maybe-split KGs can have any combination on disk:
+          * `<code>.json`              → single-pass run
+          * `<code>-east.json`, ...    → size-based split
+          * both, when a maybe-split retry replaces only some blocks
+
+        Source of truth for freshness is the **Zenodo manifest's**
+        ``uploaded_at`` for ``<code>_json``, since `generated_at` is
+        only the in-process timestamp and can be older than a later
+        re-upload that fixed something. We fall back to the file's
+        own `generated_at` and finally to mtime.
+
+        Strategy: greedy by timestamp desc — accept a file only when
+        its bbox is not already covered by an accepted, fresher file.
+        Returns ``(plain_path_or_None, [(block_code, data_dict), ...])``
+        with the second list ordered by block code for deterministic
+        aggregation. Either result may be empty.
+        """
+        from pathlib import Path as _P
+        jdir = _P(json_dir)
+        manifest = manifest or {}
+
+        def _ts_for(code, path, data):
+            entry = manifest.get(f'{code}_json') if manifest else None
+            if isinstance(entry, dict):
+                ua = entry.get('uploaded_at') or ''
+                if ua:
+                    return ua
+            ga = data.get('generated_at') or ''
+            if ga:
+                return ga
+            try:
+                import kg_docs as _kd2
+                return _kd2.timestamp(code, jdir)
+            except Exception:
+                return ''
+
+        # Manifest evidence — a successful Zenodo upload is the only
+        # signal that a JSON file represents a *committed* result. We use
+        # it both to pick freshness (uploaded_at) and to discard files
+        # whose corresponding manifest entry is missing or marked as an
+        # error (`<code>_error`).
+        def _has_good_json_entry(code):
+            e = manifest.get(f'{code}_json') if manifest else None
+            if not isinstance(e, dict):
+                return False
+            if 'error' in (e.get('status') or ''):
+                return False
+            return bool(e.get('uploaded_at'))
+
+        def _is_errored(code):
+            err = manifest.get(f'{code}_error') if manifest else None
+            if not isinstance(err, dict):
+                return False
+            err_ts = err.get('uploaded_at') or ''
+            ok = manifest.get(f'{code}_json') if manifest else None
+            ok_ts = ok.get('uploaded_at', '') if isinstance(ok, dict) else ''
+            # An error marker counts only when no successful upload
+            # superseded it.
+            return bool(err_ts) and err_ts > ok_ts
+
+        # Documents come from the v2 blob store first, legacy files second
+        # (kg_docs). ``plain_path`` is kept as a truthy marker for callers.
+        import kg_docs as _kd
+        plain_path = jdir / f'{parent_code}.json'
+        plain_data = None; plain_ts = ''
+        _plain_present, _block_codes = _kd.codes_for_parent(parent_code, jdir)
+        if _plain_present and not _is_errored(parent_code):
+            plain_data = _kd.load(parent_code, jdir)
+            if plain_data is not None:
+                plain_ts = _ts_for(parent_code, plain_path, plain_data)
+        block_entries = []   # (ts, path, code, data)
+        for stem in _block_codes:
+            if _is_errored(stem):
+                continue
+            d = _kd.load(stem, jdir)
+            if d is None:
+                continue
+            bp = jdir / f'{stem}.json'
+            block_entries.append((_ts_for(stem, bp, d), bp, stem, d))
+
+        # If the manifest has *_json evidence on only one side, that side
+        # wins outright — the other side's local files are stale leftovers
+        # from an attempt that never completed (no Zenodo upload).
+        plain_committed = _has_good_json_entry(parent_code)
+        block_committed = any(_has_good_json_entry(b[2]) for b in block_entries)
+        if plain_committed and not block_committed:
+            if plain_data is not None:
+                return (plain_path, [(parent_code, plain_data)])
+        elif block_committed and not plain_committed:
+            plain_data = None
+
+        # Otherwise pick the side with the freshest timestamp.
+        newest_block_ts = max((b[0] for b in block_entries), default='')
+        if plain_data is not None and (plain_ts >= newest_block_ts or not block_entries):
+            return (plain_path, [(parent_code, plain_data)])
+        if block_entries:
+            block_list = sorted([(c, d) for _, _, c, d in block_entries],
+                                 key=lambda x: x[0])
+            return (None, block_list)
+        return (None, [])
+
+    def _enrich_kg_from_blocks(self, c, parent_code, block_list):
+        """Aggregate multiple block JSONs into the parent KG row."""
+        if not block_list:
+            return
+        merged = self._merge_block_data(parent_code, block_list)
+        self._enrich_kg(c, parent_code, merged)
+
+    def _merge_block_data(self, parent_code, block_list):
+        """Aggregate multiple block JSONs into a JSON-shape dict.
+
+        Each block_list entry is (block_code, data_dict). Merges ALL
+        data — area summaries, terrain, NDVI, SAR, Hansen, buildings,
+        classification, phenology, etc. — so the result looks
+        exactly as if processed in one pass. Used both for indexing
+        and for serving `/api/v1/kg/<code>` on split KGs.
+        """
+        if not block_list:
+            return {}
+
+        block_list = sorted(block_list, key=lambda x: x[0])
+
+        # ── helpers ──────────────────────────────────────────────
+        def _wavg(key_path):
+            """Area-weighted average of a nested numeric field."""
+            vals = []
+            for _, d in block_list:
+                v = d
+                for k in key_path:
+                    v = v.get(k) if isinstance(v, dict) else None
+                    if v is None:
+                        break
+                area = d.get('total_area_sqm', 1)
+                if v is not None and isinstance(v, (int, float)):
+                    vals.append((v, area))
+            if not vals:
+                return None
+            return round(sum(v * w for v, w in vals) / sum(w for _, w in vals), 4)
+
+        def _sum(key_path):
+            total = 0
+            for _, d in block_list:
+                v = d
+                for k in key_path:
+                    v = v.get(k) if isinstance(v, dict) else None
+                    if v is None:
+                        break
+                if v is not None and isinstance(v, (int, float)):
+                    total += v
+            return total
+
+        def _min_val(key_path):
+            vals = [v for v in (_deep(d, key_path) for _, d in block_list)
+                    if v is not None and isinstance(v, (int, float))]
+            return min(vals) if vals else None
+
+        def _max_val(key_path):
+            vals = [v for v in (_deep(d, key_path) for _, d in block_list)
+                    if v is not None and isinstance(v, (int, float))]
+            return max(vals) if vals else None
+
+        def _deep(d, key_path):
+            for k in key_path:
+                d = d.get(k) if isinstance(d, dict) else None
+                if d is None:
+                    return None
+            return d
+
+        def _any_val(key_path):
+            """First non-None value across blocks."""
+            for _, d in block_list:
+                v = _deep(d, key_path)
+                if v is not None:
+                    return v
+            return None
+
+        # ── scaffold from last block ─────────────────────────────
+        _, last_data = block_list[-1]
+        merged = {}  # build from scratch, not shallow copy
+
+        # Top-level
+        total_area = _sum(['total_area_sqm'])
+        merged['total_area_sqm'] = total_area
+        merged['generated_at'] = _any_val(['generated_at'])
+        merged['observation_period'] = _any_val(['observation_period']) or {}
+
+        # (parcels: not merged any more — Kataster purge 2026-10-13,
+        # docs/kataster-purge.md; 2.4 products carry none.)
+
+        # ── buildings (concatenate + dedupe by building_id) ──────
+        # Same boundary-straddle issue: kg_buildings has no PK, so
+        # duplicates silently double-count instead of erroring.
+        _blds_by_id = {}
+        _bld_order = []
+        for _, d in block_list:
+            _bfd = d.get('building_footprints')
+            if not isinstance(_bfd, dict):
+                _bfd = {}  # legacy empty-list shape
+            for b in _bfd.get('details', []):
+                bid = b.get('building_id', '')
+                prev = _blds_by_id.get(bid)
+                if prev is None:
+                    _blds_by_id[bid] = b
+                    _bld_order.append(bid)
+                elif (float(b.get('footprint_area_sqm') or 0)
+                        > float(prev.get('footprint_area_sqm') or 0)):
+                    _blds_by_id[bid] = b
+        all_bf_details = [_blds_by_id[bid] for bid in _bld_order]
+        merged['building_footprints'] = {
+            'count': len(all_bf_details),
+            'details': all_bf_details,
+        }
+
+        # ── new buildings (concatenate features) ─────────────────
+        all_nb = []
+        for _, d in block_list:
+            _nb = d.get('new_buildings')
+            if isinstance(_nb, dict):
+                all_nb.extend(_nb.get('features', []))
+            elif isinstance(_nb, list):
+                all_nb.extend(_nb)  # legacy flat-list shape
+        merged['new_buildings'] = {
+            'count': len(all_nb),
+            'features': all_nb,
+        }
+
+        # ── infrastructure ───────────────────────────────────────
+        # Source per-block format is {total, by_type:{<typ>:{count,total_area_sqm,features}}}.
+        # Concatenate features per type, sum counts/areas; recompute total.
+        merged_inf_by_type = {}
+        for _, d in block_list:
+            inf = d.get('infrastructure')
+            if not isinstance(inf, dict):
+                inf = {}  # legacy empty-list shape
+            for typ, info in (inf.get('by_type') or {}).items():
+                if typ not in merged_inf_by_type:
+                    merged_inf_by_type[typ] = {
+                        'count': 0, 'total_area_sqm': 0.0, 'features': [],
+                    }
+                m = merged_inf_by_type[typ]
+                m['count'] += info.get('count', 0) or 0
+                m['total_area_sqm'] += info.get('total_area_sqm', 0) or 0
+                m['features'].extend(info.get('features', []) or [])
+            # Older block JSONs may have flat features only — keep them too.
+            for f in (inf.get('features') or []):
+                typ = f.get('type', 'unknown')
+                if typ not in merged_inf_by_type:
+                    merged_inf_by_type[typ] = {'count': 0, 'total_area_sqm': 0.0, 'features': []}
+                merged_inf_by_type[typ]['features'].append(f)
+                merged_inf_by_type[typ]['count'] += 1
+                merged_inf_by_type[typ]['total_area_sqm'] += f.get('area_sqm', 0) or 0
+        for typ, m in merged_inf_by_type.items():
+            m['total_area_sqm'] = round(m['total_area_sqm'], 1)
+        merged['infrastructure'] = {
+            'total': sum(m['count'] for m in merged_inf_by_type.values()),
+            'by_type': merged_inf_by_type,
+        }
+
+        # ── landscape ────────────────────────────────────────────
+        merged['landscape'] = {
+            'dominant_type': _any_val(['landscape', 'dominant_type']),
+            'vegetated_fraction': _wavg(['landscape', 'vegetated_fraction']),
+            'shannon_diversity': _wavg(['landscape', 'shannon_diversity']),
+            'n_segments': _sum(['landscape', 'n_segments']),
+            'edge_density': _wavg(['landscape', 'edge_density']),
+            'mean_segment_area_sqm': _wavg(['landscape', 'mean_segment_area_sqm']),
+            'is_vegetated': _any_val(['landscape', 'is_vegetated']),
+        }
+        # Pass-through landscape.terrain (if blocks include it) — use freshest.
+        _lt = _any_val(['landscape', 'terrain'])
+        if _lt is not None:
+            merged['landscape']['terrain'] = _lt
+
+        # ── area_summary (merge by type) ─────────────────────────
+        merged_area_sum = {}
+        merged_height_dist = {}
+        # Track count-weighted means for height_distribution
+        for _, d in block_list:
+            for otype, info in d.get('area_summary', {}).items():
+                if otype not in merged_area_sum:
+                    merged_area_sum[otype] = {'pixels': 0, 'area_sqm': 0,
+                                              'n_objects': 0,
+                                              'observation_period': info.get('observation_period')}
+                merged_area_sum[otype]['pixels'] += info.get('pixels', 0) or 0
+                merged_area_sum[otype]['area_sqm'] += info.get('area_sqm', 0) or 0
+                merged_area_sum[otype]['n_objects'] += info.get('n_objects', 0) or 0
+                if info.get('observation_period') and not merged_area_sum[otype].get('observation_period'):
+                    merged_area_sum[otype]['observation_period'] = info['observation_period']
+            for otype, hd in d.get('height_distribution', {}).items():
+                if otype not in merged_height_dist:
+                    merged_height_dist[otype] = {
+                        'min': None, 'max': None, 'p90': None,
+                        '_mean_wsum': 0.0, '_count': 0,
+                        '_p90_wsum': 0.0,
+                    }
+                mhd = merged_height_dist[otype]
+                cnt = hd.get('count', 0) or 0
+                mhd['_count'] += cnt
+                if hd.get('min') is not None:
+                    mhd['min'] = hd['min'] if mhd['min'] is None else min(mhd['min'], hd['min'])
+                if hd.get('max') is not None:
+                    mhd['max'] = hd['max'] if mhd['max'] is None else max(mhd['max'], hd['max'])
+                if hd.get('mean') is not None and cnt > 0:
+                    mhd['_mean_wsum'] += hd['mean'] * cnt
+                if hd.get('p90') is not None and cnt > 0:
+                    mhd['_p90_wsum'] += hd['p90'] * cnt
+        if total_area > 0:
+            for otype in merged_area_sum:
+                merged_area_sum[otype]['fraction'] = round(
+                    merged_area_sum[otype]['area_sqm'] / total_area, 4)
+        merged['area_summary'] = merged_area_sum
+        for otype, hd in merged_height_dist.items():
+            cnt = hd['_count']
+            hd['count'] = cnt
+            if cnt > 0:
+                hd['mean'] = round(hd['_mean_wsum'] / cnt, 2)
+                hd['p90'] = round(hd['_p90_wsum'] / cnt, 2)
+            del hd['_mean_wsum']; del hd['_p90_wsum']; del hd['_count']
+        merged['height_distribution'] = merged_height_dist
+
+        # ── terrain (weighted averages + min/max extremes) ───────
+        # Area-weighted aspect_distribution_pct + slope_classes_pct.
+        _aspect_acc = {}
+        _slope_acc = {}
+        _aspect_w = 0.0
+        _slope_w = 0.0
+        for _, d in block_list:
+            tw = d.get('total_area_sqm', 0) or 0
+            ad = (d.get('terrain', {}) or {}).get('aspect_distribution_pct') or {}
+            if ad and tw > 0:
+                for k, v in ad.items():
+                    _aspect_acc[k] = _aspect_acc.get(k, 0.0) + (v or 0) * tw
+                _aspect_w += tw
+            sd = (d.get('terrain', {}) or {}).get('slope_classes_pct') or {}
+            if sd and tw > 0:
+                for k, v in sd.items():
+                    _slope_acc[k] = _slope_acc.get(k, 0.0) + (v or 0) * tw
+                _slope_w += tw
+        merged['terrain'] = {
+            'elevation_min_m': _min_val(['terrain', 'elevation_min_m']),
+            'elevation_max_m': _max_val(['terrain', 'elevation_max_m']),
+            'elevation_mean_m': _wavg(['terrain', 'elevation_mean_m']),
+            'elevation_range_m': None,  # computed below
+            'steepness_mean_deg': _wavg(['terrain', 'steepness_mean_deg']),
+            'steepness_max_deg': _max_val(['terrain', 'steepness_max_deg']),
+            'aspect_dominant': _any_val(['terrain', 'aspect_dominant']),
+            'roughness_mean': _wavg(['terrain', 'roughness_mean']),
+            'curvature_mean': _wavg(['terrain', 'curvature_mean']),
+            'terrain_class': _any_val(['terrain', 'terrain_class']),
+            'method': _any_val(['terrain', 'method']),
+        }
+        if _aspect_w > 0:
+            merged['terrain']['aspect_distribution_pct'] = {
+                k: round(v / _aspect_w, 2) for k, v in _aspect_acc.items()}
+        if _slope_w > 0:
+            merged['terrain']['slope_classes_pct'] = {
+                k: round(v / _slope_w, 2) for k, v in _slope_acc.items()}
+        e_min = merged['terrain']['elevation_min_m']
+        e_max = merged['terrain']['elevation_max_m']
+        if e_min is not None and e_max is not None:
+            merged['terrain']['elevation_range_m'] = round(e_max - e_min, 2)
+
+        # ── tree stats ───────────────────────────────────────────
+        merged_ts = {
+            'count': _sum(['tree_stats', 'count']),
+            'total_canopy_sqm': _sum(['tree_stats', 'total_canopy_sqm']),
+            'est_stem_volume_m3': _sum(['tree_stats', 'est_stem_volume_m3']),
+            'mean_height_m': _wavg(['tree_stats', 'mean_height_m']),
+        }
+        merged['tree_stats'] = merged_ts
+
+        # ── NDVI ─────────────────────────────────────────────────
+        merged['ndvi'] = {
+            'copernicus_mean': _wavg(['ndvi', 'copernicus_mean']),
+            'bev_nir_mean': _wavg(['ndvi', 'bev_nir_mean']),
+            'bev_nir_std': _wavg(['ndvi', 'bev_nir_std']),
+            'method_bev': _any_val(['ndvi', 'method_bev']),
+            'method_copernicus': _any_val(['ndvi', 'method_copernicus']),
+        }
+
+        # ── SAR ──────────────────────────────────────────────────
+        merged['sar'] = {
+            'vv_mean_db': _wavg(['sar', 'vv_mean_db']),
+            'vh_mean_db': _wavg(['sar', 'vh_mean_db']),
+            'vv_std_db': _wavg(['sar', 'vv_std_db']),
+            'vh_std_db': _wavg(['sar', 'vh_std_db']),
+            'method': _any_val(['sar', 'method']),
+        }
+
+        # ── NDVI harmonics ───────────────────────────────────────
+        merged['ndvi_harmonics'] = {
+            'mean_mean': _wavg(['ndvi_harmonics', 'mean_mean']),
+            'amplitude_mean': _wavg(['ndvi_harmonics', 'amplitude_mean']),
+            'phase_mean': _wavg(['ndvi_harmonics', 'phase_mean']),
+            'rmse_mean': _wavg(['ndvi_harmonics', 'rmse_mean']),
+            'method': _any_val(['ndvi_harmonics', 'method']),
+        }
+
+        # ── temporal change ──────────────────────────────────────
+        # Union datasets_compared across blocks (set-merge, not weighted avg).
+        _ds_union = set()
+        for _, d in block_list:
+            for ds in (d.get('temporal_change', {}) or {}).get('datasets_compared', []) or []:
+                _ds_union.add(ds)
+        _height_change_mean = _wavg(['temporal_change', 'height_change_mean_m'])
+        _dtm_change_max = _max_val(['temporal_change', 'dtm_change_max_abs_m'])
+        merged['temporal_change'] = {
+            'net_volume_change_m3': _sum(['temporal_change', 'net_volume_change_m3']),
+            'mean_stability': _wavg(['temporal_change', 'mean_stability']),
+            'dtm_change_mean_m': _wavg(['temporal_change', 'dtm_change_mean_m']),
+            'dtm_change_max_abs_m': _dtm_change_max,
+            'height_change_mean_m': _height_change_mean,
+            'n_changed_segments': _sum(['temporal_change', 'n_changed_segments']),
+            'total_disturbed_volume_m3': _sum(['temporal_change', 'total_disturbed_volume_m3']),
+            'datasets_compared': sorted(_ds_union) if _ds_union else None,
+            'method': _any_val(['temporal_change', 'method']),
+        }
+
+        # ── hansen (merge loss_by_year + headline aggregates) ────
+        merged_hansen_loss = {}
+        merged_hansen_area = {}
+        for _, d in block_list:
+            for yr, val in d.get('hansen', {}).get('loss_by_year', {}).items():
+                if isinstance(val, dict):
+                    px = val.get('pixels', 0)
+                    ar = val.get('area_sqm', 0)
+                else:
+                    px = val
+                    ar = 0
+                try:
+                    merged_hansen_loss[yr] = merged_hansen_loss.get(yr, 0) + int(px)
+                    merged_hansen_area[yr] = merged_hansen_area.get(yr, 0) + int(ar or 0)
+                except (ValueError, TypeError):
+                    pass
+        _hansen = {}
+        if merged_hansen_loss:
+            _hansen['loss_by_year'] = {
+                yr: {'pixels': merged_hansen_loss[yr],
+                     'area_sqm': merged_hansen_area.get(yr, 0)}
+                for yr in merged_hansen_loss
+            }
+            _hansen['total_loss_pixels'] = sum(merged_hansen_loss.values())
+        # Weighted treecover2000 + summed current forest pixels
+        _tc = _wavg(['hansen', 'mean_treecover2000_pct'])
+        if _tc is not None:
+            _hansen['mean_treecover2000_pct'] = _tc
+        _cf = _sum(['hansen', 'current_forest_pixels'])
+        if _cf:
+            _hansen['current_forest_pixels'] = _cf
+        _hmethod = _any_val(['hansen', 'method'])
+        if _hmethod:
+            _hansen['method'] = _hmethod
+        merged['hansen'] = _hansen
+
+        # ── phenology ────────────────────────────────────────────
+        merged_phen = {}
+        for _, d in block_list:
+            for cls_name, frac in d.get('phenology', {}).get('distribution', {}).items():
+                merged_phen[cls_name] = merged_phen.get(cls_name, 0) + (frac or 0)
+        # Re-normalize
+        phen_total = sum(merged_phen.values()) or 1
+        merged['phenology'] = {
+            'distribution': {k: round(v / phen_total, 4) for k, v in merged_phen.items()},
+        }
+
+        # ── classification ───────────────────────────────────────
+        merged_ptc = {}
+        for _, d in block_list:
+            for otype, info in d.get('classification', {}).get('per_type_confidence', {}).items():
+                if otype not in merged_ptc:
+                    merged_ptc[otype] = {'count': 0, 'diverged_count': 0,
+                                         'area_sqm': 0, '_conf_sum': 0,
+                                         '_p10_sum': 0, '_p10_w': 0,
+                                         '_min': None}
+                m = merged_ptc[otype]
+                cnt = info.get('count', 0) or 0
+                m['count'] += cnt
+                m['diverged_count'] += info.get('diverged_count', 0) or 0
+                m['area_sqm'] += info.get('area_sqm', 0) or 0
+                if info.get('mean') is not None and cnt:
+                    m['_conf_sum'] += info['mean'] * cnt
+                if info.get('p10') is not None and cnt:
+                    m['_p10_sum'] += info['p10'] * cnt
+                    m['_p10_w'] += cnt
+                if info.get('min') is not None:
+                    m['_min'] = info['min'] if m['_min'] is None else min(m['_min'], info['min'])
+        for otype, m in merged_ptc.items():
+            m['mean'] = round(m['_conf_sum'] / m['count'], 4) if m['count'] else None
+            if m['_p10_w']:
+                m['p10'] = round(m['_p10_sum'] / m['_p10_w'], 4)
+            m['min'] = m.pop('_min')
+            del m['_conf_sum']; del m['_p10_sum']; del m['_p10_w']
+
+        # Top divergences: concatenate, sort by count desc, take top 10
+        all_top_div = []
+        for _, d in block_list:
+            all_top_div.extend(d.get('classification', {}).get('top_divergences', []))
+        # Group by (rf_type, final_type) and sum counts
+        div_map = {}
+        for dv in all_top_div:
+            key = (dv.get('rf_type', ''), dv.get('final_type', ''))
+            div_map[key] = div_map.get(key, 0) + dv.get('count', 0)
+        merged_top_div = sorted(
+            [{'rf_type': k[0], 'final_type': k[1], 'count': v}
+             for k, v in div_map.items()],
+            key=lambda x: -x['count'])[:10]
+
+        _total_segs = _sum(['classification', 'total_segments'])
+        _div_count = _sum(['classification', 'diverged_count'])
+        merged['classification'] = {
+            'total_segments': _total_segs,
+            'rf_classified': _sum(['classification', 'rf_classified']),
+            'rules_classified': _sum(['classification', 'rules_classified']),
+            'infra_classified': _sum(['classification', 'infra_classified']),
+            'mean_confidence': _wavg(['classification', 'mean_confidence']),
+            'rf_mean_confidence': _wavg(['classification', 'rf_mean_confidence']),
+            'rf_classified_pct': _wavg(['classification', 'rf_classified_pct']),
+            'confidence_p10': _min_val(['classification', 'confidence_p10']),
+            'confidence_p25': _wavg(['classification', 'confidence_p25']),
+            'confidence_p50': _wavg(['classification', 'confidence_p50']),
+            'diverged_count': _div_count,
+            'diverged_pct': (round(100.0 * _div_count / _total_segs, 2)
+                             if _total_segs else _wavg(['classification', 'diverged_pct'])),
+            'per_type_confidence': merged_ptc,
+            'top_divergences': merged_top_div,
+        }
+
+        # ── top_10_objects / top_10_trees (concat → sort → take 10) ──
+        all_top_objs = []
+        all_top_trees = []
+        all_top_mm = []
+        any_mm = False
+        for _, d in block_list:
+            all_top_objs.extend(d.get('top_10_objects', []) or [])
+            all_top_trees.extend(d.get('top_10_trees', []) or [])
+            if d.get('top_manmade_objects') is not None:
+                any_mm = True
+                all_top_mm.extend(d.get('top_manmade_objects') or [])
+        # 2.3+: rank by height_robust_m (falls back to hmax for older blocks)
+        _hk = lambda o: -(o.get('height_robust_m') or o.get('height_max_m') or o.get('height_m') or 0)
+        all_top_objs.sort(key=_hk)
+        all_top_trees.sort(key=_hk)
+        all_top_mm.sort(key=_hk)
+        merged['top_10_objects'] = all_top_objs[:10]
+        merged['top_10_trees'] = all_top_trees[:10]
+        if any_mm:
+            merged['top_manmade_objects'] = all_top_mm[:10]
+
+        # ── top_by_type (concatenate, sort, take top per type) ───
+        merged_top_by_type = {}
+        for _, d in block_list:
+            for otype, entries in d.get('top_by_type', {}).items():
+                merged_top_by_type.setdefault(otype, []).extend(entries)
+        # Sort by area desc, keep top 5 per type
+        for otype in merged_top_by_type:
+            merged_top_by_type[otype] = sorted(
+                merged_top_by_type[otype],
+                key=lambda e: -(e.get('area_sqm') or 0),
+            )[:5]
+        merged['top_by_type'] = merged_top_by_type
+
+        # ── v2.4 cadastre-free products ──────────────────────────
+        # Blocks written since v2.4 carry no building_footprints at all;
+        # emitting an empty dict above makes consumers (dashboard
+        # Last-Completed card) show '0 buildings'. Mirror the per-block
+        # shape: drop the key, carry cadastre_free + a merged ``ne``
+        # summary (cells summed over blocks).
+        if any(d.get('cadastre_free') for _, d in block_list):
+            merged['cadastre_free'] = True
+            if not merged['building_footprints']['count']:
+                merged.pop('building_footprints', None)
+            _ne_blocks = [d.get('ne') for _, d in block_list if isinstance(d.get('ne'), dict)]
+            if _ne_blocks:
+                _ne_ok = [n for n in _ne_blocks if n.get('status') == 'ok']
+                _nsum = lambda grp, k: sum(int(((n.get(grp) or {}).get(k)) or 0) for n in _ne_ok)
+                merged['ne'] = {
+                    'status': 'ok' if len(_ne_ok) == len(block_list) else
+                              ('partial' if _ne_ok else (_ne_blocks[0].get('status') or 'missing')),
+                    'blocks_ok': len(_ne_ok), 'blocks': len(block_list),
+                    'declared': {'cells_n': _nsum('declared', 'cells_n'),
+                                 'kcells_n': _nsum('declared', 'kcells_n'),
+                                 'declared_unknown_n': _nsum('declared', 'declared_unknown_n'),
+                                 'source': (_ne_ok[0].get('declared') or {}).get('source') if _ne_ok else None},
+                    'observed': {'cells_observed': _nsum('observed', 'cells_observed'),
+                                 'trees_n': _nsum('observed', 'trees_n'),
+                                 'manmade_n': _nsum('observed', 'manmade_n')},
+                    'h3_res': _any_val(['ne', 'h3_res']), 'chunk_res': _any_val(['ne', 'chunk_res']),
+                    'product': _any_val(['ne', 'product']),
+                    'note': 'merged from split blocks; per-block declared/observed/verdict detail in each block JSON',
+                }
+
+        # ── coverage ─────────────────────────────────────────────
+        merged['coverage'] = {
+            'n_tiles': _sum(['coverage', 'n_tiles']),
+            'tile_km': _any_val(['coverage', 'tile_km']),
+            'total_segmented_area_sqm': _sum(['coverage', 'total_segmented_area_sqm']),
+            'building_height_coverage_pct': _wavg(['coverage', 'building_height_coverage_pct']),
+            'note': _any_val(['coverage', 'note']),
+        }
+
+        # ── data quality (weighted average) ──────────────────────
+        _avail_in_all = None
+        _all_layers = set(); _partial = set()
+        for _, d in block_list:
+            cur = set((d.get('data_quality', {}) or {}).get('available_layers', []) or [])
+            _avail_in_all = cur if _avail_in_all is None else (_avail_in_all & cur)
+            _all_layers |= cur
+            for k in (d.get('data_quality', {}) or {}).get('missing_layers', []) or []:
+                _all_layers.add(k)
+            for k in (d.get('data_quality', {}) or {}).get('partial_layers', []) or []:
+                _partial.add(k); _all_layers.add(k)
+        _avail_in_all = _avail_in_all or set()
+        merged_dq_tiles = []
+        for _, d in block_list:
+            merged_dq_tiles.extend((d.get('data_quality', {}) or {}).get('tiles', []) or [])
+        _layers_acc = {}; _layers_w = {}
+        for _, d in block_list:
+            tw = d.get('total_area_sqm', 0) or 0
+            for k, v in ((d.get('data_quality', {}) or {}).get('layers_summary') or {}).items():
+                if v is None:
+                    continue
+                _layers_acc[k] = _layers_acc.get(k, 0.0) + v * tw
+                _layers_w[k] = _layers_w.get(k, 0.0) + tw
+        layers_summary = {k: round(_layers_acc[k] / _layers_w[k], 4)
+                          for k in _layers_acc if _layers_w.get(k)}
+        merged['data_quality'] = {
+            'quality_score': _wavg(['data_quality', 'quality_score']),
+            'quality_grade': _any_val(['data_quality', 'quality_grade']),
+            'quality_weights': _any_val(['data_quality', 'quality_weights']) or {},
+            'layers_summary': layers_summary,
+            'tiles': merged_dq_tiles,
+            'n_active_tiles': _sum(['data_quality', 'n_active_tiles']),
+            'n_total_tiles': _sum(['data_quality', 'n_total_tiles']),
+            'available_layers': sorted(_avail_in_all),
+            'missing_layers': sorted(_all_layers - _avail_in_all - _partial),
+            'partial_layers': sorted(_partial),
+        }
+
+        # ── segments (sum counts per type) ─────────────────────────
+        seg_by_type = {}
+        seg_total = 0
+        for _, d in block_list:
+            s = d.get('segments', {}) or {}
+            seg_total += s.get('total', 0) or 0
+            for typ, n in (s.get('by_type') or {}).items():
+                seg_by_type[typ] = seg_by_type.get(typ, 0) + (n or 0)
+        if seg_total or seg_by_type:
+            merged['segments'] = {
+                'total': seg_total or sum(seg_by_type.values()),
+                'by_type': seg_by_type,
+            }
+
+        # ── phenology method ────────────────────────────────────
+        _phen_method = _any_val(['phenology', 'method'])
+        if _phen_method:
+            merged.setdefault('phenology', {})['method'] = _phen_method
+
+        # ── methods + version (carry through, all blocks share these) ──
+        _methods = _any_val(['methods'])
+        if _methods is not None:
+            merged['methods'] = _methods
+        _version = _any_val(['version'])
+        if _version is not None:
+            merged['version'] = _version
+
+        # Block metadata for reference
+        merged['_blocks'] = [
+            {'code': bc, 'label': bc.split('-', 1)[1] if '-' in bc else bc}
+            for bc, _ in block_list
+        ]
+        # Mirror parent identity from the freshest block.
+        merged['kg_code'] = parent_code
+        for k in ('kg_name', 'gemeinde', 'state', 'district', 'bbox'):
+            v = next((d.get(k) for _, d in reversed(block_list) if d.get(k)), None)
+            if v is not None:
+                merged[k] = v
+        return merged
+
+    def update_kg(self, kg_code, json_path=None, manifest=None):
+        """Incremental update for a single KG after processing.
+
+        Handles block codes (e.g. '49006-north') and maybe-split parents
+        (plain + blocks coexisting) by aggregating the freshest set of
+        on-disk files via ``_select_kg_files_for_parent``. Zenodo URLs
+        are written under the parent code.
+        """
+        from kg_splitter import parent_kg_code as _parent_code
+        _target_code = _parent_code(kg_code)
+
+        with self._write_lock:
+            c = self._conn()
+            try:
+                return self._update_kg_locked(c, kg_code, _target_code, json_path, manifest)
+            except Exception:
+                # Never leave an open write transaction behind: it holds
+                # the WAL write lock for the life of this thread-local
+                # connection and stalls every other writer (2026-09-24:
+                # a positional INSERT mismatch after an ALTER TABLE did
+                # exactly that for v2-ingest).
+                try:
+                    c.rollback()
+                except Exception:
+                    pass
+                raise
+
+    def _update_kg_locked(self, c, kg_code, _target_code, json_path, manifest):
+        if True:
+            _json_dir = (Path(json_path).parent
+                         if json_path else Path('data/austria_processor/json'))
+            plain_path, block_list = self._select_kg_files_for_parent(
+                _target_code, _json_dir, manifest=manifest)
+            if not block_list and json_path and Path(json_path).exists():
+                # Fallback: file just landed and selector saw nothing.
+                try:
+                    data = json.loads(Path(json_path).read_text())
+                    self._enrich_kg(c, _target_code, data)
+                    _repair_observe(kg_code, data, manifest)
+                except Exception as e:
+                    log.warning('update_kg %s fallback: %s', kg_code, e)
+            elif len(block_list) == 1 and plain_path is not None:
+                # Single plain file — fast path.
+                self._enrich_kg(c, _target_code, block_list[0][1])
+                if json_path:
+                    _repair_observe(kg_code, block_list[0][1], manifest)
+            elif block_list:
+                self._enrich_kg_from_blocks(c, _target_code, block_list)
+                if json_path:
+                    for _bc, _bd in block_list:
+                        if _bc == kg_code:
+                            _repair_observe(kg_code, _bd, manifest)
+            if manifest:
+                # Candidate codes for manifest lookup: parent + every
+                # accepted block. We pick the freshest entry per kind so a
+                # split parent's row consistently links to the most
+                # recently uploaded artefact.
+                _codes = [_target_code] + [bc for bc, _ in (block_list or [])
+                                            if bc != _target_code]
+                if not _codes:
+                    _codes = [kg_code]
+                _write_zenodo_links(c, _target_code, _codes, manifest)
+            c.commit()
+
+    # ════════════════════════════════════════════════════════════════
+    # Manifest sync + progress summary (source of truth for dashboards)
+    # ════════════════════════════════════════════════════════════════
+
+    def sync_manifest_links(self, manifest):
+        """Re-derive ``product_version`` / Zenodo URLs / upload timestamps
+        for every processed parent from *manifest* (``{key: entry}``).
+
+        Cheap (dict lookups only, no JSON reads) — meant to run whenever
+        the manifest file changes so re-upgrades (v2.1 → v2.2) that do
+        not produce a new local JSON still show up in the index."""
+        if not manifest:
+            return 0
+        by_parent = {}
+        for k in manifest:
+            if not k.endswith('_json'):
+                continue
+            code = k[:-5]
+            base = code.split('-', 1)[0]
+            if not base.isdigit():
+                continue
+            by_parent.setdefault(base, set()).add(code)
+        n = 0
+        with self._write_lock:
+            c = self._conn()
+            rows = c.execute('SELECT kg_code FROM kg WHERE processed=1').fetchall()
+            for (parent,) in rows:
+                codes = sorted(by_parent.get(parent) or {parent})
+                if parent not in codes:
+                    codes.insert(0, parent)
+                try:
+                    _write_zenodo_links(c, parent, codes, manifest)
+                    n += 1
+                except Exception as e:
+                    if 'locked' in str(e).lower():
+                        # Another connection holds the write lock: bail out
+                        # instead of eating busy_timeout (30 s) per parent
+                        # while holding _write_lock (blocked v2-ingest for
+                        # hours, 2026-09-24). Next manifest change retries.
+                        log.warning('sync_manifest_links: database locked after '
+                                    '%d parents — aborting this pass', n)
+                        try:
+                            c.rollback()
+                        except Exception:
+                            pass
+                        return n
+                    log.debug('sync_manifest_links %s: %s', parent, e)
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      ('manifest_synced_at',
+                       time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
+            c.commit()
+        return n
+
+    @staticmethod
+    def _rate_window(times, now_ts, win_s=24 * 3600, tail_n=50, min_n=5):
+        """(rate_per_h, n, window_s) over the last 24h (≥min_n samples)
+        or the last *tail_n* completions; ``(0, 0, 0)`` if too few."""
+        times = sorted(t for t in times if t)
+        recent = [t for t in times if now_ts - t <= win_s]
+        if len(recent) >= min_n:
+            window_s = max(now_ts - recent[0], 1.0)
+            n = len(recent)
+        elif len(times) >= min_n:
+            tail = times[-tail_n:]
+            window_s = max(now_ts - tail[0], 1.0)
+            n = len(tail)
+        else:
+            return 0.0, 0, 0
+        return n / (window_s / 3600.0), n, window_s
+
+    def progress_summary(self, manifest=None, total_kgs=None,
+                         current_version=None, days=30):
+        """Fleet progress derived from the index (one row per PARENT KG —
+        split blocks and product re-uploads can't double count).
+
+        * ``done`` — processed parents; ``rate_per_h`` / ``eta_s`` from
+          fresh-completion timestamps (``json_uploaded_at``; v2 upgrade
+          uploads do NOT count).  If the index has no timestamps yet
+          (pre-migration) the ``_json`` entries of *manifest* are used.
+        * ``v2`` — per-version histogram, ``upgraded_current`` (parents
+          whose every block is at *current_version*), 24h upgrade count
+          / rate / ETA against ``total - upgraded_current``.
+        """
+        from datetime import datetime as _dt, timezone as _tz
+        if current_version is None:
+            try:
+                from v21_products import MANIFEST_VERSION as current_version
+            except Exception:
+                current_version = 'v2.3'
+        current_version = _norm_version(current_version)
+        now_ts = time.time()
+
+        def _ts(iso):
+            try:
+                return _dt.fromisoformat(str(iso).replace('Z', '+00:00')).timestamp()
+            except Exception:
+                return None
+
+        c = self._conn()
+        n_rows = c.execute('SELECT COUNT(*) FROM kg').fetchone()[0]
+        from kg_universe import expected_total as _et
+        total = max(int(total_kgs or _et()), int(n_rows or 0))
+        rows = c.execute(
+            'SELECT kg_code, product_version, json_uploaded_at, json_v2_uploaded_at, '
+            'zenodo_json_v2_url FROM kg WHERE processed=1').fetchall()
+        done = len(rows)
+        done_times = {}
+        by_version = {}
+        up_times_current = []
+        upgraded_any = 0
+        for code, pv, jts, j2ts, j2url in rows:
+            t = _ts(jts) if jts else None
+            if t:
+                done_times[code] = t
+            pv = pv or 'v1'
+            by_version[pv] = by_version.get(pv, 0) + 1
+            if j2url:
+                upgraded_any += 1
+            if pv == current_version and j2ts:
+                t2 = _ts(j2ts)
+                if t2:
+                    up_times_current.append(t2)
+        source = 'index'
+        # Fallback: index lacks timestamps → derive from the manifest's
+        # ``_json`` entries, folded to parents (max across blocks).
+        if manifest and len(done_times) < max(1, done // 2):
+            source = 'manifest'
+            done_times = {}
+            for k, e in manifest.items():
+                if not k.endswith('_json') or not isinstance(e, dict):
+                    continue
+                if 'error' in str(e.get('status') or ''):
+                    continue
+                t = _ts(e.get('uploaded_at'))
+                if not t:
+                    continue
+                parent = k[:-5].split('-', 1)[0]
+                if t > done_times.get(parent, 0):
+                    done_times[parent] = t
+        rate_h, win_n, win_s = self._rate_window(done_times.values(), now_ts)
+        remaining = max(total - done, 0)
+        eta_s = (remaining / rate_h) * 3600.0 if rate_h > 0 else 0
+        # Daily fresh-completion buckets (sparkline).
+        today = _dt.now(_tz.utc).date()
+        buckets = [0] * days
+        for t in done_times.values():
+            d_ago = (today - _dt.fromtimestamp(t, _tz.utc).date()).days
+            if 0 <= d_ago < days:
+                buckets[days - 1 - d_ago] += 1
+        upgraded_current = by_version.get(current_version, 0)
+        up_24h = sum(1 for t in up_times_current if now_ts - t <= 24 * 3600)
+        up_rate_h, up_n, _ = self._rate_window(up_times_current, now_ts)
+        up_remaining = max(total - upgraded_current, 0)
+        up_eta_s = (up_remaining / up_rate_h) * 3600.0 if up_rate_h > 0 else 0
+        stale = {v: n for v, n in by_version.items()
+                 if v not in ('v1', current_version) and _version_key(v) > (1,)}
+        return {
+            'total': total, 'done': done,
+            'pct': round(100.0 * done / total, 2) if total else 0.0,
+            'rate_per_h': round(rate_h, 2), 'eta_s': int(eta_s),
+            'window_n': win_n, 'window_s': int(win_s),
+            'avg_s_per_kg': round(win_s / win_n, 1) if win_n else None,
+            'last_completion_ts': max(done_times.values()) if done_times else None,
+            'completed_24h': sum(1 for t in done_times.values() if now_ts - t <= 24 * 3600),
+            'daily_completions': buckets, 'source': source,
+            'v2': {
+                'current_version': current_version,
+                'by_version': dict(sorted(by_version.items(), key=lambda kv: _version_key(kv[0]))),
+                'upgraded_current': upgraded_current,
+                'upgraded_any': upgraded_any,
+                'stale_versions': stale,          # upgraded but not at current → re-upgrade pending
+                'stale_total': sum(stale.values()),
+                'upgraded_24h': up_24h,
+                'rate_per_h': round(up_rate_h, 2), 'window_n': up_n,
+                'eta_s': int(up_eta_s),
+                'eta_days': round(up_eta_s / 86400.0, 1) if up_eta_s else None,
+                'remaining': up_remaining,
+            },
+        }
+
+    # ════════════════════════════════════════════════════════════════
+    # Stats
+    # ════════════════════════════════════════════════════════════════
+
+    def stats(self):
+        """Index statistics."""
+        c = self._conn()
+        s = {}
+        for name, q in [
+            ('kg_count', 'SELECT COUNT(*) FROM kg'),
+            ('processed_count', 'SELECT COUNT(*) FROM kg WHERE processed=1'),
+            ('total_area_km2', 'SELECT COALESCE(SUM(total_area_sqm),0)/1e6 FROM kg'),
+            ('processed_area_km2', 'SELECT COALESCE(SUM(total_area_sqm),0)/1e6 FROM kg WHERE processed=1'),
+            ('total_buildings', 'SELECT COALESCE(SUM(building_count),0) FROM kg'),
+            ('total_tree_count', 'SELECT COALESCE(SUM(tree_count),0) FROM kg WHERE processed=1'),
+            ('total_new_buildings', 'SELECT COALESCE(SUM(new_building_count),0) FROM kg WHERE processed=1'),
+            ('zenodo_kgs', 'SELECT COUNT(*) FROM kg WHERE zenodo_json_url IS NOT NULL'),
+            ('states_covered', 'SELECT COUNT(DISTINCT state_code) FROM kg WHERE state_code != ""'),
+            ('districts_covered', 'SELECT COUNT(DISTINCT district_code) FROM kg WHERE district_code != ""'),
+            ('landcover_types', 'SELECT COUNT(DISTINCT object_type) FROM kg_landcover'),
+            ('avg_quality_score', 'SELECT ROUND(AVG(quality_score),2) FROM kg WHERE quality_score IS NOT NULL'),
+            ('avg_confidence', 'SELECT ROUND(AVG(mean_confidence),3) FROM kg WHERE mean_confidence IS NOT NULL'),
+            ('avg_rf_classified_pct', 'SELECT ROUND(AVG(rf_classified_pct),1) FROM kg WHERE rf_classified_pct IS NOT NULL'),
+            ('avg_rf_diverged_pct', 'SELECT ROUND(AVG(rf_diverged_pct),1) FROM kg WHERE rf_diverged_pct IS NOT NULL'),
+            ('total_divergence_pairs', 'SELECT COUNT(DISTINCT rf_type || final_type) FROM kg_divergence'),
+            ('indexed_segments', 'SELECT COUNT(*) FROM kg_type_top'),
+            ('indexed_segment_types', 'SELECT COUNT(DISTINCT object_type) FROM kg_type_top'),
+        ]:
+            r = c.execute(q).fetchone()
+            s[name] = round(r[0], 2) if r[0] is not None else 0
+        # Meta
+        for row in c.execute('SELECT key, value FROM index_meta'):
+            s[f'_meta_{row[0]}'] = row[1]
+        return s
+
+    # ════════════════════════════════════════════════════════════════
+    # Query: single KG
+    # ════════════════════════════════════════════════════════════════
+
+    def merged_kg_json(self, kg_code, manifest=None):
+        """Return a JSON-shape dict for a KG, merging plain + block files.
+
+        Returns ``None`` when no on-disk JSON exists for this parent.
+        Suitable for ``/api/v1/kg/<code>`` to serve split-KG callers a
+        single, complete record (landscape.n_segments, tree_stats, etc.)
+        rather than the flat index row.
+        """
+        from kg_splitter import parent_kg_code as _parent_code
+        parent = _parent_code(kg_code)
+        json_dir = Path('data/austria_processor/json')
+        if manifest is None:
+            try:
+                mp = Path('data/austria_processor/zenodo_manifest.json')
+                if mp.exists():
+                    md = json.loads(mp.read_text())
+                    manifest = md.get('entries', md)
+            except Exception:
+                manifest = {}
+        plain_path, block_list = self._select_kg_files_for_parent(
+            parent, json_dir, manifest=manifest)
+        if not block_list:
+            return None
+        if len(block_list) == 1 and plain_path is not None:
+            data = block_list[0][1]
+            data.setdefault('kg_code', parent)
+            return data
+        return self._merge_block_data(parent, block_list)
+
+    def query_kg(self, kg_code):
+        """Full KG record with landcover, hansen, and links."""
+        c = self._conn()
+        row = c.execute('SELECT * FROM kg WHERE kg_code=?', (kg_code,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        # Landcover
+        d['landcover'] = [dict(r) for r in
+            c.execute('SELECT * FROM kg_landcover WHERE kg_code=? ORDER BY area_sqm DESC', (kg_code,))]
+        # Hansen
+        d['hansen_loss'] = [dict(r) for r in
+            c.execute('SELECT loss_year, loss_pixels FROM kg_hansen WHERE kg_code=? ORDER BY loss_year', (kg_code,))]
+        # Classification per-type confidence
+        d['classification'] = [dict(r) for r in
+            c.execute('SELECT * FROM kg_classification WHERE kg_code=? ORDER BY rf_count DESC', (kg_code,))]
+        # Divergence pairs
+        d['divergence'] = [dict(r) for r in
+            c.execute('SELECT rf_type, final_type, count FROM kg_divergence WHERE kg_code=? ORDER BY count DESC', (kg_code,))]
+        # Links
+        d['_links'] = self._build_links(d)
+        return d
+
+    def _build_links(self, d):
+        """Build _links object for a KG dict."""
+        code = d['kg_code']
+        links = {'json': f'{BASE_URL}/api/v1/kg/{code}'}
+        if d.get('zenodo_json_url'):
+            links['zenodo_json'] = d['zenodo_json_url']
+        if d.get('zenodo_light_gpkg_url'):
+            links['zenodo_light_gpkg'] = d['zenodo_light_gpkg_url']
+        if d.get('zenodo_full_gpkg_url'):
+            links['zenodo_full_gpkg'] = d['zenodo_full_gpkg_url']
+        if d.get('zenodo_json_v2_url'):
+            links['zenodo_json_v2'] = d['zenodo_json_v2_url']
+        if d.get('zenodo_light_gpkg_v2_url'):
+            links['zenodo_light_gpkg_v2'] = d['zenodo_light_gpkg_v2_url']
+        if d.get('product_version'):
+            links['product_version'] = d['product_version']
+        # segment/terrain are geometry-driven, not KG-driven: they work on any
+        # Austrian geometry regardless of whether this KG has precomputed
+        # aggregates. Always advertise them, and flag the on-demand case so a
+        # consumer doesn't read processed:0 as "no terrain here".
+        links['segment'] = f'{BASE_URL}/api/v1/segment'
+        links['terrain'] = f'{BASE_URL}/api/v1/terrain'
+        if not d.get('processed'):
+            d['terrain_on_demand'] = True
+        return links
+
+    # ════════════════════════════════════════════════════════════════
+    # Query: KG JSON access helpers
+    # ════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _kg_json_docs(kg_code):
+        """Yield ``(code, doc)`` for the parent + any split blocks, reading
+        the v2 blob store first and legacy files second (``kg_docs``)."""
+        import kg_docs as _kd
+        yield from _kd.iter_docs(kg_code)
+
+    @staticmethod
+    def _kg_json_paths(kg_code):
+        """Return all local JSON files for a KG (parent + any split blocks).
+        Legacy (file-only) — prefer ``_kg_json_docs``.
+
+        Split KGs (>22 tiles) live in `<code>-<block>.json`, never `<code>.json`.
+        Both the parent and the block files are returned in deterministic order
+        so callers can iterate and short-circuit on first match.
+        """
+        jdir = Path('data/austria_processor/json')
+        out = []
+        plain = jdir / f'{kg_code}.json'
+        if plain.exists():
+            out.append(plain)
+        try:
+            out += sorted(jdir.glob(f'{kg_code}-*.json'))
+        except Exception:
+            pass
+        return out
+
+    # ════════════════════════════════════════════════════════════════
+
+    def query_bbox(self, min_lon, min_lat, max_lon, max_lat,
+                   processed_only=False, limit=500, offset=0):
+        """Find KGs intersecting a bounding box via R-tree."""
+        c = self._conn()
+        # R-tree query: find KGs whose bbox overlaps the query bbox
+        q = '''SELECT k.* FROM kg k
+               JOIN kg_rtree r ON r.id = (SELECT rowid FROM kg WHERE kg_code=k.kg_code)
+               WHERE r.max_lon >= ? AND r.min_lon <= ?
+                 AND r.max_lat >= ? AND r.min_lat <= ?'''
+        params = [min_lon, max_lon, min_lat, max_lat]
+        if processed_only:
+            q += ' AND k.processed=1'
+        q += ' LIMIT ?'
+        params.append(limit)
+        # Faster approach: use R-tree directly then join
+        q2_base = '''FROM kg_rtree r
+                JOIN kg k ON k.rowid = r.id
+                WHERE r.max_lon >= ? AND r.min_lon <= ?
+                  AND r.max_lat >= ? AND r.min_lat <= ?'''
+        params2 = [min_lon, max_lon, min_lat, max_lat]
+        if processed_only:
+            q2_base += ' AND k.processed=1'
+        total = c.execute(f'SELECT COUNT(*) {q2_base}', params2).fetchone()[0]
+        q2 = f'SELECT k.* {q2_base} LIMIT ? OFFSET ?'
+        params2.extend([limit, offset])
+        results = [self._kg_summary(r) for r in c.execute(q2, params2)]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
+
+    def query_point(self, lon, lat, radius_km=5, limit=50, offset=0):
+        """Find KGs containing or near a point."""
+        # Approximate degree offset for radius
+        dlat = radius_km / 111.0
+        dlon = radius_km / (111.0 * max(0.5, __import__('math').cos(__import__('math').radians(lat))))
+        bbox_result = self.query_bbox(lon - dlon, lat - dlat, lon + dlon, lat + dlat,
+                                      limit=10000)  # fetch all within bbox for sorting
+        all_results = bbox_result.get('results', [])
+        # Sort by distance to centroid
+        import math
+        for r in all_results:
+            cx = r.get('centroid_lon', 0) or 0
+            cy = r.get('centroid_lat', 0) or 0
+            r['_distance_km'] = round(math.sqrt(
+                ((lon - cx) * 111 * math.cos(math.radians(lat))) ** 2 +
+                ((lat - cy) * 111) ** 2
+            ), 2)
+        all_results.sort(key=lambda r: r.get('_distance_km', 999))
+        total = len(all_results)
+        results = all_results[offset:offset + limit]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
+
+    # ════════════════════════════════════════════════════════════════
+    # Query: admin hierarchy
+    # ════════════════════════════════════════════════════════════════
+
+    def query_admin(self, level, code=None, name=None, processed_only=False,
+                    limit=500, offset=0):
+        """Query by admin level: state/district/gemeinde/kg.
+        code: exact match. name: FTS search."""
+        c = self._conn()
+        if name:
+            return self.query_text(name, limit=limit, offset=offset)
+
+        col_map = {
+            'state': ('state_code', 'state_name'),
+            'bundesland': ('state_code', 'state_name'),
+            'district': ('district_code', 'district_name'),
+            'bezirk': ('district_code', 'district_name'),
+            'gemeinde': ('gemeinde_code', 'gemeinde_name'),
+            'municipality': ('gemeinde_code', 'gemeinde_name'),
+            'kg': ('kg_code', 'kg_name'),
+        }
+        if level not in col_map:
+            return {'total': 0, 'offset': offset, 'limit': limit, 'results': []}
+        code_col, name_col = col_map[level]
+        q_base = f'FROM kg WHERE {code_col}=?'
+        params = [code]
+        if processed_only:
+            q_base += ' AND processed=1'
+        total = c.execute(f'SELECT COUNT(*) {q_base}', params).fetchone()[0]
+        q = f'SELECT * {q_base} ORDER BY {name_col} LIMIT ? OFFSET ?'
+        params.extend([limit, offset])
+        results = [self._kg_summary(r) for r in c.execute(q, params)]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
+
+    @staticmethod
+    def _normalize_name(s: str) -> str:
+        """Normalize German ß→ss for FTS indexing and querying."""
+        return s.replace('ß', 'ss').replace('SS', 'SS') if s else s
+
+    def query_text(self, q, limit=20, offset=0):
+        """Full-text search across KG/gemeinde/district/state names."""
+        c = self._conn()
+        # Normalize ß→ss so queries like 'Viess' match 'Vießling'
+        q_norm = self._normalize_name(q)
+        # Tokenize query for FTS prefix matching
+        terms = q_norm.strip().split()
+        if not terms:
+            return {'total': 0, 'offset': offset, 'limit': limit, 'results': []}
+        fts_q = ' '.join(t + '*' for t in terms)
+        try:
+            total = c.execute('''
+                SELECT COUNT(*) FROM fts_kg f
+                JOIN kg k ON k.kg_code = f.kg_code
+                WHERE fts_kg MATCH ?
+            ''', (fts_q,)).fetchone()[0]
+            rows = c.execute('''
+                SELECT k.* FROM fts_kg f
+                JOIN kg k ON k.kg_code = f.kg_code
+                WHERE fts_kg MATCH ?
+                ORDER BY rank LIMIT ? OFFSET ?
+            ''', (fts_q, limit, offset)).fetchall()
+            results = [self._kg_summary(r) for r in rows]
+            # FTS returned nothing — try LIKE fallback (handles partial ß variants)
+            if not results:
+                raise ValueError('fts_empty')
+        except Exception:
+            # Fallback to LIKE
+            like = f'%{q}%'
+            total = c.execute('''
+                SELECT COUNT(*) FROM kg
+                WHERE kg_name LIKE ? OR gemeinde_name LIKE ?
+                   OR district_name LIKE ? OR state_name LIKE ?
+            ''', (like, like, like, like)).fetchone()[0]
+            rows = c.execute('''
+                SELECT * FROM kg
+                WHERE kg_name LIKE ? OR gemeinde_name LIKE ?
+                   OR district_name LIKE ? OR state_name LIKE ?
+                LIMIT ? OFFSET ?
+            ''', (like, like, like, like, limit, offset)).fetchall()
+            results = [self._kg_summary(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
+
+    # ════════════════════════════════════════════════════════════════
+    # Query: aggregates
+    # ════════════════════════════════════════════════════════════════
+
+    def aggregate_district(self, district_code_or_name):
+        """Aggregate landscape stats for a Bezirk."""
+        val = district_code_or_name
+        if not val.isdigit():
+            for code, name in DISTRICT_NAMES.items():
+                if name.lower() == val.lower():
+                    val = code
+                    break
+        return self._aggregate('district_code', val)
+
+    def aggregate_gemeinde(self, gemeinde_code_or_name):
+        """Aggregate landscape stats for a Gemeinde."""
+        val = gemeinde_code_or_name
+        if not val.isdigit():
+            c = self._conn()
+            row = c.execute('SELECT gemeinde_code FROM kg WHERE gemeinde_name = ? LIMIT 1', (val,)).fetchone()
+            if row:
+                val = row[0]
+        return self._aggregate('gemeinde_code', val)
+
+    def aggregate_state(self, state_code_or_name):
+        """Aggregate landscape stats for a Bundesland."""
+        # Accept either code or name
+        if len(state_code_or_name) <= 2 and state_code_or_name.isdigit():
+            return self._aggregate('state_code', state_code_or_name)
+        # Reverse lookup
+        for code, name in STATE_CODES.items():
+            if name.lower() == state_code_or_name.lower():
+                return self._aggregate('state_code', code)
+        return self._aggregate('state_name', state_code_or_name)
+
+    def aggregate_country(self):
+        """Aggregate landscape stats for all of Austria."""
+        return self._aggregate(None, None)
+
+    def _aggregate(self, col, val):
+        c = self._conn()
+        where = f'WHERE {col}=?' if col else ''
+        params = [val] if col else []
+
+        # Basic counts
+        r = c.execute(f'''
+            SELECT COUNT(*) as total_kgs,
+                   SUM(CASE WHEN processed=1 THEN 1 ELSE 0 END) as processed_kgs,
+                   ROUND(SUM(total_area_sqm)/1e6, 2) as total_area_km2,
+                   SUM(building_count) as total_buildings,
+                   SUM(tree_count) as total_trees,
+                   ROUND(SUM(tree_canopy_sqm)/1e6, 2) as tree_canopy_km2,
+                   ROUND(SUM(tree_stem_volume_m3), 0) as total_stem_volume_m3,
+                   SUM(new_building_count) as total_new_buildings,
+                   SUM(infrastructure_count) as total_infrastructure,
+                   ROUND(AVG(CASE WHEN processed=1 THEN elevation_mean_m END), 1) as avg_elevation_m,
+                   ROUND(AVG(CASE WHEN processed=1 THEN slope_mean_deg END), 2) as avg_slope_deg,
+                   ROUND(AVG(CASE WHEN processed=1 THEN ndvi_mean END), 3) as avg_ndvi,
+                   ROUND(AVG(CASE WHEN processed=1 THEN quality_score END), 2) as avg_quality_score,
+                   ROUND(AVG(CASE WHEN processed=1 THEN mean_confidence END), 3) as avg_confidence,
+                   ROUND(AVG(CASE WHEN processed=1 THEN rf_classified_pct END), 1) as avg_rf_classified_pct,
+                   ROUND(AVG(CASE WHEN processed=1 THEN rf_mean_confidence END), 3) as avg_rf_confidence,
+                   ROUND(AVG(CASE WHEN processed=1 THEN rf_diverged_pct END), 1) as avg_rf_diverged_pct,
+                   ROUND(SUM(CASE WHEN processed=1 THEN net_volume_change_m3 ELSE 0 END), 0) as total_net_volume_change_m3,
+                   MIN(min_lon) as min_lon, MIN(min_lat) as min_lat,
+                   MAX(max_lon) as max_lon, MAX(max_lat) as max_lat
+            FROM kg {where}
+        ''', params).fetchone()
+        agg = dict(r)
+
+        # Admin name
+        if col == 'state_code':
+            agg['name'] = STATE_CODES.get(val, val)
+            agg['level'] = 'state'
+        elif col == 'district_code':
+            agg['name'] = DISTRICT_NAMES.get(val, val)
+            agg['level'] = 'district'
+        elif col == 'gemeinde_code':
+            row = c.execute('SELECT gemeinde_name FROM kg WHERE gemeinde_code=? LIMIT 1', [val]).fetchone()
+            agg['name'] = row[0] if row else val
+            agg['level'] = 'gemeinde'
+        elif col == 'state_name':
+            agg['name'] = val
+            agg['level'] = 'state'
+        else:
+            agg['name'] = 'Austria'
+            agg['level'] = 'country'
+
+        # Top landcover types (processed KGs only)
+        lc_where = f'WHERE k.{col}=?' if col else ''
+        lc_params = [val] if col else []
+        lc_rows = c.execute(f'''
+            SELECT lc.object_type,
+                   ROUND(SUM(lc.area_sqm)/1e6, 3) as total_area_km2,
+                   ROUND(AVG(lc.fraction), 4) as avg_fraction,
+                   SUM(lc.n_objects) as total_objects
+            FROM kg_landcover lc
+            JOIN kg k ON k.kg_code = lc.kg_code
+            {lc_where}
+            GROUP BY lc.object_type
+            ORDER BY total_area_km2 DESC
+            LIMIT 10
+        ''', lc_params).fetchall()
+        agg['top_landcover'] = [dict(r) for r in lc_rows]
+
+        # Hansen loss summary
+        h_rows = c.execute(f'''
+            SELECT h.loss_year, SUM(h.loss_pixels) as total_pixels
+            FROM kg_hansen h
+            JOIN kg k ON k.kg_code = h.kg_code
+            {lc_where}
+            GROUP BY h.loss_year
+            ORDER BY h.loss_year
+        ''', lc_params).fetchall()
+        agg['hansen_loss_by_year'] = {r['loss_year']: r['total_pixels'] for r in h_rows}
+
+        return agg
+
+    # ════════════════════════════════════════════════════════════════
+    # Query: rankings and filters
+    # ════════════════════════════════════════════════════════════════
+
+    def query_type_ranking(self, object_type, metric='area', limit=20, offset=0):
+        """Rank KGs by a specific object type."""
+        c = self._conn()
+        order = {'area': 'lc.area_sqm', 'fraction': 'lc.fraction',
+                 'count': 'lc.n_objects', 'height': 'lc.height_mean'}
+        col = order.get(metric, 'lc.area_sqm')
+        total = c.execute('''
+            SELECT COUNT(*) FROM kg_landcover lc
+            JOIN kg k ON k.kg_code = lc.kg_code
+            WHERE lc.object_type=?
+        ''', (object_type,)).fetchone()[0]
+        rows = c.execute(f'''
+            SELECT k.kg_code, k.kg_name, k.gemeinde_name, k.district_name, k.state_name,
+                   lc.area_sqm, lc.fraction, lc.n_objects,
+                   lc.height_min, lc.height_max, lc.height_mean, lc.height_p90
+            FROM kg_landcover lc
+            JOIN kg k ON k.kg_code = lc.kg_code
+            WHERE lc.object_type=?
+            ORDER BY {col} DESC
+            LIMIT ? OFFSET ?
+        ''', (object_type, limit, offset)).fetchall()
+        results = [dict(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
+
+    def query_hansen_loss(self, year_from=None, year_to=None, min_loss=0,
+                          limit=50, offset=0):
+        """Find KGs with forest loss in a year range."""
+        c = self._conn()
+        where_parts = []
+        params = []
+        if year_from:
+            where_parts.append('h.loss_year >= ?')
+            params.append(year_from)
+        if year_to:
+            where_parts.append('h.loss_year <= ?')
+            params.append(year_to)
+        where = ('WHERE ' + ' AND '.join(where_parts)) if where_parts else ''
+        total = c.execute(f'''
+            SELECT COUNT(*) FROM (
+                SELECT h.kg_code
+                FROM kg_hansen h
+                JOIN kg k ON k.kg_code = h.kg_code
+                {where}
+                GROUP BY h.kg_code
+                HAVING SUM(h.loss_pixels) >= ?
+            )
+        ''', params + [min_loss]).fetchone()[0]
+        rows = c.execute(f'''
+            SELECT k.kg_code, k.kg_name, k.gemeinde_name, k.state_name,
+                   SUM(h.loss_pixels) as total_loss
+            FROM kg_hansen h
+            JOIN kg k ON k.kg_code = h.kg_code
+            {where}
+            GROUP BY h.kg_code
+            HAVING total_loss >= ?
+            ORDER BY total_loss DESC
+            LIMIT ? OFFSET ?
+        ''', params + [min_loss, limit, offset]).fetchall()
+        results = [dict(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
+
+    def query_new_buildings(self, min_count=1, limit=50, offset=0):
+        """Find KGs with new (uncadastred) buildings."""
+        c = self._conn()
+        total = c.execute('''
+            SELECT COUNT(*) FROM kg
+            WHERE processed=1 AND new_building_count >= ?
+        ''', (min_count,)).fetchone()[0]
+        rows = c.execute('''
+            SELECT kg_code, kg_name, gemeinde_name, district_name, state_name,
+                   new_building_count, total_area_sqm, quality_score
+            FROM kg WHERE processed=1 AND new_building_count >= ?
+            ORDER BY new_building_count DESC LIMIT ? OFFSET ?
+        ''', (min_count, limit, offset)).fetchall()
+        results = [dict(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
+
+    def query_processed(self, limit=500, offset=0):
+        """List all processed KGs."""
+        c = self._conn()
+        total = c.execute('SELECT COUNT(*) FROM kg WHERE processed=1').fetchone()[0]
+        rows = c.execute('''
+            SELECT * FROM kg WHERE processed=1
+            ORDER BY kg_name LIMIT ? OFFSET ?
+        ''', (limit, offset)).fetchall()
+        results = [self._kg_summary(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
+
+    # ════════════════════════════════════════════════════════════════
+    # Query: classification divergence & confidence
+    # ════════════════════════════════════════════════════════════════
+
+    def query_divergence(self, min_pct=0, rf_type=None, final_type=None,
+                         limit=50, offset=0):
+        """Find KGs where RF classification diverges most from final type.
+
+        Args:
+            min_pct: minimum divergence percentage (0-100)
+            rf_type: filter to divergences FROM this RF type
+            final_type: filter to divergences TO this final type
+            limit: max results
+        """
+        c = self._conn()
+        if rf_type or final_type:
+            # Query via kg_divergence table for specific type pairs
+            where_parts = []
+            params = []
+            if rf_type:
+                where_parts.append('d.rf_type=?')
+                params.append(rf_type)
+            if final_type:
+                where_parts.append('d.final_type=?')
+                params.append(final_type)
+            where = ' AND '.join(where_parts)
+            total = c.execute(f'''
+                SELECT COUNT(*) FROM kg_divergence d
+                JOIN kg k ON k.kg_code = d.kg_code
+                WHERE {where}
+            ''', params).fetchone()[0]
+            rows = c.execute(f'''
+                SELECT k.kg_code, k.kg_name, k.gemeinde_name, k.district_name,
+                       k.state_name, k.rf_diverged_pct, k.rf_diverged_count,
+                       k.mean_confidence, k.rf_mean_confidence,
+                       d.rf_type, d.final_type, d.count as pair_count
+                FROM kg_divergence d
+                JOIN kg k ON k.kg_code = d.kg_code
+                WHERE {where}
+                ORDER BY d.count DESC
+                LIMIT ? OFFSET ?
+            ''', params + [limit, offset]).fetchall()
+            results = [dict(r) for r in rows]
+        else:
+            # Query via kg table for overall divergence ranking
+            total = c.execute('''
+                SELECT COUNT(*) FROM kg
+                WHERE processed=1 AND rf_diverged_pct >= ?
+            ''', (min_pct,)).fetchone()[0]
+            rows = c.execute('''
+                SELECT * FROM kg
+                WHERE processed=1 AND rf_diverged_pct >= ?
+                ORDER BY rf_diverged_pct DESC
+                LIMIT ? OFFSET ?
+            ''', (min_pct, limit, offset)).fetchall()
+            results = [self._kg_summary(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
+
+    def query_low_confidence(self, max_confidence=0.5, limit=50, offset=0):
+        """Find KGs with lowest mean classification confidence."""
+        c = self._conn()
+        total = c.execute('''
+            SELECT COUNT(*) FROM kg
+            WHERE processed=1 AND mean_confidence IS NOT NULL
+                  AND mean_confidence <= ?
+        ''', (max_confidence,)).fetchone()[0]
+        rows = c.execute('''
+            SELECT * FROM kg
+            WHERE processed=1 AND mean_confidence IS NOT NULL
+                  AND mean_confidence <= ?
+            ORDER BY mean_confidence ASC
+            LIMIT ? OFFSET ?
+        ''', (max_confidence, limit, offset)).fetchall()
+        results = [self._kg_summary(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
+
+    def query_confidence_ranking(self, order='asc', limit=50, offset=0):
+        """Rank KGs by classification confidence.
+
+        Args:
+            order: 'asc' for lowest first, 'desc' for highest first
+        """
+        c = self._conn()
+        total = c.execute('''
+            SELECT COUNT(*) FROM kg
+            WHERE processed=1 AND mean_confidence IS NOT NULL
+        ''').fetchone()[0]
+        direction = 'ASC' if order == 'asc' else 'DESC'
+        rows = c.execute(f'''
+            SELECT * FROM kg
+            WHERE processed=1 AND mean_confidence IS NOT NULL
+            ORDER BY mean_confidence {direction}
+            LIMIT ? OFFSET ?
+        ''', (limit, offset)).fetchall()
+        results = [self._kg_summary(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
+
+    def query_type_confidence(self, object_type, limit=50, offset=0):
+        """Rank KGs by RF confidence for a specific object type."""
+        c = self._conn()
+        total = c.execute('''
+            SELECT COUNT(*) FROM kg_classification cl
+            JOIN kg k ON k.kg_code = cl.kg_code
+            WHERE cl.object_type=?
+        ''', (object_type,)).fetchone()[0]
+        rows = c.execute('''
+            SELECT k.kg_code, k.kg_name, k.gemeinde_name, k.district_name,
+                   k.state_name, cl.rf_mean_confidence, cl.rf_min_confidence,
+                   cl.rf_count, cl.diverged_count, cl.area_sqm
+            FROM kg_classification cl
+            JOIN kg k ON k.kg_code = cl.kg_code
+            WHERE cl.object_type=?
+            ORDER BY cl.rf_mean_confidence ASC
+            LIMIT ? OFFSET ?
+        ''', (object_type, limit, offset)).fetchall()
+        results = [dict(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
+
+    def query_high_confidence_type(self, object_type, min_confidence=0.7,
+                                   min_area_sqm=0, limit=50, offset=0):
+        """Find KGs where a specific type has RF confidence >= threshold AND area >= min.
+
+        Returns KG summaries with the matching type's classification stats.
+        """
+        c = self._conn()
+        total = c.execute('''
+            SELECT COUNT(*)
+            FROM kg_classification cl
+            JOIN kg k ON k.kg_code = cl.kg_code
+            WHERE cl.object_type=?
+              AND cl.rf_mean_confidence >= ?
+              AND cl.area_sqm >= ?
+        ''', (object_type, min_confidence, min_area_sqm)).fetchone()[0]
+        rows = c.execute('''
+            SELECT k.*, cl.rf_mean_confidence AS type_rf_confidence,
+                   cl.rf_min_confidence AS type_rf_min_confidence,
+                   cl.rf_count AS type_rf_count,
+                   cl.diverged_count AS type_diverged_count,
+                   cl.area_sqm AS type_area_sqm
+            FROM kg_classification cl
+            JOIN kg k ON k.kg_code = cl.kg_code
+            WHERE cl.object_type=?
+              AND cl.rf_mean_confidence >= ?
+              AND cl.area_sqm >= ?
+            ORDER BY cl.area_sqm DESC
+            LIMIT ? OFFSET ?
+        ''', (object_type, min_confidence, min_area_sqm, limit, offset)).fetchall()
+        results = []
+        for r in rows:
+            d = self._kg_summary(r)
+            d['type_rf_confidence'] = r['type_rf_confidence']
+            d['type_rf_min_confidence'] = r['type_rf_min_confidence']
+            d['type_rf_count'] = r['type_rf_count']
+            d['type_diverged_count'] = r['type_diverged_count']
+            d['type_area_sqm'] = r['type_area_sqm']
+            results.append(d)
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
+
+    def query_top_features(self, feature_type, object_type=None,
+                           min_confidence=0.0, bbox=None,
+                           limit=100, offset=0):
+        """Cross-KG query for top trees / objects / new buildings / infrastructure.
+
+        feature_type: 'trees', 'objects', 'new_buildings', 'infrastructure'
+        Filters by rf_confidence >= min_confidence and optionally by object_type.
+        bbox: (w,s,e,n) to restrict which KGs are scanned.
+        Returns features sorted by height (descending).
+        """
+        c = self._conn()
+        # Pre-filter KGs spatially if bbox given
+        if bbox and len(bbox) == 4:
+            kg_rows = c.execute('''
+                SELECT k.kg_code FROM kg k
+                JOIN kg_rtree r ON r.id = k.rowid
+                WHERE k.processed=1
+                  AND r.max_lon >= ? AND r.min_lon <= ?
+                  AND r.max_lat >= ? AND r.min_lat <= ?
+                ORDER BY k.kg_code
+            ''', (bbox[0], bbox[2], bbox[1], bbox[3])).fetchall()
+        else:
+            kg_rows = c.execute(
+                'SELECT kg_code FROM kg WHERE processed=1 ORDER BY kg_code'
+            ).fetchall()
+        results = []
+        sort_key = 'height_m'
+        for kg_row in kg_rows:
+            kg_code = kg_row['kg_code']
+            for _code, data in self._kg_json_docs(kg_code):
+                if feature_type == 'trees':
+                    items = data.get('top_10_trees', [])
+                    sort_key = 'height_m'
+                elif feature_type == 'objects':
+                    items = data.get('top_10_objects', [])
+                    sort_key = 'height_max_m'
+                elif feature_type == 'new_buildings':
+                    items = data.get('new_buildings', {}).get('features', [])
+                    sort_key = 'max_height_m'
+                elif feature_type == 'infrastructure':
+                    items = []
+                    for tdata in data.get('infrastructure', {}).get('by_type', {}).values():
+                        items.extend(tdata.get('features', []))
+                    sort_key = 'area_sqm'
+                else:
+                    continue
+                for item in items:
+                    rf_conf = item.get('rf_confidence', 0)
+                    if rf_conf < min_confidence:
+                        continue
+                    if object_type:
+                        it = item.get('type', '')
+                        if it and it != object_type:
+                            continue
+                    item_out = dict(item)
+                    item_out['kg_code'] = kg_code
+                    results.append(item_out)
+        # Sort by height/area descending
+        results.sort(key=lambda x: x.get(sort_key, 0) or 0, reverse=True)
+        total = len(results)
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results[offset:offset + limit],
+        }
+
+    # ════════════════════════════════════════════════════════════════
+    # Query: cross-KG segment-level power queries (via kg_type_top)
+    # ════════════════════════════════════════════════════════════════
+
+    def query_segments(self, object_type=None, min_rf_confidence=None,
+                       max_rf_confidence=None, min_confidence=None,
+                       max_confidence=None,
+                       min_area_sqm=None, max_area_sqm=None,
+                       min_height=None, max_height=None,
+                       min_volume=None, max_volume=None,
+                       bbox=None, state=None, district=None,
+                       sort='height_max_m', sort_dir='desc',
+                       percentile=None,
+                       limit=100, offset=0):
+        """Cross-KG query over individual segments from kg_type_top.
+
+        Queries the pre-indexed top-50 segments per type per KG.
+        Supports filtering by rf_confidence (raw RF score) and confidence
+        (final/combined score after calibration), area, height, volume,
+        spatial bounds, and admin hierarchy.
+
+        percentile: float 0-1, e.g. 0.01 for top 1%, 0.05 for top 5%.
+                    Computes threshold from all matching segments, returns
+                    only those above/below the threshold.
+
+        Returns {total, results: [{kg_code, object_type, lon, lat, ...}],
+                 percentile_threshold, percentile_count}
+        """
+        c = self._conn()
+        joins = []
+        where = []
+        params = []
+
+        # Type filter (single value or comma-separated OR list)
+        if object_type:
+            types = [t.strip() for t in object_type.split(',') if t.strip()]
+            if len(types) == 1:
+                where.append('t.object_type = ?')
+                params.append(types[0])
+            else:
+                placeholders = ','.join('?' * len(types))
+                where.append(f't.object_type IN ({placeholders})')
+                params.extend(types)
+
+        # Confidence filters — both RF and combined
+        if min_rf_confidence is not None:
+            where.append('t.rf_confidence >= ?')
+            params.append(min_rf_confidence)
+        if max_rf_confidence is not None:
+            where.append('t.rf_confidence <= ?')
+            params.append(max_rf_confidence)
+        if min_confidence is not None:
+            where.append('t.confidence >= ?')
+            params.append(min_confidence)
+        if max_confidence is not None:
+            where.append('t.confidence <= ?')
+            params.append(max_confidence)
+
+        # Area filters
+        if min_area_sqm is not None:
+            where.append('t.area_sqm >= ?')
+            params.append(min_area_sqm)
+        if max_area_sqm is not None:
+            where.append('t.area_sqm <= ?')
+            params.append(max_area_sqm)
+
+        # Height filters
+        if min_height is not None:
+            where.append('t.height_max_m >= ?')
+            params.append(min_height)
+        if max_height is not None:
+            where.append('t.height_max_m <= ?')
+            params.append(max_height)
+
+        # Volume filters (absolute value comparison)
+        if min_volume is not None:
+            where.append('ABS(t.volume_change_m3) >= ?')
+            params.append(min_volume)
+        if max_volume is not None:
+            where.append('ABS(t.volume_change_m3) <= ?')
+            params.append(max_volume)
+
+        # Spatial filter via KG bbox
+        if bbox and len(bbox) == 4:
+            joins.append('JOIN kg_rtree r ON r.id = k.rowid')
+            where.append('r.max_lon >= ? AND r.min_lon <= ? AND r.max_lat >= ? AND r.min_lat <= ?')
+            params.extend([bbox[0], bbox[2], bbox[1], bbox[3]])
+
+        # Admin filters
+        if state:
+            where.append('(k.state_code = ? OR k.state_name = ?)')
+            params.extend([state, state])
+        if district:
+            dc = district
+            if not dc.isdigit():
+                for code, name in DISTRICT_NAMES.items():
+                    if name.lower() == dc.lower():
+                        dc = code
+                        break
+            where.append('k.district_code = ?')
+            params.append(dc)
+
+        # Only processed KGs
+        where.append('k.processed = 1')
+
+        # Null coordinate filter
+        where.append('t.lon IS NOT NULL AND t.lat IS NOT NULL')
+
+        join_sql = '\n            '.join(joins)
+        where_sql = ' AND '.join(where) if where else '1=1'
+
+        # Sort column validation
+        _valid_sorts = {'height_max_m', 'height_mean_m', 'area_sqm',
+                        'volume_change_m3', 'rf_confidence', 'confidence',
+                        'ABS(volume_change_m3)'}
+        if sort == 'volume':
+            sort = 'ABS(volume_change_m3)'
+        elif sort not in _valid_sorts:
+            sort = 'height_max_m'
+        sort_direction = 'DESC' if sort_dir.lower() == 'desc' else 'ASC'
+
+        # Percentile query: first count total, then compute threshold
+        percentile_threshold = None
+        percentile_count = None
+        if percentile is not None and 0 < percentile < 1:
+            # Count total matching segments
+            count_sql = f'''SELECT COUNT(*) FROM kg_type_top t
+                JOIN kg k ON k.kg_code = t.kg_code
+                {join_sql}
+                WHERE {where_sql}'''
+            total_matching = c.execute(count_sql, params).fetchone()[0]
+            if total_matching > 0:
+                percentile_count = max(1, int(total_matching * percentile))
+                # Get the threshold value at the percentile boundary
+                threshold_sql = f'''SELECT {sort} FROM kg_type_top t
+                    JOIN kg k ON k.kg_code = t.kg_code
+                    {join_sql}
+                    WHERE {where_sql}
+                    ORDER BY {sort} {sort_direction}
+                    LIMIT 1 OFFSET ?'''
+                threshold_row = c.execute(threshold_sql,
+                                         params + [percentile_count - 1]).fetchone()
+                if threshold_row:
+                    percentile_threshold = threshold_row[0]
+                    # Add threshold filter
+                    if sort_direction == 'DESC':
+                        where.append(f'{sort} >= ?')
+                    else:
+                        where.append(f'{sort} <= ?')
+                    params.append(percentile_threshold)
+                    where_sql = ' AND '.join(where)
+
+        # Total count
+        count_sql = f'''SELECT COUNT(*) FROM kg_type_top t
+            JOIN kg k ON k.kg_code = t.kg_code
+            {join_sql}
+            WHERE {where_sql}'''
+        total = c.execute(count_sql, params).fetchone()[0]
+
+        # Fetch results
+        query_sql = f'''SELECT t.*, k.kg_name, k.gemeinde_name,
+                k.district_name, k.state_name
+            FROM kg_type_top t
+            JOIN kg k ON k.kg_code = t.kg_code
+            {join_sql}
+            WHERE {where_sql}
+            ORDER BY {sort} {sort_direction}
+            LIMIT ? OFFSET ?'''
+        rows = c.execute(query_sql, params + [limit, offset]).fetchall()
+
+        results = []
+        for r in rows:
+            d = dict(r)
+            d['_links'] = {
+                'kg': f'{BASE_URL}/api/v1/kg/{d["kg_code"]}',
+                'map': f'https://www.google.com/maps?q={d["lat"]},{d["lon"]}'
+                       if d.get('lat') and d.get('lon') else None,
+            }
+            results.append(d)
+
+        out = {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
+        if percentile is not None:
+            out['percentile'] = percentile
+            out['percentile_threshold'] = percentile_threshold
+            out['percentile_count'] = percentile_count
+        return out
+
+    def query_divergence_pairs(self, limit=50, offset=0):
+        """Get the most common RF→final type divergence pairs across all KGs."""
+        c = self._conn()
+        total = c.execute('''
+            SELECT COUNT(*) FROM (
+                SELECT rf_type, final_type
+                FROM kg_divergence
+                GROUP BY rf_type, final_type
+            )
+        ''').fetchone()[0]
+        rows = c.execute('''
+            SELECT rf_type, final_type, SUM(count) as total_count,
+                   COUNT(DISTINCT kg_code) as n_kgs
+            FROM kg_divergence
+            GROUP BY rf_type, final_type
+            ORDER BY total_count DESC
+            LIMIT ? OFFSET ?
+        ''', (limit, offset)).fetchall()
+        results = [dict(r) for r in rows]
+        return {
+            'total': total,
+            'offset': offset,
+            'limit': limit,
+            'results': results,
+        }
+
+    # ════════════════════════════════════════════════════════════════
+    # Lazy-load detail from light GPKG (Zenodo or local)
+    # ════════════════════════════════════════════════════════════════
+
+    # ── siedler slim-field helpers (LID-1 / LID-2) ──────────────────
+
+    def kgs_in_bbox(self, w, s, e, n, processed_only=True):
+        """KG codes whose bbox intersects (w,s,e,n) — via kg_rtree."""
+        c = self._conn()
+        q = ('SELECT k.kg_code FROM kg_rtree r JOIN kg k ON k.rowid = r.id '
+             'WHERE r.min_lon <= ? AND r.max_lon >= ? '
+             'AND r.min_lat <= ? AND r.max_lat >= ?')
+        if processed_only:
+            q += ' AND k.processed = 1'
+        return [r[0] for r in c.execute(q, (e, w, n, s))]
+
+    def query_trees_bbox(self, w, s, e, n, min_height=20.0, limit=2000):
+        """Sampled tree apices in bbox from kg_trees (legacy sampled set)."""
+        c = self._conn()
+        kgs = self.kgs_in_bbox(w, s, e, n)
+        if not kgs:
+            return {'rows': [], 'kgs': [], 'truncated': False}
+        lim = max(1, min(int(limit), 2000))
+        rows = c.execute(
+            'SELECT kg_code, NULL, lon, lat, h_m, crown_d_m, rf_conf '
+            'FROM kg_trees WHERE kg_code IN (%s) AND lon >= ? AND lon <= ? '
+            'AND lat >= ? AND lat <= ? AND h_m >= ? '
+            'ORDER BY h_m DESC LIMIT ?' % ','.join('?' * len(kgs)),
+            kgs + [w, e, s, n, float(min_height), lim + 1]).fetchall()
+        trunc = len(rows) > lim
+        return {'rows': [tuple(r) for r in rows[:lim]], 'kgs': kgs,
+                'truncated': trunc}
+
+    def query_segments_detail(self, kg_code, bbox=None, type_filter=None,
+                              limit=500, offset=0, wait=None):
+        """Return segment polygons for a KG, optionally filtered by type."""
+        gpkg = self._resolve_gpkg(kg_code, 'light', wait=wait)
+        if not gpkg:
+            return None
+        return _query_gpkg_layer(gpkg, 'segments', bbox=bbox,
+                                 type_filter=type_filter, limit=limit, offset=offset)
+
+    def query_segment_points(self, kg_code, bbox=None, type_filter=None,
+                             limit=500, offset=0, wait=None):
+        """Return segment centroid points for a KG."""
+        gpkg = self._resolve_gpkg(kg_code, 'light', wait=wait)
+        if not gpkg:
+            # Try full GPKG which has segment_points
+            gpkg = self._resolve_gpkg(kg_code, 'full', wait=wait)
+            if not gpkg:
+                return None
+        return _query_gpkg_layer(gpkg, 'segment_points', bbox=bbox,
+                                 type_filter=type_filter, limit=limit, offset=offset)
+
+    def gpkg_layers(self, kg_code, variant='light', wait=None):
+        """List available vector layers in a KG's GPKG."""
+        gpkg = self._resolve_gpkg(kg_code, variant, wait=wait)
+        if not gpkg:
+            return None
+        try:
+            import fiona
+            layers = fiona.listlayers(gpkg)
+            result = []
+            for l in layers:
+                try:
+                    with fiona.open(gpkg, layer=l) as src:
+                        result.append({
+                            'name': l,
+                            'count': len(src),
+                            'geometry_type': src.schema.get('geometry'),
+                            'properties': list(src.schema.get('properties', {}).keys()),
+                        })
+                except Exception:
+                    result.append({'name': l, 'count': 0, 'geometry_type': None, 'properties': []})
+            return result
+        except Exception as e:
+            log.warning('gpkg_layers %s %s: %s', kg_code, variant, e)
+            return None
+
+    def _resolve_gpkg(self, kg_code, variant='light', wait=None, prefer_v1=False):
+        """Find or download a GPKG for a KG. Returns local path or None.
+
+        ``wait`` (seconds, None = block until done) is forwarded to
+        ``GpkgCache.download``; a ``zenodo_fetch.FetchInProgress`` escapes
+        when the download outlives it (callers answer 202 + progress).
+
+        Search order:
+        1. Local processor output  (data/austria_processor/gpkg/)
+        2. GPKG cache              (data/gpkg_cache/)
+        3. Download from Zenodo    (cached for future use)
+        """
+        # 1. Local processor output
+        local = Path(f'data/austria_processor/gpkg/{kg_code}_{variant}.gpkg')
+        if local.exists() and local.stat().st_size > 0:
+            return str(local)
+
+        # 2. GPKG cache
+        cache = get_gpkg_cache()
+        cached = cache.get(kg_code, variant)
+        if cached:
+            return cached
+
+        # 3. Zenodo — manifest first (fresh link + size + md5; for
+        #    variant=light prefer the v2 light GPKG, which shares the
+        #    ``light_v2`` cache slot with the v3 tree service), then the
+        #    index URL as a last resort.  Auth is added by zenodo_fetch.
+        candidates = []
+        try:
+            import trees_v3 as _t3
+            from v2_ingest import _link
+            ent = _t3.manifest_entries()
+            keys = ([f'{kg_code}_light_gpkg_v2', f'{kg_code}_light_gpkg'] if variant == 'light'
+                    else [f'{kg_code}_{variant}_gpkg'])
+            if prefer_v1:   # e.g. ``new_buildings`` exists only in the v1 light GPKG
+                keys.reverse()
+            for k in keys:
+                e = ent.get(k) or {}
+                if 'error' in str(e.get('status') or ''):
+                    continue
+                url, hdr = _link(e)
+                if url:
+                    cv = 'light_v2' if k.endswith('_v2') else variant
+                    candidates.append((cv, url, hdr, int(e.get('size') or 0), e.get('checksum') or None))
+        except Exception as ex:  # noqa: BLE001
+            log.debug('_resolve_gpkg manifest lookup %s: %s', kg_code, ex)
+        c = self._conn()
+        col = f'zenodo_{variant}_gpkg_url'
+        row = c.execute(f'SELECT {col} FROM kg WHERE kg_code=?', (kg_code,)).fetchone()
+        if row and row[0]:
+            candidates.append((variant, row[0], None, 0, None))
+        if not candidates:
+            return None
+        for cv, url, hdr, expected, md5 in candidates:
+            cached = cache.get(kg_code, cv, expected_size=expected)
+            if cached:
+                return cached
+            p = cache.download(kg_code, cv, url, headers=hdr, expected_size=expected,
+                               md5=md5, wait=wait)
+            if p:
+                return p
+        return None
+
+    # ════════════════════════════════════════════════════════════════
+    # Helpers
+    # ════════════════════════════════════════════════════════════════
+
+    def _kg_summary(self, row):
+        """Convert a kg Row to a summary dict (no landcover/hansen detail)."""
+        d = dict(row)
+        # Round float columns for cleaner output
+        for k, v in d.items():
+            if isinstance(v, float):
+                if 'pct' in k or 'fraction' in k:
+                    d[k] = round(v, 1)
+                elif 'stories' in k:
+                    d[k] = round(v, 1)
+                else:
+                    d[k] = round(v, 2)
+        d['_links'] = self._build_links(d)
+        return d
+
+
+def _repair_observe(code, doc, manifest=None) -> None:
+    """Feed the repairable-layer registry (``product_repair``) from a
+    freshly ingested v1 JSON.  Best effort, never raises."""
+    try:
+        import product_repair as _pr
+        e = (manifest or {}).get(f'{code}_json') if isinstance(manifest, dict) else None
+        ts = (e or {}).get('uploaded_at') or '' if isinstance(e, dict) else ''
+        ver = (e or {}).get('version') or '' if isinstance(e, dict) else ''
+        _pr.observe(code, doc, ts, ver)
+    except Exception as ex:
+        log.debug('product_repair observe %s: %s', code, ex)
+
+
+def _norm_version(v) -> str:
+    """Normalise a manifest ``version`` tag: ``''``/None → ``'v2'`` (pre-2.1
+    upgrades carried no tag), ``'2.2'`` → ``'v2.2'``."""
+    v = str(v or '').strip()
+    if not v:
+        return 'v2'
+    return v if v.startswith('v') else f'v{v}'
+
+
+def _version_key(v) -> tuple:
+    """Sort key so 'v1' < 'v2' < 'v2.1' < 'v2.2'."""
+    try:
+        from product_repair import base_version as _bv
+        return tuple(int(x) for x in _bv(str(v)).lstrip('v').split('.'))
+    except Exception:
+        return (0,)
+
+
+def _product_version(zj, zj2) -> str | None:
+    """Full product version of a code: ``'v2.2'`` / ``'v2.1'`` / ``'v2'``
+    from the committed ``_json_v2`` manifest entry's ``version`` tag;
+    ``'v2'`` when the ``_json`` was written by a v2 processor; ``'v1'``
+    when only v1 products exist; None if none."""
+    if isinstance(zj2, dict) and zj2.get('size') \
+            and 'error' not in str(zj2.get('status') or ''):
+        return _norm_version(zj2.get('version'))
+    if isinstance(zj, dict) and zj:
+        from product_repair import base_version as _bv
+        return 'v2' if _bv(zj.get('version')) == 'v2' else 'v1'
+    return None
+
+
+def _parent_product_version(manifest, codes) -> str | None:
+    """Version of a (possibly split) parent = the *lowest* version across
+    its product codes.  A parent is only 'v2.2' when every block that
+    has a ``_json`` also has a committed ``_json_v2`` tagged v2.2 — one
+    lagging block keeps the parent at the lower version so it is not
+    counted as upgraded twice (once per re-upgrade wave)."""
+    versions = []
+    for cc in codes:
+        zj = manifest.get(f'{cc}_json')
+        zj2 = manifest.get(f'{cc}_json_v2')
+        if not isinstance(zj, dict) and not isinstance(zj2, dict):
+            continue
+        pv = _product_version(zj if isinstance(zj, dict) else None,
+                              zj2 if isinstance(zj2, dict) else None)
+        if pv:
+            versions.append(pv)
+    if not versions:
+        return None
+    return min(versions, key=_version_key)
+
+
+_ZENODO_LINK_COLS = [
+    ('_json', 'zenodo_json_url', 'zenodo_json_size'),
+    ('_light_gpkg', 'zenodo_light_gpkg_url', 'zenodo_light_gpkg_size'),
+    ('_full_gpkg', 'zenodo_full_gpkg_url', 'zenodo_full_gpkg_size'),
+    ('_json_v2', 'zenodo_json_v2_url', 'zenodo_json_v2_size'),
+    ('_light_gpkg_v2', 'zenodo_light_gpkg_v2_url', 'zenodo_light_gpkg_v2_size'),
+]
+
+
+def _write_zenodo_links(c, target_code, codes, manifest):
+    """Write the freshest Zenodo URL per product kind across the parent +
+    its accepted block codes (so a split parent links to the most recently
+    uploaded artefact), plus ``product_version``."""
+    best_j = best_j2 = None
+    for suffix, col_url, col_size in _ZENODO_LINK_COLS:
+        best = None
+        best_ts = ''
+        for cc in codes:
+            e = manifest.get(f'{cc}{suffix}')
+            if not isinstance(e, dict):
+                continue
+            ts = e.get('uploaded_at') or ''
+            if best is None or ts > best_ts:
+                best, best_ts = e, ts
+        if best:
+            c.execute(f'UPDATE kg SET {col_url}=?, {col_size}=? WHERE kg_code=?',
+                      (_zenodo_url(best), best.get('size'), target_code))
+        if suffix == '_json':
+            best_j = best
+        elif suffix == '_json_v2':
+            best_j2 = best
+    pv = _parent_product_version(manifest, codes) or _product_version(best_j, best_j2)
+    if pv:
+        c.execute('UPDATE kg SET product_version=? WHERE kg_code=?', (pv, target_code))
+    # Completion timestamps: a split parent completes when its LAST block's
+    # product lands, so take the max across codes.  json_v2 timestamp only
+    # counts codes at the parent's (min) version, so a 2.1→2.2 re-upgrade
+    # moves the timestamp forward once every block is at 2.2.
+    j_ts = max((str((manifest.get(f'{cc}_json') or {}).get('uploaded_at') or '')
+                for cc in codes if isinstance(manifest.get(f'{cc}_json'), dict)),
+               default='')
+    j2_ts = ''
+    if pv and pv not in ('v1',) and any(
+            isinstance(manifest.get(f'{cc}_json_v2'), dict) for cc in codes):
+        j2_ts = max((str((manifest.get(f'{cc}_json_v2') or {}).get('uploaded_at') or '')
+                     for cc in codes
+                     if isinstance(manifest.get(f'{cc}_json_v2'), dict)),
+                    default='')
+    try:
+        c.execute('UPDATE kg SET json_uploaded_at=?, json_v2_uploaded_at=? WHERE kg_code=?',
+                  (j_ts or None, j2_ts or None, target_code))
+    except Exception:
+        pass  # pre-migration schema
+
+
+def _zenodo_url(entry):
+    """Build Zenodo download URL from manifest entry.
+
+    Uses the draft record files/content endpoint which works for unpublished
+    depositions (requires auth token on the server side, but is the correct
+    direct link).  Format: /api/records/<depo_id>/draft/files/<filename>/content
+    """
+    if not entry:
+        return None
+    depo_id = entry.get('depo_id')
+    filename = entry.get('filename')
+    if depo_id and filename:
+        return f"https://zenodo.org/api/records/{depo_id}/draft/files/{filename}/content"
+    # Fallback to bucket_url if depo_id unavailable
+    if entry.get('bucket_url') and filename:
+        return f"{entry['bucket_url']}/{filename}"
+    return None
+
+
+# ════════════════════════════════════════════════════════════════════════
+# GPKG lazy-load cache
+# ════════════════════════════════════════════════════════════════════════
+
+GPKG_CACHE_DIR = 'data/gpkg_cache'
+GPKG_CACHE_MAX_BYTES = 1_000_000_000  # 1 GB
+
+
+class GpkgCache:
+    """LRU disk cache for light/full GPKGs downloaded from Zenodo."""
+
+    def __init__(self, cache_dir=GPKG_CACHE_DIR, max_bytes=GPKG_CACHE_MAX_BYTES):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.max_bytes = max_bytes
+        self._lock = threading.Lock()
+
+    def _path(self, kg_code, variant):
+        return self.cache_dir / f'{kg_code}_{variant}.gpkg'
+
+    def get(self, kg_code, variant='light', expected_size=0):
+        """Return cached path if it exists, else None. Touch for LRU.
+
+        ``expected_size`` > 0 (the manifest's current byte size) turns a
+        size mismatch into an eviction: a KG that was re-upgraded (e.g.
+        63330 went 2.1 → 2.2 within one day) must not keep serving the
+        previous product from disk.
+        """
+        p = self._path(kg_code, variant)
+        if p.exists() and p.stat().st_size > 0:
+            if expected_size and p.stat().st_size != expected_size:
+                log.info('gpkg_cache: %s stale (%d vs manifest %d) — evicting',
+                         p.name, p.stat().st_size, expected_size)
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+                return None
+            try:
+                p.touch()  # update mtime for LRU
+            except OSError:
+                pass
+            return str(p)
+        return None
+
+    def sweep_stale(self, manifest_entries):
+        """Delete cached GPKGs whose size no longer matches the manifest (or
+        that have no manifest entry at all).  Returns list of removed names."""
+        by_fn = {e['filename']: e for e in manifest_entries.values()
+                 if isinstance(e, dict) and e.get('filename')}
+        removed = []
+        for p in list(self.cache_dir.glob('*.gpkg')) + list(self.cache_dir.glob('*.gpkg.tmp')):
+            e = by_fn.get(p.name)
+            if p.suffix == '.tmp' and time.time() - p.stat().st_mtime < 600:
+                continue   # in-flight zenodo_fetch download (resumable) — leave it
+            stale = p.suffix == '.tmp' or e is None or int(e.get('size') or 0) != p.stat().st_size
+            if stale:
+                try:
+                    p.unlink()
+                    removed.append(p.name)
+                    log.info('gpkg_cache: sweep removed %s', p.name)
+                except OSError:
+                    pass
+        return removed
+
+    def download(self, kg_code, variant, url, headers=None, expected_size=0,
+                 wait=None, md5=None):
+        """Download a GPKG from Zenodo through ``zenodo_fetch`` (progress-
+        aware, resumable, single-flight across threads AND gunicorn
+        workers).  Returns local path or None on terminal failure.
+
+        Zenodo *bucket* URLs (``https://zenodo.org/api/files/<uuid>/<fn>``)
+        belong to draft depositions and 403 without the owner token, so a
+        Bearer header is added for them automatically (cf. ``v2_ingest._link``);
+        ``headers`` may override.  ``expected_size`` > 0 rejects truncated
+        bodies so a half-downloaded GPKG never enters the cache.
+
+        ``wait`` (seconds) bounds how long the caller blocks: ``None`` =
+        until done, ``0`` = kick off and return immediately.  When the
+        download is still running after ``wait`` s a
+        ``zenodo_fetch.FetchInProgress`` (``.state`` = live progress dict)
+        propagates so sync endpoints can answer ``202`` and let the client
+        poll while the download continues in the background.
+        """
+        import zenodo_fetch
+        existing = self.get(kg_code, variant, expected_size=expected_size)
+        if existing:
+            return existing
+        with self._lock:
+            self._evict_if_needed()
+        dest = self._path(kg_code, variant)
+        try:
+            p = zenodo_fetch.download(url, dest, headers=headers,
+                                      expected_size=int(expected_size or 0), md5=md5,
+                                      label=f'{kg_code} {variant} GPKG', wait=wait)
+            return str(p)
+        except zenodo_fetch.FetchInProgress:
+            raise
+        except Exception as e:
+            log.warning('gpkg_cache: download failed %s %s: %s', kg_code, variant, e)
+            return None
+
+    def _evict_if_needed(self):
+        """Remove oldest files until under max_bytes."""
+        files = sorted(self.cache_dir.glob('*.gpkg'), key=lambda p: p.stat().st_mtime)
+        total = sum(f.stat().st_size for f in files)
+        while total > self.max_bytes and files:
+            victim = files.pop(0)
+            sz = victim.stat().st_size
+            try:
+                victim.unlink()
+                total -= sz
+                log.info('gpkg_cache: evicted %s (%d MB)', victim.name, sz // (1024*1024))
+            except OSError:
+                pass
+
+    def size_bytes(self):
+        """Total cache size."""
+        return sum(f.stat().st_size for f in self.cache_dir.glob('*.gpkg'))
+
+    def count(self):
+        """Number of cached files."""
+        return len(list(self.cache_dir.glob('*.gpkg')))
+
+
+_gpkg_cache = None
+_gpkg_cache_lock = threading.Lock()
+
+
+def get_gpkg_cache() -> GpkgCache:
+    global _gpkg_cache
+    if _gpkg_cache is None:
+        with _gpkg_cache_lock:
+            if _gpkg_cache is None:
+                _gpkg_cache = GpkgCache()
+    return _gpkg_cache
+
+
+def _query_gpkg_layer(gpkg_path, layer_name, bbox=None, type_filter=None,
+                      limit=500, offset=0):
+    """Read features from a GPKG layer. Returns {layer, count, features} or None.
+
+    bbox: (min_lon, min_lat, max_lon, max_lat) in WGS84
+    type_filter: list of object type strings to include
+    """
+    import fiona
+    try:
+        layers = fiona.listlayers(gpkg_path)
+        if layer_name not in layers:
+            return None
+    except Exception:
+        return None
+
+    features = []
+    total = 0
+    try:
+        with fiona.open(gpkg_path, layer=layer_name) as src:
+            if bbox:
+                it = src.filter(bbox=(bbox[0], bbox[1], bbox[2], bbox[3]))
+            else:
+                it = iter(src)
+
+            for f in it:
+                if type_filter:
+                    ft = f.get('properties', {}).get('type')
+                    if ft not in type_filter:
+                        continue
+                total += 1
+                if total <= offset:
+                    continue
+                if len(features) >= limit:
+                    continue  # keep counting total
+                feat = {
+                    'type': 'Feature',
+                    'geometry': dict(f.get('geometry', {})) if f.get('geometry') else None,
+                    'properties': dict(f.get('properties', {})),
+                }
+                features.append(feat)
+    except Exception as e:
+        log.warning('_query_gpkg_layer %s/%s: %s', gpkg_path, layer_name, e)
+        return None
+
+    return {
+        'layer': layer_name,
+        'total': total,
+        'offset': offset,
+        'limit': limit,
+        'features': features,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Module-level singleton
+# ════════════════════════════════════════════════════════════════════════
+
+_index = None
+_index_lock = threading.Lock()
+
+
+def get_index() -> SearchIndex:
+    """Get or create the global search index singleton."""
+    global _index
+    if _index is None:
+        with _index_lock:
+            if _index is None:
+                _index = SearchIndex()
+    return _index
+
+
+def init_index():
+    """Initialize and build the search index on startup."""
+    idx = get_index()
+    idx.build()
+    return idx

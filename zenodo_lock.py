@@ -1,0 +1,280 @@
+"""Distributed Zenodo upload mutex client.
+
+All Zenodo write operations across the peer fleet share one API token
+and (sometimes) one draft deposition.  Concurrent PUTs would fail with
+409s and orphan files.  This module provides a tiny client for the
+broker on the primary instance (see ``app.py`` ``/api/v1/zenodo/lock``
+endpoints).
+
+Usage::
+
+    from zenodo_lock import zenodo_upload_lock
+
+    with zenodo_upload_lock(purpose='kg_upload', kg='91109'):
+        client.upload_stream(...)
+
+If no broker URL is configured (env ``ZENODO_LOCK_URL`` empty), the
+lock is a no-op so single-instance development still works.
+"""
+from __future__ import annotations
+
+import contextlib
+import logging
+import os
+import socket
+import threading
+import time
+from pathlib import Path
+from typing import Optional
+
+import requests
+
+_ADMIN_TOKEN_PATH = Path('data/admin_token')
+
+
+def _admin_headers() -> dict:
+    """Cluster auth header for the broker. Re-read each call so token
+    rotations on disk propagate without restarts. Empty dict if missing
+    (single-host dev or loopback)."""
+    try:
+        tok = _ADMIN_TOKEN_PATH.read_text().strip()
+        if tok:
+            return {'X-Admin-Token': tok}
+    except Exception:
+        pass
+    return {}
+
+log = logging.getLogger(__name__)
+
+_DEFAULT_TTL = 120.0  # must match _ZENODO_LOCK_TTL on the server
+_HEARTBEAT_INTERVAL = 30.0  # seconds; well under TTL/2
+_ACQUIRE_RETRY_INTERVAL = 5.0  # seconds between retries when locked
+_ACQUIRE_TIMEOUT = 7200.0  # max wait for the lease (2 h; raised from 30 min for the
+# 2026-10-10 upload-concurrency experiment: with ZENODO_LOCK_KG_SLOTS=8 on the
+# broker a 25-deep waiter queue must NOT fall through to "proceeding without
+# lease", or the cap is meaningless)
+# HTTP timeout for the broker POST. Primary's gunicorn workers can stall
+# briefly under load (heavy GPKG building, search-index rebuild, etc.) so
+# 15 s was too tight — a slow tick produced spurious "proceeding without
+# lease" warnings on every cache-only peer simultaneously.
+_BROKER_HTTP_TIMEOUT = (5, 60)  # (connect, read)
+# Number of consecutive transport failures we tolerate quietly before
+# escalating to a warning. The broker is best‑effort — a single blip is
+# normal, but sustained failures should be loud.
+
+
+def _broker_url() -> Optional[str]:
+    url = os.environ.get('ZENODO_LOCK_URL', '').strip()
+    if url:
+        return url.rstrip('/')
+    # Env unset: we are probably running inside gunicorn on a director /
+    # primary (the processor always gets the env from app.py). Resolve the
+    # same way app.py does for the processor so director-side Zenodo
+    # writers (cache reconcile, chkpt deletes) still serialise through
+    # the broker instead of silently running lock-less.
+    try:
+        lock_file = Path('data/austria_processor/zenodo_lock_url.txt')
+        if lock_file.exists():
+            u = lock_file.read_text().strip()
+            if u:
+                return u.rstrip('/')
+        if Path('data/austria_processor/is_director').exists():
+            broker = 'http://127.0.0.1:8001'
+            try:
+                r = requests.get(broker + '/api/v1/zenodo/lock', timeout=1.0)
+                if r.status_code == 200:
+                    return broker
+            except Exception:
+                pass
+            return 'http://127.0.0.1:8000'
+    except Exception:
+        pass
+    return None
+
+
+def _peer_id() -> str:
+    return (
+        os.environ.get('ZENODO_LOCK_PEER')
+        or os.environ.get('INSTANCE_ID')
+        or socket.gethostname()
+        or 'unknown'
+    )
+
+
+class ZenodoLease:
+    """Active lease on the broker.  Renews itself in a daemon thread."""
+
+    def __init__(self, broker: str, peer: str, token: str, ttl_s: float):
+        self.broker = broker
+        self.peer = peer
+        self.token = token
+        self.ttl_s = ttl_s
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._heartbeat_loop, name='zenodo-lease-hb', daemon=True)
+        self._thread.start()
+
+    def _heartbeat_loop(self):
+        consecutive_fail = 0
+        while not self._stop.wait(_HEARTBEAT_INTERVAL):
+            try:
+                r = requests.post(
+                    f"{self.broker}/api/v1/zenodo/lock/heartbeat",
+                    json={'token': self.token},
+                    timeout=_BROKER_HTTP_TIMEOUT,
+                    headers=_admin_headers(),
+                )
+                if r.status_code == 410:
+                    log.warning('Upload lease lost (410) — broker reclaimed it')
+                    self._stop.set()
+                    return
+                r.raise_for_status()
+                consecutive_fail = 0
+            except Exception as e:
+                consecutive_fail += 1
+                # Single hiccups are normal (gunicorn workers briefly
+                # busy). Only escalate to a warning after sustained
+                # failures, and avoid the "zenodo"/"lease" tokens that
+                # the throttle classifier matches — broker-internal
+                # chatter shouldn't be treated as upstream Zenodo
+                # pressure.
+                level = log.info if consecutive_fail < 3 else log.warning
+                level('Upload broker heartbeat blip (%d): %s',
+                      consecutive_fail, str(e)[:160])
+
+    def release(self):
+        self._stop.set()
+        # Best-effort, retrying release. The TTL on the broker will
+        # auto-reclaim the lease within _DEFAULT_TTL seconds even if
+        # every release attempt fails, so we can't deadlock the fleet
+        # — but a clean release lets the next peer grab the lock
+        # immediately. Run in a background thread so we never block
+        # the caller's hot path on a slow primary.
+        # First attempt is synchronous with a short timeout: callers
+        # such as the processor's post-completion chkpt_delete thread
+        # run right before the process exits for a graceful restart,
+        # and a daemon release thread dies with it — the lease then
+        # sat on the broker until the TTL reaper (Sep 2026: 120 s
+        # cache-class holds after every rollout-boundary KG).
+        try:
+            requests.delete(
+                f"{self.broker}/api/v1/zenodo/lock",
+                json={'token': self.token},
+                timeout=(3, 10),
+                headers=_admin_headers(),
+            )
+            return
+        except Exception as e:
+            log.info('Upload broker release: sync attempt failed (%s) — '
+                     'retrying in background', str(e)[:120])
+
+        def _release_in_background():
+            for attempt in range(3):
+                try:
+                    requests.delete(
+                        f"{self.broker}/api/v1/zenodo/lock",
+                        json={'token': self.token},
+                        timeout=_BROKER_HTTP_TIMEOUT,
+                        headers=_admin_headers(),
+                    )
+                    return
+                except Exception as e:
+                    if attempt == 2:
+                        # Don't log "Zenodo lease release failed" — the
+                        # tokens trip the throttle classifier. Reword.
+                        log.info(
+                            'Upload broker release blip (will TTL-reclaim '
+                            'in %.0fs): %s', _DEFAULT_TTL, str(e)[:160])
+                    else:
+                        time.sleep(2 * (attempt + 1))
+        threading.Thread(
+            target=_release_in_background,
+            name='zenodo-lease-release', daemon=True,
+        ).start()
+
+
+@contextlib.contextmanager
+def zenodo_upload_lock(purpose: str = 'unknown', kg: str | None = None,
+                       max_wait_s: float = _ACQUIRE_TIMEOUT):
+    """Block until a Zenodo upload lease is granted, then auto-release.
+
+    No-op if ``ZENODO_LOCK_URL`` is not set (single-instance mode).
+    """
+    broker = _broker_url()
+    if broker is None:
+        yield None
+        return
+    peer = _peer_id()
+    deadline = time.monotonic() + max_wait_s
+    lease: Optional[ZenodoLease] = None
+    backoff = _ACQUIRE_RETRY_INTERVAL
+    transport_failures = 0
+    overload_5xx = 0
+    while True:
+        try:
+            r = requests.post(
+                f"{broker}/api/v1/zenodo/lock",
+                json={'peer': peer, 'purpose': purpose, 'kg': kg},
+                timeout=_BROKER_HTTP_TIMEOUT,
+                headers=_admin_headers(),
+            )
+        except Exception as e:
+            # Broker unreachable. We retry a couple of times on transport
+            # failures before giving up — the primary's gunicorn workers
+            # can briefly stall under load and we'd rather wait 5–10 s for
+            # the lease than fan out into uncoordinated uploads.
+            transport_failures += 1
+            if transport_failures <= 2 and time.monotonic() < deadline:
+                log.info('Zenodo lock broker transport error (%s) — retry %d',
+                         str(e)[:120], transport_failures)
+                time.sleep(min(backoff, max(1.0, deadline - time.monotonic())))
+                backoff = min(backoff * 1.5, 30.0)
+                continue
+            # Sustained failure — fail open. We'd rather process than
+            # deadlock the fleet on a network outage; the director's
+            # single‑active rule already keeps Zenodo writes mostly serial.
+            log.warning(
+                'Zenodo lock broker unreachable after %d attempts (%s) — '
+                'proceeding without lease', transport_failures, str(e)[:160])
+            yield None
+            return
+        if r.status_code == 200:
+            data = r.json()
+            lease = ZenodoLease(broker, peer, data['token'],
+                                float(data.get('ttl_s', _DEFAULT_TTL)))
+            log.info('Zenodo lease acquired (purpose=%s, kg=%s)', purpose, kg)
+            break
+        if r.status_code == 423:
+            data = r.json() if r.content else {}
+            log.info('Zenodo lock busy (%s; held by %s for %ss, idle %ss; '
+                     'shared %s/%s) — waiting',
+                     data.get('reason') or 'locked', data.get('holder'),
+                     data.get('age_s'), data.get('idle_s'),
+                     data.get('shared_used'), data.get('shared_slots'))
+        elif r.status_code in (500, 502, 503, 504):
+            # Broker transiently overloaded: the primary's gunicorn workers
+            # (or the exe.dev proxy in front of them) returned a 5xx HTML
+            # page, not a lock decision. The primary IS reachable (it just
+            # answered), so unlike a transport error we keep waiting for it
+            # to recover rather than failing open into an uncoordinated
+            # upload. Retry quietly with backoff up to the 30-min deadline
+            # instead of spamming a warning on every cache-only peer each
+            # tick. (Don't touch transport_failures — that gates fail-open.)
+            overload_5xx += 1
+            log.info('Zenodo lock broker %d (transient overload) — retry %d',
+                     r.status_code, overload_5xx)
+        else:
+            log.warning('Zenodo lock acquire returned HTTP %d: %s',
+                        r.status_code, r.text[:200])
+        if time.monotonic() >= deadline:
+            log.error('Zenodo lock acquire timeout after %.0fs — proceeding without lease',
+                      max_wait_s)
+            yield None
+            return
+        time.sleep(min(backoff, max(1.0, deadline - time.monotonic())))
+        backoff = min(backoff * 1.5, 30.0)
+    try:
+        yield lease
+    finally:
+        if lease is not None:
+            lease.release()

@@ -1,0 +1,15284 @@
+#!/usr/bin/env python3
+"""Austria Landscape Processor — segment every KG, upload to Zenodo.
+
+Produces per-KG:
+  1. Full GPKG: all rasters (DTM, DSM, nDSM, ortho, CIR, segmentation) + legend
+  2. Light GPKG: segmentation raster+vector, parcels w/ DTM heights, buildings
+     w/ object heights, vectorised new buildings, vectorised infrastructure
+  3. JSON summary: area summary, landscape characterisation, tallest objects/trees,
+     terrain stats, NDVI, Hansen loss, new buildings, infrastructure
+
+Usage:
+  python3 austria_processor.py                     # process all KGs
+  python3 austria_processor.py --kg 63349          # process single KG
+  python3 austria_processor.py --state Steiermark  # process one state
+  python3 austria_processor.py --retry-failed      # retry failed KGs only
+"""
+from __future__ import annotations
+
+import argparse
+import atexit
+import concurrent.futures
+import ctypes
+import gc
+import json
+import logging
+import multiprocessing
+import os
+import signal
+import sys
+import shutil
+import tempfile
+import threading
+import time
+import traceback
+from collections import Counter, defaultdict
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+import numpy as np
+import requests
+try:  # keep-alive pool for module-level requests.* (see http_pool.py)
+    import http_pool as _http_pool
+    _http_pool.install()
+except Exception:
+    pass
+from pyproj import Transformer
+from shapely.geometry import box, shape as shapely_shape, Point, mapping
+from shapely.ops import transform as shapely_transform
+
+# === SECTION: Config ===
+
+# Per-peer ``recent_log`` ring in progress.json. Was 200 (~1 h of a busy
+# KG); after the 2026-09-30 director outage the fleet's rings had already
+# wrapped past the 8 h hole. 500 entries ≈ 100 KB; peer→director pushes
+# are delta-based (recent_log_delta watermark) so this costs no bandwidth.
+RECENT_LOG_RING = 500
+import umfeld as _umfeld
+CADASTRE_BASE = _umfeld.CADASTRE_BASE  # token-gated /k tier, see umfeld.py
+ZENODO_TOKEN = "REDACTED_ROTATED_ZENODO_TOKEN"
+# Product/model version.  ``SEG_MODEL_VERSION=v2`` switches the classifier to
+# the segv2 LightGBM (object_segmentation.segment_and_classify(model="v2")),
+# stamps products "v2" and adds the v2-only JSON/GPKG extras (parcel outline
+# elevation profiles, model block).  Peers stay on v1 until the env is flipped
+# in the processor unit (see segv2/HANDOVER.md → wiring).
+# Default (since the v2 rollout, 2026-09): v2 whenever the model + lightgbm are
+# usable on this host (segv2.model_v2.available()), else v1.  Explicit env
+# always wins (``SEG_MODEL_VERSION=v1`` forces the legacy RF).
+def _default_model_version() -> str:
+    env = os.environ.get("SEG_MODEL_VERSION", "").strip().lower()
+    if env in ("v1", "v2"):
+        return env
+    try:
+        import sys as _sys
+        _sv2 = str(Path(__file__).resolve().parent / "segv2")
+        if _sv2 not in _sys.path:
+            _sys.path.insert(0, _sv2)
+        import model_v2 as _mv2
+        return "v2" if _mv2.available() else "v1"
+    except Exception:
+        return "v1"
+
+
+MODEL_VERSION = _default_model_version()
+VERSION = "v2" if MODEL_VERSION == "v2" else "v1"
+# Product version of the v2 products (``_json_v2`` / ``_light_gpkg_v2``).
+# ``product_version`` in the kgjson/2 doc; the manifest entry's ``version``
+# carries ``v2.1`` so eligibility (re-upgrade when < current) works without
+# decoding blobs.  See docs/v2.1-product-spec.md.
+from v21_products import PRODUCT_VERSION, MANIFEST_VERSION as V2_PRODUCT_MANIFEST_VERSION  # noqa: E402
+
+
+def _product_upload_version(file_key: str, defects=None) -> str:
+    """Manifest/Zenodo ``version`` for a product file key.
+
+    JSON products with repairable layer gaps (``product_repair.defects``:
+    a segmented tile without harmonics / NDVI / SAR / WorldCover / Hansen)
+    are labelled ``<ver>-partial`` so ``v2_products_complete`` reads the
+    pair as not-current and the re-upgrade machinery fixes it once the
+    cells are cached — no tombstone, product stays live.  GPKGs keep the
+    plain label (docs/product-repair.md)."""
+    base = V2_PRODUCT_MANIFEST_VERSION if file_key in ("json_v2", "light_gpkg_v2", "ne_h3b") else VERSION
+    if defects and file_key in ("json", "json_v2"):
+        from product_repair import label_version
+        return label_version(base, defects)
+    return base
+# v2 upgrade mode: re-classify already-processed v1 KGs from their own
+# Zenodo full GPKG (no BEV / openEO traffic).  Set by ``--v2-upgrade`` or
+# env ``V2_UPGRADE=1`` (the director passes it in the start payload).
+V2_UPGRADE_FAILED_FILE = Path("data/austria_processor") / "v2_upgrade_failed.json"
+V2_GPKG_DIR = Path(os.environ.get("V2_UPGRADE_GPKG_DIR", "data/austria_processor/v2_source"))
+V2_UPGRADE_STREAMS = int(os.environ.get("V2_UPGRADE_STREAMS", "4"))
+# v2.4: NO cadastre-shaped output.  Since 2026-10-04 no product (JSON, light
+# GPKG, h3b) carries parcels, footprints, addresses, parcel_outline_z or any
+# parcel/building id.  The cadastre export is still fetched at run time as
+# model context (segment features, new_buildings) and cached ≤ 24 h.  The
+# legacy writers are kept behind this flag for one release and are removed
+# with the next refactor — it must stay False.
+CADASTRE_PRODUCTS = False
+# NE cells (docs/ne-v24-design.md): declared layer from umfeld-at (or a
+# local bevdirect assembly), observed layer by us, product ``<code>_ne.h3b``
+# (manifest key ``_ne_h3b``).  ``NE_REQUIRED`` → a fresh KG whose declared
+# layer is not built yet is labelled '-partial' (defect ``ne_cells``) and
+# re-upgraded later; an upgrade unit is deferred (no strike).
+NE_PRODUCT_KEY = "ne_h3b"
+
+DATA_DIR = Path("data/austria_processor")
+MANIFEST_PATH = DATA_DIR / "zenodo_manifest.json"
+JSON_DIR = DATA_DIR / "json"
+GPKG_DIR = DATA_DIR / "gpkg"  # persistent storage — survives /tmp cleanup
+LOG_DIR = DATA_DIR / "logs"
+PROGRESS_FILE = DATA_DIR / "progress.json"
+KG_LIST_FILE = DATA_DIR / "kg_list.json"
+FAILED_KGS_FILE = DATA_DIR / "failed_kgs.json"
+PARTIAL_KGS_FILE = DATA_DIR / "partial_kgs.json"
+FAILURE_COUNTS_FILE = DATA_DIR / "failure_counts.json"
+IN_PROGRESS_FILE = DATA_DIR / "in_progress_kg.txt"
+CIRCUIT_BREAKER_FILE = DATA_DIR / "openeo_circuit.json"
+TILE_HISTORY_FILE = DATA_DIR / "tile_history.json"
+COPERNICUS_PAUSE_FILE = DATA_DIR / "copernicus_paused"
+ZENODO_PAUSE_FILE = DATA_DIR / "zenodo_paused"
+POSTPONE_SIGNAL_FILE = DATA_DIR / "postpone_signal.json"
+THROTTLE_FILE = DATA_DIR / "upload_throttle"
+DEFERRED_FILE = DATA_DIR / "deferred_kgs.json"
+
+MAX_KG_PIXELS = 4_000_000
+# Reduced-CPU peer cohort (May 2026): observed Gaissau (16k objects) ~7h
+# end-to-end, Mitteregg (113k objects, 16 tiles) silent on gpkg_full+upload
+# well past 6h. Flat bump to 16h/12h gives large KGs headroom while CPUs
+# are constrained; revert to 12/9 when peer CPU allocation recovers.
+KG_TIMEOUT_SECONDS = 16 * 60 * 60        # 16 hours — first attempt
+KG_RETRY_TIMEOUT_SECONDS = 12 * 60 * 60  # 12 hours — retry attempt (checkpoints restore completed tiles)
+# Hard wall-clock cap on opportunistic frontier cell pre-warm. Pre-warm runs
+# INSIDE the KG subprocess AFTER the json file is built but BEFORE the result
+# returns to the parent (which performs the json Zenodo upload). A pre-warm
+# that marches through many uncached 0.1° cells -- each potentially hitting a
+# 180s openEO sync timeout then a multi-minute batch job -- can therefore
+# block the subprocess for hours, freezing the reported step on "json". The
+# stuck-kg watchdog then hard-restarts the peer at +12h and the block (full +
+# light GPKG already on Zenodo, but no _json product) re-queues forever and is
+# never marked complete. Pre-warm is purely opportunistic cache densification
+# and is NEVER required for KG completion, so cap its total wall time. (Jun
+# 2026 reprocess-loop fix: 49006-south, 63304-center, 90102-southeast et al.)
+PREWARM_MAX_SECONDS = 8 * 60  # 8 min budget for opportunistic pre-warm
+# Minimum tile count for a KG to eagerly publish its COMPLETE tile-checkpoint
+# bundle to the cross-peer registry the instant its full GPKG lands on Zenodo
+# (i.e. when it enters the "gpkg(s)-present, json-missing" limbo window). The
+# point is to keep a SIGKILL'd finish recoverable as cache-only work instead
+# of forcing the next peer to re-fetch tiles via Copernicus (frontier work,
+# burns a credential slot). Only large split blocks (~20 tiles) make this
+# worthwhile -- a small KG is cheap to reprocess, so we don't spend a metadata
+# PUT on it (fleet BW is the scarce resource). (Jun 2026: 90013-northwest had
+# only a stale 12/20-tile bundle and got reprocessed as frontier on at42.)
+PRE_JSON_CHKPT_PUBLISH_MIN_TILES = 12
+JSON_DIR_MAX_BYTES = 4 * 1024 ** 3  # 4GB
+MAX_KG_AREA_KM = 1.5  # crop KG bbox if wider
+DISK_MIN_FREE_GB = 5.0  # trigger cache cleanup
+DISK_CRITICAL_FREE_GB = 3.0  # pause processor if still low after cleanup
+
+# Tile caches — initialised lazily in subprocess
+_cop_cache = None
+_hansen_cache = None
+
+def _get_cop_cache():
+    global _cop_cache
+    if _cop_cache is None:
+        from tile_cache import CopernicusTileCache
+        _cop_cache = CopernicusTileCache()
+    return _cop_cache
+
+def _get_hansen_cache():
+    global _hansen_cache
+    if _hansen_cache is None:
+        from tile_cache import HansenTileCache
+        _hansen_cache = HansenTileCache()
+    return _hansen_cache
+
+# CRS transformers
+_tx_to_3035 = Transformer.from_crs("EPSG:4326", "EPSG:3035", always_xy=True)
+_tx_to_wgs = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
+
+
+# === SECTION: Disk cache management (LRU cleanup, free-space checks) ===
+
+# Track the last time we flushed tile cache to Zenodo (epoch seconds).
+# Initialised to the current time minus (interval − startup_delay) so
+# the first flush after a process restart only fires once the peer has
+# settled. Without this, every restart triggers an immediate fleet-lock
+# acquisition that blocks every other peer for 5–10 minutes during the
+# multi-product cache_flush. With the staggered start, peers fan out
+# their flushes naturally instead of dog-piling on the broker after a
+# graceful-update wave.
+_ZENODO_FLUSH_STARTUP_DELAY_S = 300  # 5 min after import
+_last_zenodo_cache_flush: float = 0.0
+# Minimum interval between flushes (seconds) — avoid hammering Zenodo API.
+_ZENODO_CACHE_FLUSH_INTERVAL = 1800  # 30 minutes
+# Background threads holding (or waiting for) a Zenodo broker lease —
+# joined with a bound at graceful shutdown so the lease is released
+# rather than orphaned (see zenodo_lock_broker ORPHAN_S).
+_BG_ZENODO_THREADS: list = []
+
+
+def _join_bg_zenodo_threads(timeout_s: float) -> None:
+    import time as _t
+    deadline = _t.monotonic() + timeout_s
+    for _th in list(_BG_ZENODO_THREADS):
+        rem = deadline - _t.monotonic()
+        if rem <= 0:
+            break
+        if _th.is_alive():
+            logging.getLogger('austria_processor').info(
+                "Waiting up to %.0fs for %s to finish", rem, _th.name)
+            _th.join(rem)
+    _BG_ZENODO_THREADS[:] = [t for t in _BG_ZENODO_THREADS if t.is_alive()]
+import time as _import_time
+_last_zenodo_cache_flush = _import_time.time() - max(
+    0, _ZENODO_CACHE_FLUSH_INTERVAL - _ZENODO_FLUSH_STARTUP_DELAY_S)
+# Threshold for "local cache grew enough to be worth force-flushing at
+# end of KG" — measured as bytes added under copernicus_tiles +
+# hansen_tiles since the previous flush.
+_FLUSH_GROWTH_BYTES = 50 * 1024 * 1024  # 50 MB
+_last_flush_cache_size_bytes: int = 0
+
+
+def _measure_local_cache_size() -> int:
+    total = 0
+    for sub in ('copernicus_tiles', 'hansen_tiles'):
+        d = DATA_DIR / sub
+        if not d.exists():
+            continue
+        try:
+            for p in d.rglob('*.npz'):
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+        except Exception:
+            pass
+    return total
+
+
+def _local_cache_grew_since_last_flush() -> bool:
+    """True if the local tile cache has gained > _FLUSH_GROWTH_BYTES bytes
+    since the last successful flush. Cheap (one rglob over .npz files).
+    """
+    cur = _measure_local_cache_size()
+    delta = cur - _last_flush_cache_size_bytes
+    return delta > _FLUSH_GROWTH_BYTES
+
+
+def flush_tile_cache_to_zenodo(force: bool = False) -> bool:
+    """Upload local Copernicus/Hansen tile cache to Zenodo for persistence.
+
+    Called proactively after each KG and reactively before disk cleanup
+    would evict expensive tiles.  Skips when:
+      * fewer than _ZENODO_CACHE_FLUSH_INTERVAL seconds since the last
+        flush (unless *force* is True), OR
+      * we're a cache-only peer (``COPERNICUS_FORBIDDEN=1``) — cache-only
+        peers never fetch new tiles, so they have nothing to add. They
+        only download from Zenodo, never upload. Without this check, 8
+        cache-only peers all queue on the upload lock every 30 min and
+        contribute nothing.
+
+    The tile cache is shared across all peers (same Zenodo deposit).
+    Concurrent writes are safe because the Peer Director enforces
+    single-active processing — only one peer writes at a time.
+
+    Returns True if upload ran, False if skipped.
+    """
+    global _last_zenodo_cache_flush
+    import time as _t
+    if os.environ.get('COPERNICUS_FORBIDDEN', '').strip() in ('1', 'true', 'yes'):
+        # Cache-only peer — never flushes. Pretend we did so callers
+        # don't keep retrying.
+        return False
+    now = _t.time()
+    if not force and (now - _last_zenodo_cache_flush) < _ZENODO_CACHE_FLUSH_INTERVAL:
+        return False
+
+    try:
+        from zenodo_cache import ZenodoCache
+        from zenodo_lock import zenodo_upload_lock
+        from contextlib import contextmanager
+        cache = ZenodoCache()
+        # Per-ZIP lock: take the fleet lease only around each ZIP's
+        # actual upload+manifest-write (typically 5–30 s), not the
+        # entire batch (which can run >10 min on a 6-attempt SSL
+        # backoff and starves all other peers waiting on the lock).
+        @contextmanager
+        def _per_zip(zip_name):
+            with zenodo_upload_lock(
+                    purpose=f'cache_flush_zip:{zip_name}') as _l:
+                yield _l
+        stats = cache.upload_all(per_zip_lock=_per_zip)
+        n_tiles = stats.get("tiles_total", 0)
+        n_zips = stats.get("zips_uploaded", 0)
+        if n_tiles > 0:
+            log.info("Zenodo cache flush: uploaded %d tiles in %d ZIPs (%.1f MB)",
+                     n_tiles, n_zips, stats.get("bytes_total", 0) / 1e6)
+        _last_zenodo_cache_flush = _t.time()
+        global _last_flush_cache_size_bytes
+        _last_flush_cache_size_bytes = _measure_local_cache_size()
+        return True
+    except Exception as e:
+        log.warning("Zenodo cache flush failed: %s", e)
+        return False
+
+
+# === SECTION: Frontier cell pre-warm (Fix #2) ===
+#
+# A frontier only fetches the ~5-15 0.1° tiles for the KG it processes, so
+# the shared Zenodo tile cache never fills densely enough for a cache-only
+# peer to find a *whole* KG ready (is_kg_fully_cached needs every product
+# for every 0.1° cell of the KG). After each successful frontier KG we
+# proactively complete a small, bounded batch of still-uncached 0.1° cells
+# *within this peer's own KG_CELL_FILTER cell* across all 5 products
+# (ndvi/worldcover/sar/harmonics + hansen), then flush to Zenodo.
+#
+# This is gated entirely by the director (demand-side trigger
+# cache_ready_kgs<100 AND supply-side Copernicus-health gate), shipped to
+# peers as a 'prewarm' block in the synced cache_manifest.json. No restart,
+# no new endpoint, no new traffic.
+
+def _read_prewarm_flag() -> dict:
+    """Read the director-synced prewarm directive from cache_manifest.json.
+
+    Returns ``{}`` (disabled) on any error. Shape written by the director:
+    ``{"enabled": bool, "cells_per_kg": int, "updated_at": iso}``.
+    """
+    try:
+        p = DATA_DIR / "cache_manifest.json"
+        if not p.exists():
+            return {}
+        pw = (json.loads(p.read_text()) or {}).get("prewarm") or {}
+        return pw if isinstance(pw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _owning_cell_for_kg(kg: dict) -> tuple | None:
+    """Return this peer's KG_CELL_FILTER cell (s,n,w,e) containing *kg*.
+
+    Only frontier peers carry a cell filter; cache-only peers and an
+    unfiltered processor return None (caller skips pre-warm).
+    """
+    raw = os.environ.get("KG_CELL_FILTER", "").strip()
+    if not raw:
+        return None
+    try:
+        cells = [(float(s), float(n), float(w), float(e))
+                 for s, n, w, e in json.loads(raw)]
+    except Exception:
+        return None
+    bb = kg.get("bbox") or {}
+    s = bb.get("min_lat"); n = bb.get("max_lat")
+    w = bb.get("min_lon"); e = bb.get("max_lon")
+    if None in (s, n, w, e):
+        return None
+    lat_mid = 0.5 * (s + n)
+    lon_mid = 0.5 * (w + e)
+    for cs, cn, cw, ce in cells:
+        if (cs - 1e-9 <= lat_mid < cn - 1e-9
+                and cw - 1e-9 <= lon_mid < ce - 1e-9):
+            return (cs, cn, cw, ce)
+    return None
+
+
+PREWARM_REPAIR_CELLS_PER_KG = int(os.environ.get("PREWARM_REPAIR_CELLS_PER_KG", "4"))
+
+
+def _repair_cells_fill(flag: dict, obs_year: int) -> int:
+    """Fetch up to ``PREWARM_REPAIR_CELLS_PER_KG`` director-requested
+    ``prewarm.repair_cells`` (``[{w,s,e,n,products:[…]}]``), only the
+    listed products, skipping cells another frontier already filled
+    (Zenodo index check). Flushes when anything was fetched."""
+    cells = flag.get("repair_cells") or []
+    if not cells:
+        return 0
+    from tile_cache import CacheMissError
+    try:
+        from copernicus import CreditsExhaustedError, IPThrottledError
+    except Exception:
+        class CreditsExhaustedError(Exception):
+            pass
+        class IPThrottledError(Exception):
+            pass
+    cop = _get_cop_cache()
+    hc = _get_hansen_cache()
+    done = 0
+    deadline = time.time() + PREWARM_MAX_SECONDS
+    # Randomised start so concurrent frontiers don't all take cell #1.
+    import random as _rnd
+    order = list(cells)
+    _rnd.shuffle(order)
+    for c in order:
+        if done >= PREWARM_REPAIR_CELLS_PER_KG or time.time() >= deadline:
+            break
+        try:
+            csub = {"west": float(c["w"]), "south": float(c["s"]),
+                    "east": float(c["e"]), "north": float(c["n"])}
+            products = set(c.get("products") or [])
+        except Exception:
+            continue
+        kw = {"ndvi": "ndvi" in products, "landcover": "worldcover" in products,
+              "sar": "sar" in products, "harmonics": "harmonics" in products}
+        try:
+            already = (not any(kw.values())
+                       or cop.has_cached(csub, year=obs_year, local_ok=False, **kw))
+            if "hansen" in products and already:
+                already = hc.has_cached((csub["west"], csub["south"],
+                                         csub["east"], csub["north"]), local_ok=False)
+        except Exception:
+            already = False
+        if already:
+            continue
+        try:
+            if kw["ndvi"]:
+                cop.get_ndvi(csub, year=obs_year)
+            if kw["landcover"]:
+                cop.get_landcover(csub)
+            if kw["sar"]:
+                cop.get_sar(csub, year=obs_year)
+            if kw["harmonics"]:
+                cop.get_harmonics(csub, year=obs_year)
+            if "hansen" in products:
+                # get_raw swallows UMD failures and returns None (incl. the
+                # post-failure cooldown) — don't log/count that as filled,
+                # otherwise the same dead cell is re-picked on every KG.
+                if hc.get_raw((csub["west"], csub["south"],
+                               csub["east"], csub["north"])) is None:
+                    log.info("repair: cell %.2f,%.2f hansen unavailable (UMD), skipped",
+                             csub["west"], csub["south"])
+                    products.discard("hansen")
+                    if not any(kw.values()):
+                        continue  # nothing else fetched for this cell
+            done += 1
+            log.info("repair: filled cell %.2f,%.2f %s", csub["west"], csub["south"],
+                     ",".join(sorted(products)))
+        except (CreditsExhaustedError, IPThrottledError) as e:
+            log.info("repair: stopping early (Copernicus throttled/exhausted): %s", e)
+            break
+        except CacheMissError:
+            break
+        except Exception as e:
+            log.warning("repair: cell %.2f,%.2f %s failed: %s", csub["west"], csub["south"],
+                        ",".join(sorted(products)), e)
+    if done:
+        try:
+            flush_tile_cache_to_zenodo(force=True)
+        except Exception as e:
+            log.warning("repair: flush failed: %s", e)
+    return done
+
+
+def prewarm_cell_tiles(kg: dict, obs_year: int) -> int:
+    """Densify the shared Zenodo cache around a just-completed frontier KG.
+
+    Walks the 0.1° grid of this peer's owning KG_CELL_FILTER cell, and for
+    a bounded number of *fully-uncached* cells fetches all Copernicus
+    products (ndvi/worldcover/sar/harmonics) + the parent Hansen tile, so
+    each touched 0.1° cell becomes wholly cache-ready. Then flushes.
+
+    No-op (returns 0) when:
+      * cache-only peer (``COPERNICUS_FORBIDDEN``) — can't fetch, and
+      * the director hasn't enabled warming, or
+      * this processor has no owning cell.
+
+    Bounds work to ``cells_per_kg`` (director-scaled by Copernicus health).
+    Honours CreditsExhausted / IPThrottled / CacheMiss by stopping early.
+    """
+    if os.environ.get('COPERNICUS_FORBIDDEN', '').strip() in ('1', 'true', 'yes'):
+        return 0
+    flag = _read_prewarm_flag()
+    # Director-requested repair cells (product_repair: exact (cell,
+    # products) pairs missing for '-partial' KGs) go first — independent
+    # of the demand-side enable flag and of this peer's owning cell, the
+    # director already gated them on openEO health.
+    repaired = 0
+    try:
+        repaired = _repair_cells_fill(flag, obs_year)
+    except Exception as e:
+        log.debug("prewarm: repair cells: %s", e)
+    if not flag.get("enabled"):
+        return repaired
+    budget = int(flag.get("cells_per_kg", 0) or 0)
+    if budget <= 0:
+        return repaired
+    cell = _owning_cell_for_kg(kg)
+    if cell is None:
+        return repaired
+    cs, cn, cw, ce = cell
+
+    from tile_cache import CacheMissError
+    try:
+        from copernicus import CreditsExhaustedError, IPThrottledError
+    except Exception:
+        class CreditsExhaustedError(Exception):
+            pass
+        class IPThrottledError(Exception):
+            pass
+
+    cop = _get_cop_cache()
+    hc = _get_hansen_cache()
+    step = 0.1
+    done = 0
+    # Hard wall-clock deadline: pre-warm must NEVER block the subprocess
+    # result (and therefore the json upload) for more than this budget.
+    _deadline = time.time() + PREWARM_MAX_SECONDS
+
+    # Iterate the cell's 0.1° grid in deterministic (row-major) order so
+    # repeated calls march through the grid, skipping cells already filled
+    # by earlier completions. Skip-check uses local_ok=True: a cell already
+    # on this peer's disk should not consume the per-KG fetch budget. Such
+    # local-but-not-yet-Zenodo cells are still pushed to the fleet because
+    # flush_tile_cache_to_zenodo(force=True) below uploads the whole local
+    # cache, not just what we fetched this call.
+    lat = round(cs, 4)
+    while lat < cn - 1e-9 and done < budget and time.time() < _deadline:
+        lon = round(cw, 4)
+        while lon < ce - 1e-9 and done < budget and time.time() < _deadline:
+            csub = {"west": round(lon, 4), "south": round(lat, 4),
+                    "east": round(lon + step, 4), "north": round(lat + step, 4)}
+            already = False
+            try:
+                already = cop.has_cached(
+                    csub, ndvi=True, landcover=True, sar=True,
+                    harmonics=True, year=obs_year, local_ok=True)
+            except Exception:
+                already = False
+            if already:
+                lon = round(lon + step, 4)
+                continue
+            try:
+                cop.get_ndvi(csub, year=obs_year)
+                cop.get_landcover(csub)
+                cop.get_sar(csub, year=obs_year)
+                cop.get_harmonics(csub, year=obs_year)
+                try:
+                    hc.get_raw((csub["west"], csub["south"],
+                                csub["east"], csub["north"]))
+                except Exception as he:
+                    log.debug("prewarm: hansen cell skipped: %s", he)
+                done += 1
+            except (CreditsExhaustedError, IPThrottledError) as e:
+                log.info("prewarm: stopping early (Copernicus throttled/exhausted): %s", e)
+                lat = cn  # break outer
+                break
+            except CacheMissError:
+                # Shouldn't happen off-cache-only, but be defensive.
+                lat = cn
+                break
+            except Exception as e:
+                log.debug("prewarm: cell %.2f,%.2f fetch failed: %s",
+                          csub["west"], csub["south"], e)
+            lon = round(lon + step, 4)
+        lat = round(lat + step, 4)
+
+    if time.time() >= _deadline:
+        log.info("prewarm: hit %ds wall-clock budget after %d cell(s) — "
+                 "stopping so json upload is not blocked",
+                 PREWARM_MAX_SECONDS, done)
+
+    if done > 0:
+        log.info("prewarm: filled %d 0.1° cell(s) in cell "
+                 "[%.0f,%.0f,%.0f,%.0f] after KG %s; flushing",
+                 done, cs, cn, cw, ce, kg.get("kg_code", "?"))
+        try:
+            flush_tile_cache_to_zenodo(force=True)
+        except Exception as e:
+            log.warning("prewarm: flush failed: %s", e)
+    return done
+
+
+def _v2_input_code(name: str) -> str:
+    """Product code a ``v2_source`` file belongs to (``61047_full.gpkg``,
+    ``04016-southwest_light_v2.src.gpkg``, ``61047.json.gz`` → code)."""
+    base = name.split(".", 1)[0]
+    for suf in ("_light_v2", "_full", "_v2"):
+        if base.endswith(suf):
+            return base[: -len(suf)]
+    return base
+
+
+def _evict_stale_v2_inputs(current_kg_code: str, need_bytes: int, _log,
+                           *, max_age_s: float = 1800.0) -> int:
+    """Delete v2-upgrade inputs that do not belong to the running unit.
+
+    Keeps files younger than *max_age_s* (a parallel download in flight)
+    and anything for ``current_kg_code`` / its parent / sibling blocks /
+    the in-progress marker. Oldest first, stops once *need_bytes* freed
+    (``need_bytes <= 0`` → evict everything stale). Returns bytes freed."""
+    if not V2_GPKG_DIR.exists():
+        return 0
+    keep: set[str] = set()
+    try:
+        in_prog = IN_PROGRESS_FILE.read_text().strip() if IN_PROGRESS_FILE.exists() else ""
+    except Exception:
+        in_prog = ""
+    for c in (current_kg_code, in_prog):
+        if not c:
+            continue
+        keep.add(c)
+        keep.add(c.split("-")[0])
+    now = time.time()
+    cands = []
+    for sub in (V2_GPKG_DIR, V2_GPKG_DIR / "v1json"):
+        if not sub.is_dir():
+            continue
+        for f in sub.iterdir():
+            if not f.is_file():
+                continue
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            code = _v2_input_code(f.name)
+            if code in keep or code.split("-")[0] in keep:
+                continue
+            if now - st.st_mtime < max_age_s:
+                continue
+            cands.append((st.st_mtime, st.st_size, f))
+    cands.sort()
+    freed = 0
+    n = 0
+    for _, sz, f in cands:
+        if need_bytes > 0 and freed >= need_bytes:
+            break
+        try:
+            f.unlink()
+            freed += sz
+            n += 1
+        except OSError:
+            continue
+    if n:
+        _log.info("  v2_source: freed %.1f MB (%d stale upgrade inputs; kept %s)",
+                  freed / 1e6, n, sorted(keep) or "-")
+    return freed
+
+
+def check_disk_space(current_kg_code: str = "") -> bool:
+    """Check free disk space and clean caches if below threshold.
+
+    Cleanup is **prioritised**: cheap-to-refetch caches (BEV COG tiles, ortho
+    tiles) are evicted first.  Expensive caches (Copernicus openEO tiles,
+    Hansen) are only touched as a last resort, because re-fetching them costs
+    ~15-45 min per tile via openEO batch jobs.
+
+    The function stops evicting as soon as enough space is freed (target:
+    DISK_MIN_FREE_GB + 2 GB headroom), rather than blindly deleting a fixed
+    amount from every category.
+
+    Returns True if processing can continue, False if disk is critically low.
+    """
+    import shutil
+    usage = shutil.disk_usage("/")
+    free_gb = usage.free / (1024 ** 3)
+
+    if free_gb >= DISK_MIN_FREE_GB:
+        return True
+
+    _log = logging.getLogger("disk_cleanup")
+    _log.warning("Disk free: %.1f GB (threshold: %.1f GB) — starting cache cleanup",
+                 free_gb, DISK_MIN_FREE_GB)
+    freed_bytes = 0
+
+    # How much we need to free to get back to threshold + 2 GB headroom
+    need_bytes = int((DISK_MIN_FREE_GB + 2.0 - free_gb) * 1024 ** 3)
+
+    def _enough_freed() -> bool:
+        return freed_bytes >= need_bytes
+
+    def _lru_delete(directory: Path, target_bytes: int, label: str,
+                    exclude_prefix: str = "") -> int:
+        """Delete oldest files in directory by mtime until target_bytes freed."""
+        nonlocal freed_bytes
+        if not directory.exists():
+            return 0
+        files = []
+        for f in directory.iterdir():
+            if f.is_file() and not f.name.startswith("."):
+                if exclude_prefix and f.name.startswith(exclude_prefix):
+                    continue
+                try:
+                    files.append((f, f.stat().st_mtime, f.stat().st_size))
+                except OSError:
+                    continue
+        files.sort(key=lambda x: x[1])  # oldest first
+        deleted = 0
+        n_deleted = 0
+        for fpath, _, fsize in files:
+            if deleted >= target_bytes:
+                break
+            try:
+                fpath.unlink()
+                deleted += fsize
+                freed_bytes += fsize
+                n_deleted += 1
+                # Also remove sidecar .meta.json if present
+                meta = fpath.with_name(fpath.stem + ".meta.json")
+                if meta.exists():
+                    meta.unlink(missing_ok=True)
+            except OSError:
+                continue
+        if deleted > 0:
+            _log.info("  %s: freed %.1f MB (%d files)",
+                      label, deleted / 1e6, n_deleted)
+        return deleted
+
+    target_2gb = 2 * 1024 ** 3
+
+    # 1. Delete old temp GPKG files (>1 hour old) — always
+    if GPKG_DIR.exists():
+        import time as _t
+        now = _t.time()
+        for f in GPKG_DIR.iterdir():
+            if f.is_file() and (now - f.stat().st_mtime) > 3600:
+                try:
+                    sz = f.stat().st_size
+                    f.unlink()
+                    freed_bytes += sz
+                    _log.info("  Deleted old GPKG: %s (%.1f MB)", f.name, sz / 1e6)
+                except OSError:
+                    pass
+
+    # 1b. Stale v2-upgrade inputs (``data/austria_processor/v2_source``).
+    #     Every v2.x upgrade unit downloads its parent's full GPKG (1-2 GB)
+    #     + light/json inputs there; ``_v2_release_inputs`` deletes them on
+    #     the normal exit paths but hard stops (director role promotion,
+    #     dup-kg, OOM of the parent, srv restart) leave them behind and
+    #     nothing else ever looked at the directory. Oct 2026: 250 GB of
+    #     orphaned GPKGs fleet-wide (3-11 GB per peer), ten peers under
+    #     5 GB free and KGs being *deferred for handoff* after a full
+    #     tile loop because the GPKG build could not find 5 GB. Everything
+    #     here is a Zenodo re-download away, so it goes first — keeping
+    #     only the unit we are working on (+ its parent / sibling blocks)
+    #     and the ``ne/`` NEC cache (GC'd by ``cleanup_ne_dir``).
+    if not _enough_freed():
+        try:
+            freed_bytes += _evict_stale_v2_inputs(current_kg_code, need_bytes - freed_bytes, _log)
+        except Exception as e:  # noqa: BLE001
+            _log.debug("v2_source eviction skipped: %s", e)
+
+    # --- Tier 1: cheap to re-fetch (COG range reads, ~seconds) ---
+
+    # 2. BEV tile cache (LRU) — cheap, fast COG reads
+    if not _enough_freed():
+        bev_cache = DATA_DIR / "bev_tile_cache"
+        _lru_delete(bev_cache, target_2gb, "bev_tile_cache")
+
+    # 3. Ortho tile cache (LRU) — cheap, fast COG reads
+    if not _enough_freed():
+        ortho_cache = DATA_DIR / "ortho_tile_cache"
+        _lru_delete(ortho_cache, target_2gb, "ortho_tile_cache")
+
+    # 4. RF training Copernicus cache (LRU) — batch download intermediates,
+    #    the tile_cache .npz files are the canonical copies
+    if not _enough_freed():
+        rf_cop_cache = Path("rf_training_data/copernicus_cache")
+        _lru_delete(rf_cop_cache, target_2gb, "rf_copernicus_cache")
+
+    # 4a. Raster sidecars from non-active KGs (Phase 1 dd08d74).
+    #     Raster sidecars (DTM/DSM/nDSM + multi-date + ortho .npy) are by
+    #     far the heaviest piece of tile_checkpoints and only need to
+    #     survive *within* a KG run (so the gpkg_full step can mmap them
+    #     instead of re-reading BEV). Once the next KG starts, sidecars
+    #     from previous KGs are pure dead weight — the metadata pickle
+    #     beside them is what lets a subprocess restart skip the tile
+    #     loop. Drop sidecars first (keeping pickles) before falling
+    #     through to the more aggressive whole-KG purge below.
+    if not _enough_freed():
+        ckpt_root = DATA_DIR / "tile_checkpoints"
+        if ckpt_root.exists():
+            try:
+                in_prog = IN_PROGRESS_FILE.read_text().strip() if IN_PROGRESS_FILE.exists() else ""
+            except Exception:
+                in_prog = ""
+            sidecar_freed = 0
+            sidecar_n_kgs = 0
+            try:
+                import tile_raster_sidecar as _trs_clean
+                for kg_dir in ckpt_root.iterdir():
+                    if _enough_freed():
+                        break
+                    if not kg_dir.is_dir():
+                        continue
+                    if kg_dir.name == in_prog:
+                        continue
+                    sz_before = 0
+                    for r, _, files in os.walk(kg_dir):
+                        if Path(r).name != "raster":
+                            continue
+                        for f in files:
+                            try:
+                                sz_before += (Path(r) / f).stat().st_size
+                            except OSError:
+                                pass
+                    if sz_before <= 0:
+                        continue
+                    _trs_clean.release_kg(ckpt_root, kg_dir.name)
+                    sidecar_freed += sz_before
+                    freed_bytes += sz_before
+                    sidecar_n_kgs += 1
+            except Exception:
+                pass
+            if sidecar_n_kgs:
+                _log.info("  tile_checkpoints: freed %.1f MB raster sidecars "
+                          "(%d non-active KGs; pickles kept)",
+                          sidecar_freed / 1e6, sidecar_n_kgs)
+
+    # 4b. Stale tile_checkpoints/<kg> subdirs.
+    #     Tile checkpoints accelerate same-KG retries, but on cache-only /
+    #     demoted peers (or after a KG was reclaimed by a peer) they become
+    #     pure dead weight — and previously the only big disk consumer left
+    #     once role-data eviction purged json/+index. We preserve checkpoints
+    #     only for KGs we are currently working on, plus those queued for our
+    #     own retry, and only those that are recent enough to plausibly be
+    #     retried before tier-2 expensive caches would be evicted.
+    if not _enough_freed():
+        ckpt_root = DATA_DIR / "tile_checkpoints"
+        if ckpt_root.exists():
+            try:
+                in_prog = IN_PROGRESS_FILE.read_text().strip() if IN_PROGRESS_FILE.exists() else ""
+            except Exception:
+                in_prog = ""
+            keep_codes: set[str] = {in_prog} if in_prog else set()
+            # ALWAYS protect the KG we were explicitly told we're working
+            # on, plus its parent/blocks if it's a split block. The
+            # IN_PROGRESS_FILE marker can briefly lag the actual KG
+            # (written just after the per-KG disk check) and the GPKG-build
+            # eviction calls us mid-KG from the subprocess; dropping the
+            # live KG's tile checkpoints here would force a full re-fetch
+            # of every tile we already paid for.
+            if current_kg_code:
+                keep_codes.add(current_kg_code)
+                try:
+                    from kg_splitter import (is_block_code as _is_blk,
+                                             parent_kg_code as _parent_of)
+                    if _is_blk(current_kg_code):
+                        keep_codes.add(_parent_of(current_kg_code))
+                except Exception:
+                    pass
+            try:
+                if RETRY_QUEUE_FILE.exists():
+                    keep_codes.update(json.loads(RETRY_QUEUE_FILE.read_text() or "[]"))
+            except Exception:
+                pass
+            try:
+                if DEFERRED_FILE.exists():
+                    for entry in json.loads(DEFERRED_FILE.read_text() or "[]"):
+                        # entries are [idx, kg_dict, attempt]
+                        try:
+                            keep_codes.add(entry[1].get("kg_code", ""))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            now = time.time()
+            # Sort subdirs by mtime, oldest first; purge until enough freed.
+            subdirs = []
+            for d in ckpt_root.iterdir():
+                if not d.is_dir():
+                    continue
+                if d.name in keep_codes:
+                    continue
+                try:
+                    age_s = now - d.stat().st_mtime
+                    sz = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+                    subdirs.append((d, age_s, sz))
+                except OSError:
+                    continue
+            subdirs.sort(key=lambda x: -x[1])  # oldest first
+            n_purged = 0
+            ckpt_freed = 0
+            for d, age_s, sz in subdirs:
+                if _enough_freed():
+                    break
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                    ckpt_freed += sz
+                    freed_bytes += sz
+                    n_purged += 1
+                except Exception:
+                    continue
+            if n_purged:
+                _log.info("  tile_checkpoints: freed %.1f MB (%d stale KG dirs)",
+                          ckpt_freed / 1e6, n_purged)
+
+    # --- Tier 2: expensive to re-fetch (openEO batch jobs, ~15-45 min) ---
+    # Only evict these if tier 1 wasn't enough.
+
+    if not _enough_freed():
+        _log.warning("  Tier-1 caches insufficient (freed %.1f MB, need %.1f MB) "
+                     "— flushing tiles to Zenodo before evicting",
+                     freed_bytes / 1e6, need_bytes / 1e6)
+
+        # Flush tile cache to Zenodo BEFORE evicting expensive tiles,
+        # so they can be restored later via HTTP range reads (~2-3 requests).
+        flush_tile_cache_to_zenodo(force=True)
+
+        # 5. Hansen tiles (LRU) — moderately expensive
+        hansen_cache = DATA_DIR / "hansen_tiles"
+        _lru_delete(hansen_cache, target_2gb, "hansen_tiles")
+
+    if not _enough_freed():
+        # 6. Copernicus tiles (LRU) — MOST expensive to re-fetch
+        cop_cache = DATA_DIR / "copernicus_tiles"
+        _lru_delete(cop_cache, target_2gb, "copernicus_tiles")
+
+    _log.info("Disk cleanup freed %.1f MB total", freed_bytes / 1e6)
+
+    # Re-check
+    usage = shutil.disk_usage("/")
+    free_gb = usage.free / (1024 ** 3)
+    if free_gb < DISK_CRITICAL_FREE_GB:
+        _log.error("Disk still critically low: %.1f GB free after cleanup. "
+                   "Pausing processor.", free_gb)
+        return False
+
+    _log.info("Disk free after cleanup: %.1f GB — OK to continue", free_gb)
+    return True
+
+
+# === SECTION: Logging ===
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+    stream=sys.stdout,
+)
+log = logging.getLogger('austria_processor')
+for name in ['rasterio', 'urllib3', 'botocore', 'PIL', 'fiona']:
+    logging.getLogger(name).setLevel(logging.WARNING)
+
+# === SECTION: Ensure directories ===
+
+for d in [DATA_DIR, JSON_DIR, GPKG_DIR, LOG_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+# === SECTION: ProgressTracker (JSON-backed state, read by dashboard API) ===
+
+_progress_lock = None  # set in main()
+
+class ProgressTracker:
+    """Thread-safe progress state, persisted to disk."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = __import__('threading').Lock()
+        # Sliding-window of (ts, kind) entries for warning-rate computation.
+        # In-memory only: a restart wipes it, which is the right behaviour
+        # — a fresh process should not inherit historical alarm state.
+        from collections import deque as _deque
+        self._warning_history = _deque()
+        self._state = {
+            "state": "idle",
+            "total_kgs": 0,
+            "_completed_parent_codes": [],
+            "completed": 0,
+            "success": 0,
+            "failed": 0,
+            "uploaded": 0,
+            "upload_size_bytes": 0,
+            "current_kg": None,
+            "rate_kgs_per_hour": 0,
+            "avg_seconds_per_kg": 0,
+            "elapsed_seconds": 0,
+            "eta_seconds": 0,
+            "recent_log": [],
+            "failed_kgs": [],
+            "parcels_total": 0,
+            "buildings_total": 0,
+            "started_at": None,
+            "last_kg_code": None,
+            "last_kg_name": None,
+            "last_kg_uploaded_at": None,
+            "last_kg_seconds": 0,
+            "n_new_buildings_total": 0,
+            "n_infrastructure_total": 0,
+            "kg_centroids": [],
+        }
+        self._load()
+
+    def _load(self):
+        try:
+            if self.path.exists():
+                data = json.loads(self.path.read_text())
+                self._state.update(data)
+        except Exception:
+            pass
+
+    def save(self):
+        # Snapshot warning rates BEFORE taking the lock (warning_rates()
+        # acquires it itself) so they land in the persisted JSON. Without
+        # this the field is only visible inside this process via get();
+        # the dashboard reads progress.json off disk and would never see
+        # it, which means the director throttle never engages on peers.
+        try:
+            wr = self.warning_rates()
+        except Exception:
+            wr = {}
+        with self._lock:
+            self._state["warning_rates"] = wr
+            tmp = str(self.path) + ".tmp"
+            with open(tmp, 'w') as f:
+                json.dump(self._state, f, indent=2, default=str)
+            os.rename(tmp, str(self.path))
+
+    def get(self) -> dict:
+        with self._lock:
+            snap = dict(self._state)
+        # Attach live warning rates (cheap; ~ms even with thousands of entries).
+        try:
+            snap["warning_rates"] = self.warning_rates()
+        except Exception:
+            snap["warning_rates"] = {}
+        return snap
+
+    def update(self, **kwargs):
+        with self._lock:
+            self._state.update(kwargs)
+
+    def set_current_kg(self, kg_code: str, kg_name: str, state: str, step: str,
+                       v2_upgrade: bool = False):
+        with self._lock:
+            self._state["current_kg"] = {
+                "code": kg_code, "name": kg_name, "state": state,
+                "step": step, "started_at": datetime.now(timezone.utc).isoformat(),
+                # Dashboard: distinguishes an upgrade unit (re-classify from
+                # own full GPKG, no BEV/openEO) from a fresh KG.
+                "v2_upgrade": bool(v2_upgrade),
+                "model_version": MODEL_VERSION,
+            }
+
+    def set_step(self, step: str, detail: str = ""):
+        with self._lock:
+            if self._state["current_kg"]:
+                now = datetime.now(timezone.utc).isoformat()
+                prev_step = self._state["current_kg"].get("step", "")
+                prev_start = self._state["current_kg"].get("step_started_at")
+                # Record elapsed time for previous step
+                if prev_step and prev_start:
+                    try:
+                        from datetime import datetime as _dt
+                        t0 = _dt.fromisoformat(prev_start)
+                        t1 = _dt.fromisoformat(now)
+                        elapsed = (t1 - t0).total_seconds()
+                        steps_done = self._state["current_kg"].setdefault("step_times", {})
+                        steps_done[prev_step] = round(elapsed, 1)
+                    except Exception:
+                        pass
+                self._state["current_kg"]["step"] = step
+                self._state["current_kg"]["step_started_at"] = now
+                if detail:
+                    self._state["current_kg"]["step_detail"] = detail
+                else:
+                    self._state["current_kg"].pop("step_detail", None)
+
+    # --- Warning classification (for fleet-wide throttle in peer director).
+    # Patterns are case-insensitive substring tests; first match wins. The
+    # buckets are intentionally coarse: we only need to know whether the BEV
+    # GeoTIFF servers or Zenodo are getting hammered, not why.
+    # Tokens that mean "BEV is actually pushing back" — i.e. our OUTER
+    # bev_retry wrapper gave up, the proxy pool is exhausted, or BEV
+    # itself returned a 429/503.  GDAL's own per-range internal retry
+    # chatter is NOT in here: it's filtered by _BEV_GDAL_INTERNAL_TOKENS
+    # below and tallied as proxy-lane noise so it doesn't pin the
+    # fleet-wide BEV pause heuristic.  (2026-05-28 post-mortem: 87% of
+    # last-24h "BEV warns" were GDAL-internal retry noise from the flaky
+    # free-proxy pool, while BEV itself returned 206 in <1.5s.)
+    _WARN_BEV_TOKENS = (
+        "data.bev.gv.at", "rasterio._err", "bev_retry",
+        "als_dtm", "als_dsm",
+    )
+    # GDAL-internal retry messages — these fire every time GDAL retries
+    # a single range request before our outer wrapper sees the result.
+    # If the read ultimately succeeds (or our outer bev_retry retries with
+    # a different proxy lane), this noise should NOT count as a BEV outage
+    # signal.  Still surfaces in the log for visibility.
+    _WARN_BEV_GDAL_INTERNAL_TOKENS = (
+        # Both phrasings rasterio emits for a transport-layer retry of an
+        # internal range request.  These ALWAYS appear together with the
+        # tile URL on data.bev.gv.at, never on a true HTTP error response.
+        "http error code: 0",
+        "http response code on",
+        "retrying again in",
+        # bev_retry.py's per-attempt log lines: every CURL timeout on
+        # direct-first emits one of these before falling back to a proxy
+        # lane. Genuine BEV outage = wrapper gives up, which surfaces as
+        # "all N attempts exhausted" (handled by _WARN_BEV_EXHAUSTED_TOKEN
+        # below — that one DOES classify as 'bev'). The per-attempt
+        # chatter is proxy-lane noise and is filtered out here.
+        "retrying in ",   # 'retrying in 2s...', 'retrying in 4s...'
+    )
+    # If the message contains this substring, classification falls
+    # through the GDAL-internal filter back to 'bev'. We special-case
+    # it so the wrapper's final-give-up log line keeps signalling a
+    # real outage even if a future bev_retry refactor reuses the
+    # 'retrying in' phrasing in the same line.
+    _WARN_BEV_EXHAUSTED_TOKEN = "attempts exhausted"
+    _WARN_ZENODO_TOKENS = (
+        "zenodo.org", "zenodo ", "deposit", "sandbox.zenodo",
+    )
+    _WARN_COPERNICUS_TOKENS = (
+        "openeo", "copernicus", "sentinel", "402", "ip-throttled",
+        "creditsexhausted",
+    )
+    # Auth/config-class warnings: NOT a server-friendliness signal.
+    # An invalid_client / 401 means *this* peer's local credentials
+    # store is stale (e.g. cred secret rotated, snapshot not yet
+    # synced) — throttling the rest of the fleet would be wrong.
+    # Tallied separately so the dashboard can surface them, but does
+    # not feed peer_director._capacity_factor (no entry in
+    # THROTTLE_SATURATION_RATE for this bucket).
+    _WARN_AUTH_TOKENS = (
+        "invalid_client", "invalid client",
+        "failed to retrieve access token",
+        "401 'unauthorized'", "401 unauthorized",
+        "unauthorized client",
+    )
+
+    @classmethod
+    def _classify_warning(cls, level: str, msg: str) -> str | None:
+        if level not in ("warning", "error"):
+            return None
+        m = (msg or "").lower()
+        # Auth FIRST: a 401 message often also contains 'copernicus' /
+        # 'openeo' substrings, which would otherwise misclassify it as
+        # a server-friendliness signal and pin the fleet throttle.
+        for tok in cls._WARN_AUTH_TOKENS:
+            if tok in m:
+                return "auth"
+        for tok in cls._WARN_BEV_TOKENS:
+            if tok in m:
+                # Final-give-up line ALWAYS counts as a real BEV signal,
+                # even though it may mention 'retrying' tokens. Check
+                # this first so the GDAL/wrapper-retry filter below
+                # doesn't accidentally swallow it.
+                if cls._WARN_BEV_EXHAUSTED_TOKEN in m:
+                    return "bev"
+                # Filter out GDAL-internal retry chatter and bev_retry
+                # per-attempt log lines — not a fleet BEV-outage signal,
+                # just our own proxy lane churning or a single direct
+                # timeout falling back to proxy.
+                if any(t in m for t in cls._WARN_BEV_GDAL_INTERNAL_TOKENS):
+                    return None
+                return "bev"
+        for tok in cls._WARN_ZENODO_TOKENS:
+            if tok in m:
+                return "zenodo"
+        for tok in cls._WARN_COPERNICUS_TOKENS:
+            if tok in m:
+                return "copernicus"
+        return None
+
+    def _tally_warning(self, kind: str):
+        """Append a (ts, kind) entry to the in-memory sliding window.
+
+        Lives only in process memory — rebuilds after a restart, which is
+        what we want (a restarted peer should start with a clean slate).
+        """
+        now = time.time()
+        hist = self._warning_history
+        hist.append((now, kind))
+        # Trim entries older than 10 min — keeps the deque small.
+        cutoff = now - 600
+        while hist and hist[0][0] < cutoff:
+            hist.popleft()
+
+    def warning_rates(self) -> dict:
+        """Per-minute warning rates over the last 1, 5, and 10 min windows.
+
+        Returns ``{bev: {1m, 5m, 10m}, zenodo: {...}, copernicus: {...}}``.
+        Read by the dashboard and the peer director to drive throttle.
+        """
+        now = time.time()
+        windows = (60, 300, 600)
+        out = {k: {"1m": 0.0, "5m": 0.0, "10m": 0.0}
+               for k in ("bev", "zenodo", "copernicus", "auth")}
+        # Snapshot the deque under the lock to avoid races with appenders.
+        with self._lock:
+            snap = list(self._warning_history)
+        for ts, kind in snap:
+            for w, label in zip(windows, ("1m", "5m", "10m")):
+                if now - ts <= w:
+                    out.setdefault(kind, {"1m": 0.0, "5m": 0.0, "10m": 0.0})[label] += 1
+        # Convert raw counts → per-minute rates.
+        for kind, d in out.items():
+            d["1m"]  = round(d["1m"] / 1.0,  3)
+            d["5m"]  = round(d["5m"] / 5.0,  3)
+            d["10m"] = round(d["10m"] / 10.0, 3)
+        return out
+
+    # Meta-log substrings that REFLECT prior warnings rather than being
+    # new ones. Without this guard, "KG X: copernicus (Ns) completed with
+    # warnings" would be re-tallied as a fresh copernicus warning every
+    # time a step ended — doubling the signal and pinning the EMA.
+    _META_LOG_TOKENS = (
+        "completed with warnings",
+        "completed with errors",
+    )
+    # Substrings that are documented as NORMAL behaviour and must not
+    # contribute to the throttle EMA. Keep them visible in the log so
+    # operators can still see what's happening.
+    _BENIGN_TOKENS = (
+        # Per AGENTS.md: "Synchronous download timed out — Normal
+        # Copernicus behavior — falls back to batch job automatically"
+        "synchronous download timed out",
+        # Connection blip with internal retry; usually succeeds.
+        "urllib3.connectionpool: retrying",
+        "remote end closed connection without response",
+        # openeo's preflight POST /validation is best-effort: per upstream,
+        # "a failed validation does not block the job from running". The
+        # actual download retries+rotates on its own, so a 502/503 on the
+        # /validation endpoint is pure noise.
+        "preflight process graph validation failed",
+        "preflight process graph validation raised",
+    )
+
+    # Per-(level, msg) throttle window. When a repeating condition
+    # (e.g. paused_disk every KG iteration after a director respawn)
+    # would otherwise produce N identical log entries with N different
+    # timestamps, suppress all but the first within this window. The
+    # entries fan out to the persistent 24h merged log via the peer
+    # status push, so unthrottled spam shows up across the fleet
+    # dashboard for hours after the underlying issue resolved.
+    _LOG_DEDUP_WINDOW_S = 600  # 10 min
+
+    def add_log(self, level: str, msg: str, kg: str = ""):
+        with self._lock:
+            now_ts = time.time()
+            # Cross-restart dedup: scan tail of recent_log for the
+            # same (level, msg, kg) within the window. recent_log is
+            # persisted in progress.json and reloaded on processor
+            # restart, so this also suppresses duplicates across
+            # SIGTERM-respawn cycles (the original at2 disk-pause
+            # storm was 33 identical entries from ~30 director-driven
+            # respawns, each one a fresh log emission).
+            try:
+                tail = self._state["recent_log"][-50:]
+                for prev in reversed(tail):
+                    if (prev.get("level") == level
+                            and prev.get("msg") == msg
+                            and (prev.get("kg") or "") == (kg or "")):
+                        prev_ts = prev.get("ts", "")
+                        try:
+                            from datetime import datetime as _dt
+                            prev_t = _dt.fromisoformat(
+                                prev_ts.replace("Z", "+00:00")).timestamp()
+                        except Exception:
+                            prev_t = 0
+                        if now_ts - prev_t < self._LOG_DEDUP_WINDOW_S:
+                            return
+                        break
+            except Exception:
+                pass
+            entry = {"ts": datetime.now(timezone.utc).isoformat(),
+                     "level": level, "msg": msg, "kg": kg}
+            self._state["recent_log"].append(entry)
+            self._state["recent_log"] = self._state["recent_log"][-RECENT_LOG_RING:]
+        # Classify + tally outside the lock — _tally_warning takes its own.
+        ml = (msg or "").lower()
+        if any(tok in ml for tok in self._META_LOG_TOKENS):
+            return  # meta-reflection of an earlier warning, don't double-count
+        if any(tok in ml for tok in self._BENIGN_TOKENS):
+            return  # documented benign noise
+        kind = self._classify_warning(level, msg)
+        if kind:
+            self._tally_warning(kind)
+
+    def add_failure(self, code: str, name: str, error: str, step: str):
+        with self._lock:
+            self._state["failed_kgs"].append({
+                "code": code, "name": name, "error": error,
+                "step": step, "ts": datetime.now(timezone.utc).isoformat(),
+            })
+            self._state["failed"] += 1
+            # Only increment completed KG count for new parent codes
+            from kg_splitter import is_block_code, parent_kg_code
+            _parent = parent_kg_code(code) if is_block_code(code) else code
+            _pset = set(self._state.get("_completed_parent_codes", []))
+            if _parent not in _pset:
+                _pset.add(_parent)
+                self._state["_completed_parent_codes"] = sorted(_pset)
+                self._state["completed"] += 1
+
+    def record_success(self, parcels: int = 0, buildings: int = 0, upload_bytes: int = 0,
+                        last_kg_code: str = None, last_kg_seconds: float = 0,
+                        n_new_buildings: int = 0, n_infrastructure: int = 0,
+                        last_kg_name: str = None):
+        with self._lock:
+            from kg_splitter import is_block_code, parent_kg_code
+            _parent = parent_kg_code(last_kg_code) if last_kg_code and is_block_code(last_kg_code) else last_kg_code
+            _pset = set(self._state.get("_completed_parent_codes", []))
+            _is_new_kg = _parent and _parent not in _pset
+            if _parent:
+                _pset.add(_parent)
+                self._state["_completed_parent_codes"] = sorted(_pset)
+            # completed counts unique parent KGs, not blocks
+            if _is_new_kg:
+                self._state["success"] += 1
+                self._state["completed"] += 1
+            self._state["uploaded"] += 1
+            self._state["upload_size_bytes"] += upload_bytes
+            self._state["parcels_total"] += parcels
+            self._state["buildings_total"] += buildings
+            if last_kg_code is not None:
+                self._state["last_kg_code"] = last_kg_code
+                # Record finish time so the dashboard can render "X ago"
+                # for idle/completed peers without joining the manifest.
+                self._state["last_kg_uploaded_at"] = datetime.now(timezone.utc).isoformat()
+            if last_kg_name is not None:
+                self._state["last_kg_name"] = last_kg_name
+            self._state["last_kg_seconds"] = last_kg_seconds
+            self._state["n_new_buildings_total"] += n_new_buildings
+            self._state["n_infrastructure_total"] += n_infrastructure
+
+    def update_rates(self, started_at: float):
+        elapsed = time.time() - started_at
+        with self._lock:
+            n = self._state["completed"]
+            n_session = n - self._state.get("_completed_at_start", 0)
+            self._state["elapsed_seconds"] = int(elapsed)
+            if n_session > 0:
+                avg = elapsed / n_session
+                self._state["avg_seconds_per_kg"] = round(avg, 1)
+                self._state["rate_kgs_per_hour"] = round(3600 / avg, 2)
+                remaining = self._state["total_kgs"] - n
+                self._state["eta_seconds"] = int(remaining * avg)
+
+    def update_system_metrics(self):
+        """Collect system metrics: RAM, CPU, disk, caches."""
+        system = {}
+        try:
+            # System RAM
+            with open("/proc/meminfo") as f:
+                mi = f.read()
+            for line in mi.splitlines():
+                if line.startswith("MemTotal:"):
+                    system["ram_total_mb"] = int(line.split()[1]) // 1024
+                elif line.startswith("MemAvailable:"):
+                    system["ram_avail_mb"] = int(line.split()[1]) // 1024
+            if "ram_total_mb" in system and "ram_avail_mb" in system:
+                used = system["ram_total_mb"] - system["ram_avail_mb"]
+                system["ram_used_mb"] = used
+                system["ram_pct"] = round(100 * used / max(system["ram_total_mb"], 1), 1)
+        except Exception:
+            pass
+
+        try:
+            # CPU load
+            load1 = os.getloadavg()[0]
+            n_cpu = os.cpu_count() or 1
+            system["load_1m"] = round(load1, 2)
+            system["cpu_pct"] = round(100 * load1 / n_cpu, 1)
+        except Exception:
+            pass
+
+        # Fine-grained CPU breakdown for peer profiling: distinguishes
+        # genuine compute load from hypervisor steal (overcommitted
+        # exe.dev resource pool) and disk iowait. Two channels:
+        # 'tick' = per-update delta (~30 s of subprocess wall time);
+        # 'summary' = rolling EWMA / p95 so chronic throttling stands
+        # out from single-tick spikes. See host_telemetry.py.
+        try:
+            import host_telemetry as _ht
+            snap = _ht.cpu_snapshot("processor")
+            if snap:
+                system["cpu_user"]   = snap["user"]
+                system["cpu_system"] = snap["system"]
+                system["cpu_iowait"] = snap["iowait"]
+                system["cpu_steal"]  = snap["steal"]
+                system["cpu_idle"]   = snap["idle"]
+                system["cpu_total"]  = snap["total_pct"]
+            summ = _ht.perf_summary("processor")
+            if summ:
+                system["perf"] = summ
+            hp = _ht.host_profile()
+            if hp:
+                system["host"] = hp
+        except Exception:
+            pass
+
+        try:
+            # Disk free
+            st = os.statvfs("/")
+            free_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
+            total_gb = (st.f_blocks * st.f_frsize) / (1024 ** 3)
+            system["disk_free_gb"] = round(free_gb, 1)
+            system["disk_used_pct"] = round(100 * (1 - free_gb / total_gb), 1)
+        except Exception:
+            pass
+
+        try:
+            # Process RSS
+            status = open("/proc/self/status").read()
+            for line in status.splitlines():
+                if line.startswith("VmRSS:"):
+                    system["proc_ram_mb"] = int(line.split()[1]) // 1024
+                    break
+            system["proc_pid"] = os.getpid()
+        except Exception:
+            pass
+
+        try:
+            # JSON cache stats
+            json_files = list(JSON_DIR.glob("*.json"))
+            system["json_cache_files"] = len(json_files)
+            system["json_cache_mb"] = round(
+                sum(f.stat().st_size for f in json_files) / 1024 / 1024, 1)
+        except Exception:
+            pass
+
+        try:
+            # GPKG temp dir
+            gpkg_files = list(GPKG_DIR.glob("*.gpkg"))
+            system["gpkg_temp_files"] = len(gpkg_files)
+            system["gpkg_temp_mb"] = round(
+                sum(f.stat().st_size for f in gpkg_files) / 1024 / 1024, 1)
+        except Exception:
+            pass
+
+        try:
+            # Tile cache stats
+            from tile_cache import cache_summary
+            system["tile_caches"] = cache_summary()
+        except Exception:
+            pass
+
+        try:
+            # Circuit breaker state
+            cb = _read_circuit_breaker()
+            system["copernicus_circuit"] = (
+                "open" if cb["consecutive_failures"] >= 3
+                and (time.time() - cb["last_failure"]) < cb["cooldown"]
+                else "closed"
+            )
+        except Exception:
+            pass
+
+        with self._lock:
+            self._state["system"] = system
+
+
+# === SECTION: Circuit breaker (openEO rate-limit protection) ===
+
+def _read_circuit_breaker() -> dict:
+    try:
+        if CIRCUIT_BREAKER_FILE.exists():
+            return json.loads(CIRCUIT_BREAKER_FILE.read_text())
+    except Exception:
+        pass
+    return {"consecutive_failures": 0, "last_failure": 0.0, "cooldown": 120}
+
+def _write_circuit_breaker(state: dict):
+    try:
+        CIRCUIT_BREAKER_FILE.write_text(json.dumps(state))
+    except Exception:
+        pass
+
+
+# === SECTION: Geometry helpers (CRS transforms) ===
+
+def transform_to_3035(geom):
+    return shapely_transform(_tx_to_3035.transform, geom)
+
+def transform_to_wgs(geom):
+    return shapely_transform(_tx_to_wgs.transform, geom)
+
+
+# === SECTION: KG list (fetch + cache all 7850 KGs — see kg_universe.py) ===
+
+#: Public (token-free) KG universe endpoint on umfeld-at: one ~520 KB gz
+#: response for all 7850 KGs, ETag == universe_hash. Replaces the old
+#: /search/district × /search/kg?district=… loop (96+ requests per refresh,
+#: and the source of the 8440 artefact — see kg_universe.py).
+KG_UNIVERSE_URL = f"https://{_umfeld.HOST}/api/v1/kgs"
+KG_LIST_ETAG_FILE = KG_LIST_FILE.with_suffix('.etag')
+KG_LIST_REFRESH_S = 24 * 3600   # local cache lifetime before a conditional GET
+KG_LIST_MIN_REFETCH_S = 3600    # never hit umfeld more often than hourly
+
+
+def _normalise_umfeld_kg(row: dict, prev: dict | None, state_filter=None) -> dict | None:
+    """Map one ``/api/v1/kgs`` row onto the legacy kg_list.json shape
+    (``bbox`` dict with min/max_lon/lat, ``lat``/``lon`` centroid). Count
+    fields (parcel_count / building_count / total_area_sqm) are not part
+    of the public universe — carried over from the previous cache entry."""
+    code = str(row.get('kg_code') or '')
+    if not code:
+        return None
+    bb = row.get('bbox')
+    if isinstance(bb, (list, tuple)) and len(bb) == 4:
+        bb = {'min_lon': bb[0], 'min_lat': bb[1], 'max_lon': bb[2], 'max_lat': bb[3]}
+    elif not isinstance(bb, dict):
+        bb = (prev or {}).get('bbox') or {}
+    cen = row.get('centroid')
+    if isinstance(cen, (list, tuple)) and len(cen) == 2:
+        lon, lat = cen
+    elif bb:
+        lon = (bb.get('min_lon', 0) + bb.get('max_lon', 0)) / 2
+        lat = (bb.get('min_lat', 0) + bb.get('max_lat', 0)) / 2
+    else:
+        lon, lat = (prev or {}).get('lon'), (prev or {}).get('lat')
+    out = {
+        'kg_code': code,
+        'kg_name': row.get('kg_name', ''),
+        'gemeinde_code': str(row.get('gemeinde_code') or ''),
+        'gemeinde_name': row.get('gemeinde_name', ''),
+        'district_code': str(row.get('district_code') or ''),
+        'district_name': row.get('district_name', ''),
+        'state_name': row.get('state_name', ''),
+        'bbox': bb, 'lat': lat, 'lon': lon,
+        'parcel_count': (prev or {}).get('parcel_count', 0),
+        'building_count': (prev or {}).get('building_count', 0),
+        'total_area_sqm': (prev or {}).get('total_area_sqm', 0),
+    }
+    if state_filter and out['state_name'].lower() != state_filter.lower():
+        return None
+    return out
+
+
+def _fetch_kg_universe(etag: str | None):
+    """One conditional GET of :data:`KG_UNIVERSE_URL`.
+
+    Returns ``(rows, etag)``; ``rows is None`` on 304 (unchanged).  Raises
+    on transport errors or a universe-contract mismatch (the caller keeps
+    the cached list in both cases — a hash mismatch is a new KG epoch
+    that must be coordinated with umfeld-at via kg_universe.py, never
+    merged silently)."""
+    import kg_universe
+    hdrs = {'Accept': 'application/json', 'Accept-Encoding': 'gzip',
+            'User-Agent': 'srtm-lidar-at kg-universe-sync'}
+    if etag:
+        hdrs['If-None-Match'] = etag
+    resp = requests.get(KG_UNIVERSE_URL, headers=hdrs, timeout=90)
+    if resp.status_code == 304:
+        return None, etag
+    resp.raise_for_status()
+    body = resp.json()
+    data = body.get('data', body)
+    rows = data.get('kgs') or []
+    codes = {str(r.get('kg_code')) for r in rows if r.get('kg_code')}
+    got_hash = kg_universe.universe_hash(codes)
+    claimed = data.get('universe_hash') or resp.headers.get('X-KG-Universe-Hash')
+    n = data.get('kg_count', len(codes))
+    if claimed and claimed != got_hash:
+        raise RuntimeError(f"umfeld /kgs: claimed universe_hash {claimed[:12]} != "
+                           f"recomputed {got_hash[:12]} over {len(codes)} codes")
+    if int(n) != kg_universe.KG_TOTAL or len(codes) != kg_universe.KG_TOTAL:
+        raise RuntimeError(f"umfeld /kgs: kg_count={n} rows={len(codes)}, "
+                           f"contract KG_TOTAL={kg_universe.KG_TOTAL} — new KG epoch?")
+    if got_hash != kg_universe.UNIVERSE_HASH_CONTRACT:
+        raise RuntimeError(f"umfeld /kgs: universe_hash {got_hash[:12]} != contract "
+                           f"{kg_universe.UNIVERSE_HASH_CONTRACT[:12]} — new KG epoch; "
+                           f"bump kg_universe.UNIVERSE_HASH_CONTRACT in lock-step with umfeld")
+    new_etag = resp.headers.get('ETag') or f'"{got_hash}"'
+    return rows, new_etag
+
+
+def get_all_kgs(state_filter: str = None) -> list[dict]:
+    """All 7850 KGs (legacy kg_list.json shape). Caches to kg_list.json.
+
+    Source: a single ``GET umfeld-at/api/v1/kgs`` (public, ~520 KB gz),
+    conditional via ``If-None-Match`` once we hold an ETag, at most hourly
+    and only when the local cache is older than :data:`KG_LIST_REFRESH_S`.
+    The response must satisfy the shared universe contract
+    (``kg_count == KG_TOTAL`` and ``universe_hash == UNIVERSE_HASH_CONTRACT``)
+    or it is rejected and the cached list is kept — the KG universe can
+    only change by an explicit, coordinated epoch bump.
+    """
+    import kg_universe
+    cached = None
+    age = None
+    if KG_LIST_FILE.exists():
+        try:
+            cached = kg_universe.dedupe(json.loads(KG_LIST_FILE.read_text()))
+        except Exception as e:
+            log.warning("kg_list.json unreadable: %s", e)
+        age = time.time() - KG_LIST_FILE.stat().st_mtime
+    complete = bool(cached) and len(cached) >= kg_universe.KG_TOTAL * kg_universe.MIN_COMPLETE_FRAC
+
+    def _filtered(lst):
+        if state_filter:
+            return [k for k in lst if str(k.get('state_name', '')).lower() == state_filter.lower()]
+        return lst
+
+    if complete and age is not None and age < KG_LIST_REFRESH_S:
+        log.info("Loaded %d KGs from cache (%s)", len(cached), KG_LIST_FILE)
+        return _filtered(cached)
+    if cached and age is not None and age < KG_LIST_MIN_REFETCH_S:
+        # Incomplete-but-recent: someone refreshed <1h ago and the upstream
+        # refused/failed then too — don't hammer umfeld, use what we have.
+        return _filtered(cached)
+
+    etag = None
+    try:
+        etag = KG_LIST_ETAG_FILE.read_text().strip() or None
+    except Exception:
+        pass
+    if not complete:
+        etag = None  # cache not trustworthy → force a full body
+
+    try:
+        rows, new_etag = _fetch_kg_universe(etag)
+    except Exception as e:
+        log.warning("KG universe fetch failed (%s) — keeping cached list of %d",
+                    e, len(cached or []))
+        if cached:
+            # Stamp mtime so the fleet retries hourly, not on every start.
+            try:
+                os.utime(KG_LIST_FILE, (time.time(), time.time() - KG_LIST_REFRESH_S + KG_LIST_MIN_REFETCH_S))
+            except Exception:
+                pass
+            return _filtered(cached)
+        raise
+
+    if rows is None:
+        log.info("KG universe unchanged (304, etag %s) — %d KGs from cache", (etag or '')[:14], len(cached))
+        try:
+            os.utime(KG_LIST_FILE, None)
+        except Exception:
+            pass
+        return _filtered(cached)
+
+    prev_by_code = {str(k.get('kg_code')): k for k in (cached or [])}
+    all_kgs = []
+    for r in rows:
+        k = _normalise_umfeld_kg(r, prev_by_code.get(str(r.get('kg_code'))))
+        if k:
+            all_kgs.append(k)
+    all_kgs = kg_universe.dedupe(all_kgs)
+    log.info("Fetched %d KGs from %s (etag %s)", len(all_kgs), KG_UNIVERSE_URL, (new_etag or '')[:14])
+    try:
+        tmp = KG_LIST_FILE.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps(all_kgs, indent=1, default=str))
+        os.replace(tmp, KG_LIST_FILE)
+        if new_etag:
+            KG_LIST_ETAG_FILE.write_text(new_etag)
+    except Exception as e:
+        log.warning("kg_list.json write failed: %s", e)
+    return _filtered(all_kgs)
+
+
+# === SECTION: Cadastre data fetching (REST API calls) ===
+
+# Transient HTTP statuses worth retrying — the cadastre-process-api can be
+# briefly overloaded (503) or hit a gateway hiccup (502/504/429). A 404 or
+# other 4xx is NOT transient (the KG genuinely has no cadastre) and must not
+# trigger a retry/requeue.
+_CADASTRE_TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+
+
+def _cadastre_tier_refused(resp) -> bool:
+    """True when the response is the umfeld /k tier's token refusal
+    (401/403, or its unadvertised-prefix 404 ``{"error":"not_found","docs":…}``)."""
+    try:
+        if resp is None:
+            return False
+        if resp.status_code in (401, 403):
+            return True
+        if resp.status_code == 404:
+            b = resp.json()
+            return isinstance(b, dict) and b.get("error") == "not_found" and "docs" in b
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+_CADASTRE_MAX_ATTEMPTS = 5
+_CADASTRE_BACKOFF_BASE_S = 5.0
+
+# Sep 2026: the cadastre API no longer blocks on a cold KG. /export/geojson
+# answers HTTP 202 + Retry-After with a ``warming`` block (no ``parcels`` /
+# ``building_footprints`` keys!) while the KG file comes from its Zenodo
+# mirror. A 202 must be POLLED, never parsed as an empty cadastre —
+# ``raise_for_status()`` lets 2xx through, so without the guard below a cold
+# KG silently produced a GPKG with zero parcels. ``?wait=`` (max 120 s)
+# makes the server block as long as it can first; the polling loop has its
+# own budget independent of the transient-error attempts.
+_CADASTRE_EXPORT_WAIT_S = 120
+_CADASTRE_PENDING_BUDGET_S = 15 * 60
+_CADASTRE_PENDING_DEFAULT_RETRY_S = 8.0
+
+
+def _cadastre_pending(resp) -> tuple:
+    """-> (is_pending, retry_after_s, detail) for a cadastre API response.
+
+    Pending = HTTP 202, or a JSON body carrying ``status:pending`` /
+    ``warming`` (defensive: same shape on every 'not ready' answer).
+    """
+    pending = resp.status_code == 202
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001
+        body = None
+    if isinstance(body, dict) and (body.get("status") == "pending" or "warming" in body):
+        pending = True
+    if not pending:
+        return False, 0.0, ""
+    ra = None
+    try:
+        ra = float(resp.headers.get("Retry-After") or 0) or None
+    except ValueError:
+        ra = None
+    detail = ""
+    if isinstance(body, dict):
+        w = body.get("warming") or {}
+        if ra is None:
+            try:
+                ra = float(w.get("retry_after_s") or 0) or None
+            except (TypeError, ValueError):
+                ra = None
+        kgs = w.get("kgs") or []
+        if kgs:
+            k = kgs[0]
+            detail = (f"state={k.get('state')} pct={k.get('pct')} "
+                      f"attempt={k.get('attempt')}/{k.get('max_attempts')} "
+                      f"queue_pos={k.get('queue_position')}")
+            if k.get("last_error"):
+                detail += f" last_error={str(k.get('last_error'))[:80]}"
+        z = w.get("zenodo") or {}
+        if z.get("status"):
+            detail += f" mirror={z.get('status')}"
+    ra = min(max(ra or _CADASTRE_PENDING_DEFAULT_RETRY_S, 1.0), 60.0)
+    return True, ra, detail.strip()
+
+# Layers we actually consume. ``landuse_polygons`` (~70 % of a full export)
+# was requested for years but never read downstream (segv2 gets landuse via
+# its own training-side fetch in segv2/labels.py) — dropped Sep 2026 per the
+# cadastre API's bandwidth guidance.
+_CADASTRE_EXPORT_LAYERS = "parcels,building_footprints,buildings"
+
+# Local ETag cache for /export/geojson (the API's most expensive endpoint;
+# its ETag is a pure function of the KG file, max-age 86400). Split blocks
+# of one parent, deferred retries and stuck-KG restarts all re-fetch the
+# same parent export — with the cache a re-fetch is a 0-byte 304.
+_CADASTRE_CACHE_DIR = DATA_DIR / "cadastre_cache"
+# v2.4 posture rule (docs/v2.4-ne-proposal.md §1): cadastre geometry is run-time
+# model context only, cached ≤ 24 h, never persisted beyond the KG run.
+_CADASTRE_CACHE_MAX_AGE_S = 24 * 3600
+
+
+def _cadastre_cache_paths(kg_code: str):
+    d = _CADASTRE_CACHE_DIR
+    return d / f"{kg_code}.json.gz", d / f"{kg_code}.etag"
+
+
+def _cadastre_cache_load(kg_code: str):
+    """→ (etag|None, body_bytes|None). Prunes stale entries opportunistically."""
+    body_p, etag_p = _cadastre_cache_paths(kg_code)
+    try:
+        if not (body_p.exists() and etag_p.exists()):
+            return None, None
+        if time.time() - body_p.stat().st_mtime > _CADASTRE_CACHE_MAX_AGE_S:
+            body_p.unlink(missing_ok=True); etag_p.unlink(missing_ok=True)
+            return None, None
+        return etag_p.read_text().strip() or None, body_p.read_bytes()
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def _cadastre_cache_store(kg_code: str, etag: str, body: bytes) -> None:
+    import gzip as _gz
+    try:
+        _CADASTRE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        body_p, etag_p = _cadastre_cache_paths(kg_code)
+        tmp = body_p.with_suffix(".tmp")
+        with _gz.open(tmp, "wb", compresslevel=6) as fh:
+            fh.write(body)
+        os.replace(tmp, body_p)
+        etag_p.write_text(etag)
+        # Opportunistic prune of old entries (bounded dir, ~1-3 MB gz each).
+        now = time.time()
+        for f in _CADASTRE_CACHE_DIR.glob("*.json.gz"):
+            if now - f.stat().st_mtime > _CADASTRE_CACHE_MAX_AGE_S:
+                f.unlink(missing_ok=True)
+                f.with_suffix("").with_suffix(".etag").unlink(missing_ok=True)
+    except Exception as e:  # noqa: BLE001
+        log.debug("cadastre cache store failed for %s: %s", kg_code, e)
+
+
+def fetch_cadastre_data(kg_code: str) -> dict:
+    """Fetch parcels, building footprints, buildings (addresses), landuse from cadastre API.
+
+    On a *transient* failure (timeout, connection error, or 5xx/429 from an
+    overloaded API) we retry with exponential backoff. If every attempt fails
+    we set ``result['_fetch_failed'] = True`` so the caller can abort + requeue
+    the KG rather than silently emit a GPKG with no parcels/buildings.
+    """
+    result = {"parcels": [], "building_footprints": [], "landuse": [],
+              "parcels_geojson": [], "buildings_geojson": [],
+              "building_addresses": []}
+    data = None
+    last_exc = None
+    cached_etag, cached_gz = _cadastre_cache_load(kg_code)
+    _pending_deadline = time.monotonic() + _CADASTRE_PENDING_BUDGET_S
+    _pending_polls = 0
+    _attempt = 0
+    while _attempt < _CADASTRE_MAX_ATTEMPTS:
+        _attempt += 1
+        try:
+            _hdrs = {"If-None-Match": cached_etag} if (cached_etag and cached_gz) else {}
+            resp = requests.get(
+                f"{CADASTRE_BASE}/export/geojson",
+                params={"kg": kg_code,
+                        "layers": _CADASTRE_EXPORT_LAYERS,
+                        "include_geometry": "true",
+                        "wait": _CADASTRE_EXPORT_WAIT_S},
+                headers=_hdrs,
+                timeout=_CADASTRE_EXPORT_WAIT_S + 60,
+            )
+            if resp.status_code == 304 and cached_gz:
+                import gzip as _gz
+                data = json.loads(_gz.decompress(cached_gz))
+                log.info("KG %s: cadastre export unchanged (304, local ETag cache)", kg_code)
+                break
+            resp.raise_for_status()
+            _pend, _ra, _detail = _cadastre_pending(resp)
+            if _pend:
+                # Cold KG still warming from the cadastre API's Zenodo mirror.
+                # Poll (does NOT consume a transient-error attempt) until the
+                # pending budget is exhausted, then _fetch_failed -> requeue.
+                _pending_polls += 1
+                _attempt -= 1
+                if time.monotonic() + _ra > _pending_deadline:
+                    last_exc = RuntimeError(
+                        f"cadastre export still pending after "
+                        f"{_CADASTRE_PENDING_BUDGET_S // 60} min ({_detail})")
+                    break
+                _lvl = log.warning if _pending_polls % 5 == 0 else log.info
+                _lvl("KG %s: cadastre export pending (202, poll %d, %s) - "
+                     "retrying in %.0fs", kg_code, _pending_polls, _detail or "warming", _ra)
+                time.sleep(_ra)
+                continue
+            data = resp.json()
+            if not isinstance(data, dict) or not any(
+                    k in data for k in ("parcels", "building_footprints", "buildings", "meta")):
+                # Neither a warming block nor a layered export (a genuinely
+                # empty KG still carries ``meta.feature_count=0``): never
+                # accept an unknown shape as "empty cadastre".
+                _keys = list(data)[:8] if isinstance(data, dict) else type(data).__name__
+                raise RuntimeError(f"unexpected cadastre export shape: keys={_keys}")
+            _et = resp.headers.get("ETag")
+            if _et:
+                _cadastre_cache_store(kg_code, _et, resp.content)
+            break
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            last_exc = e
+            if _cadastre_tier_refused(e.response):
+                # umfeld /k tier answers a missing/rotated token with the
+                # generic 404 body — never "empty cadastre"; retry/requeue.
+                status = 503
+                log.error("KG %s: cadastre upstream refused the token (umfeld /k tier) — "
+                          "check data/umfeld_token", kg_code)
+            if status in _CADASTRE_TRANSIENT_STATUS and _attempt < _CADASTRE_MAX_ATTEMPTS:
+                _sleep = _CADASTRE_BACKOFF_BASE_S * (2 ** (_attempt - 1))
+                log.warning("KG %s: cadastre fetch transient %s (attempt %d/%d), "
+                            "retrying in %.0fs", kg_code, status, _attempt,
+                            _CADASTRE_MAX_ATTEMPTS, _sleep)
+                time.sleep(_sleep)
+                continue
+            if status == 410:
+                # umfeld's /k cadastre routes are retired (Kataster purge,
+                # 2026-10-13).  NEVER an empty cadastre: this peer must run
+                # bev mode (vtcseamless) — defer the KG, the cadastre step
+                # self-heals the sidecar / the director installs the tooling.
+                log.error("KG %s: umfeld cadastre route retired (410) — this peer is not in "
+                          "bev mode; deferring (ne_source sidecar=%s)", kg_code,
+                          __import__('ne_h3').ne_source())
+                result["_fetch_failed"] = True
+                result["_retired"] = True
+                return result
+            # Non-transient (4xx other than 429) — genuine empty cadastre.
+            log.warning("KG %s: cadastre fetch failed (non-transient): %s", kg_code, e)
+            return result
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError) as e:
+            last_exc = e
+            if _attempt < _CADASTRE_MAX_ATTEMPTS:
+                _sleep = _CADASTRE_BACKOFF_BASE_S * (2 ** (_attempt - 1))
+                log.warning("KG %s: cadastre fetch %s (attempt %d/%d), "
+                            "retrying in %.0fs", kg_code, type(e).__name__,
+                            _attempt, _CADASTRE_MAX_ATTEMPTS, _sleep)
+                time.sleep(_sleep)
+                continue
+        except RuntimeError as e:
+            # Unexpected body shape: treat as transient (API-side hiccup),
+            # never as "the KG has no cadastre".
+            last_exc = e
+            if _attempt < _CADASTRE_MAX_ATTEMPTS:
+                _sleep = _CADASTRE_BACKOFF_BASE_S * (2 ** (_attempt - 1))
+                log.warning("KG %s: cadastre fetch %s (attempt %d/%d), retrying in %.0fs",
+                            kg_code, e, _attempt, _CADASTRE_MAX_ATTEMPTS, _sleep)
+                time.sleep(_sleep)
+                continue
+        except Exception as e:
+            # JSON decode / unexpected — treat as non-transient.
+            log.warning("KG %s: cadastre fetch failed: %s", kg_code, e)
+            return result
+
+    if data is None:
+        # All retries exhausted on a transient error — flag for requeue.
+        log.error("KG %s: cadastre fetch failed after %d attempts (API overloaded?): %s",
+                  kg_code, _CADASTRE_MAX_ATTEMPTS, last_exc)
+        result["_fetch_failed"] = True
+        return result
+
+    # Parse parcels
+    parcels_fc = data.get("parcels", {}).get("features", [])
+    for f in parcels_fc:
+        try:
+            geom = shapely_shape(f["geometry"])
+            if geom.is_empty:
+                continue
+            geom_3035 = transform_to_3035(geom)
+            props = f.get("properties", {})
+            result["parcels"].append({
+                "geometry": geom_3035,
+                "geometry_wgs": geom,
+                "properties": props,
+                "parcel_id": props.get("parcel_id", ""),
+                "area_sqm": props.get("area_sqm", 0),
+            })
+            result["parcels_geojson"].append(f)
+        except Exception:
+            continue
+
+    # Parse building footprints
+    bfp_fc = data.get("building_footprints", {}).get("features", [])
+    for f in bfp_fc:
+        try:
+            geom = shapely_shape(f["geometry"])
+            if geom.is_empty:
+                continue
+            geom_3035 = transform_to_3035(geom)
+            result["building_footprints"].append({
+                "geometry": geom_3035,
+                "geometry_wgs": geom,
+                "properties": f.get("properties", {}),
+            })
+            result["buildings_geojson"].append(f)
+        except Exception:
+            continue
+
+    # Parse building address points (for joining to footprints)
+    bld_fc = data.get("buildings", {}).get("features", [])
+    for f in bld_fc:
+        try:
+            geom = shapely_shape(f["geometry"])
+            if geom.is_empty:
+                continue
+            geom_3035 = transform_to_3035(geom)
+            props = f.get("properties", {})
+            result["building_addresses"].append({
+                "geometry_3035": geom_3035,
+                "building_id": props.get("building_id", ""),
+                "full_address": props.get("full_address", ""),
+                "house_number": props.get("house_number", ""),
+                "street": props.get("street", ""),
+                "postal_code": props.get("postal_code", ""),
+                "location": props.get("location", ""),
+            })
+        except Exception:
+            continue
+
+    # Landuse: no longer requested (see _CADASTRE_EXPORT_LAYERS); the key is
+    # kept (always []) so downstream block-filter code stays shape-stable.
+
+    # --- Filter buildings to KG boundary (parcels define the KG extent) ---
+    n_before = len(result["building_footprints"])
+    if result["parcels"] and result["building_footprints"]:
+        try:
+            from shapely.ops import unary_union as _uu
+            from shapely.validation import make_valid as _mv
+            parcel_geoms = []
+            for p in result["parcels"]:
+                g = p["geometry"]
+                try:
+                    parcel_geoms.append(_mv(g) if not g.is_valid else g)
+                except Exception:
+                    parcel_geoms.append(g.buffer(0))
+            kg_boundary = _uu(parcel_geoms).buffer(50)  # 50m buffer
+            filtered_bfp = []
+            filtered_bfp_geo = []
+            for i, b in enumerate(result["building_footprints"]):
+                if kg_boundary.contains(b["geometry"].centroid):
+                    filtered_bfp.append(b)
+                    if i < len(result["buildings_geojson"]):
+                        filtered_bfp_geo.append(result["buildings_geojson"][i])
+            n_removed = n_before - len(filtered_bfp)
+            if n_removed > 0:
+                log.info("KG %s: filtered %d/%d buildings outside KG boundary",
+                         kg_code, n_removed, n_before)
+            result["building_footprints"] = filtered_bfp
+            result["buildings_geojson"] = filtered_bfp_geo
+        except Exception as e:
+            log.warning("KG %s: building filter failed: %s", kg_code, e)
+
+    log.info("KG %s: %d parcels, %d footprints (was %d), %d addresses, %d landuse",
+             kg_code, len(result["parcels"]), len(result["building_footprints"]),
+             n_before, len(result["building_addresses"]), len(result["landuse"]))
+    return result
+
+
+_CADASTRE_BEV_ATTEMPTS = 2
+
+
+def fetch_cadastre_data_bevdirect(kg_code: str, bbox_wgs: tuple) -> dict:
+    """bev mode (``ne_h3.cadastre_source() == 'bevdirect'``): the pipeline's
+    parcels + footprints from the public BEV vector tiles — the SAME one
+    viewport grid ``vct_pilot.build_declared`` turns into the parent's NEC1
+    (docs/vct-pilot.md → bev mode).  No call to umfeld's ``/k`` tier.
+
+    Shape-compatible with :func:`fetch_cadastre_data`; differences:
+
+    * ``parcels`` = this KG's parcels (``kg_code`` match), ``parcel_id`` /
+      ``area_sqm`` / ``ez`` / ``status`` kept; parcels clipped by the
+      bevdirect cell grid are unioned back (``cad.restored``);
+    * ``building_footprints`` = footprints whose centroid lies inside the
+      own-parcel union (+2 m) — bevdirect footprints carry no ``kg``;
+      ``building_footprints_viewport`` = EVERY footprint of the padded bbox
+      (own + neighbours) for the per-tile raster mask, replacing the per-tile
+      ``/k/spatial/footprints`` call;
+    * no address points (``building_addresses`` = [], unused since v2.4).
+
+    The data arrives over a pipe from the helper subprocess and lives only
+    in this process (never a file).  Transient failure → ``_fetch_failed``
+    (the KG is deferred, exactly like the umfeld path).
+    """
+    import vct_pilot as _vct
+    result = {"parcels": [], "building_footprints": [], "landuse": [],
+              "parcels_geojson": [], "buildings_geojson": [],
+              "building_addresses": [], "building_footprints_viewport": [], "_source": "bevdirect"}
+    cad = None
+    last = None
+    for attempt in range(1, _CADASTRE_BEV_ATTEMPTS + 1):
+        box_ = {}
+        try:
+            _vct.build_declared(kg_code, bbox_wgs, cadastre=box_)
+        except _vct.DeclaredDeficient as e:
+            log.info("KG %s: %s (cadastre itself is complete)", kg_code, e)
+        except Exception as e:  # noqa: BLE001
+            last = e
+            log.warning("KG %s: bevdirect cadastre/declared build failed (attempt %d/%d): %s",
+                        kg_code, attempt, _CADASTRE_BEV_ATTEMPTS, str(e)[:200])
+        cad = box_.get("cad")
+        if cad:
+            break
+        if box_.get("error"):
+            last = RuntimeError(box_["error"])
+        if attempt < _CADASTRE_BEV_ATTEMPTS:
+            time.sleep(20 * attempt)
+    if not cad:
+        log.error("KG %s: bevdirect cadastre unavailable after %d attempts: %s — deferring",
+                  kg_code, _CADASTRE_BEV_ATTEMPTS, last)
+        result["_fetch_failed"] = True
+        return result
+    for p in cad.get("parcels") or []:
+        try:
+            geom = shapely_shape(p["geometry"])
+            if geom.is_empty:
+                continue
+            if not geom.is_valid:
+                geom = geom.buffer(0)
+            props = {k: p.get(k) for k in ("parcel_id", "kg_code", "gnr", "ez", "status", "area_sqm", "lon", "lat")}
+            result["parcels"].append({"geometry": transform_to_3035(geom), "geometry_wgs": geom, "properties": props,
+                                      "parcel_id": p.get("parcel_id", ""), "area_sqm": p.get("area_sqm", 0)})
+            result["parcels_geojson"].append({"type": "Feature", "geometry": p["geometry"], "properties": props})
+        except Exception:
+            continue
+    own_union = None
+    if result["parcels"]:
+        try:
+            from shapely.ops import unary_union as _uu
+            own_union = _uu([q["geometry"] for q in result["parcels"]]).buffer(2)
+        except Exception as e:  # noqa: BLE001
+            log.warning("KG %s: own-parcel union failed (all footprints kept): %s", kg_code, e)
+    for f in cad.get("footprints") or []:
+        try:
+            geom = shapely_shape(f["geometry"])
+            if geom.is_empty:
+                continue
+            if not geom.is_valid:
+                geom = geom.buffer(0)
+            g3 = transform_to_3035(geom)
+            props = {"id": f.get("id"), "ns": f.get("ns"), "ns_code": f.get("ns_code"), "parcel_id": f.get("parcel_id")}
+            rec = {"geometry": g3, "geometry_wgs": geom, "properties": props}
+            result["building_footprints_viewport"].append(rec)
+            if own_union is None or own_union.contains(g3.centroid):
+                result["building_footprints"].append(rec)
+                result["buildings_geojson"].append({"type": "Feature", "geometry": f["geometry"], "properties": props})
+        except Exception:
+            continue
+    st = cad.get("stats") or {}
+    log.info("KG %s: bevdirect cadastre: %d parcels (%s clipped→restored), %d own footprints of %d in bbox",
+             kg_code, len(result["parcels"]), st.get("restored", 0), len(result["building_footprints"]),
+             len(result["building_footprints_viewport"]))
+    return result
+
+
+def _kg_bbox_lookup(kg_code: str) -> dict | None:
+    """``{min_lon,min_lat,max_lon,max_lat}`` for a KG without umfeld's ``/k``:
+    the director's ``kg_list.json`` → the local bevdirect-serve ``/kg/<kg>``
+    (BEV VGD admin bbox) → our own public API."""
+    try:
+        b = _parent_bbox_wgs(kg_code)
+        if b:
+            return {"min_lon": b[0], "min_lat": b[1], "max_lon": b[2], "max_lat": b[3]}
+    except Exception:
+        pass
+    try:
+        import ne_h3 as _neh
+        r = requests.get(f"http://{_neh.BEVDIRECT_ADDR}/kg/{str(kg_code).zfill(5)}", timeout=5)
+        if r.ok:
+            k = (r.json() or {}).get("kg") or {}
+            bb = k.get("bbox") or k
+            if isinstance(bb, dict) and "min_lon" in bb:
+                return {x: float(bb[x]) for x in ("min_lon", "min_lat", "max_lon", "max_lat")}
+            if isinstance(bb, (list, tuple)) and len(bb) == 4:
+                return {"min_lon": bb[0], "min_lat": bb[1], "max_lon": bb[2], "max_lat": bb[3]}
+    except Exception:
+        pass
+    try:
+        r = requests.get(f"https://example.invalid/api/v1/kg/{str(kg_code).zfill(5)}", timeout=20)
+        if r.ok:
+            bb = (r.json() or {}).get("bbox") or {}
+            if isinstance(bb, dict) and "min_lon" in bb:
+                return {x: float(bb[x]) for x in ("min_lon", "min_lat", "max_lon", "max_lat")}
+            if isinstance(bb, (list, tuple)) and len(bb) == 4:
+                return {"min_lon": bb[0], "min_lat": bb[1], "max_lon": bb[2], "max_lat": bb[3]}
+    except Exception:
+        pass
+    return None
+
+
+# === SECTION: Height enrichment (DTM/DSM → parcel + building heights) ===
+
+def enrich_parcels_with_heights(parcels: list, dtm: np.ndarray,
+                                transform) -> list[dict]:
+    """Add DTM elevation at each parcel vertex + centroid."""
+    enriched = []
+    for p in parcels:
+        geom_3035 = p["geometry"]
+        geom_wgs = p["geometry_wgs"]
+        props = dict(p.get("properties", {}))
+
+        # Centroid height
+        try:
+            c3 = geom_3035.centroid
+            col = int((c3.x - transform.c) / transform.a)
+            row = int((transform.f - c3.y) / abs(transform.e))
+            h, w = dtm.shape
+            if 0 <= row < h and 0 <= col < w:
+                props["centroid_dtm_m"] = round(float(dtm[row, col]), 2)
+            c_wgs = transform_to_wgs(c3)
+            props["centroid_lon"] = round(c_wgs.x, 7)
+            props["centroid_lat"] = round(c_wgs.y, 7)
+        except Exception:
+            pass
+
+        # Vertex heights
+        try:
+            coords = []
+            if geom_wgs.geom_type == 'Polygon':
+                rings = [geom_wgs.exterior] + list(geom_wgs.interiors)
+            elif geom_wgs.geom_type == 'MultiPolygon':
+                rings = []
+                for poly in geom_wgs.geoms:
+                    rings.append(poly.exterior)
+                    rings.extend(poly.interiors)
+            else:
+                rings = []
+
+            for ring in rings:
+                ring_coords = []
+                for x, y in ring.coords:
+                    pt_3035 = _tx_to_3035.transform(x, y)
+                    col2 = int((pt_3035[0] - transform.c) / transform.a)
+                    row2 = int((transform.f - pt_3035[1]) / abs(transform.e))
+                    dtm_val = None
+                    if 0 <= row2 < dtm.shape[0] and 0 <= col2 < dtm.shape[1]:
+                        dtm_val = round(float(dtm[row2, col2]), 2)
+                    ring_coords.append({"lon": round(x, 7), "lat": round(y, 7),
+                                        "dtm_m": dtm_val})
+                coords.append(ring_coords)
+            props["vertex_heights"] = coords
+        except Exception:
+            pass
+
+        enriched.append({"parcel_id": p["parcel_id"], "area_sqm": p["area_sqm"],
+                         "properties": props, "geometry_wgs": geom_wgs})
+    return enriched
+
+
+def enrich_buildings_with_heights(buildings: list, dtm: np.ndarray,
+                                  dsm: np.ndarray, ndsm: np.ndarray,
+                                  transform) -> list[dict]:
+    """Add object height stats for each building footprint."""
+    from rasterio.features import rasterize as rio_rasterize
+    enriched = []
+    h, w = dtm.shape
+
+    for b in buildings:
+        geom_3035 = b["geometry"]
+        geom_wgs = b["geometry_wgs"]
+        props = dict(b.get("properties", {}))
+
+        try:
+            # Rasterize this single footprint
+            fp_mask = rio_rasterize(
+                [(geom_3035, 1)], out_shape=(h, w), transform=transform,
+                fill=0, dtype=np.uint8, all_touched=True,
+            ).astype(bool)
+
+            obj_heights = ndsm[fp_mask]
+            dsm_vals = dsm[fp_mask]
+
+            if len(obj_heights) > 0:
+                max_h = float(np.nanmax(obj_heights))
+                mean_h = float(np.nanmean(obj_heights))
+                std_h = float(np.nanstd(dsm_vals))  # DSM std for roof type
+
+                props["max_height_m"] = round(max_h, 2)
+                props["mean_height_m"] = round(mean_h, 2)
+                props["dsm_std"] = round(std_h, 2)
+                props["roof_type_hint"] = "flat" if std_h < 1.5 else "pitched"
+                props["stories_est"] = max(1, round(max_h / 3.0))
+                props["footprint_area_sqm"] = round(float(geom_3035.area), 1)
+        except Exception:
+            pass
+
+        # Centroid
+        try:
+            c3 = geom_3035.centroid
+            c_wgs = transform_to_wgs(c3)
+            props["centroid_lon"] = round(c_wgs.x, 7)
+            props["centroid_lat"] = round(c_wgs.y, 7)
+        except Exception:
+            pass
+
+        # Vertex heights
+        try:
+            coords = []
+            if geom_wgs.geom_type == 'Polygon':
+                rings_w = [geom_wgs.exterior]
+            elif geom_wgs.geom_type == 'MultiPolygon':
+                rings_w = [p.exterior for p in geom_wgs.geoms]
+            else:
+                rings_w = []
+            for ring in rings_w:
+                rc = []
+                for x, y in ring.coords:
+                    pt_3035 = _tx_to_3035.transform(x, y)
+                    col2 = int((pt_3035[0] - transform.c) / transform.a)
+                    row2 = int((transform.f - pt_3035[1]) / abs(transform.e))
+                    oh = None
+                    if 0 <= row2 < h and 0 <= col2 < w:
+                        oh = round(float(ndsm[row2, col2]), 2)
+                    rc.append({"lon": round(x, 7), "lat": round(y, 7),
+                               "object_height_m": oh})
+                coords.append(rc)
+            props["vertex_heights"] = coords
+        except Exception:
+            pass
+
+        enriched.append({"properties": props, "geometry_wgs": geom_wgs,
+                         "geometry_3035": geom_3035})
+    return enriched
+
+
+# === SECTION: Vectorise unmatched segments (new buildings, infrastructure) ===
+
+def _segment_touches_edge(seg_mask: np.ndarray) -> bool:
+    """Return True if any pixel in *seg_mask* lies on the raster boundary.
+
+    Edge-touching segments are likely truncated by the segmentation window
+    and their area/shape metrics are unreliable.
+    """
+    h, w = seg_mask.shape
+    if h < 2 or w < 2:
+        return True
+    return bool(
+        seg_mask[0, :].any() or seg_mask[-1, :].any() or
+        seg_mask[:, 0].any() or seg_mask[:, -1].any()
+    )
+
+
+def vectorise_unmatched_buildings(objects: list, labels: np.ndarray,
+                                  mask: np.ndarray, transform,
+                                  cadastre_fp_mask: np.ndarray,
+                                  ndsm: np.ndarray,
+                                  kg_mask: np.ndarray | None = None) -> list[dict]:
+    """Find roof/building segments that don't overlap cadastre footprints.
+
+    ``kg_mask`` (bool raster of this KG's parcel union): segments with less
+    than half their pixels inside it are skipped — they are outside the KG
+    (tile grid overhang) and would otherwise be reported as "new" merely
+    because the KG export carries no footprints there.
+    """
+    from rasterio.features import shapes as rasterize_shapes
+
+    results = []
+    obj_map = {o.obj_id: o for o in objects}
+
+    # Segments classified as roof/building
+    building_objs = [o for o in objects if o.obj_type == 'roof']
+    if not building_objs:
+        return results
+
+    building_ids = {o.obj_id for o in building_objs}
+    label_int = labels.astype(np.int32)
+    n_outside_kg = 0
+
+    for geom_dict, val in rasterize_shapes(
+        label_int, mask=mask & np.isin(label_int, list(building_ids)),
+        transform=transform, connectivity=4,
+    ):
+        oid = int(val)
+        obj = obj_map.get(oid)
+        if obj is None:
+            continue
+
+        # Check overlap with cadastre footprints
+        seg_mask = labels == oid
+        if kg_mask is not None:
+            _n_seg = int(np.sum(seg_mask))
+            if _n_seg == 0 or np.sum(seg_mask & kg_mask) / _n_seg < 0.5:
+                n_outside_kg += 1
+                continue  # outside this KG's parcels → neighbour's building
+        if cadastre_fp_mask is not None:
+            overlap = np.sum(seg_mask & cadastre_fp_mask)
+            total = np.sum(seg_mask)
+            if total > 0 and overlap / total > 0.3:
+                continue  # matches existing cadastre footprint
+
+        # This is a "new" building
+        from shapely.geometry import shape as s_shape
+        try:
+            poly_3035 = s_shape(geom_dict)
+            # Skip tiny polygon fragments (< 20 sqm) — these are
+            # segmentation noise at edges, not real buildings.
+            if poly_3035.area < 20:
+                continue
+            poly_wgs = transform_to_wgs(poly_3035)
+            c_wgs = poly_wgs.centroid
+            at_edge = _segment_touches_edge(seg_mask)
+
+            # Height stats from nDSM
+            seg_h = ndsm[seg_mask]
+            max_h = float(np.nanmax(seg_h)) if len(seg_h) > 0 else 0
+            mean_h = float(np.nanmean(seg_h)) if len(seg_h) > 0 else 0
+
+            results.append({
+                "type": obj.obj_type,
+                "area_sqm": round(float(poly_3035.area), 1),
+                "max_height_m": round(max_h, 2),
+                "mean_height_m": round(mean_h, 2),
+                "stories_est": max(1, round(max_h / 3.0)),
+                "roof_type_hint": "flat" if (np.nanstd(seg_h) if len(seg_h) > 0 else 0) < 1.5 else "pitched",
+                "centroid_lon": round(c_wgs.x, 7),
+                "centroid_lat": round(c_wgs.y, 7),
+                "geometry_wgs": mapping(poly_wgs),
+                "confidence": round(obj.confidence, 2),
+                "classifier_source": getattr(obj, 'classifier_source', 'rules'),
+                "rf_type": getattr(obj, 'rf_type', ''),
+                "rf_confidence": round(getattr(obj, 'rf_confidence', 0.0), 3),
+                "edge_clipped": at_edge,
+            })
+        except Exception:
+            continue
+
+    if n_outside_kg:
+        log.info("new buildings: skipped %d roof segment(s) outside the KG parcel union", n_outside_kg)
+    return results
+
+
+def vectorise_infrastructure(objects: list, labels: np.ndarray,
+                             mask: np.ndarray, transform,
+                             ndsm: np.ndarray, dtm: np.ndarray,
+                             dtm_dates: dict = None) -> list[dict]:
+    """Vectorise parking, solar panels, earthworks, clear cuts, etc."""
+    from rasterio.features import shapes as rasterize_shapes
+
+    INFRA_TYPES = {
+        'parking': {'min_area': 50, 'fields': ['area_sqm', 'est_parking_spots']},
+        'solar_panel': {'min_area': 10, 'fields': ['area_sqm']},
+        'excavation': {'min_area': 20, 'fields': ['volume_m3']},
+        'fill': {'min_area': 20, 'fields': ['volume_m3']},
+        'tree_loss': {'min_area': 5000, 'fields': ['area_sqm']},  # 0.5ha = 5000m2
+        'bridge': {'min_area': 20, 'fields': ['area_sqm', 'max_height_m']},
+        'mast': {'min_area': 1, 'fields': ['max_height_m']},
+        'fence': {'min_area': 5, 'fields': ['length_m']},
+        'wall': {'min_area': 5, 'fields': ['length_m']},
+    }
+
+    results = []
+
+    for obj in objects:
+        if obj.obj_type not in INFRA_TYPES:
+            continue
+        spec = INFRA_TYPES[obj.obj_type]
+
+        seg_mask = labels == obj.obj_id
+        if not seg_mask.any():
+            continue
+        at_edge = _segment_touches_edge(seg_mask)
+
+        # Area filter — relax for edge-clipped segments since their
+        # measured area is a lower bound (the real feature continues
+        # beyond the segmentation window).
+        effective_area = obj.area_sqm
+        if at_edge and obj.obj_type == 'tree_loss':
+            # Edge-clipped tree_loss: only require 500m² (the full
+            # clearing might be huge, we just see the edge of it)
+            if effective_area < 500:
+                continue
+        elif obj.obj_type == 'tree_loss':
+            if effective_area < 5000:
+                continue  # interior clear cuts > 0.5ha only
+        else:
+            if effective_area < spec['min_area']:
+                continue
+
+        try:
+            label_single = np.where(seg_mask, 1, 0).astype(np.int32)
+            from shapely.geometry import shape as s_shape
+
+            # Collect all polygons for this segment and pick the largest
+            all_polys = [
+                s_shape(gd)
+                for gd, val in rasterize_shapes(
+                    label_single, mask=seg_mask, transform=transform, connectivity=4,
+                )
+                if val != 0
+            ]
+            if not all_polys:
+                continue
+            poly_3035 = max(all_polys, key=lambda p: p.area)
+
+            # Apply min_area filter on the actual polygon area (not segment-level)
+            if poly_3035.area < spec['min_area']:
+                continue
+
+            poly_wgs = transform_to_wgs(poly_3035)
+            c_wgs = poly_wgs.centroid
+
+            seg_h = ndsm[seg_mask]
+
+            feature = {
+                "type": obj.obj_type,
+                "area_sqm": round(float(poly_3035.area), 1),
+                "centroid_lon": round(c_wgs.x, 7),
+                "centroid_lat": round(c_wgs.y, 7),
+                "geometry_wgs": mapping(poly_wgs),
+                "confidence": round(obj.confidence, 2),
+                "classifier_source": getattr(obj, 'classifier_source', 'rules'),
+                "rf_type": getattr(obj, 'rf_type', ''),
+                "rf_confidence": round(getattr(obj, 'rf_confidence', 0.0), 3),
+                "edge_clipped": at_edge,
+            }
+
+            if obj.obj_type == 'parking':
+                # ~12.5 m2 per parking spot (standard)
+                feature["est_parking_spots"] = max(1, round(poly_3035.area / 12.5))
+
+            if obj.obj_type in ('excavation', 'fill'):
+                # Volume estimate: mean absolute height change * area
+                mean_h = abs(float(np.nanmean(seg_h))) if len(seg_h) > 0 else 0
+                volume = mean_h * poly_3035.area
+                feature["volume_m3"] = round(volume, 1)
+                if volume < 10 and not at_edge:
+                    continue  # skip tiny earthworks (unless edge-clipped)
+
+            if obj.obj_type in ('bridge', 'mast'):
+                feature["max_height_m"] = round(float(np.nanmax(seg_h)), 2) if len(seg_h) > 0 else 0
+
+            if obj.obj_type in ('fence', 'wall'):
+                # Length estimate from perimeter / 2 (rectangular assumption)
+                feature["length_m"] = round(poly_3035.length / 2, 1)
+                feature["max_height_m"] = round(float(np.nanmax(seg_h)), 2) if len(seg_h) > 0 else 0
+
+            results.append(feature)
+        except Exception:
+            continue
+
+    return results
+
+
+# === SECTION: Resolve edge-clipped features (tile boundary fixup) ===
+
+def resolve_edge_clipped_features(
+    new_buildings: list,
+    infrastructure: list,
+    full_ndsm: np.ndarray,
+    full_dsm: np.ndarray,
+    full_mask: np.ndarray,
+    full_transform,
+) -> tuple[list, list]:
+    """Re-measure edge-clipped buildings & infra using the full-KG nDSM.
+
+    For each feature with ``edge_clipped=True`` whose type has height above
+    ground (roofs, solar, mast, excavation, fill, bridge), we rasterize the
+    clipped polygon into the *full-KG* nDSM, then flood-fill outwards from
+    that seed into contiguous pixels that match the height profile.  The
+    resulting polygon replaces the clipped one and the flag is cleared to
+    ``edge_resolved``.
+
+    Tree-loss keeps its flag because it depends on temporal differencing which
+    only exists inside the segmentation window.
+
+    Returns (new_buildings, infrastructure) — mutated copies.
+    """
+    from rasterio.features import rasterize as rio_rasterize
+    from rasterio.features import shapes as rio_shapes
+    from shapely.geometry import shape as s_shape
+    from scipy.ndimage import binary_dilation
+
+    fh, fw = full_ndsm.shape
+    RESOLVABLE_TYPES = {'roof', 'greenhouse', 'solar_panel', 'parking',
+                        'excavation', 'fill', 'bridge', 'mast'}
+
+    def _try_resolve(feat: dict) -> dict:
+        """Attempt to grow a clipped feature into full-KG nDSM."""
+        if not feat.get('edge_clipped'):
+            return feat
+        if feat.get('type') not in RESOLVABLE_TYPES:
+            return feat
+
+        try:
+            geom_wgs = feat['geometry_wgs']
+            if isinstance(geom_wgs, dict):
+                poly_wgs = s_shape(geom_wgs)
+            else:
+                poly_wgs = geom_wgs
+            poly_3035 = transform_to_3035(poly_wgs)
+
+            # Rasterize seed into full-KG grid
+            seed = rio_rasterize(
+                [(poly_3035, 1)], out_shape=(fh, fw), transform=full_transform,
+                fill=0, dtype=np.uint8, all_touched=True).astype(bool)
+            if seed.sum() < 2:
+                return feat
+
+            # Height profile of the seed region
+            seed_h = full_ndsm[seed & full_mask]
+            seed_h = seed_h[np.isfinite(seed_h)]
+            if len(seed_h) < 2:
+                return feat
+            h_lo = float(np.percentile(seed_h, 10)) - 2.0
+            h_hi = float(np.percentile(seed_h, 90)) + 2.0
+
+            # Height-compatible mask in full-KG
+            compatible = full_mask & np.isfinite(full_ndsm) & \
+                         (full_ndsm >= h_lo) & (full_ndsm <= h_hi)
+
+            # Iterative binary dilation from seed, bounded by compatible
+            grown = seed.copy()
+            for _ in range(200):  # max ~200m growth
+                expanded = binary_dilation(grown, iterations=1) & compatible
+                if expanded.sum() == grown.sum():
+                    break
+                grown = expanded
+
+            if grown.sum() <= seed.sum():
+                return feat  # no growth
+
+            # Vectorize the grown mask
+            grown_int = grown.astype(np.int32)
+            polys = []
+            for geom_dict, val in rio_shapes(grown_int, mask=grown,
+                                             transform=full_transform):
+                if val == 1:
+                    polys.append(s_shape(geom_dict))
+            if not polys:
+                return feat
+
+            from shapely.ops import unary_union as _uu
+            merged_3035 = _uu(polys)
+            merged_wgs = transform_to_wgs(merged_3035)
+
+            # Recompute stats on grown region
+            grown_h = full_ndsm[grown]
+            grown_h = grown_h[np.isfinite(grown_h)]
+            max_h = float(np.nanmax(grown_h)) if len(grown_h) > 0 else feat.get('max_height_m', 0)
+            mean_h = float(np.nanmean(grown_h)) if len(grown_h) > 0 else feat.get('mean_height_m', 0)
+
+            grown_dsm = full_dsm[grown]
+            grown_dsm = grown_dsm[np.isfinite(grown_dsm)]
+            dsm_std = float(np.std(grown_dsm)) if len(grown_dsm) > 0 else 0.0
+
+            resolved = dict(feat)
+            resolved['geometry_wgs'] = mapping(merged_wgs)
+            resolved['area_sqm'] = round(float(merged_3035.area), 1)
+            resolved['max_height_m'] = round(max_h, 2)
+            if 'mean_height_m' in resolved:
+                resolved['mean_height_m'] = round(mean_h, 2)
+            c_wgs = merged_wgs.centroid
+            resolved['centroid_lon'] = round(c_wgs.x, 7)
+            resolved['centroid_lat'] = round(c_wgs.y, 7)
+            resolved['edge_clipped'] = False
+            resolved['edge_resolved'] = True
+
+            # Type-specific updates
+            if feat.get('type') in ('roof', 'greenhouse', 'solar_panel'):
+                resolved['stories_est'] = max(1, round(max_h / 3.0))
+                resolved['roof_type_hint'] = 'flat' if dsm_std < 1.5 else 'pitched'
+            if feat.get('type') == 'parking':
+                resolved['est_parking_spots'] = max(1, round(merged_3035.area / 12.5))
+            if feat.get('type') in ('excavation', 'fill'):
+                resolved['volume_m3'] = round(abs(mean_h) * merged_3035.area, 1)
+
+            log.info("  edge_resolved %s: %s m² → %s m²",
+                     feat.get('type'), feat.get('area_sqm'), resolved['area_sqm'])
+            return resolved
+        except Exception as e:
+            log.debug("  edge_resolve failed for %s: %s", feat.get('type'), e)
+            return feat
+
+    resolved_nb = [_try_resolve(nb) for nb in new_buildings]
+    resolved_infra = [_try_resolve(inf) for inf in infrastructure]
+    return resolved_nb, resolved_infra
+
+
+# === SECTION: GPKG CRS fix + style + vector writers (shared by full + light builders) ===
+
+def _fix_gpkg_raster_crs(gpkg_path: str):
+    """Ensure GPKG raster layers are properly registered for QGIS.
+
+    Layers written by rasterio fall into two categories:
+    - float32 (DTM/DSM/etc): already '2d-gridded-coverage' with proper ancillary
+    - uint8 (Ortho/CIR/segment_type/WorldCover/Hansen): registered as 'tiles'
+
+    The 'tiles' data_type is the correct GPKG standard for PNG/JPEG tile pyramids.
+    GDAL and QGIS both read CRS from 'tiles' layers via gpkg_tile_matrix_set.srs_id.
+    Do NOT convert 'tiles' to '2d-gridded-coverage' — that extension is for
+    single-band gridded elevation data (TIFF tiles) and breaks multi-band
+    JPEG/PNG layers (Ortho, CIR) in QGIS, causing 'h_band null' errors and
+    the raster to appear at 0,0 without CRS.
+
+    This function:
+    1. Ensures the gpkg_spatial_ref_sys entry is complete (WKT1 + WKT2)
+    2. Repairs uint8 layers that were wrongly converted to '2d-gridded-coverage'
+       by an older version of this code (reverts them to 'tiles' and cleans up
+       bogus extension/ancillary entries)
+    """
+    import sqlite3
+    if not os.path.exists(gpkg_path) or os.path.getsize(gpkg_path) == 0:
+        return
+    conn = sqlite3.connect(gpkg_path)
+    try:
+        # --- 1. Ensure EPSG:3035 has both WKT1 and WKT2 definitions ---
+        row = conn.execute(
+            "SELECT definition, definition_12_063 FROM gpkg_spatial_ref_sys "
+            "WHERE srs_id = 3035"
+        ).fetchone()
+        if row:
+            wkt1, wkt2 = row
+            needs_update = False
+            if not wkt1 or wkt1 == 'undefined':
+                from pyproj import CRS
+                wkt1 = CRS.from_epsg(3035).to_wkt('WKT1_GDAL')
+                needs_update = True
+            if not wkt2 or wkt2 == 'undefined':
+                from pyproj import CRS
+                wkt2 = CRS.from_epsg(3035).to_wkt('WKT2_2019')
+                needs_update = True
+            if needs_update:
+                conn.execute(
+                    "UPDATE gpkg_spatial_ref_sys "
+                    "SET definition = ?, definition_12_063 = ? "
+                    "WHERE srs_id = 3035",
+                    (wkt1, wkt2)
+                )
+                log.info("Updated EPSG:3035 WKT definitions in %s", gpkg_path)
+
+        # --- 2. Repair uint8 layers wrongly registered as 2d-gridded-coverage ---
+        # Legitimate float32 gridded layers have column_name='tile_data' in
+        # gpkg_extensions.  Bogus uint8 layers (from old code) have
+        # column_name IS NULL.  Revert those to 'tiles' data_type and clean
+        # up the spurious extension + ancillary rows.
+        try:
+            bogus = conn.execute(
+                "SELECT table_name FROM gpkg_extensions "
+                "WHERE extension_name = 'gpkg_2d_gridded_coverage' "
+                "AND column_name IS NULL "
+                "AND table_name NOT IN "
+                "  ('gpkg_2d_gridded_coverage_ancillary', "
+                "   'gpkg_2d_gridded_tile_ancillary')"
+            ).fetchall()
+            if bogus:
+                bogus_names = [r[0] for r in bogus]
+                log.info("Repairing %d uint8 layers wrongly registered as "
+                         "2d-gridded-coverage: %s", len(bogus_names), bogus_names)
+                for tname in bogus_names:
+                    # Revert data_type to 'tiles'
+                    conn.execute(
+                        "UPDATE gpkg_contents SET data_type = 'tiles' "
+                        "WHERE table_name = ? AND data_type = '2d-gridded-coverage'",
+                        (tname,)
+                    )
+                    # Remove bogus extension entry
+                    conn.execute(
+                        "DELETE FROM gpkg_extensions "
+                        "WHERE table_name = ? "
+                        "AND extension_name = 'gpkg_2d_gridded_coverage' "
+                        "AND column_name IS NULL",
+                        (tname,)
+                    )
+                    # Remove bogus ancillary rows
+                    try:
+                        conn.execute(
+                            "DELETE FROM gpkg_2d_gridded_coverage_ancillary "
+                            "WHERE tile_matrix_set_name = ?",
+                            (tname,)
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        conn.execute(
+                            "DELETE FROM gpkg_2d_gridded_tile_ancillary "
+                            "WHERE tpudt_name = ?",
+                            (tname,)
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.debug("GPKG repair check skipped (no extensions table?): %s", e)
+
+        conn.commit()
+    except Exception as e:
+        log.warning("GPKG CRS fix failed for %s: %s", gpkg_path, e)
+    finally:
+        conn.close()
+
+SEGMENT_COLORS = {
+    "tree":         (0, 100, 0, 180),
+    "shrub":        (34, 139, 34, 180),
+    "grass":        (124, 252, 0, 150),
+    "hedge":        (46, 139, 87, 170),
+    "water":        (30, 144, 255, 180),
+    "wetland":      (0, 168, 150, 170),
+    "roof":         (220, 20, 60, 200),
+    "greenhouse":   (255, 105, 180, 180),
+    "solar_panel":  (65, 105, 225, 200),
+    "fence":        (160, 82, 45, 170),
+    "wall":         (139, 69, 19, 170),
+    "mast":         (64, 64, 64, 200),
+    "wind_turbine": (21, 101, 192, 200),
+    "substation":   (255, 111, 0, 200),
+    "road":         (128, 128, 128, 160),
+    "path":         (169, 169, 169, 150),
+    "parking":      (105, 105, 105, 160),
+    "bridge":       (112, 128, 144, 170),
+    "rail":         (90, 60, 110, 180),
+    "crop":         (218, 165, 32, 160),
+    "orchard":      (107, 142, 35, 170),
+    "vineyard":     (147, 112, 219, 170),
+    "garden":       (60, 179, 113, 160),
+    "bare_soil":    (210, 180, 140, 140),
+    "rock":         (139, 134, 130, 160),
+    "glacier":      (200, 235, 255, 180),
+    "excavation":   (139, 0, 0, 200),
+    "fill":         (255, 140, 0, 200),
+    "tree_loss":    (255, 0, 255, 200),
+    "construction": (255, 69, 0, 200),
+    "unclassified": (190, 190, 190, 120),
+}
+
+
+def _segment_type_colormap():
+    """Build a GDAL color table {type_code: (R,G,B,A)} for the segment_type raster.
+
+    Baked into the uint8 ``segment_type`` band via ``dst.write_colormap`` so the
+    GPKG 'tiles' layer renders as a real colour PNG in *any* viewer (QGIS, GDAL,
+    web) — without it the band stores R=G=B=type_code and renders near-black
+    ("empty"). Code 0 (background / no segment) maps to fully transparent.
+    Mirrors the categorized QML written by ``_write_gpkg_all_styles`` so the
+    raster and the paletted style agree.
+    """
+    from object_segmentation import OBJECT_TYPES as _OT
+    cmap = {0: (0, 0, 0, 0)}  # background → transparent
+    for _name, _rgba in SEGMENT_COLORS.items():
+        _code = _OT.get(_name)
+        if _code is None:
+            continue
+        r, g, b, a = _rgba
+        cmap[int(_code)] = (int(r), int(g), int(b), int(a))
+    return cmap
+
+
+def _to_multi(geom_dict: dict) -> dict:
+    """Promote a Polygon geometry dict to MultiPolygon for fiona schema compat."""
+    if geom_dict and geom_dict.get('type') == 'Polygon':
+        return {'type': 'MultiPolygon', 'coordinates': [geom_dict['coordinates']]}
+    return geom_dict
+
+
+def _height_class(h):
+    """Classify height (m) into a forestry-relevant height class string."""
+    if h is None or h < 0.5:
+        return 'ground'
+    if h < 2:
+        return 'low (<2m)'
+    if h < 5:
+        return 'shrub (2-5m)'
+    if h < 10:
+        return 'young (5-10m)'
+    if h < 15:
+        return 'pole (10-15m)'
+    if h < 20:
+        return 'mid (15-20m)'
+    if h < 25:
+        return 'mature (20-25m)'
+    if h < 30:
+        return 'tall (25-30m)'
+    return 'emergent (30m+)'
+
+
+def _viridis_rgb(t):
+    """Return (R,G,B) for t in [0,1] on the viridis scale."""
+    VIRIDIS = [
+        (68,1,84),(72,35,116),(64,67,135),(52,94,141),(41,120,142),
+        (32,144,140),(34,167,132),(68,190,112),(121,209,81),(189,222,38),(253,231,37)
+    ]
+    t = max(0.0, min(1.0, t))
+    idx = t * (len(VIRIDIS) - 1)
+    lo = int(idx)
+    hi = min(lo + 1, len(VIRIDIS) - 1)
+    f = idx - lo
+    return tuple(int(VIRIDIS[lo][c] + f * (VIRIDIS[hi][c] - VIRIDIS[lo][c])) for c in range(3))
+
+
+def _write_gpkg_categorized_style(gpkg_path: str, layer_name: str,
+                                   color_mode: str = 'type'):
+    """Write a QGIS categorized renderer style for segment vectors.
+
+    Produces a proper legend with one entry per object type, coloured
+    to match the raster segment_type palette.
+    """
+    import sqlite3
+    from object_segmentation import OBJECT_TYPES as _OT
+
+    # Build categorized renderer with one category per type
+    categories = []
+    symbols = []
+    for idx, (type_name, rgba) in enumerate(sorted(
+            SEGMENT_COLORS.items(), key=lambda x: _OT.get(x[0], 99))):
+        r, g, b, a = rgba
+        symbols.append(
+            f'<symbol type="fill" name="{idx}" alpha="0.7">'
+            f'<layer class="SimpleFill" enabled="1" locked="0" pass="0">'
+            f'<Option type="Map">'
+            f'<Option type="QString" value="{r},{g},{b},{a}" name="color"/>'
+            f'<Option type="QString" value="50,50,50,180" name="outline_color"/>'
+            f'<Option type="QString" value="0.2" name="outline_width"/>'
+            f'</Option></layer></symbol>'
+        )
+        categories.append(
+            f'<category value="{type_name}" symbol="{idx}" label="{type_name}"/>'
+        )
+
+    qml = (
+        '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+        '<qgis version="3.34">'
+        '<renderer-v2 type="categorizedSymbol" attr="type" symbollevels="0">'
+        '<categories>' + ''.join(categories) + '</categories>'
+        '<symbols>' + ''.join(symbols) + '</symbols>'
+        '</renderer-v2></qgis>'
+    )
+    conn = sqlite3.connect(gpkg_path)
+    try:
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS layer_styles ('
+            'id INTEGER PRIMARY KEY AUTOINCREMENT,'
+            'f_table_catalog TEXT DEFAULT \'\','
+            'f_table_schema TEXT DEFAULT \'\','
+            'f_table_name TEXT,'
+            'f_geometry_column TEXT,'
+            'styleName TEXT,'
+            'styleQML TEXT,'
+            'styleSLD TEXT,'
+            'useAsDefault BOOLEAN,'
+            'description TEXT,'
+            'owner TEXT,'
+            'ui TEXT,'
+            'update_time TIMESTAMP DEFAULT (strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\'))'
+            ')'
+        )
+        conn.execute(
+            'INSERT INTO layer_styles '
+            '(f_table_name, f_geometry_column, styleName, styleQML, useAsDefault, description) '
+            'VALUES (?, ?, ?, ?, 1, ?)',
+            (layer_name, 'geom', f'Segment {color_mode}', qml,
+             f'Auto-generated colour-by-{color_mode} style'),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# === Chunked GPKG vector-layer writer ===
+#
+# fiona's GPKG driver opens a single transaction per `with fiona.open(...)`
+# block and only COMMITs on exit. On big KGs (>100k features × ~80
+# columns), SQLite's rollback journal grows to roughly the size of the
+# inserted data. A 2.6 GB GPKG can need >1 GB of *additional* free
+# space at COMMIT time; if disk runs out mid-COMMIT the layer is lost
+# AND the half-broken transaction state cascades into the next layer
+# write (triggers reference missing tables, ROLLBACK fails — see the
+# 2026-06-03 at2 / KG 90102-north incident; the v0da6a77
+# `journal_mode=MEMORY` workaround made the cascade worse and was
+# reverted).
+#
+# Real fix: chunked commits. We close + reopen the layer in append
+# mode every `_GPKG_CHUNK_FEATURES` features. Each chunk's journal is
+# bounded to ~(chunk_size × ~120 B) = ~1 MB — a peer with even a few
+# hundred MB free can finish a 400k-feature layer. Side benefits:
+#  - committed chunks survive a mid-write crash (durability)
+#  - no half-committed transaction can ever leak into the next layer
+#  - close+reopen is cheap (<100 ms) compared with the per-feature
+#    encoding cost, so overhead is negligible (~20 reopens for 200k
+#    features).
+#
+# `_write_gpkg_features_chunked` takes the schema/crs/layer and an
+# iterator of fiona feature dicts. The caller (a generator) owns all
+# the per-feature property construction.
+_GPKG_CHUNK_FEATURES = 10000
+
+
+def _write_gpkg_features_chunked(gpkg_path: str, schema: dict, crs,
+                                 layer_name: str, features,
+                                 chunk_size: int = _GPKG_CHUNK_FEATURES) -> int:
+    """Write features to a GPKG layer in bounded-transaction chunks.
+
+    First chunk creates the layer (`mode='w'`); subsequent chunks
+    open the layer for append (`mode='a'`). Each `with` block is
+    its own SQLite transaction, so the rollback journal is bounded
+    to ~`chunk_size * 120 B` regardless of total feature count.
+
+    Returns the number of features written.
+    """
+    import fiona
+    written = 0
+    batch: list = []
+    layer_exists = False
+
+    def _flush():
+        nonlocal written, layer_exists
+        if not batch:
+            return
+        _gpkg_heartbeat(f"vectors {layer_name}: {written + len(batch)} features")
+        if layer_exists:
+            with fiona.open(gpkg_path, 'a', driver='GPKG',
+                            layer=layer_name) as dst:
+                dst.writerecords(batch)
+        else:
+            with fiona.open(gpkg_path, 'w', driver='GPKG',
+                            layer=layer_name, schema=schema, crs=crs) as dst:
+                dst.writerecords(batch)
+            layer_exists = True
+        written += len(batch)
+        batch.clear()
+
+    for feat in features:
+        batch.append(feat)
+        if len(batch) >= chunk_size:
+            _flush()
+    _flush()
+
+    if not layer_exists:
+        # Zero features: still create an empty layer so the GPKG
+        # contents are consistent (callers expect the layer to exist).
+        with fiona.open(gpkg_path, 'w', driver='GPKG',
+                        layer=layer_name, schema=schema, crs=crs):
+            pass
+    return written
+
+
+def _write_segment_vectors(gpkg_path: str, labels: np.ndarray,
+                           objects: list, mask: np.ndarray,
+                           transform, layer_name: str = 'segments',
+                           obs_year: int = 0):
+    """Write vectorised segment polygons with full attributes to a GPKG.
+
+    Includes all SegmentedObject attributes: height, shape, spectral,
+    temporal change, texture, SAR, harmonics, phenology, and
+    observation period metadata.
+    """
+    from rasterio.features import shapes as rasterize_shapes
+    from fiona.crs import from_epsg
+
+    obj_map = {o.obj_id: o for o in objects}
+    label_int = labels.astype(np.int32)
+
+    schema = {
+        'geometry': 'MultiPolygon',
+        'properties': [
+            # Identity
+            ('id', 'int'),
+            ('type', 'str'),
+            ('type_code', 'int'),
+            ('group_type', 'str'),
+            ('height_class', 'str'),
+            # Geometry
+            ('area_sqm', 'float'),
+            ('perimeter_m', 'float'),
+            ('compactness', 'float'),
+            ('elongation', 'float'),
+            ('solidity', 'float'),
+            ('extent', 'float'),
+            # Height
+            ('height_max_m', 'float'),
+            ('height_mean_m', 'float'),
+            ('height_p90_m', 'float'),
+            ('height_std_m', 'float'),
+            # Surface / terrain
+            ('slope_mean_deg', 'float'),
+            ('aspect_mean_deg', 'float'),
+            ('aspect_dominant', 'str'),
+            ('roughness', 'float'),
+            ('dsm_edge_strength', 'float'),
+            ('elevation_mean_m', 'float'),
+            ('elevation_min_m', 'float'),
+            ('elevation_max_m', 'float'),
+            ('tri_mean', 'float'),
+            ('tpi_mean', 'float'),
+            ('curvature_mean', 'float'),
+            ('terrain_class', 'str'),
+            # Spectral
+            ('ndvi_mean', 'float'),
+            ('ndvi_std', 'float'),
+            ('ndvi_fused', 'float'),
+            ('brightness_mean', 'float'),
+            ('nir_mean', 'float'),
+            # Temporal change
+            ('height_change_m', 'float'),
+            ('dtm_change_m', 'float'),
+            ('temporal_stability', 'float'),
+            ('volume_change_m3', 'float'),
+            ('volume_change_abs_m3', 'float'),
+            ('dtm_change_max_m', 'float'),
+            # Texture (GLCM)
+            ('glcm_entropy', 'float'),
+            ('glcm_homogeneity', 'float'),
+            ('texture_complexity', 'float'),
+            # SAR
+            ('sar_vv', 'float'),
+            ('sar_vh', 'float'),
+            # Phenology
+            ('harm_amplitude', 'float'),
+            ('harm_phase', 'float'),
+            ('phenology_class', 'str'),
+            # Classification
+            ('confidence', 'float'),
+            ('is_manmade', 'int'),
+            ('classifier', 'str'),
+            ('rf_model', 'str'),
+            ('rf_type', 'str'),
+            ('rf_confidence', 'float'),
+            # Rendering
+            ('color', 'str'),
+            ('color_height', 'str'),
+            # Observation period
+            ('obs_year', 'int'),
+        ],
+    }
+    def _feat_iter():
+        for geom_dict, val in rasterize_shapes(
+            label_int, mask=mask, transform=transform, connectivity=4,
+        ):
+            oid = int(val)
+            obj = obj_map.get(oid)
+            if obj is None:
+                continue
+            tc = SEGMENT_COLORS.get(obj.obj_type, (128, 128, 128, 120))
+            hex_type = '#{:02X}{:02X}{:02X}'.format(tc[0], tc[1], tc[2])
+            hv = _viridis_rgb(min(1.0, (max(0, obj.height_max) / 45.0) ** 0.5))
+            hex_height = '#{:02X}{:02X}{:02X}'.format(*hv)
+            yield {
+                'geometry': _to_multi(geom_dict),
+                'properties': {
+                    'id': oid,
+                    'type': obj.obj_type,
+                    'type_code': obj.type_code,
+                    'group_type': obj.group_type or '',
+                    'height_class': _height_class(obj.height_max),
+                    'area_sqm': round(obj.area_sqm, 1),
+                    'perimeter_m': round(obj.perimeter_m, 1),
+                    'compactness': round(obj.compactness, 3),
+                    'elongation': round(obj.elongation, 2),
+                    'solidity': round(obj.solidity, 3),
+                    'extent': round(obj.extent, 3),
+                    'height_max_m': round(obj.height_max, 2),
+                    'height_mean_m': round(obj.height_mean, 2),
+                    'height_p90_m': round(obj.height_p90, 2),
+                    'height_std_m': round(obj.height_std, 2),
+                    'slope_mean_deg': round(obj.slope_mean, 1),
+                    'aspect_mean_deg': round(obj.aspect_mean, 1),
+                    'aspect_dominant': obj.aspect_dominant or 'flat',
+                    'roughness': round(obj.roughness, 3),
+                    'dsm_edge_strength': round(obj.dsm_edge_strength, 3),
+                    'elevation_mean_m': round(obj.elevation_mean, 2),
+                    'elevation_min_m': round(obj.elevation_min, 2),
+                    'elevation_max_m': round(obj.elevation_max, 2),
+                    'tri_mean': round(obj.tri_mean, 3),
+                    'tpi_mean': round(obj.tpi_mean, 3),
+                    'curvature_mean': round(obj.curvature_mean, 4),
+                    'terrain_class': obj.terrain_class or 'level',
+                    'ndvi_mean': round(obj.ndvi_mean, 4),
+                    'ndvi_std': round(obj.ndvi_std, 4),
+                    'ndvi_fused': round(obj.ndvi_fused, 4),
+                    'brightness_mean': round(obj.brightness_mean, 1),
+                    'nir_mean': round(obj.nir_mean, 1),
+                    'height_change_m': round(obj.height_change, 3),
+                    'dtm_change_m': round(obj.dtm_change, 3),
+                    'temporal_stability': round(obj.temporal_stability, 3),
+                    'volume_change_m3': round(obj.volume_change_m3, 1),
+                    'volume_change_abs_m3': round(obj.volume_change_abs_m3, 1),
+                    'dtm_change_max_m': round(obj.dtm_change_max, 3),
+                    'glcm_entropy': round(obj.glcm_entropy, 4),
+                    'glcm_homogeneity': round(obj.glcm_homogeneity, 4),
+                    'texture_complexity': round(obj.texture_complexity, 4),
+                    'sar_vv': round(obj.sar_vv, 4),
+                    'sar_vh': round(obj.sar_vh, 4),
+                    'harm_amplitude': round(obj.harm_amplitude, 4),
+                    'harm_phase': round(obj.harm_phase, 1),
+                    'phenology_class': obj.phenology_class or '',
+                    'confidence': round(obj.confidence, 3),
+                    'is_manmade': int(obj.is_manmade) if obj.is_manmade else 0,
+                    'classifier': getattr(obj, 'classifier_source', 'rules'),
+                    'rf_model': getattr(obj, 'rf_model_hash', ''),
+                    'rf_type': getattr(obj, 'rf_type', ''),
+                    'rf_confidence': round(getattr(obj, 'rf_confidence', 0.0), 3),
+                    'color': hex_type,
+                    'color_height': hex_height,
+                    'obs_year': obs_year or 0,
+                },
+            }
+
+    written = _write_gpkg_features_chunked(
+        gpkg_path, schema, from_epsg(3035), layer_name, _feat_iter(),
+    )
+    log.info("GPKG vector layer '%s': %d polygons", layer_name, written)
+
+    try:
+        _write_gpkg_categorized_style(gpkg_path, layer_name, 'type')
+    except Exception as e:
+        log.warning('GPKG style table failed: %s', e)
+
+
+def _write_segment_points(gpkg_path: str, objects: list,
+                          layer_name: str = 'segment_points',
+                          obs_year: int = 0):
+    """Write segment centroid points with full attributes to a GPKG.
+
+    This mirrors the GeoJSON Point features that the API returns,
+    enabling the same map visualisation from the GPKG/Zenodo store.
+    """
+    from fiona.crs import from_epsg
+
+    schema = {
+        'geometry': 'Point',
+        'properties': [
+            # Identity
+            ('id', 'int'),
+            ('type', 'str'),
+            ('type_code', 'int'),
+            ('group_type', 'str'),
+            ('height_class', 'str'),
+            # Geometry
+            ('area_sqm', 'float'),
+            ('perimeter_m', 'float'),
+            ('compactness', 'float'),
+            ('elongation', 'float'),
+            ('solidity', 'float'),
+            ('extent', 'float'),
+            # Height
+            ('height_max_m', 'float'),
+            ('height_mean_m', 'float'),
+            ('height_p90_m', 'float'),
+            ('height_std_m', 'float'),
+            # Surface / terrain
+            ('slope_mean_deg', 'float'),
+            ('aspect_mean_deg', 'float'),
+            ('aspect_dominant', 'str'),
+            ('roughness', 'float'),
+            ('dsm_edge_strength', 'float'),
+            ('elevation_mean_m', 'float'),
+            ('elevation_min_m', 'float'),
+            ('elevation_max_m', 'float'),
+            ('tri_mean', 'float'),
+            ('tpi_mean', 'float'),
+            ('curvature_mean', 'float'),
+            ('terrain_class', 'str'),
+            # Spectral
+            ('ndvi_mean', 'float'),
+            ('ndvi_fused', 'float'),
+            ('brightness_mean', 'float'),
+            ('nir_mean', 'float'),
+            # Temporal
+            ('height_change_m', 'float'),
+            ('dtm_change_m', 'float'),
+            ('temporal_stability', 'float'),
+            ('volume_change_m3', 'float'),
+            ('volume_change_abs_m3', 'float'),
+            ('dtm_change_max_m', 'float'),
+            # Texture
+            ('glcm_entropy', 'float'),
+            ('glcm_homogeneity', 'float'),
+            ('texture_complexity', 'float'),
+            # SAR
+            ('sar_vv', 'float'),
+            ('sar_vh', 'float'),
+            # Phenology
+            ('harm_amplitude', 'float'),
+            ('harm_phase', 'float'),
+            ('phenology_class', 'str'),
+            # Classification
+            ('confidence', 'float'),
+            ('is_manmade', 'int'),
+            ('classifier', 'str'),
+            ('rf_model', 'str'),
+            ('rf_type', 'str'),
+            ('rf_confidence', 'float'),
+            # Rendering
+            ('color', 'str'),
+            ('color_height', 'str'),
+            # Observation
+            ('obs_year', 'int'),
+        ],
+    }
+
+    def _feat_iter():
+        for obj in objects:
+            # Convert centroid from EPSG:3035 to WGS84
+            try:
+                lon, lat = _tx_to_wgs.transform(obj.centroid_e, obj.centroid_n)
+            except Exception:
+                continue
+            tc = SEGMENT_COLORS.get(obj.obj_type, (128, 128, 128, 120))
+            hex_type = '#{:02X}{:02X}{:02X}'.format(tc[0], tc[1], tc[2])
+            hv = _viridis_rgb(min(1.0, (max(0, obj.height_max) / 45.0) ** 0.5))
+            hex_height = '#{:02X}{:02X}{:02X}'.format(*hv)
+            yield {
+                'geometry': {'type': 'Point', 'coordinates': [round(lon, 7), round(lat, 7)]},
+                'properties': {
+                    'id': obj.obj_id,
+                    'type': obj.obj_type,
+                    'type_code': obj.type_code,
+                    'group_type': obj.group_type or '',
+                    'height_class': _height_class(obj.height_max),
+                    'area_sqm': round(obj.area_sqm, 1),
+                    'perimeter_m': round(obj.perimeter_m, 1),
+                    'compactness': round(obj.compactness, 3),
+                    'elongation': round(obj.elongation, 2),
+                    'solidity': round(obj.solidity, 3),
+                    'extent': round(obj.extent, 3),
+                    'height_max_m': round(obj.height_max, 2),
+                    'height_mean_m': round(obj.height_mean, 2),
+                    'height_p90_m': round(obj.height_p90, 2),
+                    'height_std_m': round(obj.height_std, 2),
+                    'slope_mean_deg': round(obj.slope_mean, 1),
+                    'aspect_mean_deg': round(obj.aspect_mean, 1),
+                    'aspect_dominant': obj.aspect_dominant or 'flat',
+                    'roughness': round(obj.roughness, 3),
+                    'dsm_edge_strength': round(obj.dsm_edge_strength, 3),
+                    'elevation_mean_m': round(obj.elevation_mean, 2),
+                    'elevation_min_m': round(obj.elevation_min, 2),
+                    'elevation_max_m': round(obj.elevation_max, 2),
+                    'tri_mean': round(obj.tri_mean, 3),
+                    'tpi_mean': round(obj.tpi_mean, 3),
+                    'curvature_mean': round(obj.curvature_mean, 4),
+                    'terrain_class': obj.terrain_class or 'level',
+                    'ndvi_mean': round(obj.ndvi_mean, 4),
+                    'ndvi_fused': round(obj.ndvi_fused, 4),
+                    'brightness_mean': round(obj.brightness_mean, 1),
+                    'nir_mean': round(obj.nir_mean, 1),
+                    'height_change_m': round(obj.height_change, 3),
+                    'dtm_change_m': round(obj.dtm_change, 3),
+                    'temporal_stability': round(obj.temporal_stability, 3),
+                    'volume_change_m3': round(obj.volume_change_m3, 1),
+                    'volume_change_abs_m3': round(obj.volume_change_abs_m3, 1),
+                    'dtm_change_max_m': round(obj.dtm_change_max, 3),
+                    'glcm_entropy': round(obj.glcm_entropy, 4),
+                    'glcm_homogeneity': round(obj.glcm_homogeneity, 4),
+                    'texture_complexity': round(obj.texture_complexity, 4),
+                    'sar_vv': round(obj.sar_vv, 4),
+                    'sar_vh': round(obj.sar_vh, 4),
+                    'harm_amplitude': round(obj.harm_amplitude, 4),
+                    'harm_phase': round(obj.harm_phase, 1),
+                    'phenology_class': obj.phenology_class or '',
+                    'confidence': round(obj.confidence, 3),
+                    'is_manmade': int(obj.is_manmade) if obj.is_manmade else 0,
+                    'classifier': getattr(obj, 'classifier_source', 'rules'),
+                    'rf_model': getattr(obj, 'rf_model_hash', ''),
+                    'rf_type': getattr(obj, 'rf_type', ''),
+                    'rf_confidence': round(getattr(obj, 'rf_confidence', 0.0), 3),
+                    'color': hex_type,
+                    'color_height': hex_height,
+                    'obs_year': obs_year or 0,
+                },
+            }
+
+    written = _write_gpkg_features_chunked(
+        gpkg_path, schema, from_epsg(4326), layer_name, _feat_iter(),
+    )
+    log.info("GPKG point layer '%s': %d points", layer_name, written)
+
+    # Add point style
+    try:
+        _write_gpkg_point_style(gpkg_path, layer_name)
+    except Exception as e:
+        log.warning('GPKG point style failed: %s', e)
+
+
+def _write_gpkg_point_style(gpkg_path: str, layer_name: str):
+    """Write QGIS categorized point style matching segment type colours."""
+    import sqlite3
+    from object_segmentation import OBJECT_TYPES as _OT
+
+    categories = []
+    symbols = []
+    for idx, (type_name, rgba) in enumerate(sorted(
+            SEGMENT_COLORS.items(), key=lambda x: _OT.get(x[0], 99))):
+        r, g, b, a = rgba
+        symbols.append(
+            f'<symbol type="marker" name="{idx}" alpha="0.8">'
+            f'<layer class="SimpleMarker" enabled="1" locked="0" pass="0">'
+            f'<Option type="Map">'
+            f'<Option type="QString" value="circle" name="name"/>'
+            f'<Option type="QString" value="3" name="size"/>'
+            f'<Option type="QString" value="{r},{g},{b},{a}" name="color"/>'
+            f'<Option type="QString" value="50,50,50,180" name="outline_color"/>'
+            f'<Option type="QString" value="0.2" name="outline_width"/>'
+            f'</Option></layer></symbol>'
+        )
+        categories.append(
+            f'<category value="{type_name}" symbol="{idx}" label="{type_name}"/>'
+        )
+
+    qml = (
+        '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+        '<qgis version="3.34">'
+        '<renderer-v2 type="categorizedSymbol" attr="type" symbollevels="0">'
+        '<categories>' + ''.join(categories) + '</categories>'
+        '<symbols>' + ''.join(symbols) + '</symbols>'
+        '</renderer-v2></qgis>'
+    )
+    conn = sqlite3.connect(gpkg_path)
+    try:
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS layer_styles ('
+            'id INTEGER PRIMARY KEY AUTOINCREMENT,'
+            'f_table_catalog TEXT DEFAULT \'\','
+            'f_table_schema TEXT DEFAULT \'\','
+            'f_table_name TEXT,'
+            'f_geometry_column TEXT,'
+            'styleName TEXT,'
+            'styleQML TEXT,'
+            'styleSLD TEXT,'
+            'useAsDefault BOOLEAN,'
+            'description TEXT,'
+            'owner TEXT,'
+            'ui TEXT,'
+            'update_time TIMESTAMP DEFAULT (strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\'))'
+            ')'
+        )
+        conn.execute(
+            'INSERT INTO layer_styles '
+            '(f_table_name, f_geometry_column, styleName, styleQML, useAsDefault, description) '
+            'VALUES (?, ?, ?, ?, 1, ?)',
+            (layer_name, 'geom', 'Segment points by type', qml,
+             'Auto-generated colour-by-type point style'),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _write_gpkg_all_styles(gpkg_path: str, has_segments: bool = True,
+                           has_points: bool = True, has_parcels: bool = False,
+                           has_buildings: bool = False, has_new_buildings: bool = False,
+                           has_infrastructure: bool = False):
+    """Write QGIS styles for all vector and raster layers in a GPKG."""
+    import sqlite3
+    conn = sqlite3.connect(gpkg_path)
+    try:
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS layer_styles ('
+            'id INTEGER PRIMARY KEY AUTOINCREMENT,'
+            'f_table_catalog TEXT DEFAULT \'\','
+            'f_table_schema TEXT DEFAULT \'\','
+            'f_table_name TEXT,'
+            'f_geometry_column TEXT,'
+            'styleName TEXT,'
+            'styleQML TEXT,'
+            'styleSLD TEXT,'
+            'useAsDefault BOOLEAN,'
+            'description TEXT,'
+            'owner TEXT,'
+            'ui TEXT,'
+            'update_time TIMESTAMP DEFAULT (strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\'))'
+            ')'
+        )
+
+        def _add_style(table, geom_col, name, qml, desc):
+            conn.execute(
+                'INSERT INTO layer_styles '
+                '(f_table_name, f_geometry_column, styleName, styleQML, useAsDefault, description) '
+                'VALUES (?, ?, ?, ?, 1, ?)',
+                (table, geom_col, name, qml, desc),
+            )
+
+        # --- Vector layer styles ---
+
+        # Parcels: yellow outline, transparent fill
+        if has_parcels:
+            _add_style('parcels', 'geom', 'Parcel boundaries',
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><renderer-v2 type="singleSymbol">'
+                '<symbols><symbol type="fill" name="0" alpha="0.3">'
+                '<layer class="SimpleFill"><Option type="Map">'
+                '<Option type="QString" value="255,255,200,50" name="color"/>'
+                '<Option type="QString" value="200,180,0,255" name="outline_color"/>'
+                '<Option type="QString" value="0.4" name="outline_width"/>'
+                '</Option></layer></symbol></symbols></renderer-v2></qgis>',
+                'Yellow outline parcel boundaries')
+
+        # Buildings: red fill, dark outline
+        if has_buildings:
+            _add_style('buildings', 'geom', 'Buildings',
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><renderer-v2 type="singleSymbol">'
+                '<symbols><symbol type="fill" name="0" alpha="0.6">'
+                '<layer class="SimpleFill"><Option type="Map">'
+                '<Option type="QString" value="220,20,60,160" name="color"/>'
+                '<Option type="QString" value="100,10,30,255" name="outline_color"/>'
+                '<Option type="QString" value="0.3" name="outline_width"/>'
+                '</Option></layer></symbol></symbols></renderer-v2></qgis>',
+                'Red building footprints')
+
+        # New buildings: magenta, dashed
+        if has_new_buildings:
+            _add_style('new_buildings', 'geom', 'New buildings',
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><renderer-v2 type="singleSymbol">'
+                '<symbols><symbol type="fill" name="0" alpha="0.7">'
+                '<layer class="SimpleFill"><Option type="Map">'
+                '<Option type="QString" value="255,0,255,180" name="color"/>'
+                '<Option type="QString" value="180,0,180,255" name="outline_color"/>'
+                '<Option type="QString" value="0.5" name="outline_width"/>'
+                '<Option type="QString" value="dash" name="outline_style"/>'
+                '</Option></layer></symbol></symbols></renderer-v2></qgis>',
+                'Magenta dashed new building detections')
+
+        # Infrastructure: orange
+        if has_infrastructure:
+            _add_style('infrastructure', 'geom', 'Infrastructure',
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><renderer-v2 type="singleSymbol">'
+                '<symbols><symbol type="fill" name="0" alpha="0.6">'
+                '<layer class="SimpleFill"><Option type="Map">'
+                '<Option type="QString" value="255,140,0,160" name="color"/>'
+                '<Option type="QString" value="180,100,0,255" name="outline_color"/>'
+                '<Option type="QString" value="0.3" name="outline_width"/>'
+                '</Option></layer></symbol></symbols></renderer-v2></qgis>',
+                'Orange infrastructure features')
+
+        # --- Raster layer styles ---
+        # Detect which raster tables exist in this GPKG
+        raster_tables = set()
+        try:
+            rows = conn.execute(
+                "SELECT table_name FROM gpkg_contents "
+                "WHERE data_type IN ('tiles', '2d-gridded-coverage')"
+            ).fetchall()
+            raster_tables = {r[0] for r in rows}
+        except Exception:
+            pass
+
+        # Build segment_type categorized colour map from SEGMENT_COLORS
+        if 'segment_type' in raster_tables:
+            _cat_items = []
+            for type_name, type_code in sorted(SEGMENT_COLORS.items(), key=lambda x: x[1]):
+                from object_segmentation import OBJECT_TYPES as _OT
+                code = _OT.get(type_name)
+                if code is None:
+                    continue
+                r, g, b, a = SEGMENT_COLORS[type_name]
+                _cat_items.append(
+                    f'<item value="{code}" label="{type_name}" '
+                    f'color="{r},{g},{b}" alpha="{a}"/>'
+                )
+            seg_qml = (
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34">'
+                '<pipe><rasterrenderer type="paletted" band="1" opacity="0.8">'
+                '<colorPalette>' + ''.join(_cat_items) + '</colorPalette>'
+                '</rasterrenderer></pipe></qgis>'
+            )
+            _add_style('segment_type', '', 'Object types', seg_qml,
+                       'Categorized colour map by object type code')
+
+        # DTM/DSM: terrain colour ramp (green-brown-white)
+        dtm_qml = (
+            '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+            '<qgis version="3.34"><pipe>'
+            '<rasterrenderer type="singlebandpseudocolor" band="1" opacity="1">'
+            '<rastershader><colorrampshader colorRampType="INTERPOLATED" '
+            'classificationMode="2" minimumValue="0" maximumValue="3000">'
+            '<item value="0" color="#1a9641" label="0m"/>'
+            '<item value="500" color="#a6d96a" label="500m"/>'
+            '<item value="1000" color="#ffffbf" label="1000m"/>'
+            '<item value="2000" color="#a0522d" label="2000m"/>'
+            '<item value="3000" color="#ffffff" label="3000m"/>'
+            '</colorrampshader></rastershader></rasterrenderer></pipe></qgis>'
+        )
+        if 'DTM' in raster_tables:
+            _add_style('DTM', '', 'Elevation', dtm_qml,
+                       'Terrain elevation colour ramp')
+        if 'DSM' in raster_tables:
+            _add_style('DSM', '', 'Surface model', dtm_qml,
+                       'Digital surface model colour ramp')
+
+        # nDSM / segment_height: height colour ramp (viridis-style)
+        height_qml = (
+            '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+            '<qgis version="3.34"><pipe>'
+            '<rasterrenderer type="singlebandpseudocolor" band="1" opacity="1">'
+            '<rastershader><colorrampshader colorRampType="INTERPOLATED" '
+            'classificationMode="2" minimumValue="0" maximumValue="30">'
+            '<item value="0" color="#440154" label="0m"/>'
+            '<item value="5" color="#31688e" label="5m"/>'
+            '<item value="10" color="#35b779" label="10m"/>'
+            '<item value="20" color="#90d743" label="20m"/>'
+            '<item value="30" color="#fde725" label="30m"/>'
+            '</colorrampshader></rastershader></rasterrenderer></pipe></qgis>'
+        )
+        if 'nDSM' in raster_tables:
+            _add_style('nDSM', '', 'Object heights', height_qml,
+                       'Normalised DSM height colour ramp')
+        if 'segment_height' in raster_tables:
+            _add_style('segment_height', '', 'Segment heights', height_qml,
+                       'Segment height colour ramp')
+
+        # Multi-band RGB rendering (Ortho + CIR)
+        _rgb_qml = (
+            '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+            '<qgis version="3.34"><pipe>'
+            '<rasterrenderer type="multibandcolor" opacity="1" '
+            'redBand="1" greenBand="2" blueBand="3">'
+            '</rasterrenderer></pipe></qgis>'
+        )
+        for tbl in raster_tables:
+            if tbl.startswith('Ortho_'):
+                _add_style(tbl, '', 'True colour', _rgb_qml,
+                           'RGB orthophoto rendering')
+            elif tbl.startswith('CIR_'):
+                _add_style(tbl, '', 'CIR false colour', _rgb_qml,
+                           'Colour Infrared: NIR→R, Red→G, Green→B')
+            elif tbl.startswith('DTM_'):
+                _add_style(tbl, '', 'Elevation', dtm_qml,
+                           f'Terrain elevation {tbl}')
+            elif tbl.startswith('DSM_'):
+                _add_style(tbl, '', 'Surface model', dtm_qml,
+                           f'Digital surface model {tbl}')
+
+        # --- Sentinel-2 NDVI: green-yellow-brown diverging ramp ---
+        if 'NDVI' in raster_tables:
+            ndvi_qml = (
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><pipe>'
+                '<rasterrenderer type="singlebandpseudocolor" band="1" opacity="1">'
+                '<rastershader><colorrampshader colorRampType="INTERPOLATED" '
+                'classificationMode="2" minimumValue="-0.2" maximumValue="1.0">'
+                '<item value="-0.2" color="#d73027" label="-0.2 (bare/water)"/>'
+                '<item value="0.0" color="#f46d43" label="0.0"/>'
+                '<item value="0.1" color="#fdae61" label="0.1"/>'
+                '<item value="0.2" color="#fee08b" label="0.2"/>'
+                '<item value="0.3" color="#ffffbf" label="0.3"/>'
+                '<item value="0.4" color="#d9ef8b" label="0.4"/>'
+                '<item value="0.5" color="#a6d96a" label="0.5"/>'
+                '<item value="0.6" color="#66bd63" label="0.6"/>'
+                '<item value="0.7" color="#1a9850" label="0.7"/>'
+                '<item value="0.8" color="#006837" label="0.8 (dense veg)"/>'
+                '<item value="1.0" color="#004529" label="1.0"/>'
+                '</colorrampshader></rastershader></rasterrenderer></pipe></qgis>'
+            )
+            _add_style('NDVI', '', 'Sentinel-2 NDVI', ndvi_qml,
+                       'NDVI composite: red = bare/water, green = vegetation')
+
+        # --- ESA WorldCover: official class colour scheme ---
+        if 'WorldCover' in raster_tables:
+            wc_qml = (
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><pipe>'
+                '<rasterrenderer type="paletted" band="1" opacity="0.85">'
+                '<colorPalette>'
+                '<item value="10" color="#006400" label="Tree cover" alpha="255"/>'
+                '<item value="20" color="#ffbb22" label="Shrubland" alpha="255"/>'
+                '<item value="30" color="#ffff4c" label="Grassland" alpha="255"/>'
+                '<item value="40" color="#f096ff" label="Cropland" alpha="255"/>'
+                '<item value="50" color="#fa0000" label="Built-up" alpha="255"/>'
+                '<item value="60" color="#b4b4b4" label="Bare / sparse veg" alpha="255"/>'
+                '<item value="70" color="#f0f0f0" label="Snow and ice" alpha="255"/>'
+                '<item value="80" color="#0064c8" label="Permanent water" alpha="255"/>'
+                '<item value="90" color="#0096a0" label="Herbaceous wetland" alpha="255"/>'
+                '<item value="95" color="#00cf75" label="Mangroves" alpha="255"/>'
+                '<item value="100" color="#fae6a0" label="Moss and lichen" alpha="255"/>'
+                '</colorPalette>'
+                '</rasterrenderer></pipe></qgis>'
+            )
+            _add_style('WorldCover', '', 'ESA WorldCover 2021', wc_qml,
+                       'Land cover classes with official ESA colour scheme')
+
+        # --- Sentinel-1 SAR VV: grey ramp for radar backscatter (linear sigma0) ---
+        if 'SAR_VV' in raster_tables:
+            vv_qml = (
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><pipe>'
+                '<rasterrenderer type="singlebandgray" opacity="1" '
+                'grayBand="1">'
+                '<contrastEnhancement><minValue>0</minValue>'
+                '<maxValue>0.4</maxValue>'
+                '<algorithm>StretchToMinimumMaximum</algorithm>'
+                '</contrastEnhancement>'
+                '</rasterrenderer></pipe></qgis>'
+            )
+            _add_style('SAR_VV', '', 'SAR VV backscatter', vv_qml,
+                       'Sentinel-1 SAR VV polarisation (linear sigma0, 0 to 0.4)')
+        # --- Sentinel-1 SAR VH: grey ramp for radar backscatter (linear sigma0) ---
+        if 'SAR_VH' in raster_tables:
+            vh_qml = (
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><pipe>'
+                '<rasterrenderer type="singlebandgray" opacity="1" '
+                'grayBand="1">'
+                '<contrastEnhancement><minValue>0</minValue>'
+                '<maxValue>0.1</maxValue>'
+                '<algorithm>StretchToMinimumMaximum</algorithm>'
+                '</contrastEnhancement>'
+                '</rasterrenderer></pipe></qgis>'
+            )
+            _add_style('SAR_VH', '', 'SAR VH backscatter', vh_qml,
+                       'Sentinel-1 SAR VH polarisation (linear sigma0, 0 to 0.1)')
+
+        # --- Hansen tree cover 2000: green ramp 0-100% ---
+        if 'Hansen_treecover' in raster_tables:
+            tc_qml = (
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><pipe>'
+                '<rasterrenderer type="singlebandpseudocolor" band="1" opacity="0.9">'
+                '<rastershader><colorrampshader colorRampType="INTERPOLATED" '
+                'classificationMode="2" minimumValue="0" maximumValue="100">'
+                '<item value="0" color="#f7f7f7" label="0% (no trees)"/>'
+                '<item value="10" color="#d9f0a3" label="10%"/>'
+                '<item value="25" color="#addd8e" label="25%"/>'
+                '<item value="50" color="#78c679" label="50%"/>'
+                '<item value="75" color="#31a354" label="75%"/>'
+                '<item value="100" color="#006837" label="100% (full canopy)"/>'
+                '</colorrampshader></rastershader></rasterrenderer></pipe></qgis>'
+            )
+            _add_style('Hansen_treecover', '', 'Tree cover 2000', tc_qml,
+                       'Hansen Global Forest: tree canopy density in year 2000')
+
+        # --- Hansen loss year: diverging yellow→red timeline ---
+        if 'Hansen_lossyear' in raster_tables:
+            ly_qml = (
+                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
+                '<qgis version="3.34"><pipe>'
+                '<rasterrenderer type="paletted" band="1" opacity="0.9">'
+                '<colorPalette>'
+                '<item value="0" color="#ffffff" label="No loss" alpha="0"/>'
+                '<item value="1" color="#ffffcc" label="2001" alpha="255"/>'
+                '<item value="5" color="#fed976" label="2005" alpha="255"/>'
+                '<item value="10" color="#fd8d3c" label="2010" alpha="255"/>'
+                '<item value="15" color="#e31a1c" label="2015" alpha="255"/>'
+                '<item value="20" color="#b10026" label="2020" alpha="255"/>'
+                '<item value="23" color="#800026" label="2023" alpha="255"/>'
+                '</colorPalette>'
+                '</rasterrenderer></pipe></qgis>'
+            )
+            _add_style('Hansen_lossyear', '', 'Forest loss year', ly_qml,
+                       'Hansen Global Forest: year of forest loss (1=2001 … 23=2023)')
+
+        # --- Licence / attribution (gpkg_metadata extension) ---
+        # Every GPKG we redistribute must carry the BEV / Copernicus / ESA /
+        # Hansen / OSM credits.  Single source of truth: attributions.py.
+        try:
+            import attributions as _attr
+            _all_layers = {r[0] for r in conn.execute(
+                "SELECT table_name FROM gpkg_contents").fetchall()}
+            _attr.write_gpkg_metadata(conn, layers=_all_layers)
+        except Exception as _e:
+            log.warning("gpkg_metadata attribution write failed: %s", _e)
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+
+# NOTE: `_compute_tile_grid` and `_merge_terrain_stats` are defined once, in the
+# process_one_kg section below (earlier duplicate definitions removed).
+
+def _find_tile_for_point(e3035, n3035, tile_seg_results):
+    """Find tile containing point (e, n) EPSG:3035."""
+    for tr in tile_seg_results:
+        left, bottom, right, top = tr["bounds_3035"]
+        if left <= e3035 <= right and bottom <= n3035 <= top:
+            return tr
+    return None
+
+
+# Phase 1 sidecar telemetry. Bumped by every gpkg_full sidecar lookup
+# (DTM/DSM/nDSM, multi-date DTM/DSM, ortho RGB+NIR) and drained once at
+# the end of build_full_gpkg_tiled into a single INFO log line. Reset
+# at function entry so each KG reports its own hit/miss ratio. Process-
+# local (one subprocess per KG) so plain module state is fine.
+_SIDECAR_STATS: dict = {
+    "dtm_hit": 0, "dtm_miss": 0,
+    "dtm_multi_hit": 0, "dtm_multi_miss": 0,
+    "ortho_hit": 0, "ortho_miss": 0,
+}
+
+
+def _sidecar_stat(key: str, n: int = 1) -> None:
+    try:
+        _SIDECAR_STATS[key] = _SIDECAR_STATS.get(key, 0) + n
+    except Exception:
+        pass
+
+
+# --- GPKG-build liveness heartbeat ------------------------------------
+# The director's stuck-KG watchdog (peer_director._check_stuck_kg) kills
+# any peer whose progress fingerprint freezes for STUCK_KG_FROZEN_S (12h).
+# The fingerprint moves on step_detail_ts, which only updates through
+# process_one_kg._report_step — a closure the GPKG builders historically
+# never called during their multi-hour raster stitches. Result (Jul 2026):
+# ~40 healthy gpkg_full builds on big KGs (91017, 01651, 50017, ...) were
+# hard-killed at exactly 12.0h and looped across peers indefinitely.
+#
+# process_one_kg registers its _report_step here so module-level builders
+# (and gpkg_streamed) can emit within-step detail without plumbing a
+# callback through every signature. Throttled to one write per 60s —
+# the watchdog only needs the fingerprint to move well within 12h.
+_STEP_REPORT_HOOK = [None]      # [callable(step, detail) | None]
+_HB_LAST = [0.0]
+_HB_MIN_INTERVAL_S = 60.0
+
+
+def _gpkg_heartbeat(detail: str, force: bool = False) -> None:
+    """Emit a step-detail heartbeat (throttled) so the stuck-KG watchdog
+    sees progress during long GPKG builds. Re-reports the CURRENT step
+    (the hook closes over process_one_kg's step state) so a heartbeat
+    from a shared helper (e.g. the chunked vector writer, used by both
+    gpkg_full and gpkg_light) never mislabels the step. No-op when no
+    hook is set (unit tests importing the builders directly)."""
+    try:
+        hook = _STEP_REPORT_HOOK[0]
+        if hook is None:
+            return
+        now = time.time()
+        if not force and (now - _HB_LAST[0]) < _HB_MIN_INTERVAL_S:
+            return
+        _HB_LAST[0] = now
+        # Worker RSS rides along so an OOM-killed build leaves a memory
+        # trail in the processor log (Oct 2026: 44 Mpx gpkg_full still
+        # dies at ~6.5 GB after the float32 accumulators — which sub-step
+        # carries the bulk is otherwise invisible from the primary).
+        try:
+            _rss = int(open("/proc/self/status").read().split("VmRSS:")[1].split()[0]) >> 10
+            detail = f"{detail} rss={_rss}M"
+            log.info("  gpkg heartbeat: %s", detail)
+        except Exception:
+            pass
+        hook(detail)
+    except Exception:
+        pass
+
+
+def _read_dtm_for_tile(tr, kg_code: str | None = None, tile_idx: int | None = None):
+    """Re-read DTM/DSM for a tile.
+
+    If *kg_code* and *tile_idx* are supplied AND a local raster sidecar
+    exists (written by the per-tile loop), the sidecar is mmap'd from
+    disk — no BEV call. Otherwise we fall back to the live BEV read and
+    persist a sidecar for any subsequent same-tile read within this KG.
+    Disk-budget enforcement is delegated to ``tile_raster_sidecar``.
+    """
+    import raster_io as _rio
+    import tile_index as _ti
+    if kg_code is not None and tile_idx is not None:
+        try:
+            import tile_raster_sidecar as _trs
+            ckpt_root = DATA_DIR / "tile_checkpoints"
+            cached = _trs.load_dtm_dsm(ckpt_root, kg_code, tile_idx, "default")
+            if cached is not None:
+                _sidecar_stat("dtm_hit")
+                return cached
+        except Exception:
+            pass
+    if kg_code is not None and tile_idx is not None:
+        _sidecar_stat("dtm_miss")
+    tdata = _rio.read_dtm_dsm(box(*tr["bounds_3035"]), _ti.DEFAULT_DATASET)
+    if kg_code is not None and tile_idx is not None:
+        try:
+            import tile_raster_sidecar as _trs
+            ckpt_root = DATA_DIR / "tile_checkpoints"
+            _trs.persist_dtm_dsm(ckpt_root, kg_code, tile_idx, tdata, "default")
+        except Exception:
+            pass
+    return tdata
+
+
+# === SECTION: Boundary segment merging (cross-tile stitching) ===
+
+def _relay_subprocess_info(msg: str, step: str = "") -> None:
+    """Module-level twin of the ``_relay_info`` closure in ``process_kg``:
+    append an INFO line to ``subprocess_warnings.jsonl`` so the parent's
+    step-monitor forwards it into the merged fleet log (``/process.txt?q=``).
+    Used for per-KG forensics that would otherwise live only in the peer's
+    local processor.log (e.g. ``anchor-weak`` cross-tile merge outcomes)."""
+    try:
+        with open(DATA_DIR / "subprocess_warnings.jsonl", "a") as _wf:
+            _wf.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(),
+                                  "level": "info", "msg": msg, "step": step}) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _merge_boundary_segments(
+    labels_full: np.ndarray,
+    seg_type_full: np.ndarray,
+    all_objects: list,
+    tile_seg_results: list,
+    full_left: float,
+    full_top: float,
+    res: float,
+    ndsm_full: np.ndarray | None = None,
+    mark_uncertain: bool = False,
+):
+    """Merge compatible segments that touch across tile boundaries.
+
+    Segments split by tile boundaries often have too few pixels for reliable
+    classification.  This function:
+      1. Computes the overlap zones from tile_seg_results bounds.
+      2. Scans overlap zones for adjacent segment-pairs from different tiles.
+      3. Merges compatible pairs (union-find) using the same _MERGE_RULES.
+      4. Remaps labels_full / seg_type_full so the merged segment has one ID.
+      5. Recomputes area-weighted stats for the surviving SegmentedObject.
+      6. Re-classifies merged segments.
+
+    Modifies labels_full, seg_type_full, and all_objects **in place**.
+    Returns the number of merges performed.
+    """
+    from object_segmentation import _MERGE_RULES, OBJECT_TYPES, classify_object
+
+    full_h, full_w = labels_full.shape
+    obj_map = {o.obj_id: o for o in all_objects}
+    if len(obj_map) < 2:
+        return 0, {}
+
+    # ------------------------------------------------------------------
+    # 1. Build a tile-ownership raster to identify cross-tile adjacency.
+    #    Each pixel gets the index of the tile that "owns" it (highest
+    #    feather weight).  Adjacent pixels with different tile owners
+    #    AND different labels are cross-tile boundary candidates.
+    # ------------------------------------------------------------------
+    tile_owner = np.full((full_h, full_w), -1, dtype=np.int16)
+    tile_best_w = np.zeros((full_h, full_w), dtype=np.float32)
+
+    def _fw(rows, cols, margin=100):
+        wy = np.ones(rows, dtype=np.float32)
+        wx = np.ones(cols, dtype=np.float32)
+        m = min(margin, rows // 2, cols // 2)
+        if m > 0:
+            ramp = np.linspace(0.0, 1.0, m, endpoint=False, dtype=np.float32)
+            wy[:m] = np.minimum(wy[:m], ramp)
+            wy[-m:] = np.minimum(wy[-m:], ramp[::-1])
+            wx[:m] = np.minimum(wx[:m], ramp)
+            wx[-m:] = np.minimum(wx[-m:], ramp[::-1])
+        return wy[:, None] * wx[None, :]
+
+    for ti_idx, tr in enumerate(tile_seg_results):
+        th, tw = tr["shape"]
+        tile_left, tile_bottom, tile_right, tile_top = tr["bounds_3035"]
+        col_off = int(round((tile_left - full_left) / res))
+        row_off = int(round((full_top - tile_top) / res))
+        r_end = min(row_off + th, full_h)
+        c_end = min(col_off + tw, full_w)
+        th_eff = r_end - row_off
+        tw_eff = c_end - col_off
+        if th_eff <= 0 or tw_eff <= 0:
+            continue
+        fw = _fw(th_eff, tw_eff, margin=100)
+        wins = fw > tile_best_w[row_off:r_end, col_off:c_end]
+        tile_owner[row_off:r_end, col_off:c_end] = np.where(
+            wins, ti_idx, tile_owner[row_off:r_end, col_off:c_end])
+        tile_best_w[row_off:r_end, col_off:c_end] = np.maximum(
+            tile_best_w[row_off:r_end, col_off:c_end], fw)
+    del tile_best_w
+
+    # ------------------------------------------------------------------
+    # 2. Find adjacent segment pairs across tile boundaries.
+    #    Scan horizontal and vertical neighbours; keep pairs where
+    #    tile_owner differs AND labels differ AND both labels are valid.
+    # ------------------------------------------------------------------
+    adj_pairs: set[tuple[int, int]] = set()
+
+    def _collect_cross_pairs(owner_a, owner_b, label_a, label_b):
+        """Find unique (min,max) label pairs across tile boundaries."""
+        cross = ((owner_a != owner_b) & (owner_a >= 0) & (owner_b >= 0)
+                 & (label_a != label_b) & (label_a > 0) & (label_b > 0))
+        if not cross.any():
+            return
+        rc = np.nonzero(cross)
+        la = label_a[rc].astype(np.int64)
+        lb = label_b[rc].astype(np.int64)
+        # Vectorised unique-pair extraction
+        mn = np.minimum(la, lb)
+        mx = np.maximum(la, lb)
+        # Pack into single int64 for fast unique
+        packed = mn * (np.int64(labels_full.max()) + 1) + mx
+        for p in np.unique(packed):
+            divisor = int(labels_full.max()) + 1
+            a_id = int(p // divisor)
+            b_id = int(p % divisor)
+            adj_pairs.add((a_id, b_id))
+
+    # Vertical adjacency: (r, c) vs (r, c+1)
+    _collect_cross_pairs(
+        tile_owner[:, :-1], tile_owner[:, 1:],
+        labels_full[:, :-1], labels_full[:, 1:])
+    # Horizontal adjacency: (r, c) vs (r+1, c)
+    _collect_cross_pairs(
+        tile_owner[:-1, :], tile_owner[1:, :],
+        labels_full[:-1, :], labels_full[1:, :])
+    del tile_owner
+
+    if not adj_pairs:
+        return 0, {}
+    _gpkg_heartbeat(f"boundary merge: {len(adj_pairs)} cross-tile pairs")
+
+    # ------------------------------------------------------------------
+    # 3. Filter to compatible pairs and build union-find
+    # ------------------------------------------------------------------
+    parent = {}
+
+    def find(x):
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent[x], parent[x])
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        # Larger area survives as root
+        oa = obj_map.get(ra)
+        ob = obj_map.get(rb)
+        area_a = oa.area_sqm if oa else 0
+        area_b = ob.area_sqm if ob else 0
+        if area_a >= area_b:
+            parent[rb] = ra
+        else:
+            parent[ra] = rb
+
+    n_compat = 0
+    for id_a, id_b in adj_pairs:
+        oa = obj_map.get(id_a)
+        ob = obj_map.get(id_b)
+        if oa is None or ob is None:
+            continue
+        # Check compatibility: same type or merge-rule compatible
+        if oa.obj_type == ob.obj_type:
+            union(id_a, id_b)
+            n_compat += 1
+        else:
+            compat_a = _MERGE_RULES.get(oa.obj_type, set())
+            if ob.obj_type in compat_a:
+                union(id_a, id_b)
+                n_compat += 1
+
+    if n_compat == 0:
+        return 0, {}
+
+    # ------------------------------------------------------------------
+    # 4. Build merge groups
+    # ------------------------------------------------------------------
+    groups: dict[int, list[int]] = {}  # root_id → [member_ids]
+    all_ids = set()
+    for id_a, id_b in adj_pairs:
+        all_ids.add(id_a)
+        all_ids.add(id_b)
+    for oid in all_ids:
+        root = find(oid)
+        groups.setdefault(root, set()).add(oid)
+    # Only keep groups with actual merges
+    merge_groups = {root: members for root, members in groups.items()
+                    if len(members) > 1}
+    if not merge_groups:
+        return 0, {}
+
+    _ANCHOR_MAX_AREA = {
+        # Manmade: individual structures rarely > these sizes
+        'roof': 2000, 'wall': 500, 'fence': 500, 'mast': 200,
+        'greenhouse': 2000, 'solar_panel': 1000, 'substation': 3000,
+        'wind_turbine': 5000,
+        # Transport: roads are elongated but segments stay bounded
+        'road': 5000, 'path': 3000, 'parking': 3000, 'bridge': 1000,
+        # Vegetation: canopy segments are naturally larger
+        'tree': 20000, 'shrub': 15000, 'hedge': 5000,
+        'grass': 30000, 'crop': 50000, 'garden': 10000,
+        'orchard': 20000, 'vineyard': 15000,
+        # Natural / disturbance
+        'water': 50000, 'bare_soil': 30000, 'rock': 30000,
+        'excavation': 10000, 'fill': 10000, 'construction': 5000,
+        'tree_loss': 20000, 'earthwork': 10000,
+    }
+
+    # v2: gate anchor-weak groups *before* merging instead of demoting the
+    # merged blob to 'unclassified' in step 7.  In v2 every member already
+    # carries a LightGBM type and step 7 keeps the survivor's type (no RF
+    # re-classification), so an anchor-weak group used to become one huge
+    # 'unclassified' polygon — 2026-09-21: 16111-northeast-2 lost a 29 ha
+    # crop field (5 anchors, 57.9k m²/anchor > 50k), 90013-southwest lost
+    # 30 ha of rock at 30.7k m²/anchor (limit 30k), 91123-southwest a 3 ha
+    # parking; v2_verify then tripped ``unclassified_le_v1`` (v2 2–11 %%
+    # vs v1 0 %%) and the KG struck out.  Leaving those groups unmerged
+    # keeps the tile-level objects with their own honest types/confidence
+    # (a cross-tile seam, which is what v1 produced whenever it did not
+    # merge) and never manufactures unclassified area.  The anchor
+    # heuristic still guards v1, where the demoted blob came from the RF
+    # re-classifying one tiny mis-typed anchor.
+    if MODEL_VERSION == "v2":
+        _skipped = []
+        for root_id, member_ids in list(merge_groups.items()):
+            surv = obj_map.get(root_id)
+            if surv is None:
+                continue
+            compat = _MERGE_RULES.get(surv.obj_type, set()) | {surv.obj_type}
+            tot = 0.0
+            n_anch = 0
+            for mid in member_ids:
+                o = obj_map.get(mid)
+                if o is None:
+                    continue
+                tot += o.area_sqm
+                if o.obj_type in compat:
+                    n_anch += 1
+            per = tot / max(n_anch, 1)
+            lim = _ANCHOR_MAX_AREA.get(surv.obj_type, 10000)
+            if per > lim:
+                _skipped.append((root_id, surv.obj_type, tot, n_anch, per, lim))
+                del merge_groups[root_id]
+        for root_id, t, tot, n_anch, per, lim in _skipped[:20]:
+            log.info("  Anchor-weak (v2, merge skipped): id=%d type=%s area=%.0fm² anchors=%d "
+                     "(%.0fm²/anchor, limit=%d) — members kept as tile-level objects",
+                     root_id, t, tot, n_anch, per, lim)
+        if _skipped:
+            _by_t = Counter(x[1] for x in _skipped)
+            _msg = ("anchor-weak: v2 cross-tile merge skipped %d group(s), %.1f ha kept as tile-level objects "
+                    "(%s; largest %s %.1f ha/%d anchors)" % (
+                        len(_skipped), sum(x[2] for x in _skipped) / 1e4,
+                        " ".join(f"{t}={n}" for t, n in _by_t.most_common(5)),
+                        max(_skipped, key=lambda x: x[2])[1], max(x[2] for x in _skipped) / 1e4,
+                        max(_skipped, key=lambda x: x[2])[3]))
+            log.info("  " + _msg)
+            _relay_subprocess_info(_msg, "merge")
+        if not merge_groups:
+            return 0, {}
+
+    # ------------------------------------------------------------------
+    # 5. Remap labels and recompute stats
+    # ------------------------------------------------------------------
+    n_merges = 0
+    remap = {}  # old_id → new_id (survivor)
+    remove_ids = set()
+
+    for root_id, member_ids in merge_groups.items():
+        survivor = obj_map.get(root_id)
+        if survivor is None:
+            continue
+        absorbed = [obj_map[mid] for mid in member_ids
+                    if mid != root_id and mid in obj_map]
+        if not absorbed:
+            continue
+
+        # Area-weighted merge of stats
+        total_area = survivor.area_sqm + sum(o.area_sqm for o in absorbed)
+        if total_area <= 0:
+            continue
+
+        def _wmean(attr):
+            """Area-weighted mean of an attribute."""
+            val = getattr(survivor, attr) * survivor.area_sqm
+            for o in absorbed:
+                val += getattr(o, attr) * o.area_sqm
+            return val / total_area
+
+        # Recompute survivor stats
+        survivor.area_sqm = total_area
+        survivor.perimeter_m = survivor.perimeter_m + sum(o.perimeter_m for o in absorbed)  # approximate
+        survivor.height_max = max(survivor.height_max, *(o.height_max for o in absorbed))
+        survivor.height_mean = _wmean('height_mean')
+        survivor.height_p90 = max(survivor.height_p90, *(o.height_p90 for o in absorbed))
+        survivor.height_std = _wmean('height_std')
+        survivor.slope_mean = _wmean('slope_mean')
+        survivor.roughness = _wmean('roughness')
+        survivor.ndvi_mean = _wmean('ndvi_mean')
+        survivor.ndvi_std = _wmean('ndvi_std')
+        survivor.ndvi_fused = _wmean('ndvi_fused')
+        survivor.brightness_mean = _wmean('brightness_mean')
+        survivor.nir_mean = _wmean('nir_mean')
+        survivor.height_change = _wmean('height_change')
+        survivor.dtm_change = _wmean('dtm_change')
+        survivor.temporal_stability = _wmean('temporal_stability')
+        survivor.volume_change_m3 = survivor.volume_change_m3 + sum(o.volume_change_m3 for o in absorbed)
+        survivor.volume_change_abs_m3 = survivor.volume_change_abs_m3 + sum(o.volume_change_abs_m3 for o in absorbed)
+        survivor.dtm_change_max = max(survivor.dtm_change_max, *(o.dtm_change_max for o in absorbed))
+        survivor.glcm_entropy = _wmean('glcm_entropy')
+        survivor.glcm_homogeneity = _wmean('glcm_homogeneity')
+        survivor.texture_complexity = _wmean('texture_complexity')
+        survivor.sar_vv = _wmean('sar_vv')
+        survivor.sar_vh = _wmean('sar_vh')
+        survivor.harm_amplitude = _wmean('harm_amplitude')
+        survivor.harm_phase = _wmean('harm_phase')
+        # Recompute compactness (approximate)
+        if survivor.perimeter_m > 0:
+            survivor.compactness = round(
+                4 * 3.14159 * survivor.area_sqm / (survivor.perimeter_m ** 2), 4)
+
+        # Recompute centroid from pixel coordinates
+        # (done after label remap below)
+
+        # Build remap
+        for o in absorbed:
+            remap[o.obj_id] = root_id
+            remove_ids.add(o.obj_id)
+        n_merges += len(absorbed)
+
+    if not remap:
+        return 0, {}
+
+    # Save pre-merge types for anchor-density check in step 7
+    _pre_merge_types = {o.obj_id: o.obj_type for o in all_objects}
+    for oid in remove_ids:
+        o = obj_map.get(oid)
+        if o:
+            _pre_merge_types[oid] = o.obj_type
+
+    # ------------------------------------------------------------------
+    # 6. Apply label remap to the full rasters (vectorised)
+    # ------------------------------------------------------------------
+    # Build a lookup array for fast remapping
+    max_label = int(labels_full.max())
+    lut = np.arange(max_label + 1, dtype=np.int32)
+    for old_id, new_id in remap.items():
+        if old_id <= max_label:
+            lut[old_id] = new_id
+    labels_full[:] = lut[labels_full]
+    _gpkg_heartbeat(f"boundary merge: {len(merge_groups)} groups, relabelled")
+    # seg_type_full for the merged groups is painted ONCE after step 7
+    # (which may still re-type survivors) via a label→type LUT. The old
+    # per-group ``seg_type_full[labels_full == root_id]`` (here, again in
+    # step 7, and ``np.argwhere`` per group in step 8) was 3 full-raster
+    # passes per merge group — 30+ Mpx KGs with thousands of cross-tile
+    # groups sat heartbeat-less in here for hours (Oct 2026 stuck-kg).
+
+    # ------------------------------------------------------------------
+    # 7. Re-classify merged segments with anchor-density validation
+    #
+    # "Anchor density" = how many original same-type segments support
+    # the merged polygon.  A 10 ha polygon classified as "roof" from
+    # one tiny segment is very weak; 10 ha of "tree" from 50 segments
+    # is solid.  When area-per-anchor exceeds the threshold, we force
+    # re-classification and penalise confidence.
+    # ------------------------------------------------------------------
+    _MANMADE_TYPES = {
+        'roof', 'wall', 'fence', 'mast', 'greenhouse', 'solar_panel',
+        'road', 'path', 'parking', 'bridge', 'wind_turbine', 'substation'}
+
+    rf = None
+    if MODEL_VERSION != "v2":
+        try:
+            from learned_classifier import get_classifier
+            rf = get_classifier()
+        except Exception:
+            rf = None
+
+    n_reclassified = 0
+    n_anchor_weak = 0
+    for root_id, member_ids in merge_groups.items():
+        survivor = obj_map.get(root_id)
+        if survivor is None:
+            continue
+
+        # --- Anchor-density check ---
+        current_type = survivor.obj_type
+        # Count how many original (pre-merge) segments had a compatible type
+        n_anchors = 0
+        compat_set = _MERGE_RULES.get(current_type, set()) | {current_type}
+        for mid in member_ids:
+            orig_type = _pre_merge_types.get(mid, '')
+            if orig_type in compat_set:
+                n_anchors += 1
+        n_anchors = max(n_anchors, 1)
+
+        area_per_anchor = survivor.area_sqm / n_anchors
+        max_area = _ANCHOR_MAX_AREA.get(current_type, 10000)
+        anchor_weak = area_per_anchor > max_area
+
+        if anchor_weak:
+            n_anchor_weak += 1
+            log.info("  Anchor-weak: id=%d type=%s area=%.0fm² anchors=%d "
+                     "(%.0fm²/anchor, limit=%d)",
+                     root_id, current_type, survivor.area_sqm,
+                     n_anchors, area_per_anchor, max_area)
+
+        # --- Build features for re-classification ---
+        feat = {
+            'area_sqm': survivor.area_sqm,
+            'height_max': survivor.height_max,
+            'height_mean': survivor.height_mean,
+            'height_p90': survivor.height_p90,
+            'height_std': survivor.height_std,
+            'slope_mean': survivor.slope_mean,
+            'roughness': survivor.roughness,
+            'ndvi_mean': survivor.ndvi_mean,
+            'ndvi_std': survivor.ndvi_std,
+            'ndvi_fused': survivor.ndvi_fused,
+            'brightness_mean': survivor.brightness_mean,
+            'nir_mean': survivor.nir_mean,
+            'height_change': survivor.height_change,
+            'dtm_change': survivor.dtm_change,
+            'temporal_stability': survivor.temporal_stability,
+            'compactness': survivor.compactness,
+            'elongation': survivor.elongation,
+            'solidity': survivor.solidity,
+            'extent': survivor.extent,
+            'dsm_edge_strength': survivor.dsm_edge_strength,
+            'volume_change_m3': survivor.volume_change_m3,
+            'volume_change_abs_m3': survivor.volume_change_abs_m3,
+            'dtm_change_max': survivor.dtm_change_max,
+            'glcm_entropy': survivor.glcm_entropy,
+            'glcm_homogeneity': survivor.glcm_homogeneity,
+            'texture_complexity': survivor.texture_complexity,
+            'sar_vv': survivor.sar_vv,
+            'sar_vh': survivor.sar_vh,
+            'harm_amplitude': survivor.harm_amplitude,
+            'harm_phase': survivor.harm_phase,
+            'perimeter_m': survivor.perimeter_m,
+        }
+        if survivor.features:
+            for k, v in survivor.features.items():
+                if k not in feat:
+                    feat[k] = v
+
+        new_type = None
+        new_conf = survivor.confidence
+        _has_spec = bool(survivor.ndvi_mean)
+        if MODEL_VERSION == "v2":
+            # v2: members were compatible by _MERGE_RULES; keep the survivor's
+            # LightGBM type instead of re-classifying with the v1 RF / rules.
+            new_type = current_type
+        elif rf and rf.model is not None:
+            try:
+                _pred, _conf = rf.predict(feat)
+                if _pred and _conf >= 0.4:
+                    # Post-split: earthwork → excavation or fill
+                    if _pred == "earthwork":
+                        dtm_ch = feat.get("dtm_change", 0.0)
+                        _pred = "excavation" if dtm_ch < 0 else "fill"
+                    new_type = _pred
+                    new_conf = _conf
+                elif mark_uncertain and (_conf or 0) < 0.15 \
+                        and survivor.area_sqm < 1000:
+                    new_type = 'unclassified'
+                    new_conf = _conf if _conf else 0.0
+                else:
+                    # Low-confidence RF → rule-based fallback
+                    new_type = None
+            except Exception:
+                pass
+        if new_type is None:
+            try:
+                new_type, _, new_conf, _ = classify_object(
+                    feat, has_spectral=_has_spec)
+            except Exception:
+                new_type = None
+
+        # Anchor-weak: if the re-classified type is also implausible
+        # for the anchor count, mark as unclassified.
+        if anchor_weak and new_type and new_type != 'unclassified':
+            new_max = _ANCHOR_MAX_AREA.get(new_type, 10000)
+            new_area_per = survivor.area_sqm / n_anchors
+            if new_area_per > new_max:
+                # Re-classified type is also too large per anchor → unclassified
+                log.info("    → unclassified (re-class %s also exceeds %.0f/anchor)",
+                         new_type, new_max)
+                new_type = 'unclassified'
+                new_conf = min(new_conf * 0.3, 0.2)
+            else:
+                # Re-classified type fits the anchor density → accept but penalise
+                new_conf = min(new_conf * 0.7, 0.5)
+
+        if new_type and new_type in OBJECT_TYPES:
+            if new_type != current_type:
+                n_reclassified += 1
+            survivor.obj_type = new_type
+            survivor.type_code = OBJECT_TYPES[new_type]
+            survivor.confidence = new_conf
+            survivor.is_manmade = new_type in _MANMADE_TYPES
+
+    # ------------------------------------------------------------------
+    # 8. Paint merged types + recompute centroids — vectorised, strip-wise
+    # ------------------------------------------------------------------
+    _type_lut = np.full(max_label + 1, -1, dtype=np.int16)      # -1 = untouched label
+    for root_id in merge_groups:
+        survivor = obj_map.get(root_id)
+        if survivor is not None and root_id <= max_label:
+            _type_lut[root_id] = survivor.type_code
+    _cnt = np.zeros(max_label + 1, dtype=np.int64)
+    _rsum = np.zeros(max_label + 1, dtype=np.float64)
+    _csum = np.zeros(max_label + 1, dtype=np.float64)
+    _strip = 2000
+    for r0 in range(0, full_h, _strip):
+        r1 = min(full_h, r0 + _strip)
+        lb = labels_full[r0:r1]
+        tl = _type_lut[lb]
+        m = tl >= 0
+        if not m.any():
+            continue
+        seg_type_full[r0:r1][m] = tl[m].astype(np.uint8)
+        rr, cc = np.nonzero(m)
+        lab = lb[rr, cc]
+        _cnt += np.bincount(lab, minlength=max_label + 1)
+        _rsum += np.bincount(lab, weights=rr + r0, minlength=max_label + 1)
+        _csum += np.bincount(lab, weights=cc, minlength=max_label + 1)
+        _gpkg_heartbeat(f"boundary merge: paint rows {r1}/{full_h}")
+    for root_id in merge_groups:
+        survivor = obj_map.get(root_id)
+        if survivor is None or root_id > max_label or _cnt[root_id] <= 0:
+            continue
+        mean_row = _rsum[root_id] / _cnt[root_id]
+        mean_col = _csum[root_id] / _cnt[root_id]
+        survivor.centroid_e = full_left + (mean_col + 0.5) * res
+        survivor.centroid_n = full_top - (mean_row + 0.5) * res
+
+    # ------------------------------------------------------------------
+    # 9. Remove absorbed objects from all_objects
+    # ------------------------------------------------------------------
+    all_objects[:] = [o for o in all_objects if o.obj_id not in remove_ids]
+
+    log.info("  Boundary merge: %d pairs found, %d segments merged into %d groups, "
+             "%d reclassified, %d anchor-weak",
+             len(adj_pairs), n_merges, len(merge_groups),
+             n_reclassified, n_anchor_weak)
+    if n_anchor_weak:
+        # v1 (or a v2 group that slipped past the pre-merge gate): merged
+        # blob(s) were demoted to 'unclassified' — surface fleet-wide so an
+        # ``unclassified_le_v1`` verify FAIL can be traced via ?q=anchor-weak.
+        _relay_subprocess_info(
+            f"anchor-weak: {n_anchor_weak} merged cross-tile group(s) demoted to unclassified "
+            f"({n_merges} merges, model={MODEL_VERSION}) — check unclassified_le_v1 in v2verify", "merge")
+    return n_merges, remap
+
+
+# === SECTION: Tiled GPKG + JSON builders (build_full/light_gpkg, build_json_summary) ===
+
+def _purge_stale_gpkg(path: str) -> None:
+    """Remove a stale GPKG and its SQLite sidecars before rebuilding.
+
+    Earlier processor runs (uid=root, pre-runuser fix) sometimes left
+    behind ``.gpkg-wal``/``.gpkg-shm``/``.gpkg-journal`` files owned by
+    root.  When the new uid=exedev subprocess opens the GPKG, SQLite sees
+    the unwritable journal, falls back to read-only mode, and segment-
+    vector inserts then fail with ``attempt to write a readonly database``.
+    Plain ``os.unlink(path)`` of just the .gpkg leaves the sidecars in
+    place — we have to nuke all of them.  Also tries ``sudo rm`` as a
+    last resort if a sidecar is owned by root.
+    """
+    import errno
+    import subprocess as _sp
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        p = path + suffix
+        if not os.path.exists(p):
+            continue
+        try:
+            os.unlink(p)
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EPERM):
+                try:
+                    _sp.run(["sudo", "-n", "rm", "-f", p],
+                            capture_output=True, timeout=10)
+                except Exception:
+                    pass
+            else:
+                log.warning("_purge_stale_gpkg: cannot remove %s: %s", p, e)
+
+
+def _gpkg_reuse_ok(path: str) -> bool:
+    """Return True iff an on-disk full GPKG from a prior attempt is safe
+    to reuse verbatim (skip rebuild + upload as-is).
+
+    A stuck-KG hard restart (SIGKILL mid-build) leaves a structurally
+    incomplete file; before this gate the reuse path shipped those to
+    Zenodo. Checks, cheapest first:
+
+      * no hot SQLite sidecars (-wal/-shm/-journal — interrupted write)
+      * GPKG application_id magic (0x47504B47)
+      * ``layer_styles`` table exists with rows — written by
+        ``_write_gpkg_all_styles`` at the very END of BOTH the in-memory
+        and streamed builders, so its presence implies the build ran to
+        completion. (Streamed builds write segment vectors early, so
+        vector-layer presence alone would be a false completeness signal.)
+      * ``PRAGMA quick_check(1)`` passes (stops at first corruption; much
+        cheaper than integrity_check on multi-GB files).
+    """
+    import sqlite3 as _sq3
+    try:
+        for _sfx in ("-wal", "-shm", "-journal"):
+            if os.path.exists(path + _sfx):
+                log.warning("GPKG reuse check: hot sidecar %s present", path + _sfx)
+                return False
+        con = _sq3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            app_id = con.execute("PRAGMA application_id").fetchone()[0]
+            if app_id != 0x47504B47:
+                log.warning("GPKG reuse check: bad application_id 0x%x", app_id)
+                return False
+            row = con.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='table' AND name='layer_styles'").fetchone()
+            if not row or row[0] == 0:
+                log.warning("GPKG reuse check: no layer_styles table "
+                            "(build did not reach the final styles step)")
+                return False
+            if (con.execute("SELECT COUNT(*) FROM layer_styles").fetchone()[0] or 0) == 0:
+                log.warning("GPKG reuse check: layer_styles empty")
+                return False
+            qc = con.execute("PRAGMA quick_check(1)").fetchone()[0]
+            if qc != "ok":
+                log.warning("GPKG reuse check: quick_check failed: %s", qc)
+                return False
+        finally:
+            con.close()
+        return True
+    except Exception as e:
+        log.warning("GPKG reuse check errored (%s) — treating as not reusable", e)
+        return False
+
+
+
+class LabelMixError(RuntimeError):
+    """A tile's label raster resolves (through the global obj_map) to objects
+    of *another* tile — the restored-checkpoint id collision (Oct 2026).
+    Raised before any raster is painted so nothing corrupt is ever written
+    or uploaded; the KG fails and retries (checkpoints kept, restore path
+    now remaps ids — ``_remap_restored_tile_ids``)."""
+
+
+def _assert_tile_labels_consistent(tr: dict, obj_map: dict, tile_idx: int, kg_code: str = "") -> None:
+    """Every label id of this tile that is in *obj_map* must name one of the
+    tile's own objects (``tr["objects"]``; the core objects are the same
+    instances).  Clean tiles measure exactly 0 foreign ids; a label-mixed
+    tile has most of its ids pointing elsewhere.  Tiles without an
+    ``objects`` list (ancient checkpoints) are not checked."""
+    objs = tr.get("objects")
+    lab = tr.get("labels")
+    if not objs or lab is None or not getattr(lab, "size", 0):
+        return
+    own = {id(o) for o in objs}
+    own_ids = {int(o.obj_id) for o in objs}
+    uniq = np.unique(lab)
+    matched = foreign = 0
+    for uid in uniq:
+        if uid == 0:
+            continue
+        obj = obj_map.get(int(uid))
+        if obj is None:
+            continue
+        matched += 1
+        if id(obj) not in own and int(uid) not in own_ids:
+            foreign += 1
+    if foreign >= 2 and foreign > 0.01 * matched:
+        raise LabelMixError(
+            f"KG {kg_code} tile {tile_idx + 1}: {foreign}/{matched} label ids resolve to objects of "
+            f"other tiles — label/obj_id collision (restored checkpoint?); refusing to stitch")
+
+
+
+def _rss_mb() -> int:
+    """Own VmRSS in MiB (0 when unreadable)."""
+    try:
+        return int(open("/proc/self/status").read().split("VmRSS:")[1].split()[0]) >> 10
+    except Exception:
+        return 0
+
+
+def _malloc_trim() -> None:
+    """Hand freed heap back to the kernel (``malloc_trim(0)``).
+
+    The tile loop churns millions of small allocations (segment feature
+    dicts, shapely rings, segv2 DataFrames) between the big numpy arrays;
+    ``gc.collect()`` frees them to glibc, but glibc keeps the fragmented
+    arenas mapped. Oct 2026 heartbeat trail: a KG restored entirely from
+    checkpoints (no tile loop) entered ``build_full_gpkg_tiled`` at
+    1.3-1.6 GB RSS, a freshly segmented KG of the same size at 3.2-4.6 GB
+    — with identical ``tile_seg_results``. Trimming after every tile and
+    before the stitch gives the stitch accumulators that headroom back."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _strip_object_features(objects) -> int:
+    """Drop ``SegmentedObject.features`` (the ~90-key per-object feature
+    vector the classifier consumed) once a tile is classified.
+
+    Memory, not correctness: the dict is ~5 KB of the ~7.4 KB each object
+    costs in RAM (measured on chkpt_14118 tile_0: 3161 objects, 23 MB →
+    pickled 5.2 MB vs 2.1 MB without features). A 24-tile KG keeps all
+    ~160 k tile objects alive in ``tile_seg_results`` until the full GPKG
+    is built, so the worker enters ``build_full_gpkg_tiled`` at ~5 GB RSS
+    (Oct 2026 heartbeat trail: ``stitch tile 1/24 rss=5176M``), and the
+    ≥40 Mpx float32 accumulators (+1.3-1.5 GB) push it past the ~6.5 GB
+    effective ceiling of the 8 GB VMs — 15 gpkg_full + 8 gpkg_light OOM
+    kills / 24 h. The v2 pipeline never reads ``features`` again:
+    ``_merge_boundary_segments`` keeps the survivor's LightGBM type, and
+    none of the GPKG / JSON / NE writers touch it. The v1 RF re-classify
+    path in the boundary merge *does* use it, so v1 keeps the dicts.
+    Checkpoints pickled before this change are stripped on restore too.
+    """
+    if MODEL_VERSION != "v2" or not objects:
+        return 0
+    n = 0
+    for o in objects:
+        if getattr(o, "features", None):
+            o.features = {}
+            n += 1
+    return n
+
+def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=False):
+    """Full GPKG: stitched raster layers (DTM, DSM, nDSM, segment_type,
+    segment_height) covering the full KG bbox, plus unified segment vectors."""
+    import rasterio
+    import rasterio.transform
+    # Reset Phase 1 sidecar telemetry for this KG's gpkg_full step.
+    # We emit one summary line at the end of the function (subprocess
+    # warnings JSONL — the parent step monitor relays into the merged
+    # 24h log so we can audit sidecar hit ratios fleet-wide).
+    for _k in list(_SIDECAR_STATS.keys()):
+        _SIDECAR_STATS[_k] = 0
+    out_path = str(GPKG_DIR / f"{kg_code}_full.gpkg")
+    _purge_stale_gpkg(out_path)
+    if not tile_seg_results:
+        open(out_path, 'w').close()
+        return out_path
+
+    table_count = 0
+    _GPKG_NODATA = -9999.0  # NaN not supported in GPKG ancillary table
+
+    def _write_table(name, arrays, h, w, tf, dtype='float32', descs=None):
+        nonlocal table_count
+        _gpkg_heartbeat(f"writing layer {name}", force=True)
+        opts = dict(driver='GPKG', width=w, height=h, count=len(arrays),
+                    dtype=dtype, crs='EPSG:3035', transform=tf,
+                    RASTER_TABLE=name, RASTER_IDENTIFIER=name)
+        if dtype == 'float32': opts['nodata'] = _GPKG_NODATA
+        if table_count > 0: opts['APPEND_SUBDATASET'] = 'YES'
+        with rasterio.open(out_path, 'w', **opts) as dst:
+            if name == 'segment_type' and dtype == 'uint8':
+                # Bake the type→colour table into the band BEFORE writing pixels
+                # so GDAL emits palette PNG tiles (mode 'P') that render as real
+                # colours in any viewer. Written after the band, GDAL ignores it
+                # for multi-tile rasters and stores grey 'L' tiles (R=G=B=code →
+                # near-black "empty" look). Order is load-bearing.
+                try:
+                    dst.write_colormap(1, _segment_type_colormap())
+                except Exception as _e:
+                    log.warning("segment_type colormap write failed: %s", _e)
+            for i, arr in enumerate(arrays, 1):
+                band = arr[:h, :w]
+                if dtype == 'float32':
+                    band = np.where(np.isnan(band), _GPKG_NODATA, band)
+                dst.write(band, i)
+                if descs and i <= len(descs): dst.set_band_description(i, descs[i-1])
+        table_count += 1
+
+    # ------------------------------------------------------------------
+    # Compute union bounding box of all tiles
+    # ------------------------------------------------------------------
+    # Grid anchor (2.2): snap the union outwards to whole metres so the
+    # stitched grid is the integer-metre BEV grid regardless of whether a
+    # tile arrived with a fractional origin (restored pre-2.2 checkpoint).
+    import raster_io as _rio_grid
+    full_left, full_bottom, full_right, full_top, full_w, full_h, full_tf = \
+        _rio_grid.full_grid_from_bounds([tr["bounds_3035"] for tr in tile_seg_results])
+    res = 1.0  # 1m resolution
+
+    log.info("  Full-KG raster: %d x %d px (%.0f x %.0f m), %d tiles",
+             full_w, full_h, full_right - full_left, full_top - full_bottom,
+             len(tile_seg_results))
+
+    # ------------------------------------------------------------------
+    # For large KGs, use strip-streamed writing to stay within memory
+    # ------------------------------------------------------------------
+    from gpkg_streamed import _STREAM_PIXEL_THRESHOLD, _MAX_FULL_GPKG_PIXELS, build_full_gpkg_streamed
+    n_pixels = full_h * full_w
+    if n_pixels > _MAX_FULL_GPKG_PIXELS:
+        log.info("  Full-KG raster %.0f Mpx > %.0f Mpx — skipping full GPKG "
+                 "(light GPKG + JSON still produced)",
+                 n_pixels / 1e6, _MAX_FULL_GPKG_PIXELS / 1e6)
+        # Create an empty placeholder so upload code doesn't break
+        open(out_path, 'w').close()
+        return out_path, {}
+    if n_pixels > _STREAM_PIXEL_THRESHOLD:
+        log.info("  Full-KG raster %.0f Mpx > %.0f Mpx threshold — using streamed builder",
+                 n_pixels / 1e6, _STREAM_PIXEL_THRESHOLD / 1e6)
+        return build_full_gpkg_streamed(
+            kg_code, tile_seg_results, all_objects, obs_year,
+            mark_uncertain, out_path, full_h, full_w, full_left, full_top,
+            full_right, full_bottom, full_tf, res,
+            _write_segment_vectors=_write_segment_vectors,
+            _write_segment_points=_write_segment_points,
+            _write_gpkg_all_styles=_write_gpkg_all_styles,
+            _fix_gpkg_raster_crs=_fix_gpkg_raster_crs,
+            _merge_boundary_segments=_merge_boundary_segments,
+            SEGMENT_COLORS=SEGMENT_COLORS,
+        )
+
+    # ------------------------------------------------------------------
+    # Allocate full-KG rasters (weighted accumulation for seamless blending)
+    # ------------------------------------------------------------------
+    # For continuous rasters (DTM/DSM/nDSM), use weighted accumulation
+    # to feather-blend overlapping tiles and eliminate stitching lines.
+    # float32, not float64 (Oct 2026): the four accumulators were 32 B/px
+    # → 1.3 GB at 42 Mpx on top of a worker already holding ~4 GB of
+    # tile arrays + objects, and the 8 GB VMs (no swap, srv ~1.5 GB)
+    # OOM-killed 15/18 full-GPKG builds ≥40 Mpx right at "stitch tile 1".
+    # Feather-weighted sums of ≤4 tiles × ~3000 m are exact to ~0.2 mm
+    # in float32, far below the 1 m-grid LiDAR noise floor.
+    dtm_sum = np.zeros((full_h, full_w), dtype=np.float32)
+    dsm_sum = np.zeros((full_h, full_w), dtype=np.float32)
+    ndsm_sum = np.zeros((full_h, full_w), dtype=np.float32)
+    weight_sum = np.zeros((full_h, full_w), dtype=np.float32)
+    seg_type_full = np.zeros((full_h, full_w), dtype=np.uint8)
+    seg_height_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
+    labels_full = np.zeros((full_h, full_w), dtype=np.int32)
+    # For categorical rasters (labels/type), track best tile per pixel
+    # so overlap zones use the tile whose centre is closest (= highest feather weight).
+    best_cat_weight = np.zeros((full_h, full_w), dtype=np.float32)
+
+    obj_map = {o.obj_id: o for o in all_objects}
+
+    def _feather_weight(rows, cols, margin=100):
+        """Build a 2D weight array that tapers from 1.0 at centre to 0.0 at edges.
+
+        margin is the feather width in pixels (= overlap_km * 1000 = 100m @ 1m res).
+        Pixels beyond margin from any edge get weight 1.0.
+        """
+        wy = np.ones(rows, dtype=np.float32)
+        wx = np.ones(cols, dtype=np.float32)
+        m = min(margin, rows // 2, cols // 2)
+        if m > 0:
+            ramp = np.linspace(0.0, 1.0, m, endpoint=False, dtype=np.float32)
+            wy[:m] = np.minimum(wy[:m], ramp)
+            wy[-m:] = np.minimum(wy[-m:], ramp[::-1])
+            wx[:m] = np.minimum(wx[:m], ramp)
+            wx[-m:] = np.minimum(wx[-m:], ramp[::-1])
+        return wy[:, None] * wx[None, :]  # outer product → 2D
+
+    # ------------------------------------------------------------------
+    # Paint each tile into the full-KG rasters
+    # ------------------------------------------------------------------
+    def _paint_dtm_tile(ti_idx, tr, row_off, col_off, th_eff, tw_eff):
+        """DTM/DSM/nDSM feather-blend for one tile. Raises on read failure.
+
+        Encapsulated so the deferred-retry pass below can call it again
+        after forcing a bev_proxy pool refresh. See the ``_deferred``
+        block below for the recovery rationale.
+        """
+        tdata = _read_dtm_for_tile(tr, kg_code=kg_code, tile_idx=ti_idx)
+        # Defensive shape clamp: BEV reads or sidecars occasionally return
+        # arrays off-by-one from the nominal ``tr["shape"]`` (window vs
+        # bbox-pixel rounding). Take the intersection so all slices,
+        # the feather weight, and the destination window match exactly.
+        _ah, _aw = tdata["dtm"].shape[:2]
+        th_eff_d = min(th_eff, _ah)
+        tw_eff_d = min(tw_eff, _aw)
+        r_end_d = row_off + th_eff_d
+        c_end_d = col_off + tw_eff_d
+        tile_dtm = tdata["dtm"][:th_eff_d, :tw_eff_d].astype(np.float32)
+        tile_dsm = tdata["dsm"][:th_eff_d, :tw_eff_d].astype(np.float32)
+        tile_ndsm = tdata["ndsm"][:th_eff_d, :tw_eff_d].astype(np.float32)
+        del tdata
+
+        fw = _feather_weight(th_eff_d, tw_eff_d, margin=100)
+        valid = ~np.isnan(tile_dtm)
+        w = np.where(valid, fw, np.float32(0.0)).astype(np.float32)
+
+        dtm_sum[row_off:r_end_d, col_off:c_end_d] += np.where(valid, tile_dtm, np.float32(0.0)) * w
+        dsm_sum[row_off:r_end_d, col_off:c_end_d] += np.where(valid, tile_dsm, np.float32(0.0)) * w
+        ndsm_sum[row_off:r_end_d, col_off:c_end_d] += np.where(valid, tile_ndsm, np.float32(0.0)) * w
+        weight_sum[row_off:r_end_d, col_off:c_end_d] += w
+
+    _deferred_dtm: list[tuple[int, dict, int, int, int, int]] = []
+
+    _n_tiles_hb = len(tile_seg_results)
+    for ti_idx, tr in enumerate(tile_seg_results):
+        _gpkg_heartbeat(f"stitch tile {ti_idx + 1}/{_n_tiles_hb}")
+        th, tw = tr["shape"]
+        tile_left, tile_bottom, tile_right, tile_top = tr["bounds_3035"]
+
+        # Compute pixel offset of this tile within the full-KG raster
+        col_off = int(round((tile_left - full_left) / res))
+        row_off = int(round((full_top - tile_top) / res))
+
+        # Clamp to full raster bounds (safety)
+        r_end = min(row_off + th, full_h)
+        c_end = min(col_off + tw, full_w)
+        th_eff = r_end - row_off
+        tw_eff = c_end - col_off
+        if th_eff <= 0 or tw_eff <= 0:
+            continue
+
+        # DTM / DSM / nDSM — feather-blended
+        try:
+            _paint_dtm_tile(ti_idx, tr, row_off, col_off, th_eff, tw_eff)
+        except Exception as e:
+            # Defer rather than accept a NaN hole. The most common cause
+            # is a transient direct-egress flap (DNS / Read failed) that
+            # has driven bev_proxy's ``direct`` slot into a multi-hour
+            # cooldown while the proxy pool hasn't refreshed yet. Forcing
+            # a pool refresh once after the loop almost always heals it.
+            log.warning(
+                "GPKG tile %d DTM read failed (deferred for retry): %s",
+                ti_idx + 1, e)
+            _deferred_dtm.append((ti_idx, tr, row_off, col_off, th_eff, tw_eff))
+
+        # Segment type + segment height + labels (categorical — highest-weight-wins)
+        # Only overwrite a pixel if this tile has a higher feather weight
+        # (i.e. the pixel is closer to this tile's centre than any previous tile).
+        if tr.get("labels") is not None:
+            _assert_tile_labels_consistent(tr, obj_map, ti_idx, kg_code)
+            labels_tile = tr["labels"][:th_eff, :tw_eff].astype(np.int32)
+
+            type_tile = np.zeros((th_eff, tw_eff), dtype=np.uint8)
+            for uid in np.unique(labels_tile):
+                if uid == 0: continue
+                obj = obj_map.get(int(uid))
+                if obj: type_tile[labels_tile == uid] = obj.type_code
+
+            cat_fw = _feather_weight(th_eff, tw_eff, margin=100)
+            # Only a pixel that this tile actually segmented (label > 0) may
+            # win or raise the best-weight bar. Otherwise a high-feather tile's
+            # empty corner (reprojected rotated-quad NaN triangle) would win the
+            # overlap seam and block a valid lower-feather tile, leaving the
+            # tapering triangular slivers seen in segments/segment_height.
+            # …and the label must belong to a *kept* (core) object: a label
+            # whose centroid fell outside this tile's core is not in obj_map,
+            # so type_tile is 0 there — letting it win would paint a class-0
+            # hole and block the neighbour tile where that object IS core
+            # (62202: two ~650 px seam holes inside parcels, 0.62 % of the
+            # union, in both v1 and v2 — 2026-09-21).
+            tile_valid = (labels_tile > 0) & (type_tile > 0)
+            _bw = best_cat_weight[row_off:r_end, col_off:c_end]
+            wins = tile_valid & (cat_fw > _bw)
+            labels_full[row_off:r_end, col_off:c_end] = np.where(
+                wins, labels_tile, labels_full[row_off:r_end, col_off:c_end])
+            seg_type_full[row_off:r_end, col_off:c_end] = np.where(
+                wins, type_tile, seg_type_full[row_off:r_end, col_off:c_end])
+
+            if tr.get("ndsm") is not None:
+                tile_sh = tr["ndsm"][:th_eff, :tw_eff].astype(np.float32)
+                seg_height_full[row_off:r_end, col_off:c_end] = np.where(
+                    wins, tile_sh, seg_height_full[row_off:r_end, col_off:c_end])
+
+            best_cat_weight[row_off:r_end, col_off:c_end] = np.where(
+                tile_valid, np.maximum(_bw, cat_fw), _bw)
+
+    # ------------------------------------------------------------------
+    # Deferred DTM retry: force a bev_proxy pool refresh, then re-attempt
+    # every tile we couldn't read on the first pass. The refresh both
+    # heals the ``direct`` slot's fail_score (decay 0.5 per success) and
+    # rebuilds the proxy roster, so a tile that hit a 21h cooldown 30s
+    # ago can now resolve via a fresh proxy. After this we accept the
+    # NaN hole and the caller's partial-KG bookkeeping promotes the KG
+    # to the retry queue for a future pass.
+    # ------------------------------------------------------------------
+    if _deferred_dtm:
+        log.info(
+            "GPKG: %d DTM tile(s) deferred; forcing bev_proxy pool refresh",
+            len(_deferred_dtm))
+        try:
+            import bev_proxy as _bp
+            _bp._refresh_pool()
+        except Exception as _e:
+            log.warning("GPKG: forced bev_proxy refresh failed: %s", _e)
+        still_failed: list[int] = []
+        for ti_idx, tr, row_off, col_off, th_eff, tw_eff in _deferred_dtm:
+            try:
+                _paint_dtm_tile(ti_idx, tr, row_off, col_off, th_eff, tw_eff)
+                log.info("GPKG tile %d DTM recovered on retry", ti_idx + 1)
+            except Exception as e:
+                still_failed.append(ti_idx + 1)
+                log.error(
+                    "GPKG tile %d DTM RE-READ FAILED after pool refresh: "
+                    "%s — NaN hole in DTM/DSM/nDSM for this tile window",
+                    ti_idx + 1, e)
+        if still_failed:
+            # Surface as a structured partial-KG signal so the parent /
+            # director can promote the KG to retry_queue. The existing
+            # ``current_step.json`` warning-relay picks this up via
+            # ``log.warning`` already, so emit one summary line.
+            log.warning(
+                "GPKG: %d tile(s) left with NaN holes after deferred "
+                "retry: %s",
+                len(still_failed),
+                ",".join(str(t) for t in still_failed))
+
+    # ------------------------------------------------------------------
+    # Normalise weighted sums → final blended rasters
+    # ------------------------------------------------------------------
+    # Normalise in place (no float64 temporaries, one live full-size
+    # array per layer): sum /= weight, then NaN where no data. Each
+    # accumulator *becomes* the final layer and the old name is rebound
+    # to None so the closure cells of _paint_dtm_tile release it.
+    has_data = weight_sum > 0
+    _wsafe = np.where(has_data, weight_sum, np.float32(1.0))
+    weight_sum = None
+    nodata = ~has_data
+    del has_data
+
+    for _acc in (dtm_sum, dsm_sum, ndsm_sum):
+        np.divide(_acc, _wsafe, out=_acc)
+        _acc[nodata] = np.nan
+    del _wsafe, nodata, _acc
+    dtm_full, dsm_full, ndsm_full = dtm_sum, dsm_sum, ndsm_sum
+    dtm_sum = dsm_sum = ndsm_sum = None
+    best_cat_weight = None
+
+    # ------------------------------------------------------------------
+    # Merge boundary segments across tiles (before writing rasters)
+    # ------------------------------------------------------------------
+    _label_remap = {}
+    try:
+        _, _label_remap = _merge_boundary_segments(
+            labels_full, seg_type_full, all_objects,
+            tile_seg_results, full_left, full_top, res,
+            ndsm_full=ndsm_full, mark_uncertain=mark_uncertain)
+    except Exception as e:
+        log.warning("Full GPKG boundary merge failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Write stitched raster layers
+    # ------------------------------------------------------------------
+    _write_table('DTM', [dtm_full], full_h, full_w, full_tf,
+                 descs=['Digital Terrain Model (m)'])
+    del dtm_full
+
+    _write_table('DSM', [dsm_full], full_h, full_w, full_tf,
+                 descs=['Digital Surface Model (m)'])
+    del dsm_full
+
+    _write_table('nDSM', [ndsm_full], full_h, full_w, full_tf,
+                 descs=['Normalised DSM (m)'])
+    del ndsm_full
+
+    _write_table('segment_type', [seg_type_full], full_h, full_w, full_tf,
+                 dtype='uint8', descs=['Object type code'])
+    del seg_type_full
+
+    _write_table('segment_height', [seg_height_full], full_h, full_w, full_tf,
+                 descs=['Segment height (m)'])
+    del seg_height_full
+
+    # ------------------------------------------------------------------
+    # Multi-date DTM/DSM: one layer per additional date
+    # ------------------------------------------------------------------
+    import tile_index as _ti
+    import raster_io as _rio
+    other_dates = sorted(d for d in _ti.DATASETS if d != _ti.DEFAULT_DATASET)
+    for date_key in other_dates:
+        year = _ti.dataset_to_year(date_key)
+        # float32 accumulators (see the DTM block above — OOM budget).
+        dtm_sum2 = np.zeros((full_h, full_w), dtype=np.float32)
+        dsm_sum2 = np.zeros((full_h, full_w), dtype=np.float32)
+        wsum2 = np.zeros((full_h, full_w), dtype=np.float32)
+        any_data = False
+        for ti_idx, tr in enumerate(tile_seg_results):
+            _gpkg_heartbeat(f"DTM/DSM {year} tile {ti_idx + 1}/{_n_tiles_hb}")
+            th, tw = tr["shape"]
+            tile_left = tr["bounds_3035"][0]
+            tile_top = tr["bounds_3035"][3]
+            col_off = int(round((tile_left - full_left) / res))
+            row_off = int(round((full_top - tile_top) / res))
+            r_end = min(row_off + th, full_h)
+            c_end = min(col_off + tw, full_w)
+            th_eff = r_end - row_off
+            tw_eff = c_end - col_off
+            if th_eff <= 0 or tw_eff <= 0:
+                continue
+            try:
+                # Sidecar-first: skip BEV if the per-tile loop already wrote
+                # this multi-date layer to disk.
+                d2 = None
+                try:
+                    import tile_raster_sidecar as _trs
+                    d2 = _trs.load_dtm_dsm(
+                        DATA_DIR / "tile_checkpoints", kg_code, ti_idx, date_key)
+                except Exception:
+                    d2 = None
+                if d2 is not None:
+                    _sidecar_stat("dtm_multi_hit")
+                else:
+                    _sidecar_stat("dtm_multi_miss")
+                    d2 = _rio.read_dtm_dsm(box(*tr["bounds_3035"]), date_key)
+                    try:
+                        import tile_raster_sidecar as _trs
+                        _trs.persist_dtm_dsm(
+                            DATA_DIR / "tile_checkpoints", kg_code, ti_idx,
+                            d2, date_key)
+                    except Exception:
+                        pass
+                # Defensive shape clamp (off-by-one between nominal
+                # ``tr['shape']`` and BEV/sidecar arrays).
+                _mh, _mw = d2["dtm"].shape[:2]
+                th_eff_m = min(th_eff, _mh)
+                tw_eff_m = min(tw_eff, _mw)
+                r_end_m = row_off + th_eff_m
+                c_end_m = col_off + tw_eff_m
+                td = d2["dtm"][:th_eff_m, :tw_eff_m].astype(np.float32)
+                ts2 = d2["dsm"][:th_eff_m, :tw_eff_m].astype(np.float32)
+                del d2
+                fw = _feather_weight(th_eff_m, tw_eff_m, margin=100)
+                v = ~np.isnan(td)
+                w = np.where(v, fw, np.float32(0.0)).astype(np.float32)
+                dtm_sum2[row_off:r_end_m, col_off:c_end_m] += np.where(v, td, np.float32(0.0)) * w
+                dsm_sum2[row_off:r_end_m, col_off:c_end_m] += np.where(v, ts2, np.float32(0.0)) * w
+                wsum2[row_off:r_end_m, col_off:c_end_m] += w
+                any_data = True
+            except Exception:
+                pass
+        if any_data:
+            try:
+                hd2 = wsum2 > 0
+                _ws2 = np.where(hd2, wsum2, np.float32(1.0))
+                wsum2 = None
+                _nd2 = ~hd2
+                del hd2
+                # In-place normalise — the accumulators become the layers.
+                np.divide(dtm_sum2, _ws2, out=dtm_sum2)
+                dtm_sum2[_nd2] = np.nan
+                np.divide(dsm_sum2, _ws2, out=dsm_sum2)
+                dsm_sum2[_nd2] = np.nan
+                del _ws2, _nd2
+                dtm_extra, dsm_extra = dtm_sum2, dsm_sum2
+                dtm_sum2 = dsm_sum2 = None
+                _write_table(f'DTM_{year}', [dtm_extra], full_h, full_w, full_tf,
+                             descs=[f'DTM {year} (m)'])
+                _write_table(f'DSM_{year}', [dsm_extra], full_h, full_w, full_tf,
+                             descs=[f'DSM {year} (m)'])
+                log.info("  FULL_GPKG: DTM/DSM %d written", year)
+                del dtm_extra, dsm_extra
+            except Exception as e:
+                # Multi-date DTM/DSM is supplementary; skip on transient
+                # GDAL/GPKG failures (e.g. SetGeoTransform errors) so the
+                # primary GPKG completes. Matches gpkg_streamed.py policy.
+                log.warning("FULL_GPKG: multi-date %d failed: %s", year, e)
+        dtm_sum2 = dsm_sum2 = wsum2 = None
+
+    # ------------------------------------------------------------------
+    # Ortho + CIR: one layer per available ortho year
+    # ------------------------------------------------------------------
+    import ortho_io as _oio
+    import concurrent.futures as _cf
+    # Ortho year slots: map ortho_year → read_ortho_for_als year param
+    _ORTHO_YEARS = {2024: 2024, 2023: 2023, 2020: 2020}
+
+    def _stitch_ortho_for_year(o_year):
+        """Read ortho per tile for a given year, feather-blend into full-KG."""
+        # float32: uint8 sources × feather weights ≤ 1 over ≤ 4 tiles are
+        # exact well below 1 DN. float64 here was 40 B/px → 1.7 GB at
+        # 42 Mpx, the single largest gpkg_full allocation (OOM, Oct 2026).
+        ortho_sum = np.zeros((4, full_h, full_w), dtype=np.float32)
+        ortho_w = np.zeros((full_h, full_w), dtype=np.float32)
+        got_rgb = False
+        got_nir = False
+        for ti_idx, tr in enumerate(tile_seg_results):
+            _gpkg_heartbeat(f"ortho {o_year} tile {ti_idx + 1}/{_n_tiles_hb}")
+            th, tw = tr["shape"]
+            tile_left = tr["bounds_3035"][0]
+            tile_top = tr["bounds_3035"][3]
+            col_off = int(round((tile_left - full_left) / res))
+            row_off = int(round((full_top - tile_top) / res))
+            r_end = min(row_off + th, full_h)
+            c_end = min(col_off + tw, full_w)
+            th_eff = r_end - row_off
+            tw_eff = c_end - col_off
+            if th_eff <= 0 or tw_eff <= 0:
+                continue
+            try:
+                # Sidecar-first: ortho RGB(+NIR) stashed per (tile, year)
+                # during the per-tile loop — skip BEV entirely if present.
+                rgb_t = nir_t = None
+                try:
+                    import tile_raster_sidecar as _trs
+                    _hit = _trs.load_ortho(
+                        DATA_DIR / "tile_checkpoints", kg_code, ti_idx, o_year)
+                    if _hit is not None:
+                        rgb_t, nir_t = _hit
+                except Exception:
+                    pass
+                if rgb_t is not None:
+                    _sidecar_stat("ortho_hit")
+                else:
+                    _sidecar_stat("ortho_miss")
+                if rgb_t is None:
+                    tdata = _read_dtm_for_tile(tr, kg_code=kg_code, tile_idx=ti_idx)
+                    with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                        fut = _ex.submit(_oio.read_ortho_for_als, tdata, year=o_year)
+                        rgb_t, nir_t = fut.result(timeout=600)  # 10m — GPKG ortho read
+                    del tdata
+                    try:
+                        import tile_raster_sidecar as _trs
+                        _trs.persist_ortho(
+                            DATA_DIR / "tile_checkpoints", kg_code, ti_idx,
+                            rgb_t, nir_t, o_year)
+                    except Exception:
+                        pass
+                if rgb_t is not None:
+                    got_rgb = True
+                    # Defensive shape clamp — same reasoning as the DTM
+                    # block: BEV/sidecar arrays can be off-by-one from the
+                    # nominal tile shape; intersect everything so all
+                    # slices and the destination window match exactly.
+                    _oh, _ow = rgb_t[0].shape[:2]
+                    th_eff_o = min(th_eff, _oh)
+                    tw_eff_o = min(tw_eff, _ow)
+                    r_end_o = row_off + th_eff_o
+                    c_end_o = col_off + tw_eff_o
+                    fw = _feather_weight(th_eff_o, tw_eff_o, margin=100).astype(np.float32)
+                    for b in range(3):
+                        ortho_sum[b, row_off:r_end_o, col_off:c_end_o] += \
+                            rgb_t[b][:th_eff_o, :tw_eff_o].astype(np.float32) * fw
+                    if nir_t is not None:
+                        got_nir = True
+                        ortho_sum[3, row_off:r_end_o, col_off:c_end_o] += \
+                            nir_t[:th_eff_o, :tw_eff_o].astype(np.float32) * fw
+                    ortho_w[row_off:r_end_o, col_off:c_end_o] += fw
+            except Exception as e:
+                log.warning("GPKG tile %d ortho yr=%d failed: %s", ti_idx + 1, o_year, e)
+        # Normalise
+        has = ortho_w > 0
+        np.copyto(ortho_w, np.float32(1.0), where=~has)
+        ortho_arr = np.zeros((4, full_h, full_w), dtype=np.uint8)
+        for b in range(4):
+            _band = ortho_sum[b]
+            np.divide(_band, ortho_w, out=_band)
+            np.clip(_band, 0, 255, out=_band)
+            _band[~has] = 0
+            ortho_arr[b] = _band.astype(np.uint8)
+        del ortho_sum, ortho_w, has
+        return ortho_arr, got_rgb, got_nir
+
+    for o_year in sorted(_ORTHO_YEARS.keys(), reverse=True):  # newest first
+        try:
+            ortho_full, got_rgb, got_nir = _stitch_ortho_for_year(_ORTHO_YEARS[o_year])
+            if got_rgb:
+                bands = [ortho_full[0], ortho_full[1], ortho_full[2]]
+                descs = ['Red', 'Green', 'Blue']
+                if got_nir:
+                    bands.append(ortho_full[3])
+                    descs.append('NIR')
+                _write_table(f'Ortho_{o_year}', bands, full_h, full_w, full_tf,
+                             dtype='uint8', descs=descs)
+                if got_nir:
+                    _write_table(f'CIR_{o_year}',
+                                 [ortho_full[3], ortho_full[0], ortho_full[1]],
+                                 full_h, full_w, full_tf, dtype='uint8',
+                                 descs=['NIR\u2192Red', 'Red\u2192Green', 'Green\u2192Blue'])
+                log.info("  FULL_GPKG: Ortho+CIR %d written (NIR=%s)", o_year, got_nir)
+            else:
+                log.info("  FULL_GPKG: no ortho data for year %d", o_year)
+            del ortho_full
+        except Exception as e:
+            log.warning("FULL_GPKG: ortho year %d failed: %s", o_year, e)
+
+    # ------------------------------------------------------------------
+    # Copernicus NDVI (10m, resampled to 1m grid)
+    # ------------------------------------------------------------------
+    try:
+        cop_cache = _get_cop_cache()
+        ndvi_sum = np.zeros((full_h, full_w), dtype=np.float32)
+        ndvi_wsum = np.zeros((full_h, full_w), dtype=np.float32)
+        any_ndvi = False
+        for ti_idx, tr in enumerate(tile_seg_results):
+            _gpkg_heartbeat(f"NDVI tile {ti_idx + 1}/{_n_tiles_hb}")
+            bbox_wgs = tr["bbox_wgs"]
+            tw_t, ts_t, te_t, tn_t = bbox_wgs
+            bbox_dict = {"west": tw_t, "south": ts_t, "east": te_t, "north": tn_t}
+            nd = cop_cache.get_ndvi(bbox_dict, year=obs_year)
+            if nd and nd.get("ndvi") is not None:
+                from rasterio.warp import reproject, Resampling
+                src_arr = nd["ndvi"].astype(np.float32)
+                src_tf = nd["transform"]
+                src_crs = nd.get("crs", "EPSG:4326")
+                th_t, tw_t2 = tr["shape"]
+                tile_left = tr["bounds_3035"][0]
+                tile_top = tr["bounds_3035"][3]
+                col_off = int(round((tile_left - full_left) / res))
+                row_off = int(round((full_top - tile_top) / res))
+                r_end = min(row_off + th_t, full_h)
+                c_end = min(col_off + tw_t2, full_w)
+                th_eff = r_end - row_off
+                tw_eff = c_end - col_off
+                if th_eff <= 0 or tw_eff <= 0:
+                    continue
+                dst_tf = rasterio.transform.from_bounds(
+                    tile_left, tr["bounds_3035"][1],
+                    tr["bounds_3035"][2], tile_top, tw_t2, th_t)
+                dst_arr = np.full((th_t, tw_t2), np.nan, dtype=np.float32)
+                reproject(
+                    src_arr, dst_arr,
+                    src_transform=src_tf, src_crs=src_crs,
+                    dst_transform=dst_tf, dst_crs='EPSG:3035',
+                    resampling=Resampling.bilinear,
+                )
+                tile_data = dst_arr[:th_eff, :tw_eff]
+                fw = _feather_weight(th_eff, tw_eff, margin=100)
+                v = ~np.isnan(tile_data)
+                w = np.where(v, fw, np.float32(0.0)).astype(np.float32)
+                ndvi_sum[row_off:r_end, col_off:c_end] += np.where(v, tile_data, np.float32(0.0)).astype(np.float32) * w
+                ndvi_wsum[row_off:r_end, col_off:c_end] += w
+                any_ndvi = True
+        if any_ndvi:
+            hd = ndvi_wsum > 0
+            np.copyto(ndvi_wsum, np.float32(1.0), where=~hd)
+            np.divide(ndvi_sum, ndvi_wsum, out=ndvi_sum)
+            ndvi_sum[~hd] = np.nan
+            ndvi_full = ndvi_sum
+            ndvi_sum = ndvi_wsum = None
+            del hd
+            _write_table('NDVI', [ndvi_full], full_h, full_w, full_tf,
+                         descs=['Sentinel-2 NDVI composite'])
+            log.info("  FULL_GPKG: NDVI written")
+            del ndvi_full
+        ndvi_sum = ndvi_wsum = None
+    except Exception as e:
+        from tile_cache import CacheMissError as _CacheMissError
+        if isinstance(e, _CacheMissError) or isinstance(getattr(e, '__cause__', None), _CacheMissError):
+            raise
+        log.warning("FULL_GPKG: NDVI layer failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # ESA WorldCover (10m, resampled to 1m grid)
+    # ------------------------------------------------------------------
+    try:
+        cop_cache = _get_cop_cache()
+        wc_full = np.zeros((full_h, full_w), dtype=np.uint8)
+        any_wc = False
+        for ti_idx, tr in enumerate(tile_seg_results):
+            _gpkg_heartbeat(f"WorldCover tile {ti_idx + 1}/{_n_tiles_hb}")
+            bbox_wgs = tr["bbox_wgs"]
+            tw_t, ts_t, te_t, tn_t = bbox_wgs
+            bbox_dict = {"west": tw_t, "south": ts_t, "east": te_t, "north": tn_t}
+            lc = cop_cache.get_landcover(bbox_dict)
+            if lc and lc.get("map") is not None:
+                from rasterio.warp import reproject, Resampling
+                src_arr = lc["map"].astype(np.uint8)
+                src_tf = lc["transform"]
+                src_crs = lc.get("crs", "EPSG:4326")
+                th_t, tw_t2 = tr["shape"]
+                tile_left = tr["bounds_3035"][0]
+                tile_top = tr["bounds_3035"][3]
+                col_off = int(round((tile_left - full_left) / res))
+                row_off = int(round((full_top - tile_top) / res))
+                r_end = min(row_off + th_t, full_h)
+                c_end = min(col_off + tw_t2, full_w)
+                th_eff = r_end - row_off
+                tw_eff = c_end - col_off
+                if th_eff <= 0 or tw_eff <= 0:
+                    continue
+                dst_tf = rasterio.transform.from_bounds(
+                    tile_left, tr["bounds_3035"][1],
+                    tr["bounds_3035"][2], tile_top, tw_t2, th_t)
+                dst_arr = np.zeros((th_t, tw_t2), dtype=np.uint8)
+                reproject(
+                    src_arr, dst_arr,
+                    src_transform=src_tf, src_crs=src_crs,
+                    dst_transform=dst_tf, dst_crs='EPSG:3035',
+                    resampling=Resampling.nearest,
+                )
+                wc_full[row_off:r_end, col_off:c_end] = dst_arr[:th_eff, :tw_eff]
+                any_wc = True
+        if any_wc:
+            _write_table('WorldCover', [wc_full], full_h, full_w, full_tf,
+                         dtype='uint8', descs=['ESA WorldCover 2021 class'])
+            log.info("  FULL_GPKG: WorldCover written")
+        del wc_full
+    except Exception as e:
+        from tile_cache import CacheMissError as _CacheMissError
+        if isinstance(e, _CacheMissError) or isinstance(getattr(e, '__cause__', None), _CacheMissError):
+            raise
+        log.warning("FULL_GPKG: WorldCover layer failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Sentinel-1 SAR (VV + VH, 10m, resampled to 1m grid)
+    # ------------------------------------------------------------------
+    try:
+        cop_cache = _get_cop_cache()
+        vv_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
+        vh_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
+        any_sar = False
+        for ti_idx, tr in enumerate(tile_seg_results):
+            _gpkg_heartbeat(f"SAR tile {ti_idx + 1}/{_n_tiles_hb}")
+            bbox_wgs = tr["bbox_wgs"]
+            tw_t, ts_t, te_t, tn_t = bbox_wgs
+            bbox_dict = {"west": tw_t, "south": ts_t, "east": te_t, "north": tn_t}
+            sar = cop_cache.get_sar(bbox_dict, year=obs_year)
+            if sar:
+                from rasterio.warp import reproject, Resampling
+                th_t, tw_t2 = tr["shape"]
+                tile_left = tr["bounds_3035"][0]
+                tile_top = tr["bounds_3035"][3]
+                col_off = int(round((tile_left - full_left) / res))
+                row_off = int(round((full_top - tile_top) / res))
+                r_end = min(row_off + th_t, full_h)
+                c_end = min(col_off + tw_t2, full_w)
+                th_eff = r_end - row_off
+                tw_eff = c_end - col_off
+                if th_eff <= 0 or tw_eff <= 0:
+                    continue
+                dst_tf = rasterio.transform.from_bounds(
+                    tile_left, tr["bounds_3035"][1],
+                    tr["bounds_3035"][2], tile_top, tw_t2, th_t)
+                src_tf = sar["transform"]
+                src_crs = sar.get("crs", "EPSG:4326")
+                for band_name, full_arr in [("vv", vv_full), ("vh", vh_full)]:
+                    src_arr = sar.get(band_name)
+                    if src_arr is not None:
+                        src_arr = src_arr.astype(np.float32)
+                        dst_arr = np.full((th_t, tw_t2), np.nan, dtype=np.float32)
+                        reproject(
+                            src_arr, dst_arr,
+                            src_transform=src_tf, src_crs=src_crs,
+                            dst_transform=dst_tf, dst_crs='EPSG:3035',
+                            resampling=Resampling.bilinear,
+                        )
+                        full_arr[row_off:r_end, col_off:c_end] = dst_arr[:th_eff, :tw_eff]
+                        any_sar = True
+        if any_sar:
+            _write_table('SAR_VV', [vv_full], full_h, full_w, full_tf,
+                         descs=['Sentinel-1 VV (dB)'])
+            _write_table('SAR_VH', [vh_full], full_h, full_w, full_tf,
+                         descs=['Sentinel-1 VH (dB)'])
+            log.info("  FULL_GPKG: SAR_VV + SAR_VH written")
+        del vv_full, vh_full
+    except Exception as e:
+        from tile_cache import CacheMissError as _CacheMissError
+        if isinstance(e, _CacheMissError) or isinstance(getattr(e, '__cause__', None), _CacheMissError):
+            raise
+        log.warning("FULL_GPKG: SAR layer failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Hansen Global Forest Change (30m, resampled to 1m grid)
+    # ------------------------------------------------------------------
+    try:
+        hc = _get_hansen_cache()
+        tc_full = np.zeros((full_h, full_w), dtype=np.uint8)
+        ly_full = np.zeros((full_h, full_w), dtype=np.uint8)
+        any_hansen = False
+        for ti_idx, tr in enumerate(tile_seg_results):
+            _gpkg_heartbeat(f"Hansen tile {ti_idx + 1}/{_n_tiles_hb}")
+            bbox_wgs = tr["bbox_wgs"]
+            tw_t, ts_t, te_t, tn_t = bbox_wgs
+            th_t, tw_t2 = tr["shape"]
+            tile_left = tr["bounds_3035"][0]
+            tile_top = tr["bounds_3035"][3]
+            col_off = int(round((tile_left - full_left) / res))
+            row_off = int(round((full_top - tile_top) / res))
+            r_end = min(row_off + th_t, full_h)
+            c_end = min(col_off + tw_t2, full_w)
+            th_eff = r_end - row_off
+            tw_eff = c_end - col_off
+            if th_eff <= 0 or tw_eff <= 0:
+                continue
+            dst_tf = rasterio.transform.from_bounds(
+                tile_left, tr["bounds_3035"][1],
+                tr["bounds_3035"][2], tile_top, tw_t2, th_t)
+            hd = hc.get_forest_prior(
+                (tw_t, ts_t, te_t, tn_t), dst_tf, (th_t, tw_t2))
+            if hd:
+                tc = hd.get("treecover2000")
+                ly = hd.get("loss_year")
+                if tc is not None:
+                    tc_full[row_off:r_end, col_off:c_end] = tc[:th_eff, :tw_eff]
+                    any_hansen = True
+                if ly is not None:
+                    ly_full[row_off:r_end, col_off:c_end] = ly[:th_eff, :tw_eff]
+        if any_hansen:
+            _write_table('Hansen_treecover', [tc_full], full_h, full_w, full_tf,
+                         dtype='uint8', descs=['Tree cover 2000 (%)'])
+            _write_table('Hansen_lossyear', [ly_full], full_h, full_w, full_tf,
+                         dtype='uint8', descs=['Forest loss year (0=none, 1=2001, ..., 23=2023)'])
+            log.info("  FULL_GPKG: Hansen (treecover + lossyear) written")
+        del tc_full, ly_full
+    except Exception as e:
+        from tile_cache import CacheMissError as _CacheMissError
+        if isinstance(e, _CacheMissError) or isinstance(getattr(e, '__cause__', None), _CacheMissError):
+            raise
+        log.warning("FULL_GPKG: Hansen layer failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Segment vectors — one unified layer from stitched labels
+    # ------------------------------------------------------------------
+    if all_objects and tile_seg_results:
+        try:
+            mask_full = labels_full > 0
+            _write_segment_vectors(
+                out_path, labels_full, all_objects,
+                mask_full, full_tf, layer_name='segments', obs_year=obs_year)
+        except Exception as e:
+            log.warning("Full GPKG segment vectors failed: %s", e)
+    del labels_full
+
+    # Segment centroid points — one layer with all objects
+    if all_objects:
+        try:
+            _write_segment_points(out_path, all_objects,
+                                  layer_name='segment_points', obs_year=obs_year)
+        except Exception as e:
+            log.warning("Full GPKG segment points failed: %s", e)
+
+    # Write QGIS styles for all layers (raster + vector)
+    try:
+        _write_gpkg_all_styles(
+            out_path,
+            has_segments=bool(all_objects),
+            has_points=bool(all_objects),
+        )
+    except Exception as e:
+        log.warning("Full GPKG styles failed: %s", e)
+
+    # Fix CRS for uint8 raster layers (GDAL registers as 'tiles' not '2d-gridded-coverage')
+    _fix_gpkg_raster_crs(out_path)
+
+    fsize = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+    log.info("  FULL_GPKG: %.1f MB, %d tables, %d tiles",
+             fsize / 1e6, table_count, len(tile_seg_results))
+
+    # --- Phase 1 sidecar audit line (relayed via subprocess_warnings
+    # — parent step monitor pushes it into the merged 24h log so we
+    # can grep ?q=sidecar fleet-wide tomorrow and confirm gpkg_full is
+    # actually skipping BEV re-reads). Reads (BEV-eligible only):
+    # default DTM/DSM/nDSM (1 per tile), multi-date DTM/DSM (per year,
+    # per tile), ortho RGB+NIR (per year, per tile). hit_pct=100 means
+    # gpkg_full saw zero BEV calls; <50 means the sidecars weren't
+    # written (likely SIDECAR_MIN_FREE_GB tripped).
+    try:
+        s = _SIDECAR_STATS
+        hit = s["dtm_hit"] + s["dtm_multi_hit"] + s["ortho_hit"]
+        miss = s["dtm_miss"] + s["dtm_multi_miss"] + s["ortho_miss"]
+        tot = hit + miss
+        if tot > 0:
+            pct = (hit / tot) * 100.0
+            _summary = (
+                f"sidecar gpkg_full: "
+                f"dtm={s['dtm_hit']}/{s['dtm_hit']+s['dtm_miss']} "
+                f"dtm_multi={s['dtm_multi_hit']}/{s['dtm_multi_hit']+s['dtm_multi_miss']} "
+                f"ortho={s['ortho_hit']}/{s['ortho_hit']+s['ortho_miss']} "
+                f"hit_pct={pct:.0f}% (BEV reads saved: {hit}/{tot})"
+            )
+            log.info(_summary)
+            try:
+                import json as _j_sc
+                _warn_path = DATA_DIR / "subprocess_warnings.jsonl"
+                _entry = _j_sc.dumps({
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "level": "info",
+                    "msg": _summary,
+                    "step": "gpkg_full",
+                }) + "\n"
+                with open(_warn_path, "a") as _wf:
+                    _wf.write(_entry)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out_path, _label_remap
+
+
+def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
+                           cadastre_data, new_buildings, infrastructure,
+                           obs_year=0, mark_uncertain=False, label_remap=None,
+                           outline_profiler=None, out_path=None, v21_out=None,
+                           report_step=None, ne_declared=None):
+    """Light GPKG: stitched segment rasters + v2.1 layers (+ NE cells, v2.4).
+
+    v2.4: no cadastre vectors are written any more (``CADASTRE_PRODUCTS``).
+    ``ne_declared`` (``ne_h3.Section``, NEC1 of the parent KG) switches on
+    the observed-layer build; the ``.h3b`` product path + summary land in
+    ``v21_out["ne"]``.
+
+    ``out_path`` defaults to ``<code>_light.gpkg``; v2 passes
+    ``<code>_light_v2.gpkg`` (product key ``_light_gpkg_v2``).
+
+    ``v21_out`` (dict, v2 only): receives the product-2.1 JSON sections
+    (``terrain_grid25``, ``landcover_grid25``, ``acquisition``, ``n_apices``,
+    ``det_mode`` …) computed from the stitched arrays; the matching heavy
+    layers (``tree_apices`` points + R-tree, ``terrain_coarse_*`` 5 m
+    rasters) are written into this GPKG.  See docs/v2.1-product-spec.md."""
+    _rs = report_step or (lambda *a, **k: None)
+    import rasterio, fiona
+    import rasterio.transform
+    from fiona.crs import from_epsg
+
+    out_path = str(out_path or (GPKG_DIR / f"{kg_code}_light.gpkg"))
+    _purge_stale_gpkg(out_path)
+
+    table_count = 0
+    _GPKG_NODATA_L = -9999.0
+
+    def _write_raster(name, arrays, h, w, tf, dtype='uint8', descs=None):
+        nonlocal table_count
+        opts = dict(driver='GPKG', width=w, height=h, count=len(arrays),
+                    dtype=dtype, crs='EPSG:3035', transform=tf,
+                    RASTER_TABLE=name, RASTER_IDENTIFIER=name)
+        if dtype == 'float32': opts['nodata'] = _GPKG_NODATA_L
+        if table_count > 0: opts['APPEND_SUBDATASET'] = 'YES'
+        with rasterio.open(out_path, 'w', **opts) as dst:
+            if name == 'segment_type' and dtype == 'uint8':
+                # Colormap BEFORE pixels → palette PNG tiles. See the same block
+                # in build_full_gpkg_tiled._write_table; order is load-bearing.
+                try:
+                    dst.write_colormap(1, _segment_type_colormap())
+                except Exception as _e:
+                    log.warning("segment_type colormap write failed: %s", _e)
+            for i, arr in enumerate(arrays, 1):
+                band = arr[:h, :w]
+                if dtype == 'float32':
+                    band = np.where(np.isnan(band), _GPKG_NODATA_L, band)
+                dst.write(band, i)
+                if descs and i <= len(descs): dst.set_band_description(i, descs[i-1])
+        table_count += 1
+
+    obj_map = {o.obj_id: o for o in all_objects}
+
+    # ------------------------------------------------------------------
+    # Stitch segment rasters across all tiles into full-KG extent
+    # ------------------------------------------------------------------
+    # Check if tile arrays are available (monster KGs free them before this step)
+    _has_labels = any(tr.get("labels") is not None for tr in tile_seg_results)
+    if tile_seg_results and not _has_labels:
+        log.info("  Light GPKG: skipping raster stitching (tile arrays freed for memory)")
+    if tile_seg_results and _has_labels:
+        import raster_io as _rio_grid
+        full_left, full_bottom, full_right, full_top, full_w, full_h, full_tf = \
+            _rio_grid.full_grid_from_bounds([tr["bounds_3035"] for tr in tile_seg_results])
+        res = 1.0  # 1m resolution
+
+        # Allocate full-KG rasters for segments
+        seg_type_full = np.zeros((full_h, full_w), dtype=np.uint8)
+        seg_height_full = np.full((full_h, full_w), np.nan, dtype=np.float32)
+        labels_full = np.zeros((full_h, full_w), dtype=np.int32)
+        best_cat_weight = np.zeros((full_h, full_w), dtype=np.float32)
+
+        def _feather_weight_light(rows, cols, margin=100):
+            wy = np.ones(rows, dtype=np.float32)
+            wx = np.ones(cols, dtype=np.float32)
+            m = min(margin, rows // 2, cols // 2)
+            if m > 0:
+                ramp = np.linspace(0.0, 1.0, m, endpoint=False, dtype=np.float32)
+                wy[:m] = np.minimum(wy[:m], ramp)
+                wy[-m:] = np.minimum(wy[-m:], ramp[::-1])
+                wx[:m] = np.minimum(wx[:m], ramp)
+                wx[-m:] = np.minimum(wx[-m:], ramp[::-1])
+            return wy[:, None] * wx[None, :]
+
+        # Apply the full-GPKG boundary-merge remap *per tile, before* type
+        # painting.  ``_merge_boundary_segments`` (run by the full GPKG
+        # build) removes absorbed objects from ``all_objects``, so their
+        # label ids are no longer in ``obj_map`` — without this LUT every
+        # absorbed segment painted type 0 and never satisfied
+        # ``tile_valid``, leaving a hole exactly where a segment crossed a
+        # tile seam.  The post-paint remap below could not heal it (the px
+        # were never written).  2026-09-24: 26 fresh v2 KGs/day struck by
+        # ``segment_type_no_holes`` at 2.6–21 %% (58008-south 4.05 %%
+        # twice, deterministic) while their upgrade re-runs — no full GPKG,
+        # merge done inside this builder after painting — passed.
+        _remap_lut = None
+        if label_remap:
+            _max_lbl = max(max(label_remap), max(label_remap.values()))
+            for tr in tile_seg_results:
+                if tr.get("labels") is not None and tr["labels"].size:
+                    _max_lbl = max(_max_lbl, int(tr["labels"].max()))
+            _remap_lut = np.arange(_max_lbl + 1, dtype=np.int32)
+            for old_id, new_id in label_remap.items():
+                _remap_lut[old_id] = new_id
+            # flatten chains (a→b, b→c) so every absorbed id lands on a root
+            for _ in range(8):
+                nxt = _remap_lut[_remap_lut]
+                if np.array_equal(nxt, _remap_lut):
+                    break
+                _remap_lut = nxt
+
+        # Paint each tile (highest-weight-wins for categorical data)
+        for ti_idx, tr in enumerate(tile_seg_results):
+            th, tw = tr["shape"]
+            tile_left, tile_bottom, tile_right, tile_top = tr["bounds_3035"]
+
+            col_off = int(round((tile_left - full_left) / res))
+            row_off = int(round((full_top - tile_top) / res))
+
+            r_end = min(row_off + th, full_h)
+            c_end = min(col_off + tw, full_w)
+            th_eff = r_end - row_off
+            tw_eff = c_end - col_off
+            if th_eff <= 0 or tw_eff <= 0:
+                continue
+
+            if tr.get("labels") is not None:
+                _assert_tile_labels_consistent(tr, obj_map, ti_idx, kg_code)
+                labels_tile = tr["labels"][:th_eff, :tw_eff].astype(np.int32)
+                if _remap_lut is not None:
+                    labels_tile = _remap_lut[labels_tile]
+
+                type_tile = np.zeros((th_eff, tw_eff), dtype=np.uint8)
+                for uid in np.unique(labels_tile):
+                    if uid == 0: continue
+                    obj = obj_map.get(int(uid))
+                    if obj: type_tile[labels_tile == uid] = obj.type_code
+
+                cat_fw = _feather_weight_light(th_eff, tw_eff, margin=100)
+                # Only a pixel this tile actually segmented (label > 0) may win
+                # or raise the best-weight bar — see build_full_gpkg_tiled for the
+                # rotated-quad NaN-corner rationale (triangle-sliver fix).
+                # …and only for kept (core) objects — see build_full_gpkg_tiled.
+                tile_valid = (labels_tile > 0) & (type_tile > 0)
+                _bw = best_cat_weight[row_off:r_end, col_off:c_end]
+                wins = tile_valid & (cat_fw > _bw)
+                labels_full[row_off:r_end, col_off:c_end] = np.where(
+                    wins, labels_tile, labels_full[row_off:r_end, col_off:c_end])
+                seg_type_full[row_off:r_end, col_off:c_end] = np.where(
+                    wins, type_tile, seg_type_full[row_off:r_end, col_off:c_end])
+
+                if tr.get("ndsm") is not None:
+                    tile_sh = tr["ndsm"][:th_eff, :tw_eff].astype(np.float32)
+                    seg_height_full[row_off:r_end, col_off:c_end] = np.where(
+                        wins, tile_sh, seg_height_full[row_off:r_end, col_off:c_end])
+
+                best_cat_weight[row_off:r_end, col_off:c_end] = np.where(
+                    tile_valid, np.maximum(_bw, cat_fw), _bw)
+
+        del best_cat_weight
+
+        # Free heavy arrays from tile_seg_results — they've been copied
+        # into the full categorical arrays.  Reclaims ~10 bytes/px per
+        # tile (labels int32 + ndsm float32 + mask bool).
+        for tr in tile_seg_results:
+            tr.pop("labels", None)
+            tr.pop("ndsm", None)
+            tr.pop("mask", None)
+
+        from gpkg_streamed import _CATEGORICAL_PIXEL_LIMIT
+        _skip_merge = (full_h * full_w > _CATEGORICAL_PIXEL_LIMIT)
+
+        # Label remap from the full GPKG boundary merge was applied per tile
+        # (``_remap_lut``) before painting, so labels_full / seg_type_full
+        # already carry survivor ids + types here.
+        if label_remap:
+            log.info("  Light GPKG: applied %d label remaps from full GPKG merge (per-tile LUT)",
+                     len(label_remap))
+        elif _skip_merge:
+            log.info("  Light GPKG: skipping boundary merge (%.0f Mpx > %.0f Mpx limit)",
+                     full_h * full_w / 1e6, _CATEGORICAL_PIXEL_LIMIT / 1e6)
+        else:
+            # Fallback: run merge ourselves (e.g. if full GPKG was skipped)
+            try:
+                _merge_boundary_segments(
+                    labels_full, seg_type_full, all_objects,
+                    tile_seg_results, full_left, full_top, res,
+                    mark_uncertain=mark_uncertain)
+            except Exception as e:
+                log.warning("Light GPKG boundary merge failed: %s", e)
+
+        # --- v2.1: coarse indexes + apex inventory on the stitched arrays ---
+        _v21_coarse = None
+        _v21_apex_rows = None
+        if v21_out is not None:
+            try:
+                import v21_products as _v21
+                _t21 = time.time()
+                _rs("gpkg_light", "v2.1 terrain grid25")
+                _v21_coarse = _v21.stitch_coarse(tile_seg_results)
+                _tg = _v21.terrain_grid25(_v21_coarse) if _v21_coarse else None
+                if _tg:
+                    v21_out["terrain_grid25"] = _tg
+                    _lc = _v21.landcover_grid25(seg_type_full, full_left, full_top, res, _v21_coarse)
+                    if _lc:
+                        v21_out["landcover_grid25"] = _lc
+                _acq = _v21.acquisition_section(tile_seg_results)
+                if _acq:
+                    v21_out["acquisition"] = _acq
+                _rs("gpkg_light", f"v2.1 tree apices ({full_h * full_w / 1e6:.0f} Mpx nDSM)")
+                _bg = [b["geometry"] for b in cadastre_data.get("building_footprints", [])
+                       if b.get("geometry") is not None and not b["geometry"].is_empty]
+                _di = {}
+                _v21_crowns = []
+                _v21_canopy_counts = []
+                _lc25 = v21_out.get("landcover_grid25")
+                _g25 = ({"x0": _lc25["x0"], "y0": _lc25["y0"], "rows": _lc25["rows"], "cols": _lc25["cols"]}
+                        if _lc25 else None)
+                _v21_apex_rows = _v21.build_tree_apices(
+                    seg_height_full, full_tf, seg_type_full, labels_full, all_objects,
+                    tile_seg_results, _bg, det_info=_di, grid25=_g25,
+                    crowns_out=_v21_crowns, canopy_counts_out=_v21_canopy_counts)
+                if _lc25 and _v21_canopy_counts and _v21_canopy_counts[0] is not None:
+                    _v21.attach_canopy_frac(_lc25, _v21_canopy_counts[0])
+                v21_out["n_apices"] = len(_v21_apex_rows)
+                v21_out["n_crowns"] = len(_v21_crowns)
+                v21_out["det_mode"] = "ndsm_only"
+                v21_out["det_info"] = _di
+                v21_out["apex_seconds"] = round(time.time() - _t21, 1)
+                log.info("  v2.1: grid25 %s, %d tree apices in %.0fs (%s)",
+                         f"{_tg['cols']}x{_tg['rows']}" if _tg else "n/a",
+                         len(_v21_apex_rows), time.time() - _t21, _di)
+            except Exception as _e:  # noqa: BLE001
+                log.warning("  v2.1 index/apex build failed: %s", _e, exc_info=True)
+                _v21_apex_rows = None
+            # --- v2.4: NE cells — observed layer + .h3b product -------------
+            # Same arrays (seg_type / nDSM / labels) + the apex inventory; the
+            # declared layer (NEC1) is the parent's frozen cell set.  Failure
+            # here is a product defect (``ne_cells`` → '-partial'), never fatal.
+            if ne_declared is not None:
+                try:
+                    import ne_h3 as _neh
+                    from object_segmentation import ALL_TYPE_NAMES as _ATN
+                    _tne = time.time()
+                    _rs("gpkg_light", f"v2.4 NE cells ({ne_declared.header.get('cells_n')} res-12 cells)")
+                    _obs = _neh.build_observed(
+                        ne_declared, seg_type_full, seg_height_full, labels_full, all_objects,
+                        full_tf, _ATN, apex_rows=_v21_apex_rows or [],
+                        tile_seg_results=tile_seg_results, kg=ne_declared.header.get("kg", kg_code),
+                        coarse=_v21_coarse,
+                        heartbeat=lambda _d: _gpkg_heartbeat(f"v2.4 NE cells: {_d}"))
+                    _h3b_path = str(Path(out_path).with_name(f"{kg_code}_ne.h3b"))
+                    _is_block = "-" in str(kg_code)
+                    _hdr = _neh.write_h3b(_h3b_path, ne_declared, _obs, kg_code, PRODUCT_VERSION,
+                                          extra_header={"block": kg_code if _is_block else None,
+                                                        "parent_kg": ne_declared.header.get("kg"),
+                                                        "partial_cells": _is_block})
+                    _chk = _neh.verify_h3b(_h3b_path, expected_declared_digest=ne_declared.digest)
+                    if not _chk["ok"]:
+                        raise RuntimeError("h3b self-check failed: " + "; ".join(_chk["errors"]))
+                    v21_out["ne"] = {"h3b_path": _h3b_path, "summary": _neh.json_section(_obs, _hdr),
+                                     "neo1_section": _obs["neo1"] if not _is_block else None,
+                                     # bevdirect build → NEC1+NEO1 container post (umfeld stores it as ``bev``)
+                                     "nec1_section": (_neh.nec1_bytes(ne_declared)
+                                                      if not _is_block and _neh.is_bev_declared(ne_declared) else None),
+                                     "declared_digest": ne_declared.digest,
+                                     "declared_source": ne_declared.header.get("source"),
+                                     "seconds": round(time.time() - _tne, 1)}
+                    log.info("  v2.4: NE cells %d observed / %d, %d trees, %d man-made, %d chunks, %.0f KB, %.0fs",
+                             _obs["summary"]["observed"]["cells_observed"], len(_obs["cell_ids"]),
+                             _obs["summary"]["observed"]["trees_n"], _obs["summary"]["observed"]["manmade_n"],
+                             len(_hdr["chunks"]), os.path.getsize(_h3b_path) / 1e3, time.time() - _tne)
+                except Exception as _e:  # noqa: BLE001
+                    log.warning("  v2.4 NE cells build failed: %s", _e, exc_info=True)
+                    v21_out["ne"] = {"error": str(_e)[:200]}
+
+        # Write stitched segment rasters
+        _write_raster('segment_type', [seg_type_full], full_h, full_w, full_tf,
+                      descs=['Object type code'])
+        del seg_type_full
+
+        _write_raster('segment_height', [seg_height_full], full_h, full_w, full_tf,
+                      dtype='float32', descs=['Segment height (m)'])
+        del seg_height_full
+
+        # Segment vectors — one unified layer from stitched labels
+        if all_objects:
+            try:
+                mask_full = labels_full > 0
+                _write_segment_vectors(
+                    out_path, labels_full, all_objects,
+                    mask_full, full_tf, layer_name='segments', obs_year=obs_year)
+            except Exception as e:
+                log.warning("Light GPKG segment vectors failed: %s", e)
+        del labels_full
+
+        # --- v2.1 heavy layers: terrain_coarse_* (5 m) + tree_apices (R-tree) ---
+        if v21_out is not None:
+            try:
+                import v21_products as _v21
+                if _v21_coarse:
+                    _rs("gpkg_light", "v2.1 terrain_coarse rasters")
+                    v21_out["terrain_coarse_tables"] = _v21.write_terrain_coarse(out_path, _v21_coarse)
+                if _v21_apex_rows:
+                    _rs("gpkg_light", f"v2.1 tree_apices ({len(_v21_apex_rows)} pts)")
+                    v21_out["n_apices_written"] = _v21.write_tree_apices(out_path, _v21_apex_rows)
+                    if _v21_crowns:
+                        _rs("gpkg_light", f"v2.2 tree_crowns ({len(_v21_crowns)} polys)")
+                        v21_out["n_crowns_written"] = _v21.write_tree_crowns(out_path, _v21_crowns)
+                    log.info("  v2.2: wrote %d tree_apices, %d tree_crowns + %d terrain_coarse tables",
+                             v21_out.get("n_apices_written", 0), v21_out.get("n_crowns_written", 0),
+                             len(v21_out.get("terrain_coarse_tables") or []))
+            except Exception as _e:  # noqa: BLE001
+                log.warning("  v2.1 layer write failed: %s", _e, exc_info=True)
+            _v21_coarse = None
+            _v21_apex_rows = None
+            _v21_crowns = None
+
+    # --- Lazy DTM loading with LRU eviction for GPKG parcel/building enrichment ---
+    # Pre-loading all tiles is prohibitive for large KGs (56 tiles × ~70 MB
+    # DTM+terrain = ~4 GB).  Instead, load on demand and keep a bounded cache.
+    from terrain_analysis import compute_slope, compute_aspect, compute_tri, compute_tpi
+    from collections import OrderedDict
+    _MAX_CACHED_TILES = 6  # keep at most 6 tiles (~420 MB)
+    _gpkg_tile_data = OrderedDict()  # ti_idx → tdata (LRU order)
+
+    def _gpkg_load_tile(ti_idx, tr):
+        """Load DTM + terrain for one tile, evicting oldest if cache full."""
+        if ti_idx in _gpkg_tile_data:
+            _gpkg_tile_data.move_to_end(ti_idx)
+            return _gpkg_tile_data[ti_idx]
+        try:
+            tdata = _read_dtm_for_tile(tr)
+        except Exception:
+            return None
+        dtm_arr = tdata["dtm"]
+        tdata["slope"] = compute_slope(dtm_arr)
+        tdata["aspect"] = compute_aspect(dtm_arr)
+        tdata["tri"] = compute_tri(dtm_arr)
+        tdata["tpi"] = compute_tpi(dtm_arr, radius=5)
+        _gpkg_tile_data[ti_idx] = tdata
+        while len(_gpkg_tile_data) > _MAX_CACHED_TILES:
+            _gpkg_tile_data.popitem(last=False)
+        return tdata
+
+    def _gpkg_find_tile(e3035, n3035):
+        for ti_idx, tr in enumerate(tile_seg_results):
+            left, bottom, right, top = tr["bounds_3035"]
+            if left <= e3035 <= right and bottom <= n3035 <= top:
+                td = _gpkg_load_tile(ti_idx, tr)
+                if td is not None:
+                    return tr, td
+        return None, None
+
+    # --- Parcels (enriched from tiles) ---
+    parcels = cadastre_data["parcels"]
+    if parcels and CADASTRE_PRODUCTS:   # v2.4: never — kept one release for reference
+        schema_p = {'geometry': 'MultiPolygon', 'properties': [
+            ('parcel_id', 'str'), ('area_sqm', 'float'),
+            ('centroid_dtm_m', 'float'), ('centroid_lon', 'float'), ('centroid_lat', 'float'),
+            ('elevation_min_m', 'float'), ('elevation_max_m', 'float'), ('elevation_range_m', 'float'),
+            ('slope_mean_deg', 'float'), ('aspect_mean_deg', 'float'), ('aspect_dominant', 'str'),
+            ('tri_mean', 'float'), ('tpi_mean', 'float'), ('terrain_class', 'str'),
+            ('vertex_heights', 'str')]}
+        with fiona.open(out_path, 'w', driver='GPKG', layer='parcels',
+                        schema=schema_p, crs=from_epsg(4326)) as dst:
+            for p in parcels:
+                geom_wgs = p["geometry_wgs"]
+                props = {"parcel_id": p["parcel_id"], "area_sqm": p["area_sqm"],
+                         "centroid_dtm_m": None, "centroid_lon": None, "centroid_lat": None,
+                         "elevation_min_m": None, "elevation_max_m": None, "elevation_range_m": None,
+                         "slope_mean_deg": None, "aspect_mean_deg": None, "aspect_dominant": None,
+                         "tri_mean": None, "tpi_mean": None, "terrain_class": None,
+                         "vertex_heights": None}
+                try:
+                    c3 = p["geometry"].centroid
+                    c_wgs = transform_to_wgs(c3)
+                    props["centroid_lon"] = round(c_wgs.x, 7)
+                    props["centroid_lat"] = round(c_wgs.y, 7)
+                    tr, tdata = _gpkg_find_tile(c3.x, c3.y)
+                    if tr and tdata:
+                        tf = tdata["transform"]
+                        dtm_arr = tdata["dtm"]
+                        dh, dw = dtm_arr.shape
+                        col = int((c3.x - tf.c) / tf.a)
+                        row = int((tf.f - c3.y) / abs(tf.e))
+                        if 0 <= row < dh and 0 <= col < dw:
+                            val = float(dtm_arr[row, col])
+                            if np.isfinite(val): props["centroid_dtm_m"] = round(val, 2)
+                        # Full terrain over parcel footprint (uses pre-computed terrain arrays)
+                        try:
+                            from rasterio.features import geometry_mask as _gm
+                            pmask = _gm([mapping(p["geometry"])], out_shape=(dh, dw),
+                                        transform=tf, invert=True)
+                            pv = pmask & np.isfinite(dtm_arr)
+                            if np.sum(pv) > 4:
+                                dtm_pv = dtm_arr[pv]
+                                e_min = float(np.nanmin(dtm_pv))
+                                e_max = float(np.nanmax(dtm_pv))
+                                props["elevation_min_m"] = round(e_min, 2)
+                                props["elevation_max_m"] = round(e_max, 2)
+                                props["elevation_range_m"] = round(e_max - e_min, 2)
+                                props["slope_mean_deg"] = round(float(np.nanmean(tdata["slope"][pv])), 1)
+                                tri_val = float(np.nanmean(tdata["tri"][pv]))
+                                props["tri_mean"] = round(tri_val, 3)
+                                tpi_v = tdata["tpi"][pv]; tpi_v = tpi_v[np.isfinite(tpi_v)]
+                                if len(tpi_v) > 0:
+                                    props["tpi_mean"] = round(float(np.nanmean(tpi_v)), 3)
+                                # Terrain class from TRI
+                                if tri_val < 0.1: props["terrain_class"] = "level"
+                                elif tri_val < 0.3: props["terrain_class"] = "nearly_level"
+                                elif tri_val < 0.8: props["terrain_class"] = "slightly_rugged"
+                                elif tri_val < 1.5: props["terrain_class"] = "intermediately_rugged"
+                                elif tri_val < 3.0: props["terrain_class"] = "moderately_rugged"
+                                elif tri_val < 6.0: props["terrain_class"] = "highly_rugged"
+                                else: props["terrain_class"] = "extremely_rugged"
+                                # Aspect (circular mean)
+                                asp_vals = tdata["aspect"][pv]
+                                asp_nf = asp_vals[asp_vals >= 0]
+                                if len(asp_nf) > 0:
+                                    rad = np.radians(asp_nf)
+                                    mean_asp = float(np.degrees(np.arctan2(
+                                        np.mean(np.sin(rad)), np.mean(np.cos(rad))))) % 360
+                                    props["aspect_mean_deg"] = round(mean_asp, 1)
+                                    _dirs = [("N",0,45),("NE",45,90),("E",90,135),("SE",135,180),
+                                             ("S",180,225),("SW",225,270),("W",270,315),("NW",315,360)]
+                                    props["aspect_dominant"] = next(
+                                        (n for n,lo,hi in _dirs if lo <= mean_asp < hi), "N")
+                                else:
+                                    props["aspect_mean_deg"] = -1.0
+                                    props["aspect_dominant"] = "flat"
+                        except Exception:
+                            pass
+                        # Vertex heights (AMS anchor points)
+                        try:
+                            verts = []
+                            if geom_wgs.geom_type == 'Polygon':
+                                rings = [geom_wgs.exterior] + list(geom_wgs.interiors)
+                            elif geom_wgs.geom_type == 'MultiPolygon':
+                                rings = []
+                                for poly in geom_wgs.geoms:
+                                    rings.append(poly.exterior)
+                                    rings.extend(poly.interiors)
+                            else:
+                                rings = []
+                            for ring in rings:
+                                for x, y in ring.coords:
+                                    pt_3035 = _tx_to_3035.transform(x, y)
+                                    vc = int((pt_3035[0] - tf.c) / tf.a)
+                                    vr = int((tf.f - pt_3035[1]) / abs(tf.e))
+                                    dtm_val = None
+                                    if 0 <= vr < dh and 0 <= vc < dw:
+                                        v = float(dtm_arr[vr, vc])
+                                        if np.isfinite(v): dtm_val = round(v, 2)
+                                    verts.append(f"{round(y,7)},{round(x,7)},{dtm_val}")
+                            if verts:
+                                props["vertex_heights"] = "|".join(verts)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                dst.write({'geometry': _to_multi(mapping(geom_wgs)), 'properties': props})
+
+    # --- Buildings (enriched from tiles) ---
+    bldgs = cadastre_data["building_footprints"]
+    if bldgs and CADASTRE_PRODUCTS:     # v2.4: never
+        from rasterio.features import rasterize as rio_rasterize
+        # Build address lookup for GPKG building enrichment
+        _addr_list_gpkg = cadastre_data.get("building_addresses", [])
+        _addr_lk = {}
+        for a in _addr_list_gpkg:
+            ag = a.get("geometry_3035")
+            if ag:
+                key = (round(ag.x / 10) * 10, round(ag.y / 10) * 10)
+                _addr_lk.setdefault(key, []).append(a)
+
+        def _find_addr_gpkg(c3, max_dist=30):
+            cx, cy = c3.x, c3.y
+            best, best_d = None, max_dist
+            for dx in (-10, 0, 10):
+                for dy in (-10, 0, 10):
+                    key = (round((cx+dx)/10)*10, round((cy+dy)/10)*10)
+                    for a in _addr_lk.get(key, []):
+                        d = c3.distance(a["geometry_3035"])
+                        if d < best_d:
+                            best, best_d = a, d
+            return best
+
+        schema_b = {'geometry': 'MultiPolygon', 'properties': [
+            ('building_id', 'str'), ('ns', 'int'),
+            ('full_address', 'str'), ('house_number', 'str'),
+            ('street', 'str'), ('postal_code', 'str'), ('location', 'str'),
+            ('max_height_m', 'float'), ('mean_height_m', 'float'),
+            ('dsm_std', 'float'), ('roof_type_hint', 'str'),
+            ('stories_est', 'int'), ('footprint_area_sqm', 'float'),
+            ('centroid_lon', 'float'), ('centroid_lat', 'float'),
+            ('centroid_dtm_m', 'float'), ('vertex_heights', 'str')]}
+        with fiona.open(out_path, 'w', driver='GPKG', layer='buildings',
+                        schema=schema_b, crs=from_epsg(4326)) as dst:
+            for b in bldgs:
+                geom_3035 = b["geometry"]
+                geom_wgs = b["geometry_wgs"]
+                bp = b.get("properties", {})
+                props = {"building_id": "", "ns": None,
+                         "full_address": "", "house_number": "",
+                         "street": "", "postal_code": "", "location": "",
+                         "max_height_m": None, "mean_height_m": None, "dsm_std": None,
+                         "roof_type_hint": "", "stories_est": None,
+                         "footprint_area_sqm": round(float(geom_3035.area), 1),
+                         "centroid_lon": None, "centroid_lat": None,
+                         "centroid_dtm_m": None, "vertex_heights": None}
+                if bp.get("ns"): props["ns"] = bp["ns"]
+                try:
+                    c3 = geom_3035.centroid
+                    addr = _find_addr_gpkg(c3)
+                    if addr:
+                        props["building_id"] = addr.get("building_id", "")
+                        for ak in ("full_address", "house_number", "street", "postal_code", "location"):
+                            v = addr.get(ak, "")
+                            if v: props[ak] = v
+                except Exception:
+                    pass
+                try:
+                    c3 = geom_3035.centroid
+                    c_wgs = transform_to_wgs(c3)
+                    props["centroid_lon"] = round(c_wgs.x, 7)
+                    props["centroid_lat"] = round(c_wgs.y, 7)
+                    tr, tdata = _gpkg_find_tile(c3.x, c3.y)
+                    if tr and tdata:
+                        dh, dw = tdata["shape"]
+                        fp = rio_rasterize(
+                            [(geom_3035, 1)], out_shape=(dh, dw),
+                            transform=tdata["transform"],
+                            fill=0, dtype=np.uint8, all_touched=True).astype(bool)
+                        oh = tdata["ndsm"][fp]; oh = oh[np.isfinite(oh)]
+                        dv = tdata["dsm"][fp]; dv = dv[np.isfinite(dv)]
+                        if len(oh) > 0:
+                            mh = float(np.nanmax(oh))
+                            props["max_height_m"] = round(mh, 2)
+                            props["mean_height_m"] = round(float(np.nanmean(oh)), 2)
+                            props["dsm_std"] = round(float(np.std(dv)), 2) if len(dv) > 0 else 0.0
+                            props["roof_type_hint"] = "flat" if props["dsm_std"] < 1.5 else "pitched"
+                            props["stories_est"] = max(1, round(mh / 3.0))
+                        # Centroid DTM elevation
+                        tf_b = tdata["transform"]
+                        col_b = int((c3.x - tf_b.c) / tf_b.a)
+                        row_b = int((tf_b.f - c3.y) / abs(tf_b.e))
+                        if 0 <= row_b < dh and 0 <= col_b < dw:
+                            dtm_v = float(tdata["dtm"][row_b, col_b])
+                            if np.isfinite(dtm_v):
+                                props["centroid_dtm_m"] = round(dtm_v, 2)
+                        # Vertex heights (AMS anchor points)
+                        try:
+                            verts = []
+                            if geom_wgs.geom_type == 'Polygon':
+                                b_rings = [geom_wgs.exterior] + list(geom_wgs.interiors)
+                            elif geom_wgs.geom_type == 'MultiPolygon':
+                                b_rings = []
+                                for poly in geom_wgs.geoms:
+                                    b_rings.append(poly.exterior)
+                                    b_rings.extend(poly.interiors)
+                            else:
+                                b_rings = []
+                            dtm_b = tdata["dtm"]; ndsm_b = tdata["ndsm"]
+                            for ring in b_rings:
+                                for x, y in ring.coords:
+                                    pt_3035 = _tx_to_3035.transform(x, y)
+                                    vc = int((pt_3035[0] - tf_b.c) / tf_b.a)
+                                    vr = int((tf_b.f - pt_3035[1]) / abs(tf_b.e))
+                                    dtm_val = obj_h = None
+                                    if 0 <= vr < dh and 0 <= vc < dw:
+                                        dv2 = float(dtm_b[vr, vc])
+                                        if np.isfinite(dv2): dtm_val = round(dv2, 2)
+                                        nv = float(ndsm_b[vr, vc])
+                                        if np.isfinite(nv): obj_h = round(nv, 2)
+                                    verts.append(f"{round(y,7)},{round(x,7)},{dtm_val},{obj_h}")
+                            if verts:
+                                props["vertex_heights"] = "|".join(verts)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                dst.write({'geometry': _to_multi(mapping(geom_wgs)), 'properties': props})
+    _gpkg_tile_data.clear()  # free memory (closure cell of _gpkg_load_tile)
+
+    # --- New buildings ---
+    if new_buildings:
+        schema_nb = {'geometry': 'MultiPolygon', 'properties': [
+            ('type', 'str'), ('area_sqm', 'float'), ('max_height_m', 'float'),
+            ('stories_est', 'int'), ('roof_type_hint', 'str'), ('confidence', 'float'),
+            ('rf_confidence', 'float'), ('rf_type', 'str'), ('classifier', 'str'),
+            ('centroid_lon', 'float'), ('centroid_lat', 'float'), ('edge_clipped', 'bool')]}
+        with fiona.open(out_path, 'w', driver='GPKG', layer='new_buildings',
+                        schema=schema_nb, crs=from_epsg(4326)) as dst:
+            for nb in new_buildings:
+                dst.write({'geometry': _to_multi(nb["geometry_wgs"]), 'properties': {
+                    'type': nb.get('type','roof'), 'area_sqm': nb.get('area_sqm',0),
+                    'max_height_m': nb.get('max_height_m',0), 'stories_est': nb.get('stories_est',1),
+                    'roof_type_hint': nb.get('roof_type_hint',''), 'confidence': nb.get('confidence',0),
+                    'rf_confidence': nb.get('rf_confidence', 0),
+                    'rf_type': nb.get('rf_type', ''),
+                    'classifier': nb.get('classifier_source', 'rules'),
+                    'centroid_lon': nb.get('centroid_lon'), 'centroid_lat': nb.get('centroid_lat'),
+                    'edge_clipped': nb.get('edge_clipped', False)}})
+
+    # --- Infrastructure ---
+    if infrastructure:
+        schema_i = {'geometry': 'MultiPolygon', 'properties': [
+            ('type', 'str'), ('area_sqm', 'float'), ('volume_m3', 'float'),
+            ('max_height_m', 'float'), ('est_parking_spots', 'int'),
+            ('confidence', 'float'), ('rf_confidence', 'float'),
+            ('rf_type', 'str'), ('classifier', 'str'),
+            ('centroid_lon', 'float'), ('centroid_lat', 'float'),
+            ('edge_clipped', 'bool')]}
+        with fiona.open(out_path, 'w', driver='GPKG', layer='infrastructure',
+                        schema=schema_i, crs=from_epsg(4326)) as dst:
+            for inf in infrastructure:
+                dst.write({'geometry': _to_multi(inf["geometry_wgs"]), 'properties': {
+                    'type': inf.get('type',''), 'area_sqm': inf.get('area_sqm',0),
+                    'volume_m3': inf.get('volume_m3'), 'max_height_m': inf.get('max_height_m'),
+                    'est_parking_spots': inf.get('est_parking_spots'),
+                    'confidence': inf.get('confidence',0),
+                    'rf_confidence': inf.get('rf_confidence', 0),
+                    'rf_type': inf.get('rf_type', ''),
+                    'classifier': inf.get('classifier_source', 'rules'),
+                    'centroid_lon': inf.get('centroid_lon'), 'centroid_lat': inf.get('centroid_lat'),
+                    'edge_clipped': inf.get('edge_clipped', False)}})
+
+    # Segment centroid points — one layer with all objects
+    if all_objects:
+        try:
+            _write_segment_points(out_path, all_objects,
+                                  layer_name='segment_points', obs_year=obs_year)
+        except Exception as e:
+            log.warning("Light GPKG segment points failed: %s", e)
+
+    # Write QGIS styles for all layers
+    try:
+        _write_gpkg_all_styles(
+            out_path,
+            has_segments=bool(all_objects),
+            has_points=bool(all_objects),
+            has_parcels=bool(cadastre_data.get("parcels")) and CADASTRE_PRODUCTS,
+            has_buildings=bool(cadastre_data.get("building_footprints")) and CADASTRE_PRODUCTS,
+            has_new_buildings=bool(new_buildings),
+            has_infrastructure=bool(infrastructure),
+        )
+    except Exception as e:
+        log.warning("Light GPKG styles failed: %s", e)
+
+    # Fix CRS for uint8 raster layers (GDAL registers as 'tiles' not '2d-gridded-coverage')
+    _fix_gpkg_raster_crs(out_path)
+
+    # v2: parcel outline elevation profiles — v2.4: never written (cadastre-shaped)
+    if outline_profiler is not None and CADASTRE_PRODUCTS:
+        try:
+            import sys as _sys
+            _sv2 = str(Path(__file__).resolve().parent / "segv2")
+            if _sv2 not in _sys.path:
+                _sys.path.insert(0, _sv2)
+            import parcel_elevation as _pe
+            n = _pe.write_gpkg_table(out_path, outline_profiler.gpkg_rows())
+            log.info("  LIGHT_GPKG: %s written (%d parcels)", _pe.GPKG_TABLE, n)
+        except Exception as e:
+            log.warning("Light GPKG parcel_outline_z failed: %s", e)
+
+    return out_path
+
+
+# === SECTION: Data quality scoring ===
+
+# Weight each data source by its contribution to segmentation quality.
+# DTM+DSM are essential (segmentation fails without them).
+# Ortho and Copernicus NDVI provide spectral features for RF classification.
+# SAR, harmonics, worldcover, and hansen are supplementary.
+_QUALITY_WEIGHTS = {
+    "dtm":              0.15,
+    "dsm":              0.15,
+    "ortho":            0.15,
+    "copernicus_ndvi":  0.12,
+    "sar":              0.08,
+    "worldcover":       0.06,
+    "harmonics":        0.06,
+    "hansen":           0.05,
+    "multi_date_dtm":   0.05,
+    "terrain":          0.03,
+    "cadastre_buildings": 0.05,
+    "infrastructure":   0.02,
+    "segmentation":     0.03,
+}
+
+
+def compute_data_quality(tile_data_availability: list[dict]) -> dict:
+    """Compute data quality score and summary from per-tile availability.
+
+    Returns a dict with:
+      - quality_score: 0.0–1.0 (pixel-weighted across tiles)
+      - quality_grade: A/B/C/D/F
+      - layers_summary: per-layer fraction of tiles that had it
+      - tiles: per-tile availability list
+      - missing_layers: layers that were absent from ALL tiles
+      - available_layers: layers present in ALL tiles
+      - partial_layers: layers present in some but not all tiles
+    """
+    if not tile_data_availability:
+        return {
+            "quality_score": 0.0, "quality_grade": "F",
+            "layers_summary": {}, "tiles": [],
+            "missing_layers": list(_QUALITY_WEIGHTS.keys()),
+            "available_layers": [], "partial_layers": [],
+        }
+
+    layer_keys = list(_QUALITY_WEIGHTS.keys())
+    total_weight = sum(_QUALITY_WEIGHTS.values())
+
+    # Pixel-weighted quality: tiles with more valid pixels count more
+    total_pixels = sum(t.get("valid_pixels", 0) for t in tile_data_availability)
+    if total_pixels == 0:
+        total_pixels = len(tile_data_availability)  # fallback: equal weight
+
+    weighted_score = 0.0
+    layer_counts = {k: 0 for k in layer_keys}
+    n_active_tiles = 0  # tiles that actually had data (valid_pixels > 0 or segmentation)
+    n_upstream_failed = 0  # tiles where an upstream fetch raised (not boundary)
+    upstream_failed_tiles = []  # idx + reason for partial-KG re-queue decisions
+
+    # Pixel count we'd EXPECT a failed tile to contribute if it had succeeded.
+    # Use the median of successful tiles so a few outliers don't dominate;
+    # falls back to mean if pixel-weighted scoring would assign zero weight
+    # to upstream-failed tiles (they have valid_pixels==0 by construction).
+    _success_px = [t.get("valid_pixels", 0) for t in tile_data_availability
+                   if t.get("valid_pixels", 0) > 0]
+    _imputed_px = (sorted(_success_px)[len(_success_px) // 2]
+                   if _success_px else 1)
+
+    for t in tile_data_availability:
+        px = t.get("valid_pixels", 0)
+        upstream_fail = bool(t.get("upstream_fail"))
+        outside = bool(t.get("outside_austria") or t.get("ortho_outside_austria"))
+        if px == 0 and not t.get("segmentation"):
+            if upstream_fail and not outside:
+                # Score as a fully-missing tile so the grade reflects the gap.
+                n_upstream_failed += 1
+                upstream_failed_tiles.append({
+                    "tile_index": t.get("tile_index"),
+                    "bbox_wgs": t.get("bbox_wgs"),
+                    "reason": t.get("upstream_fail_reason", "unknown"),
+                })
+                n_active_tiles += 1
+                tile_weight = _imputed_px / max(total_pixels + _imputed_px * 1, 1)
+                # Score contribution = 0 (no layers succeeded); only pulls
+                # the weighted average down via the denominator below.
+                continue
+            else:
+                continue  # skip boundary / outside-Austria / genuinely-empty tiles
+        n_active_tiles += 1
+        tile_weight = px / total_pixels if total_pixels > 0 else 1.0 / len(tile_data_availability)
+        tile_score = 0.0
+        for k in layer_keys:
+            if t.get(k):
+                tile_score += _QUALITY_WEIGHTS[k]
+                layer_counts[k] += 1
+        weighted_score += (tile_score / total_weight) * tile_weight
+
+    n_tiles_denom = max(n_active_tiles, 1)
+    layers_summary = {k: round(v / n_tiles_denom, 3) for k, v in layer_counts.items()}
+
+    # Classify layers
+    missing = [k for k, v in layers_summary.items() if v == 0]
+    available = [k for k, v in layers_summary.items() if v >= 1.0]
+    partial = [k for k, v in layers_summary.items() if 0 < v < 1.0]
+
+    # Penalise the score by the fraction of upstream-failed tiles among
+    # all non-boundary tiles.  A 7/8 LiDAR-empty KG should NOT score A.
+    _n_non_boundary = sum(
+        1 for t in tile_data_availability
+        if not (t.get("outside_austria") or t.get("ortho_outside_austria"))
+    )
+    if _n_non_boundary > 0 and n_upstream_failed > 0:
+        _good_frac = max(0.0, 1.0 - n_upstream_failed / _n_non_boundary)
+        score = round(min(1.0, weighted_score) * _good_frac, 3)
+    else:
+        score = round(min(1.0, weighted_score), 3)
+    if score >= 0.9:
+        grade = "A"
+    elif score >= 0.75:
+        grade = "B"
+    elif score >= 0.55:
+        grade = "C"
+    elif score >= 0.35:
+        grade = "D"
+    else:
+        grade = "F"
+
+    return {
+        "quality_score": score,
+        "quality_grade": grade,
+        "quality_weights": {k: round(v / total_weight, 3) for k, v in _QUALITY_WEIGHTS.items()},
+        "layers_summary": layers_summary,
+        "tiles": tile_data_availability,
+        "n_active_tiles": n_active_tiles,
+        "n_total_tiles": len(tile_data_availability),
+        "n_upstream_failed_tiles": n_upstream_failed,
+        "upstream_failed_tiles": upstream_failed_tiles,
+        "missing_layers": missing,
+        "available_layers": available,
+        "partial_layers": partial,
+    }
+
+
+# === SECTION: robust top-N ranking ===
+# ``height_max`` is a single-pixel nDSM maximum, so a DSM spike (bird,
+# power line, edge artefact, mis-registered pixel) makes an 80 m "crop" or
+# a 73 m "tree" with p90 = 18 m.  Top-N highlight lists rank by a robust
+# height instead and drop candidates the quality_flags plausibility rules
+# would flag at ≥ high severity.  ``height_max_m`` stays in the output.
+# Sep-2026 fleet sample (1500 KGs, 7058 plausible top trees hmax<45 m &
+# area>50 m²): hmax−p90 p50=5.9 p90=11.7 p95=14.5 p99=22.5.  10 m ≈ p85 —
+# real crowns keep their apex, spikes (p99 of ALL top trees: 58 m) collapse.
+ROBUST_HEIGHT_MARGIN_M = 10.0
+_TOP_EXCLUDE_FLAG_CODES = {
+    'tree_height_implausible', 'shrub_height_implausible',
+    'hedge_height_implausible', 'orchard_height_implausible',
+    'vineyard_height_implausible', 'building_height_implausible',
+    'greenhouse_height_implausible', 'flat_type_has_height',
+    'water_has_height', 'mast_likely_misclassified',
+    'fence_height_implausible', 'wall_height_implausible',
+    'rock_height_implausible', 'construction_height_implausible',
+}
+_TOP_EXCLUDE_SEVERITIES = {'high', 'critical'}
+
+
+def _robust_height(o) -> float:
+    """hmax capped at p90 + margin (falls back to hmax if p90 missing)."""
+    hmax = float(o.height_max or 0.0)
+    p90 = getattr(o, 'height_p90', None)
+    if p90 is None:
+        return hmax
+    return round(min(hmax, float(p90) + ROBUST_HEIGHT_MARGIN_M), 2)
+
+
+def _top_quality(o) -> tuple[bool, list[str]]:
+    """(eligible_for_top_lists, sorted flag codes).
+
+    Runs ``quality_flags.apply_rules`` twice: on the robust height (any
+    height-family flag ≥ high → ineligible) and on the raw ``height_max``
+    (critical rung only, e.g. tree ≥ 80 m → ineligible).  Remaining lower-
+    severity codes are returned so the JSON entry can carry them.
+    """
+    try:
+        import quality_flags as _qf
+    except Exception:
+        return True, []
+    base = {'obj_type': o.obj_type, 'area_sqm': o.area_sqm,
+            'rf_confidence': getattr(o, 'rf_confidence', None),
+            'confidence': o.confidence,
+            'attrs': {'ndvi_mean': getattr(o, 'ndvi_mean', None)}}
+    codes, eligible = {}, True
+    try:
+        for f in _qf.apply_rules({**base, 'height_max_m': _robust_height(o),
+                                  'height_mean_m': o.height_mean}):
+            codes[f['flag_code']] = f['severity']
+            if f['flag_code'] in _TOP_EXCLUDE_FLAG_CODES and f['severity'] in _TOP_EXCLUDE_SEVERITIES:
+                eligible = False
+        for f in _qf.apply_rules({**base, 'height_max_m': float(o.height_max or 0.0),
+                                  'height_mean_m': o.height_mean}):
+            if f['flag_code'] in _TOP_EXCLUDE_FLAG_CODES and f['severity'] == 'critical':
+                eligible = False
+                codes[f['flag_code']] = 'critical'
+    except Exception:
+        return True, []
+    return eligible, sorted(codes)
+
+
+def _qf_rule_version() -> str:
+    try:
+        import quality_flags as _qf
+        return _qf.RULE_VERSION
+    except Exception:
+        return ''
+
+
+def _top_candidates(objects, n=10, manmade_only=False):
+    """Plausible objects ranked by robust height, as (obj, robust_h, codes)."""
+    out = []
+    for o in objects:
+        if manmade_only and not o.is_manmade:
+            continue
+        ok, codes = _top_quality(o)
+        if not ok:
+            continue
+        out.append((o, _robust_height(o), codes))
+    out.sort(key=lambda t: (t[1], t[0].height_max), reverse=True)
+    return out[:n]
+
+
+def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
+                             cadastre_data, terrain_stats, spectral_info,
+                             copernicus_info, hansen_info, new_buildings,
+                             infrastructure, obs_year, n_tiles=1, tile_km=1.5,
+                             total_seg_pixels=0, tile_data_availability=None,
+                             outline_profiler=None, classifier_used=None,
+                             v21_extras=None):
+    """Build JSON summary from tiled segmentation results.
+
+    ``outline_profiler`` (v2): ``segv2.parcel_elevation.ParcelOutlineProfiler``
+    already sampled in the tile loop; parcels still missing samples (tiles
+    restored from checkpoints) are topped up here from the lazy tile cache.
+    Each parcel detail then carries ``outline_z`` (compact DTM/nDSM profile
+    along the outline — see ``segv2/parcel_elevation.py`` for the encoding).
+    ``classifier_used``: {classifier string: n_tiles} → ``summary["model"]``.
+    """
+    import tile_index as ti
+    objects = all_objects
+    summary = {
+        "version": VERSION,
+        "kg_code": kg_code,
+        "kg_name": kg_info.get("kg_name", ""),
+        "state": kg_info.get("state_name", ""),
+        "gemeinde": kg_info.get("gemeinde_name", ""),
+        "district": kg_info.get("district_name", ""),
+        "bbox": kg_info.get("bbox", {}),
+        "total_area_sqm": total_seg_pixels,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "observation_period": {
+            "primary_year": obs_year, "start": f"{obs_year}-01-01", "end": f"{obs_year}-12-31",
+            "lidar_dataset": ti.DEFAULT_DATASET,
+            "all_lidar_datasets": sorted(ti.DATASETS.keys()),
+            "sentinel2": f"Sentinel-2 L2A {obs_year}",
+            "hansen": "Hansen GFC-2024-v1.12 (2000-2024)",
+            "ne_declared": "umfeld-at NE cells (frozen epoch, see section 'ne')",
+        },
+        # Licence + per-source attribution (CC BY 4.0 obligations; OSM ODbL).
+        "attribution": __import__('attributions').attribution_dict(year=obs_year),
+    }
+    # --- Area summary ---
+    type_counts = Counter()
+    type_heights = defaultdict(list)
+    for obj in objects:
+        type_counts[obj.obj_type] += int(obj.area_sqm)
+        type_heights[obj.obj_type].append(round(obj.height_max, 2))
+    total_px = max(total_seg_pixels, 1)
+    summary["area_summary"] = {
+        t: {"pixels": px, "area_sqm": px, "fraction": round(px/total_px, 4),
+            "n_objects": len(type_heights[t]),
+            "observation_period": f"{obs_year}-01-01 to {obs_year}-12-31"}
+        for t, px in type_counts.most_common()
+    }
+    summary["height_distribution"] = {
+        t: {"min": round(min(hs),2), "max": round(max(hs),2),
+            "mean": round(sum(hs)/len(hs),2),
+            "p90": round(float(np.percentile(hs,90)),2), "count": len(hs)}
+        for t, hs in type_heights.items() if hs
+    }
+    # --- Classification summary ---
+    if objects:
+        n_total = len(objects)
+        rf_objs = [o for o in objects if getattr(o, 'classifier_source', 'rules') == 'rf']
+        rules_objs = [o for o in objects if getattr(o, 'classifier_source', 'rules') == 'rules']
+        infra_objs = [o for o in objects if getattr(o, 'classifier_source', 'rules') == 'infra']
+        # Divergence: RF predicted one type but final type differs (after calibration/override)
+        diverged = [o for o in objects if getattr(o, 'rf_type', '') and o.obj_type != o.rf_type]
+        # Confidence distribution
+        all_conf = [o.confidence for o in objects]
+        rf_conf = [getattr(o, 'rf_confidence', 0.0) for o in objects if getattr(o, 'rf_type', '')]
+        # Per-type divergence breakdown
+        from collections import Counter as _Counter
+        div_pairs = _Counter((o.rf_type, o.obj_type) for o in diverged) if diverged else _Counter()
+        top_divergences = [
+            {"rf_type": rf, "final_type": fin, "count": cnt}
+            for (rf, fin), cnt in div_pairs.most_common(20)
+        ]
+        # Per-type RF confidence + area + divergence
+        type_rf_conf = defaultdict(list)
+        type_div_count = Counter()
+        for o in objects:
+            if getattr(o, 'rf_confidence', 0) > 0:
+                type_rf_conf[o.obj_type].append(o.rf_confidence)
+            if getattr(o, 'rf_type', '') and o.obj_type != o.rf_type:
+                type_div_count[o.obj_type] += 1
+        per_type_confidence = {}
+        for t, cs in type_rf_conf.items():
+            entry = {
+                "mean": round(sum(cs)/len(cs), 3),
+                "min": round(min(cs), 3),
+                "p10": round(float(np.percentile(cs, 10)), 3),
+                "count": len(cs),
+                "area_sqm": type_counts.get(t, 0),
+            }
+            if type_div_count.get(t):
+                entry["diverged_count"] = type_div_count[t]
+            per_type_confidence[t] = entry
+        summary["classification"] = {
+            "total_segments": n_total,
+            "rf_classified": len(rf_objs),
+            "rf_classified_pct": round(100 * len(rf_objs) / max(n_total, 1), 1),
+            "rules_classified": len(rules_objs),
+            "infra_classified": len(infra_objs),
+            "mean_confidence": round(sum(all_conf) / max(n_total, 1), 3),
+            "rf_mean_confidence": round(sum(rf_conf) / max(len(rf_conf), 1), 3) if rf_conf else None,
+            "confidence_p10": round(float(np.percentile(all_conf, 10)), 3) if all_conf else None,
+            "confidence_p25": round(float(np.percentile(all_conf, 25)), 3) if all_conf else None,
+            "confidence_p50": round(float(np.percentile(all_conf, 50)), 3) if all_conf else None,
+            "diverged_count": len(diverged),
+            "diverged_pct": round(100 * len(diverged) / max(n_total, 1), 1),
+            "top_divergences": top_divergences,
+            "per_type_confidence": per_type_confidence,
+        }
+    # --- Landscape ---
+    landscape = {}
+    if terrain_stats: landscape["terrain"] = terrain_stats
+    if objects:
+        total_perim = sum(getattr(o,'perimeter_m', getattr(o,'perimeter',0)) or 0 for o in objects)
+        landscape["edge_density"] = round(total_perim / total_px, 4)
+        landscape["n_segments"] = len(objects)
+        landscape["mean_segment_area_sqm"] = round(total_px / len(objects), 1)
+        tf_ = [c/total_px for c in type_counts.values()]
+        landscape["shannon_diversity"] = round(float(-sum(f*np.log(f) for f in tf_ if f > 0)), 3)
+        if type_counts: landscape["dominant_type"] = type_counts.most_common(1)[0][0]
+        veg = {'tree','shrub','grass','hedge','crop','orchard','vineyard','garden'}
+        vp = sum(v for k,v in type_counts.items() if k in veg)
+        landscape["vegetated_fraction"] = round(vp/total_px, 4)
+        landscape["is_vegetated"] = vp/total_px > 0.5
+    summary["landscape"] = landscape
+    # --- Top 10 objects/trees (legacy) + top_manmade + top_by_type ---
+    # Ranked by robust height (hmax capped at p90 + margin), plausibility-
+    # filtered via quality_flags — see `_top_candidates`.  ``height_max_m``
+    # is still reported next to ``height_robust_m``.
+    if objects:
+        def _obj_entry(o, hr, codes):
+            c = None
+            try:
+                lon, lat = _tx_to_wgs.transform(o.centroid_e, o.centroid_n)
+                c = {"lon": round(lon,7), "lat": round(lat,7)}
+            except Exception: pass
+            return {
+                "type": o.obj_type, "height_max_m": round(o.height_max,2),
+                "height_robust_m": hr, "height_p90_m": round(o.height_p90,2),
+                "height_mean_m": round(o.height_mean,2), "area_sqm": round(o.area_sqm,1),
+                "coordinate": c, "confidence": round(o.confidence,3),
+                "classifier_source": getattr(o, 'classifier_source', 'rules'),
+                "rf_type": getattr(o, 'rf_type', ''),
+                "rf_confidence": round(getattr(o, 'rf_confidence', 0.0), 3),
+                "is_manmade": o.is_manmade, "observation_year": obs_year,
+                "quality_flags": codes}
+        summary["top_10_objects"] = [_obj_entry(*t) for t in _top_candidates(objects, 10)]
+        summary["top_manmade_objects"] = [_obj_entry(*t) for t in
+                                          _top_candidates(objects, 10, manmade_only=True)]
+        summary["top_ranking"] = {
+            "metric": "height_robust_m",
+            "height_robust_m": f"min(height_max_m, height_p90_m + {ROBUST_HEIGHT_MARGIN_M:g})",
+            "excluded": "quality_flags height rules >= high on robust height, "
+                        "or critical on height_max_m",
+            "quality_flags_rule_version": _qf_rule_version()}
+        trees = [o for o in objects if o.obj_type == 'tree']
+        summary["top_10_trees"] = []
+        for t, hr, codes in _top_candidates(trees, 10):
+            c = None
+            try:
+                lon, lat = _tx_to_wgs.transform(t.centroid_e, t.centroid_n)
+                c = {"lon": round(lon,7), "lat": round(lat,7)}
+            except Exception: pass
+            summary["top_10_trees"].append({
+                "height_m": hr, "height_max_m": round(t.height_max,2),
+                "height_robust_m": hr,
+                "canopy_height_m": round(t.height_mean,2),
+                "height_p90_m": round(t.height_p90,2), "coordinate": c,
+                "area_sqm": round(t.area_sqm,1), "ndvi_mean": round(t.ndvi_mean,4),
+                "ndvi_fused": round(t.ndvi_fused,4), "height_change_m": round(t.height_change,3),
+                "phenology_class": t.phenology_class or '', "observation_year": obs_year,
+                "confidence": round(t.confidence, 3),
+                "classifier_source": getattr(t, 'classifier_source', 'rules'),
+                "rf_type": getattr(t, 'rf_type', ''),
+                "rf_confidence": round(getattr(t, 'rf_confidence', 0.0), 3),
+                "quality_flags": codes})
+        if trees:
+            summary["tree_stats"] = {
+                "count": len(trees),
+                "total_canopy_sqm": round(sum(t.area_sqm for t in trees), 1),
+                "mean_height_m": round(sum(_robust_height(t) for t in trees)/len(trees), 2),
+                "mean_height_max_m": round(sum(t.height_max for t in trees)/len(trees), 2),
+                "est_stem_volume_m3": round(sum(0.3*t.area_sqm*_robust_height(t)/3 for t in trees), 1)}
+
+        # --- top_by_type: top 50 segments per type, sorted by primary metric ---
+        # Primary metric per type:
+        #   tree → height_max, excavation/fill → abs(volume_change_m3),
+        #   tree_loss → area_sqm, roof/greenhouse/solar_panel/construction → height_max,
+        #   everything else → area_sqm
+        _VOLUME_TYPES = {'excavation', 'fill'}
+        _HEIGHT_TYPES = {'tree', 'roof', 'greenhouse', 'solar_panel', 'construction',
+                         'mast', 'fence', 'wall', 'hedge', 'shrub'}
+        _TOP_N = 50
+        by_type = defaultdict(list)
+        for o in objects:
+            by_type[o.obj_type].append(o)
+        top_by_type = {}
+        for otype, objs in by_type.items():
+            if otype in _VOLUME_TYPES:
+                objs_sorted = sorted(objs, key=lambda o: abs(o.volume_change_m3), reverse=True)
+            elif otype in _HEIGHT_TYPES:
+                objs_sorted = sorted(objs, key=lambda o: (_robust_height(o), o.height_max), reverse=True)
+            else:
+                objs_sorted = sorted(objs, key=lambda o: o.area_sqm, reverse=True)
+            entries = []
+            for o in objs_sorted[:_TOP_N]:
+                c = None
+                try:
+                    lon, lat = _tx_to_wgs.transform(o.centroid_e, o.centroid_n)
+                    c = {"lon": round(lon, 7), "lat": round(lat, 7)}
+                except Exception:
+                    pass
+                entries.append({
+                    "type": o.obj_type,
+                    "height_max_m": round(o.height_max, 2),
+                    "height_robust_m": _robust_height(o),
+                    "height_mean_m": round(o.height_mean, 2),
+                    "area_sqm": round(o.area_sqm, 1),
+                    "volume_change_m3": round(o.volume_change_m3, 1),
+                    "rf_confidence": round(getattr(o, 'rf_confidence', 0.0), 3),
+                    "confidence": round(o.confidence, 3),
+                    "coordinate": c,
+                })
+            top_by_type[otype] = entries
+        summary["top_by_type"] = top_by_type
+    # --- Terrain ---
+    summary["terrain"] = {}
+    if terrain_stats:
+        ts = terrain_stats; elev = ts.get("elevation",{}); sl = ts.get("slope_deg",{})
+        tri = ts.get("ruggedness_tri",{}); ad = ts.get("aspect_distribution_pct",{})
+        summary["terrain"] = {
+            "steepness_mean_deg": sl.get("mean"), "steepness_max_deg": sl.get("max"),
+            "aspect_dominant": max(ad, key=ad.get) if ad else "",
+            "aspect_distribution_pct": ad, "slope_classes_pct": ts.get("slope_classes_pct",{}),
+            "roughness_mean": tri.get("mean"), "curvature_mean": None,
+            "terrain_class": tri.get("classification", ""),
+            "elevation_min_m": elev.get("min"), "elevation_max_m": elev.get("max"),
+            "elevation_range_m": elev.get("range"), "elevation_mean_m": elev.get("mean"),
+            "method": "DTM slope/aspect/TRI, BEV ALS 1m, tiled"}
+    # --- NDVI ---
+    ndvi_info = {}
+    bv = spectral_info.get("_vals",[])
+    if bv: ndvi_info["bev_nir_mean"] = round(float(np.mean(bv)),4); ndvi_info["bev_nir_std"] = round(float(np.std(bv)),4); ndvi_info["method_bev"] = f"BEV DOP RGBI 0.2m, {obs_year}"
+    cv = copernicus_info.get("cop_ndvi_vals",[])
+    if cv: ndvi_info["copernicus_mean"] = round(float(np.mean(cv)),4); ndvi_info["method_copernicus"] = f"Sentinel-2 L2A, {obs_year}"
+    summary["ndvi"] = ndvi_info
+    # --- SAR ---
+    sar_info = {}
+    for band in ['vv','vh']:
+        vs = copernicus_info.get(f"{band}_vals",[])
+        if vs:
+            # NOTE: values are LINEAR sigma0 (ellipsoid) despite the legacy
+            # ``_db`` key name — kept for corpus consistency. True dB is
+            # exposed under ``{band}_db`` (see docs/cross-cutting-concerns.md).
+            m = float(np.mean(vs))
+            sar_info[f"{band}_mean_db"] = round(m, 2); sar_info[f"{band}_std_db"] = round(float(np.std(vs)),2)
+            if m > 0: sar_info[f"{band}_db"] = round(10.0 * float(np.log10(m)), 2)
+    if sar_info:
+        sar_info["units"] = "*_mean_db/*_std_db are linear sigma0 (legacy key name); *_db = 10*log10(mean) in dB"
+        sar_info["method"] = f"Sentinel-1 IW GRD, VV+VH, summer {obs_year}"
+    summary["sar"] = sar_info
+    # --- Harmonics ---
+    harm_info = {}
+    for hk in ['h_mean','h_amplitude','h_phase','h_rmse']:
+        vs = copernicus_info.get(f"{hk}_vals",[])
+        if vs: harm_info[hk.replace('h_','')+'_mean'] = round(float(np.mean(vs)),4)
+    if harm_info: harm_info["method"] = f"Harmonic fit to monthly Sentinel-2 NDVI, {obs_year}"
+    summary["ndvi_harmonics"] = harm_info
+    # --- Temporal change ---
+    temp = {}
+    if objects:
+        dc = [o.dtm_change for o in objects if abs(o.dtm_change) > 0.01]
+        hc = [o.height_change for o in objects if abs(o.height_change) > 0.01]
+        if dc: temp["dtm_change_mean_m"] = round(float(np.mean(dc)),3); temp["dtm_change_max_abs_m"] = round(float(np.max(np.abs(dc))),3); temp["n_changed_segments"] = len(dc)
+        if hc: temp["height_change_mean_m"] = round(float(np.mean(hc)),3)
+        temp["net_volume_change_m3"] = round(sum(o.volume_change_m3 for o in objects),1)
+        temp["total_disturbed_volume_m3"] = round(sum(o.volume_change_abs_m3 for o in objects),1)
+        stab = [o.temporal_stability for o in objects]
+        if stab: temp["mean_stability"] = round(float(np.mean(stab)),3)
+        temp["datasets_compared"] = sorted(ti.DATASETS.keys())
+        temp["method"] = "DTM/DSM differencing across BEV ALS dates"
+    summary["temporal_change"] = temp
+    # --- Phenology ---
+    if objects:
+        pc = Counter(o.phenology_class for o in objects if o.phenology_class)
+        if pc: summary["phenology"] = {"distribution": dict(pc.most_common()), "method": "harmonic fit"}
+    # --- Hansen ---
+    hs = {}
+    if hansen_info:
+        loss_years = hansen_info.get("loss_years",[])
+        if loss_years:
+            per_year = {}
+            for ly in loss_years:
+                for yr in range(1,25):
+                    n = int((ly==yr).sum())
+                    if n > 0:
+                        k = f"{2000+yr}"
+                        per_year.setdefault(k, {"pixels":0,"area_sqm":0})
+                        per_year[k]["pixels"] += n; per_year[k]["area_sqm"] += n*900
+            if per_year: hs["loss_by_year"] = per_year; hs["total_loss_pixels"] = sum(v["pixels"] for v in per_year.values())
+        tc = hansen_info.get("tc_vals",[])
+        if tc: hs["mean_treecover2000_pct"] = round(float(np.mean(tc)),1)
+        cf = hansen_info.get("cf_sum",[0])
+        if cf[0] > 0: hs["current_forest_pixels"] = cf[0]
+        if hs: hs["method"] = "Hansen GFC-2024-v1.12, 30m"
+    summary["hansen"] = hs
+    # --- New buildings + infrastructure ---
+    summary["new_buildings"] = {
+        "count": len(new_buildings),
+        "features": [{"type": nb.get("type"), "area_sqm": nb.get("area_sqm"),
+                      "max_height_m": nb.get("max_height_m"), "stories_est": nb.get("stories_est"),
+                      "roof_type_hint": nb.get("roof_type_hint"),
+                      "centroid_lon": nb.get("centroid_lon"), "centroid_lat": nb.get("centroid_lat"),
+                      "confidence": nb.get("confidence"),
+                      "rf_confidence": nb.get("rf_confidence", 0.0),
+                      "rf_type": nb.get("rf_type", ""),
+                      "classifier_source": nb.get("classifier_source", "rules"),
+                      "edge_clipped": nb.get("edge_clipped", False)}
+                     for nb in new_buildings]}
+    ibt = defaultdict(list)
+    for inf in infrastructure: ibt[inf["type"]].append(inf)
+    summary["infrastructure"] = {
+        "total": len(infrastructure),
+        "by_type": {t: {"count": len(items), "total_area_sqm": round(sum(i.get("area_sqm",0) for i in items),1),
+                        "features": [{k:v for k,v in i.items() if k != "geometry_wgs"} for i in items]}
+                   for t, items in ibt.items()}}
+    # --- Helpers for per-parcel/building segment stats ---
+    # Build obj_map from ALL per-tile objects (not just core) so labels match.
+    # Core-only all_objects miss overlap-zone objects whose IDs ARE in labels.
+    obj_map = {}
+    for tr_ in tile_seg_results:
+        for o in (tr_.get('objects') or []):
+            obj_map[o.obj_id] = o
+    # Also include core objects (in case tile objects list was pruned)
+    if objects:
+        for o in objects:
+            obj_map[o.obj_id] = o
+
+    def _classification_stats_from_objs(seg_objs, type_area_sqm=None):
+        """Compute classification dict from a list of segment objects.
+
+        type_area_sqm: optional dict {obj_type: pixel_count_sqm} for area.
+                       If None, uses obj.area_sqm summed per type.
+        """
+        if not seg_objs:
+            return None
+        n_total = len(seg_objs)
+        rf_objs = [o for o in seg_objs if getattr(o, 'classifier_source', 'rules') == 'rf']
+        rules_objs = [o for o in seg_objs if getattr(o, 'classifier_source', 'rules') == 'rules']
+        all_conf = [o.confidence for o in seg_objs]
+        rf_conf = [getattr(o, 'rf_confidence', 0.0) for o in rf_objs]
+        diverged = [o for o in seg_objs if getattr(o, 'rf_type', '') and o.obj_type != o.rf_type]
+        div_pairs = Counter((o.rf_type, o.obj_type) for o in diverged) if diverged else Counter()
+        top_div = [{'rf_type': rf, 'final_type': fin, 'count': cnt}
+                   for (rf, fin), cnt in div_pairs.most_common(5)]
+        # Per-type breakdown
+        _by_type_rf = defaultdict(list)   # obj_type → [rf_confidence, ...]
+        _by_type_all = defaultdict(list)  # obj_type → [confidence, ...]
+        _by_type_src = defaultdict(lambda: {'rf': 0, 'rules': 0})
+        _by_type_div = Counter()          # obj_type → diverged count
+        for o in seg_objs:
+            t = o.obj_type
+            _by_type_all[t].append(o.confidence)
+            src = getattr(o, 'classifier_source', 'rules')
+            if src in ('rf', 'rules'):
+                _by_type_src[t][src] += 1
+            if getattr(o, 'rf_confidence', 0) > 0:
+                _by_type_rf[t].append(o.rf_confidence)
+            if getattr(o, 'rf_type', '') and o.obj_type != o.rf_type:
+                _by_type_div[t] += 1
+        # Compute area per type
+        if type_area_sqm is None:
+            _area = defaultdict(float)
+            for o in seg_objs:
+                _area[o.obj_type] += o.area_sqm
+        else:
+            _area = type_area_sqm
+        by_type = {}
+        for t in _by_type_all:
+            entry = {
+                'segments': len(_by_type_all[t]),
+                'area_sqm': round(float(_area.get(t, 0)), 1),
+                'mean_confidence': round(sum(_by_type_all[t]) / len(_by_type_all[t]), 3),
+                'rf_count': _by_type_src[t]['rf'],
+                'rules_count': _by_type_src[t]['rules'],
+            }
+            if _by_type_rf.get(t):
+                entry['rf_mean_confidence'] = round(sum(_by_type_rf[t]) / len(_by_type_rf[t]), 3)
+            if _by_type_div.get(t):
+                entry['diverged_count'] = _by_type_div[t]
+            by_type[t] = entry
+        cls = {
+            'rf_classified': len(rf_objs),
+            'rules_classified': len(rules_objs),
+            'total_segments': n_total,
+            'mean_confidence': round(sum(all_conf) / n_total, 3),
+            'rf_mean_confidence': round(sum(rf_conf) / len(rf_conf), 3) if rf_conf else None,
+            'diverged_count': len(diverged),
+            'diverged_pct': round(100 * len(diverged) / n_total, 1),
+            'by_type': by_type,
+        }
+        if top_div:
+            cls['divergences'] = top_div
+        return cls
+
+    def _parcel_segment_stats(geom_3035, labels, ndsm, transform, shape):
+        """Compute area_summary, height_dist, vegetation, nDSM, classification for a parcel."""
+        from rasterio.features import rasterize as rio_rasterize
+        pm = rio_rasterize([(geom_3035, 1)], out_shape=shape,
+                           transform=transform, fill=0, dtype=np.uint8,
+                           all_touched=True).astype(bool)
+        pl = labels[pm]; pn = ndsm[pm]
+        tc_ = Counter(); th_ = defaultdict(list); seg_objs = []
+        for lbl in np.unique(pl):
+            obj = obj_map.get(int(lbl))
+            if obj:
+                npx = int((pl == lbl).sum())
+                tc_[obj.obj_type] += npx
+                th_[obj.obj_type].append(obj.height_max)
+                seg_objs.append(obj)
+        result = {}
+        if tc_:
+            tpx = max(int(pm.sum()), 1)
+            result['area_summary'] = {t: {'area_sqm': px, 'fraction': round(px / tpx, 4)}
+                                      for t, px in tc_.most_common()}
+            result['height_distribution'] = {t: {'min': round(min(hs_), 2), 'max': round(max(hs_), 2),
+                                                  'mean': round(sum(hs_) / len(hs_), 2)}
+                                              for t, hs_ in th_.items() if hs_}
+        veg = {'tree', 'shrub', 'grass', 'hedge', 'crop', 'orchard', 'vineyard', 'garden'}
+        vpx = sum(v for k, v in tc_.items() if k in veg); tpx = max(int(pm.sum()), 1)
+        result['vegetated_fraction'] = round(vpx / tpx, 4)
+        result['is_vegetated'] = vpx / tpx > 0.5
+        # Forested fraction
+        _forest_types = {'tree', 'shrub'}
+        fpx = sum(v for k, v in tc_.items() if k in _forest_types)
+        result['forested_fraction'] = round(fpx / tpx, 4)
+        # Dominant type
+        if tc_:
+            result['dominant_type'] = tc_.most_common(1)[0][0]
+        vh = pn[np.isfinite(pn)]
+        if len(vh) > 0:
+            result['ndsm_max_m'] = round(float(np.max(vh)), 2)
+            result['ndsm_mean_m'] = round(float(np.mean(vh)), 2)
+        cls = _classification_stats_from_objs(seg_objs, type_area_sqm=dict(tc_))
+        if cls:
+            result['classification'] = cls
+        return result
+
+    # --- Lazy DTM loading with LRU eviction for parcel/building enrichment ---
+    # Pre-loading all tiles is prohibitive for large KGs (56 tiles × ~70 MB
+    # DTM+terrain = ~4 GB).  Load on demand and keep a bounded cache.
+    from terrain_analysis import compute_slope as _js_slope, compute_aspect as _js_aspect, \
+        compute_tri as _js_tri, compute_tpi as _js_tpi
+    from collections import OrderedDict
+    _JS_MAX_CACHED = 6  # ~420 MB peak
+    _tile_data_cache = OrderedDict()
+
+    def _js_load_tile(ti_idx, tr):
+        if ti_idx in _tile_data_cache:
+            _tile_data_cache.move_to_end(ti_idx)
+            return _tile_data_cache[ti_idx]
+        try:
+            tdata = _read_dtm_for_tile(tr)
+        except Exception as e:
+            log.warning("JSON: failed to load DTM for tile %d: %s", ti_idx, e)
+            return None
+        dtm_arr = tdata["dtm"]
+        tdata["slope"] = _js_slope(dtm_arr)
+        tdata["aspect"] = _js_aspect(dtm_arr)
+        tdata["tri"] = _js_tri(dtm_arr)
+        tdata["tpi"] = _js_tpi(dtm_arr, radius=5)
+        _tile_data_cache[ti_idx] = tdata
+        while len(_tile_data_cache) > _JS_MAX_CACHED:
+            _tile_data_cache.popitem(last=False)
+        return tdata
+    log.info("JSON: using lazy DTM loading (cache=%d tiles) for %d tiles",
+             _JS_MAX_CACHED, len(tile_seg_results))
+
+    def _find_tile_with_data(e3035, n3035):
+        """Find tile containing point AND return its lazily-loaded tdata."""
+        for ti_idx, tr in enumerate(tile_seg_results):
+            left, bottom, right, top = tr["bounds_3035"]
+            if left <= e3035 <= right and bottom <= n3035 <= top:
+                tdata = _js_load_tile(ti_idx, tr)
+                if tdata is not None:
+                    return tr, tdata
+        return None, None
+
+    def _point_elevation_fallback(e3035, n3035):
+        """Direct DTM point read as fallback when no tile covers the point."""
+        try:
+            import raster_io as _rio
+            import tile_index as _ti
+            from shapely.geometry import box as _box
+            # Read a tiny window around the point (10×10m)
+            tdata = _rio.read_dtm_dsm(_box(e3035 - 5, n3035 - 5, e3035 + 5, n3035 + 5),
+                                      _ti.DEFAULT_DATASET)
+            dtm = tdata["dtm"]; tf = tdata["transform"]
+            col = int((e3035 - tf.c) / tf.a); row = int((tf.f - n3035) / abs(tf.e))
+            dh, dw = dtm.shape
+            if 0 <= row < dh and 0 <= col < dw:
+                val = float(dtm[row, col])
+                if np.isfinite(val):
+                    return round(val, 2)
+            # Try patch average
+            v = dtm[np.isfinite(dtm)]
+            if len(v) > 0:
+                return round(float(np.nanmean(v)), 2)
+        except Exception:
+            pass
+        return None
+
+    # --- STRtree centroid-in-polygon: object → parcel assignment ---
+    # Used as fallback when raster-based _parcel_segment_stats doesn't fire,
+    # and for Hansen per-parcel enrichment which isn't raster-based.
+    _FOREST_TYPES = {'tree', 'shrub'}
+    _VEGETATED_TYPES = {'tree', 'shrub', 'grass', 'hedge', 'crop', 'orchard',
+                        'vineyard', 'garden'}
+    _parcel_obj_map = defaultdict(list)  # parcel_idx → [obj, ...]
+
+    def _strtree_area_summary(p_objs, parcel_area_sqm):
+        """Build area_summary from STRtree-assigned objects, clamped to parcel area.
+
+        STRtree assigns whole objects to a parcel by centroid containment, so
+        objects that straddle the parcel boundary contribute their *entire*
+        area to a single parcel. Without correction the m² values can exceed
+        the cadastre parcel area by 2–4× (sample of 1000 random parcels: 20%
+        had >1.5× over-coverage). Fractions are unaffected (they're computed
+        relative to the sum), but absolute m² in `area_summary` and `frav`
+        was wrong. Clamp by scaling so the sum equals min(Σ, parcel_area).
+        """
+        from collections import Counter as _C, defaultdict as _D
+        tc = _C(); th = _D(list)
+        for obj in p_objs:
+            tc[obj.obj_type] += float(obj.area_sqm)
+            th[obj.obj_type].append(obj.height_max)
+        tot = sum(tc.values())
+        if tot <= 0:
+            return {}, th, 0.0
+        # Scale down (never up) so absolute m² never exceeds cadastre area.
+        scale = 1.0
+        if parcel_area_sqm and parcel_area_sqm > 0 and tot > parcel_area_sqm:
+            scale = parcel_area_sqm / tot
+        scaled = {t: a * scale for t, a in tc.items()}
+        ssum = max(sum(scaled.values()), 1.0)
+        area_summary = {
+            t: {'area_sqm': int(round(a)), 'fraction': round(a / ssum, 4)}
+            for t, a in sorted(scaled.items(), key=lambda kv: -kv[1])
+        }
+        return area_summary, th, ssum
+    if objects and cadastre_data["parcels"] and CADASTRE_PRODUCTS:
+        try:
+            from shapely import STRtree
+            parcel_geoms = [p["geometry"] for p in cadastre_data["parcels"]]
+            tree = STRtree(parcel_geoms)
+            for obj in objects:
+                pt = Point(obj.centroid_e, obj.centroid_n)
+                idx = tree.nearest(pt)
+                # Verify containment (nearest isn't necessarily containing)
+                if parcel_geoms[idx].contains(pt):
+                    _parcel_obj_map[idx].append(obj)
+            log.info("JSON: STRtree assigned %d/%d objects to %d parcels",
+                     sum(len(v) for v in _parcel_obj_map.values()),
+                     len(objects), len(_parcel_obj_map))
+        except Exception as e:
+            log.warning("JSON: STRtree parcel assignment failed: %s", e)
+
+    # --- Per-parcel Hansen: build raster lookup per tile ---
+    # hansen_info["loss_years"] is a list of arrays, but they lack geo-referencing.
+    # Instead, use hansen_loss_year stored in tile_seg_results (same transform/shape).
+    _hansen_tile_data = []  # list of (bounds_3035, loss_year_array, transform, shape)
+    for tr in tile_seg_results:
+        ly = tr.get("hansen_loss_year")
+        if ly is not None:
+            _hansen_tile_data.append((
+                tr["bounds_3035"], ly, tr["transform"], tr["shape"]
+            ))
+
+    # --- Per-parcel outline elevation profiles (v2) ---
+    _outline_recs = {}
+    if outline_profiler is not None:
+        try:
+            _missing_before = outline_profiler.summary()["missing"]
+            if _missing_before:
+                for _ti_idx, _tr in enumerate(tile_seg_results):
+                    _td = _js_load_tile(_ti_idx, _tr)
+                    if _td is not None:
+                        outline_profiler.sample(_td["dtm"], _td.get("dsm"), _td["transform"])
+                    if outline_profiler.summary()["missing"] == 0:
+                        break
+            _outline_recs = outline_profiler.records()
+            _sm = outline_profiler.summary()
+            log.info("JSON: parcel outline profiles: %d parcels, %d points, %d missing (%d before top-up)",
+                     _sm["parcels"], _sm["points"], _sm["missing"], _missing_before)
+        except Exception as e:
+            log.warning("JSON: parcel outline profiles failed: %s", e)
+            _outline_recs = {}
+
+    # --- Per-parcel detail ---
+    parcel_details = []
+    n_parcel_no_tile = 0
+    _parcel_idx_by_id = {id(p): i for i, p in enumerate(cadastre_data["parcels"])}
+    # v2.4: the per-parcel block is never built (CADASTRE_PRODUCTS=False) —
+    # the loop body is kept one release for reference and runs over [].
+    for p in (cadastre_data["parcels"] if CADASTRE_PRODUCTS else []):
+        pd = {"parcel_id": p["parcel_id"], "area_sqm": round(p.get("area_sqm",0), 1)}
+        geom_3035 = p["geometry"]
+        try:
+            cw = transform_to_wgs(geom_3035.centroid)
+            pd["centroid"] = {"lon": round(cw.x,7), "lat": round(cw.y,7)}
+        except Exception: pass
+        try:
+            c3 = geom_3035.centroid
+            tr, tdata = _find_tile_with_data(c3.x, c3.y)
+            if tr and tdata:
+                dtm = tdata["dtm"]; tf = tdata["transform"]
+                col = int((c3.x - tf.c)/tf.a); row = int((tf.f - c3.y)/abs(tf.e))
+                dh, dw = dtm.shape
+                if 0 <= row < dh and 0 <= col < dw:
+                    val = float(dtm[row,col])
+                    if np.isfinite(val): pd["elevation_m"] = round(val,2)
+                    else:
+                        patch = dtm[max(0,row-2):min(dh,row+3), max(0,col-2):min(dw,col+3)]
+                        v = patch[np.isfinite(patch)]
+                        if len(v) > 0: pd["elevation_m"] = round(float(np.nanmean(v)),2)
+                # Full terrain over parcel footprint (uses pre-computed terrain arrays)
+                try:
+                    from rasterio.features import geometry_mask as _gm_json
+                    pmask = _gm_json([mapping(geom_3035)], out_shape=(dh, dw),
+                                     transform=tf, invert=True)
+                    pv = pmask & np.isfinite(dtm)
+                    if np.sum(pv) > 4:
+                        dtm_pv = dtm[pv]
+                        e_min = float(np.nanmin(dtm_pv))
+                        e_max = float(np.nanmax(dtm_pv))
+                        pd["elevation_min_m"] = round(e_min, 2)
+                        pd["elevation_max_m"] = round(e_max, 2)
+                        pd["elevation_range_m"] = round(e_max - e_min, 2)
+                        pd["slope_mean_deg"] = round(float(np.nanmean(tdata["slope"][pv])), 1)
+                        tri_val = float(np.nanmean(tdata["tri"][pv]))
+                        pd["tri_mean"] = round(tri_val, 3)
+                        tpi_v = tdata["tpi"][pv]; tpi_v = tpi_v[np.isfinite(tpi_v)]
+                        if len(tpi_v) > 0:
+                            pd["tpi_mean"] = round(float(np.nanmean(tpi_v)), 3)
+                        # Terrain class from TRI
+                        if tri_val < 0.1: pd["terrain_class"] = "level"
+                        elif tri_val < 0.3: pd["terrain_class"] = "nearly_level"
+                        elif tri_val < 0.8: pd["terrain_class"] = "slightly_rugged"
+                        elif tri_val < 1.5: pd["terrain_class"] = "intermediately_rugged"
+                        elif tri_val < 3.0: pd["terrain_class"] = "moderately_rugged"
+                        elif tri_val < 6.0: pd["terrain_class"] = "highly_rugged"
+                        else: pd["terrain_class"] = "extremely_rugged"
+                        # Aspect (circular mean)
+                        asp_nf = tdata["aspect"][pv]
+                        asp_nf = asp_nf[asp_nf >= 0]
+                        if len(asp_nf) > 0:
+                            rad = np.radians(asp_nf)
+                            mean_asp = float(np.degrees(np.arctan2(
+                                np.mean(np.sin(rad)), np.mean(np.cos(rad))))) % 360
+                            pd["aspect_mean_deg"] = round(mean_asp, 1)
+                            _dirs = [("N",0,45),("NE",45,90),("E",90,135),("SE",135,180),
+                                     ("S",180,225),("SW",225,270),("W",270,315),("NW",315,360)]
+                            pd["aspect_dominant"] = next(
+                                (n for n,lo,hi in _dirs if lo <= mean_asp < hi), "N")
+                        else:
+                            pd["aspect_mean_deg"] = -1.0
+                            pd["aspect_dominant"] = "flat"
+                except Exception:
+                    pass
+                # Vertex heights (AMS anchor points)
+                try:
+                    verts = []
+                    geom_w = p["geometry_wgs"]
+                    if geom_w.geom_type == 'Polygon':
+                        rings = [geom_w.exterior] + list(geom_w.interiors)
+                    elif geom_w.geom_type == 'MultiPolygon':
+                        rings = []
+                        for poly in geom_w.geoms:
+                            rings.append(poly.exterior)
+                            rings.extend(poly.interiors)
+                    else:
+                        rings = []
+                    for ring in rings:
+                        for x, y in ring.coords:
+                            pt_3035 = _tx_to_3035.transform(x, y)
+                            vc = int((pt_3035[0] - tf.c) / tf.a)
+                            vr = int((tf.f - pt_3035[1]) / abs(tf.e))
+                            dtm_val = None
+                            if 0 <= vr < dh and 0 <= vc < dw:
+                                v = float(dtm[vr, vc])
+                                if np.isfinite(v): dtm_val = round(v, 2)
+                            if dtm_val is None:
+                                # Vertex outside centroid tile — try other tiles
+                                try:
+                                    vtr, vtdata = _find_tile_with_data(pt_3035[0], pt_3035[1])
+                                    if vtdata is not None and vtr is not tr:
+                                        vdtm = vtdata["dtm"]; vtf = vtdata["transform"]
+                                        vvc2 = int((pt_3035[0] - vtf.c) / vtf.a)
+                                        vvr2 = int((vtf.f - pt_3035[1]) / abs(vtf.e))
+                                        vdh, vdw = vdtm.shape
+                                        if 0 <= vvr2 < vdh and 0 <= vvc2 < vdw:
+                                            vv = float(vdtm[vvr2, vvc2])
+                                            if np.isfinite(vv): dtm_val = round(vv, 2)
+                                except Exception:
+                                    pass
+                            verts.append({"lat": round(y,7), "lon": round(x,7), "dtm_m": dtm_val})
+                    if verts:
+                        pd["vertex_heights"] = verts
+                except Exception:
+                    pass
+                # Segment analysis (happy path)
+                # Use tr's own ndsm/transform/shape (consistent with labels).
+                # tdata is a re-read that may differ by 1-2 pixels.
+                if tr.get("labels") is not None and objects:
+                    try:
+                        pss = _parcel_segment_stats(geom_3035, tr["labels"], tr["ndsm"],
+                                                    tr["transform"], tr["shape"])
+                        pd.update(pss)
+                    except Exception:
+                        pass  # STRtree fallback below
+                # STRtree fallback: if _parcel_segment_stats didn't produce area_summary
+                if 'area_summary' not in pd:
+                    p_idx = _parcel_idx_by_id[id(p)]
+                    p_objs = _parcel_obj_map.get(p_idx, [])
+                    if p_objs:
+                        as_, th_f, ssum = _strtree_area_summary(p_objs, p.get('area_sqm'))
+                        pd['area_summary'] = as_
+                        pd['height_distribution'] = {
+                            t: {'min': round(min(hs), 2), 'max': round(max(hs), 2),
+                                'mean': round(sum(hs) / len(hs), 2)}
+                            for t, hs in th_f.items() if hs}
+                        tpx_f = max(ssum, 1.0)
+                        vpx = sum(v['area_sqm'] for k, v in as_.items() if k in _VEGETATED_TYPES)
+                        pd['vegetated_fraction'] = round(vpx / tpx_f, 4)
+                        pd['is_vegetated'] = vpx / tpx_f > 0.5
+                        fpx = sum(v['area_sqm'] for k, v in as_.items() if k in _FOREST_TYPES)
+                        pd['forested_fraction'] = round(fpx / tpx_f, 4)
+                        pd['dominant_type'] = next(iter(as_)) if as_ else None
+                        hmax_vals = [obj.height_max for obj in p_objs if obj.height_max > 0]
+                        if hmax_vals:
+                            pd['ndsm_max_m'] = round(max(hmax_vals), 2)
+                        # classifier still uses true (unscaled) per-type areas
+                        # for confidence stats (reflects evidence volume).
+                        from collections import Counter as _CC
+                        true_tc = _CC()
+                        for obj in p_objs:
+                            true_tc[obj.obj_type] += int(obj.area_sqm)
+                        cls = _classification_stats_from_objs(p_objs, type_area_sqm=dict(true_tc))
+                        if cls:
+                            pd['classification'] = cls
+                # Ensure forested_fraction and dominant_type are always present
+                if 'area_summary' in pd and 'forested_fraction' not in pd:
+                    as_ = pd['area_summary']
+                    tpx_a = max(sum(v.get('area_sqm', 0) for v in as_.values()), 1)
+                    fpx_a = sum(v.get('area_sqm', 0) for k, v in as_.items() if k in _FOREST_TYPES)
+                    pd['forested_fraction'] = round(fpx_a / tpx_a, 4)
+                if 'area_summary' in pd and 'dominant_type' not in pd:
+                    as_ = pd['area_summary']
+                    if as_:
+                        pd['dominant_type'] = max(as_, key=lambda t: as_[t].get('area_sqm', 0))
+                # Per-parcel Hansen forest loss
+                if _hansen_tile_data and 'hansen_loss' not in pd:
+                    try:
+                        from rasterio.features import rasterize as _hz_rasterize
+                        for h_bounds, h_ly, h_tf, h_shape in _hansen_tile_data:
+                            h_left, h_bot, h_right, h_top = h_bounds
+                            c3 = geom_3035.centroid
+                            if h_left <= c3.x <= h_right and h_bot <= c3.y <= h_top:
+                                hm = _hz_rasterize([(geom_3035, 1)], out_shape=h_shape,
+                                                   transform=h_tf, fill=0, dtype=np.uint8,
+                                                   all_touched=True).astype(bool)
+                                hl = h_ly[hm]
+                                hl = hl[hl > 0]
+                                if len(hl) > 0:
+                                    per_yr = Counter(int(y) for y in hl)
+                                    pd['hansen_loss'] = {
+                                        'total_pixels': int(len(hl)),
+                                        'by_year': {str(2000 + yr): int(cnt)
+                                                    for yr, cnt in sorted(per_yr.items())},
+                                    }
+                                    # Recent loss (last 5 years)
+                                    recent = sum(cnt for yr, cnt in per_yr.items() if yr >= 20)
+                                    pd['hansen_loss']['recent_5yr_pixels'] = recent
+                                break
+                    except Exception:
+                        pass
+            else:
+                n_parcel_no_tile += 1
+                # Fallback: direct DTM point read
+                elev = _point_elevation_fallback(c3.x, c3.y)
+                if elev is not None:
+                    pd["elevation_m"] = elev
+                # Vertex heights with geometry-only fallback (dtm_m=None)
+                # so vertex_heights is always present for known parcels
+                try:
+                    verts = []
+                    geom_w = p.get("geometry_wgs")
+                    if geom_w is not None:
+                        if geom_w.geom_type == 'Polygon':
+                            rings = [geom_w.exterior] + list(geom_w.interiors)
+                        elif geom_w.geom_type == 'MultiPolygon':
+                            rings = []
+                            for poly in geom_w.geoms:
+                                rings.append(poly.exterior)
+                                rings.extend(poly.interiors)
+                        else:
+                            rings = []
+                        for ring in rings:
+                            for x, y in ring.coords:
+                                pt_3035 = _tx_to_3035.transform(x, y)
+                                dtm_val = None
+                                try:
+                                    vtr, vtdata = _find_tile_with_data(pt_3035[0], pt_3035[1])
+                                    if vtdata is not None:
+                                        vdtm = vtdata["dtm"]; vtf = vtdata["transform"]
+                                        vvc2 = int((pt_3035[0] - vtf.c) / vtf.a)
+                                        vvr2 = int((vtf.f - pt_3035[1]) / abs(vtf.e))
+                                        vdh, vdw = vdtm.shape
+                                        if 0 <= vvr2 < vdh and 0 <= vvc2 < vdw:
+                                            vv = float(vdtm[vvr2, vvc2])
+                                            if np.isfinite(vv): dtm_val = round(vv, 2)
+                                except Exception:
+                                    pass
+                                verts.append({"lat": round(y,7), "lon": round(x,7), "dtm_m": dtm_val})
+                        if verts:
+                            pd["vertex_heights"] = verts
+                except Exception:
+                    pass
+                # STRtree fallback for parcels outside all tile bounds
+                p_idx = _parcel_idx_by_id[id(p)]
+                p_objs = _parcel_obj_map.get(p_idx, [])
+                if p_objs:
+                    as_, th_f, ssum = _strtree_area_summary(p_objs, p.get('area_sqm'))
+                    pd['area_summary'] = as_
+                    pd['height_distribution'] = {
+                        t: {'min': round(min(hs), 2), 'max': round(max(hs), 2),
+                            'mean': round(sum(hs) / len(hs), 2)}
+                        for t, hs in th_f.items() if hs}
+                    tpx_f = max(ssum, 1.0)
+                    vpx = sum(v['area_sqm'] for k, v in as_.items() if k in _VEGETATED_TYPES)
+                    pd['vegetated_fraction'] = round(vpx / tpx_f, 4)
+                    pd['is_vegetated'] = vpx / tpx_f > 0.5
+                    fpx = sum(v['area_sqm'] for k, v in as_.items() if k in _FOREST_TYPES)
+                    pd['forested_fraction'] = round(fpx / tpx_f, 4)
+                    pd['dominant_type'] = next(iter(as_)) if as_ else None
+                    hmax_vals = [obj.height_max for obj in p_objs if obj.height_max > 0]
+                    if hmax_vals:
+                        pd['ndsm_max_m'] = round(max(hmax_vals), 2)
+                    from collections import Counter as _CC
+                    true_tc = _CC()
+                    for obj in p_objs:
+                        true_tc[obj.obj_type] += int(obj.area_sqm)
+                    cls = _classification_stats_from_objs(p_objs, type_area_sqm=dict(true_tc))
+                    if cls:
+                        pd['classification'] = cls
+        except Exception as e:
+            log.warning("JSON: parcel %s enrichment failed: %s", p.get("parcel_id"), e)
+        # --- Per-parcel top objects / top trees + compact fraction vector ---
+        # The KG-level top_10 lists only surface 10 entries across the whole KG;
+        # for a 4750ha KG with 130+ parcels and 85k trees, that's far too coarse
+        # for parcel-scale filtering. Emit per-parcel highlights from the same
+        # objects already assigned via STRtree (or via _parcel_segment_stats).
+        #
+        # Storage budget: at scale (7850 KGs × 200-500 parcels each) every
+        # extra byte/parcel matters. Use compact array form, top-5 only,
+        # and a tiny `frav` (FRaction Area Vector keyed by short type letters)
+        # so even parcels with no objects get something queryable.
+        #
+        # Format: top_objs[i] = [type_letter, hmax, hmean, area, lon, lat,
+        #                        conf, rf_conf, manmade_flag]
+        #         top_trees[i] = [hmax, hmean, h_p90, area, lon, lat,
+        #                          ndvi_mean, ndvi_fused, hchg, phen, conf, rf_conf]
+        #         frav = {"t": area_sqm, "c": area_sqm, ...}  (rounded ints)
+        # See _PARCEL_TOP_OBJ_KEYS / _PARCEL_TOP_TREE_KEYS below in app.py
+        # query layer (via static/process.html) for decoding.
+        from object_segmentation import TYPE_LETTER
+        TOP_N = 5
+        try:
+            p_idx = _parcel_idx_by_id[id(p)]
+            p_objs = _parcel_obj_map.get(p_idx, [])
+            # Compact frav from area_summary (or from p_objs if no raster summary)
+            as_ = pd.get('area_summary') or {}
+            if as_:
+                frav = {}
+                for t, info in as_.items():
+                    letter = TYPE_LETTER.get(t, '?')
+                    frav[letter] = int(info.get('area_sqm', 0))
+                if frav:
+                    pd['frav'] = frav
+            elif p_objs:
+                # Same clamp as area_summary fallback: scale so Σ ≤ parcel area.
+                as_fb, _, _ = _strtree_area_summary(p_objs, p.get('area_sqm'))
+                frav = {TYPE_LETTER.get(t, '?'): info['area_sqm']
+                        for t, info in as_fb.items() if info.get('area_sqm', 0) > 0}
+                if frav:
+                    pd['frav'] = frav
+            if p_objs:
+                p_top_obj = []
+                for o in sorted(p_objs, key=lambda o: o.height_max, reverse=True)[:TOP_N]:
+                    lon = lat = None
+                    try:
+                        lon, lat = _tx_to_wgs.transform(o.centroid_e, o.centroid_n)
+                        lon, lat = round(lon, 7), round(lat, 7)
+                    except Exception:
+                        pass
+                    p_top_obj.append([
+                        TYPE_LETTER.get(o.obj_type, '?'),
+                        round(o.height_max, 1),
+                        round(o.height_mean, 1),
+                        int(o.area_sqm),
+                        lon, lat,
+                        round(o.confidence, 2),
+                        round(getattr(o, 'rf_confidence', 0.0), 2),
+                        1 if o.is_manmade else 0,
+                    ])
+                if p_top_obj:
+                    pd['top_objs'] = p_top_obj
+                p_trees = [o for o in p_objs if o.obj_type == 'tree']
+                if p_trees:
+                    p_top_tree = []
+                    for t in sorted(p_trees, key=lambda o: o.height_max, reverse=True)[:TOP_N]:
+                        lon = lat = None
+                        try:
+                            lon, lat = _tx_to_wgs.transform(t.centroid_e, t.centroid_n)
+                            lon, lat = round(lon, 7), round(lat, 7)
+                        except Exception:
+                            pass
+                        p_top_tree.append([
+                            round(t.height_max, 1),
+                            round(t.height_mean, 1),
+                            round(t.height_p90, 1),
+                            int(t.area_sqm),
+                            lon, lat,
+                            round(t.ndvi_mean, 3),
+                            round(t.ndvi_fused, 3),
+                            round(t.height_change, 2),
+                            t.phenology_class or '',
+                            round(t.confidence, 2),
+                            round(getattr(t, 'rf_confidence', 0.0), 2),
+                        ])
+                    pd['top_trees'] = p_top_tree
+        except Exception as e:
+            log.debug("JSON: per-parcel top items failed for %s: %s", p.get("parcel_id"), e)
+        _oz = _outline_recs.get(str(p.get("parcel_id")))
+        if _oz:
+            pd["outline_z"] = _oz
+        parcel_details.append(pd)
+    if n_parcel_no_tile > 0:
+        log.warning("JSON: %d/%d parcels have no matching tile (centroid outside all tile bounds)",
+                    n_parcel_no_tile, len(cadastre_data["parcels"]))
+    if CADASTRE_PRODUCTS:
+        summary["parcels"] = {
+            "count": len(cadastre_data["parcels"]),
+            "total_area_sqm": round(sum(p.get("area_sqm",0) for p in cadastre_data["parcels"]), 1),
+            "details": parcel_details}
+    if _outline_recs and CADASTRE_PRODUCTS:
+        summary["parcels"]["outline_z_encoding"] = {
+            "z": "int16 LE decimetres DTM, base64", "zs": "int16 LE decimetres nDSM (DSM-DTM), base64",
+            "nodata": -32768, "points": "exterior ring of the cadastre parcel walked from vertex 0 at 'sp' metres "
+            "(segv2.parcel_elevation.outline_points); p0 = first point EPSG:3035"}
+    if classifier_used:
+        _cu = sorted(classifier_used.items(), key=lambda kv: -kv[1])
+        summary["model"] = {"version": VERSION, "classifier": _cu[0][0],
+                            "classifier_by_tile": dict(_cu) if len(_cu) > 1 else None}
+    # --- Per-building detail ---
+    # Build spatial lookup for address points → join to footprints
+    _addr_list = cadastre_data.get("building_addresses", [])
+    _addr_lookup = {}  # keyed by (rounded_x, rounded_y) → list of addr dicts
+    for a in _addr_list:
+        ag = a.get("geometry_3035")
+        if ag:
+            key = (round(ag.x / 10) * 10, round(ag.y / 10) * 10)  # 10m grid
+            _addr_lookup.setdefault(key, []).append(a)
+
+    def _find_address(centroid_3035, max_dist=30):
+        """Find nearest address point within max_dist metres of a footprint centroid."""
+        cx, cy = centroid_3035.x, centroid_3035.y
+        best, best_d = None, max_dist
+        # Search 3x3 grid cells around centroid
+        for dx in (-10, 0, 10):
+            for dy in (-10, 0, 10):
+                key = (round((cx + dx) / 10) * 10, round((cy + dy) / 10) * 10)
+                for a in _addr_lookup.get(key, []):
+                    d = centroid_3035.distance(a["geometry_3035"])
+                    if d < best_d:
+                        best, best_d = a, d
+        return best
+
+    bld_details = []
+    n_bld_no_tile = 0
+    for b in (cadastre_data["building_footprints"] if CADASTRE_PRODUCTS else []):   # v2.4: never
+        bd = {}; geom_3035 = b["geometry"]; props = b.get("properties",{})
+        bd["building_id"] = props.get("building_id", props.get("id",""))
+        bd["footprint_area_sqm"] = round(float(geom_3035.area), 1)
+        # Nutzungssymbol from footprint layer
+        if props.get("ns"): bd["ns"] = props["ns"]
+        try:
+            cw = transform_to_wgs(geom_3035.centroid)
+            bd["centroid"] = {"lon": round(cw.x,7), "lat": round(cw.y,7)}
+        except Exception: pass
+        # Join nearest address point
+        try:
+            addr = _find_address(geom_3035.centroid)
+            if addr:
+                if addr.get("building_id"): bd["building_id"] = addr["building_id"]
+                for ak in ("full_address", "house_number", "street", "postal_code", "location"):
+                    v = addr.get(ak, "")
+                    if v: bd[ak] = v
+        except Exception:
+            pass
+        try:
+            c3 = geom_3035.centroid
+            tr, tdata = _find_tile_with_data(c3.x, c3.y)
+            if tr and tdata:
+                from rasterio.features import rasterize as rio_rasterize
+                dh, dw = tdata["shape"]
+                bm = rio_rasterize([(geom_3035,1)], out_shape=(dh,dw), transform=tdata["transform"],
+                                   fill=0, dtype=np.uint8, all_touched=True).astype(bool)
+                oh = tdata["ndsm"][bm]; oh = oh[np.isfinite(oh)]
+                dv = tdata["dsm"][bm]; dv = dv[np.isfinite(dv)]
+                if len(oh) > 0:
+                    mh = float(np.nanmax(oh))
+                    bd["max_height_m"] = round(mh,2); bd["mean_height_m"] = round(float(np.nanmean(oh)),2)
+                    bd["dsm_std"] = round(float(np.std(dv)),2) if len(dv) > 0 else 0.0
+                    bd["roof_type_hint"] = "flat" if bd["dsm_std"] < 1.5 else "pitched"
+                    bd["stories_est"] = max(1, round(mh/3.0))
+                # Centroid DTM elevation
+                tf_b = tdata["transform"]
+                col_b = int((c3.x - tf_b.c) / tf_b.a)
+                row_b = int((tf_b.f - c3.y) / abs(tf_b.e))
+                if 0 <= row_b < dh and 0 <= col_b < dw:
+                    dtm_v = float(tdata["dtm"][row_b, col_b])
+                    if np.isfinite(dtm_v): bd["centroid_dtm_m"] = round(dtm_v, 2)
+                # Vertex heights (AMS anchor points + object height)
+                try:
+                    geom_w = b["geometry_wgs"]
+                    if geom_w.geom_type == 'Polygon':
+                        b_rings = [geom_w.exterior] + list(geom_w.interiors)
+                    elif geom_w.geom_type == 'MultiPolygon':
+                        b_rings = []
+                        for poly in geom_w.geoms:
+                            b_rings.append(poly.exterior)
+                            b_rings.extend(poly.interiors)
+                    else:
+                        b_rings = []
+                    dtm_b = tdata["dtm"]; ndsm_b = tdata["ndsm"]
+                    verts = []
+                    for ring in b_rings:
+                        for x, y in ring.coords:
+                            pt_3035 = _tx_to_3035.transform(x, y)
+                            vc = int((pt_3035[0] - tf_b.c) / tf_b.a)
+                            vr = int((tf_b.f - pt_3035[1]) / abs(tf_b.e))
+                            dtm_val = obj_h = None
+                            if 0 <= vr < dh and 0 <= vc < dw:
+                                dv2 = float(dtm_b[vr, vc])
+                                if np.isfinite(dv2): dtm_val = round(dv2, 2)
+                                nv = float(ndsm_b[vr, vc])
+                                if np.isfinite(nv): obj_h = round(nv, 2)
+                            verts.append({"lat": round(y,7), "lon": round(x,7),
+                                          "dtm_m": dtm_val, "obj_height_m": obj_h})
+                    if verts: bd["vertex_heights"] = verts
+                except Exception:
+                    pass
+                if tr.get("labels") is not None and objects:
+                    bl = tr["labels"][bm]; tc_ = Counter(); seg_objs = []
+                    for lbl in np.unique(bl):
+                        obj = obj_map.get(int(lbl))
+                        if obj:
+                            tc_[obj.obj_type] += int((bl==lbl).sum())
+                            seg_objs.append(obj)
+                    if tc_: bd["segment_types"] = {t:px for t,px in tc_.most_common()}
+                    cls = _classification_stats_from_objs(seg_objs)
+                    if cls:
+                        bd["classification"] = cls
+            else:
+                n_bld_no_tile += 1
+                # Fallback: at least get elevation for the centroid
+                elev = _point_elevation_fallback(c3.x, c3.y)
+                if elev is not None:
+                    bd["centroid_dtm_m"] = elev
+        except Exception as e:
+            log.debug("JSON: building %s enrichment failed: %s", bd.get("building_id"), e)
+        bld_details.append(bd)
+    if n_bld_no_tile > 0:
+        log.warning("JSON: %d/%d buildings have no matching tile", n_bld_no_tile, len(cadastre_data["building_footprints"]))
+    # Free tile data cache
+    _tile_data_cache.clear()
+    if CADASTRE_PRODUCTS:
+        summary["building_footprints"] = {"count": len(cadastre_data["building_footprints"]), "details": bld_details}
+    # --- Coverage ---
+    summary["coverage"] = {
+        "n_tiles": n_tiles, "tile_km": tile_km, "total_segmented_area_sqm": total_seg_pixels,
+        "note": "Full KG tiled segmentation. Since 2.4 no parcel/footprint data is in this product; "
+                "sub-KG detail lives in the NE cells layer (section 'ne', product <code>_ne.h3b)."}
+    summary["cadastre_free"] = True
+    # --- Data quality ---
+    dq = compute_data_quality(tile_data_availability or [])
+    summary["data_quality"] = dq
+    # --- Segment summary (counts only; full points are in GPKG) ---
+    seg_type_counts = Counter(obj.obj_type for obj in objects)
+    summary["segments"] = {
+        "total": len(objects),
+        "by_type": dict(seg_type_counts.most_common()),
+    }
+    # --- Methods ---
+    summary["methods"] = {
+        "segmentation": f"Felzenszwalb+RAG on {n_tiles} overlapping {tile_km}km tiles, centroid-dedup",
+        "classification": "Random Forest (44 features, cadastre+OSM trained) + rule-based fallback",
+        "calibration": "Cadastre footprints as run-time model context only (not stored)",
+        "height": "BEV ALS DTM/DSM 1m, nDSM = DSM - DTM",
+        "temporal_change": "DTM/DSM differencing, " + ", ".join(sorted(ti.DATASETS.keys())),
+        "ortho": "BEV DOP RGBI 0.2m", "ndvi_bev": "(NIR-Red)/(NIR+Red) from BEV DOP",
+        "ndvi_copernicus": "Sentinel-2 L2A, openEO, 10m",
+        "ndvi_harmonics": "Harmonic fit to monthly Sentinel-2 NDVI",
+        "sar": "Sentinel-1 IW GRD, VV+VH, openEO",
+        "terrain": "Slope/aspect/TRI from DTM, tiled",
+        "texture": "GLCM from ortho greyscale",
+        "hansen": "Hansen GFC-2024-v1.12, 30m",
+        "infrastructure": "austria-power API",
+        "roof_type": "DSM std < 1.5m = flat", "stories_est": "max_h/3m",
+        "stem_volume": "0.3*canopy_area*height/3", "parking_spots": "area/12.5m\u00b2",
+        "earthwork_volume": "mean(|nDSM|)*area",
+        "fragmentation": "Shannon diversity", "edge_density": "perimeter/area",
+        "phenology": "harmonic amplitude+phase \u2192 class",
+        "cadastre_source": "run-time model context only (umfeld-at /k, cached <= 24 h); products carry "
+                           "cadastre solely as NE cells (ne_h3, algo ne-cells-2) — no parcel / footprint / id",
+        "data_sources": [
+            "BEV ALS DTM/DSM 1m (2022-2024)", "BEV DOP RGBI 0.2m",
+            "Sentinel-2 L2A 10m NDVI (openEO)", "ESA WorldCover 10m",
+            "Sentinel-1 SAR IW GRD 10m (openEO)", "Hansen GFC-2024-v1.12 30m",
+            "BEV Kataster as NE cells (umfeld-at ne-cells-2, H3 res 12)", "Austria Power Infrastructure API"]}
+    # --- v2.1 coarse indexes (docs/v2.1-product-spec.md) ---------------
+    # Fixed-size 25 m grids + a < 1 KB acquisition block; the per-tree /
+    # per-5 m data lives in the light GPKG only (disk rule).
+    if v21_extras is not None and MODEL_VERSION == "v2":
+        summary["product_version"] = PRODUCT_VERSION
+        if v21_extras.get("terrain_grid25"):
+            summary.setdefault("terrain", {})["grid25"] = v21_extras["terrain_grid25"]
+        if v21_extras.get("landcover_grid25"):
+            summary["landcover"] = {"grid25": v21_extras["landcover_grid25"]}
+        if v21_extras.get("acquisition"):
+            summary["acquisition"] = v21_extras["acquisition"]
+        try:
+            import tree_inventory as _tv
+            _algo = _tv.TREE_ALGO_VERSION
+        except Exception:  # noqa: BLE001
+            _algo = None
+        ts_ = summary.setdefault("tree_stats", {})
+        ts_["apices_layer"] = "tree_apices" if v21_extras.get("n_apices_written") else None
+        ts_["n_apices"] = int(v21_extras.get("n_apices_written") or 0)
+        ts_["crowns_layer"] = "tree_crowns" if v21_extras.get("n_crowns_written") else None
+        ts_["n_crowns"] = int(v21_extras.get("n_crowns_written") or 0)
+        ts_["spectral"] = (v21_extras.get("det_info") or {}).get("spectral")
+        ts_["grid_anchor"] = "integer-metre EPSG:3035, apex = pixel centre"
+        ts_["det_mode"] = v21_extras.get("det_mode") or "skipped"
+        ts_["algo_version"] = _algo
+        _di = v21_extras.get("det_info") or {}
+        if _di:
+            ts_["apex_rejected_by_surface"] = int(_di.get("rejected_by_surface", 0) or 0)
+        summary["methods"]["tree_apices"] = (
+            "tree_inventory.build_inventory on the stitched 1 m nDSM (variable-window "
+            "local maxima + marker watershed, cadastre roof mask, v2 segment stand context); "
+            "points in _light_v2.gpkg layer tree_apices (EPSG:3035, R-tree); 2.2: per-crown BEV "
+            "ortho RGBI spectra (ndvi_mean/p10, nir, brightness, green_ratio) → vitality + "
+            "species_hint ranked KG-wide; crown outlines in layer tree_crowns (join tree_id); "
+            "grid anchored to the integer-metre BEV grid (apex = pixel centre)")
+        summary["methods"]["grid25"] = (
+            "25 m block means of the 1 m DTM/slope (terrain.grid25) and dominant v2 segment "
+            "class (landcover.grid25); 5 m terrain_coarse_* rasters in _light_v2.gpkg")
+        # --- v2.4 NE cells (docs/ne-v24-design.md) ---
+        _ne = v21_extras.get("ne") or {}
+        if _ne.get("summary"):
+            summary["ne"] = dict(_ne["summary"], status="ok")
+        else:
+            summary["ne"] = {"status": "missing", "error": _ne.get("error") or "declared layer not available"}
+        summary["methods"]["ne_cells"] = (
+            "H3 res-12 cells: declared land-use mix (NEC1, umfeld-at ne-cells-2, frozen epoch) vs our "
+            "observed layer (NEO1: segment_type mix, nDSM heights, tree count/height/crown, NDVI, dh, "
+            "verdict declared-vs-observed); NET1 = every tree apex >= 3 m, NEB1 = every man-made object "
+            "with observed height; res-10 chunked .h3b product (manifest key _ne_h3b)")
+    return summary
+
+
+# === SECTION: process_one_kg() — core per-KG pipeline (runs in subprocess) ===
+
+def _compute_tile_grid(west, south, east, north, tile_km=1.5, overlap_km=0.1):
+    """Compute a grid of overlapping tiles covering the full KG bbox.
+
+    Returns list of (w, s, e, n) bboxes in WGS84.
+    Tiles overlap by *overlap_km* so edge objects are fully contained
+    in at least one tile.
+    """
+    cos_lat = np.cos(np.radians((south + north) / 2))
+    dx_deg = tile_km / (111 * cos_lat)
+    dy_deg = tile_km / 111
+    step_x = (tile_km - overlap_km) / (111 * cos_lat)
+    step_y = (tile_km - overlap_km) / 111
+
+    tiles = []
+    y = south
+    while y < north:
+        x = west
+        while x < east:
+            tw = x
+            ts = y
+            te = min(x + dx_deg, east + dx_deg)  # allow overshoot
+            tn = min(y + dy_deg, north + dy_deg)
+            tiles.append((tw, ts, te, tn))
+            x += step_x
+        y += step_y
+    return tiles
+
+
+def _merge_terrain_stats(stats_list: list[tuple[dict, int]]) -> dict:
+    """Merge terrain stats from multiple tiles.
+
+    Each entry is (stats_dict, n_valid_pixels).  Numeric stats are
+    merged via pixel-weighted averages; min/max take the extremes;
+    percentile-based fields use weighted means (approximate but fine
+    for summary stats).
+    """
+    if not stats_list:
+        return {}
+    if len(stats_list) == 1:
+        return stats_list[0][0]
+
+    total_px = sum(n for _, n in stats_list)
+    if total_px == 0:
+        return stats_list[0][0]
+
+    def _wmean(key_path):
+        vals = []
+        for s, n in stats_list:
+            v = s
+            for k in key_path:
+                v = v.get(k) if isinstance(v, dict) else None
+                if v is None:
+                    break
+            if v is not None and isinstance(v, (int, float)):
+                vals.append((v, n))
+        if not vals:
+            return None
+        return round(sum(v * w for v, w in vals) / sum(w for _, w in vals), 3)
+
+    def _wmin(key_path):
+        vals = []
+        for s, n in stats_list:
+            v = s
+            for k in key_path:
+                v = v.get(k) if isinstance(v, dict) else None
+                if v is None:
+                    break
+            if v is not None and isinstance(v, (int, float)):
+                vals.append(v)
+        return round(min(vals), 2) if vals else None
+
+    def _wmax(key_path):
+        vals = []
+        for s, n in stats_list:
+            v = s
+            for k in key_path:
+                v = v.get(k) if isinstance(v, dict) else None
+                if v is None:
+                    break
+            if v is not None and isinstance(v, (int, float)):
+                vals.append(v)
+        return round(max(vals), 2) if vals else None
+
+    merged = {
+        "elevation": {
+            "min": _wmin(["elevation", "min"]),
+            "max": _wmax(["elevation", "max"]),
+            "mean": _wmean(["elevation", "mean"]),
+            "std": _wmean(["elevation", "std"]),
+            "range": None,  # recompute
+            "p10": _wmean(["elevation", "p10"]),
+            "p50": _wmean(["elevation", "p50"]),
+            "p90": _wmean(["elevation", "p90"]),
+        },
+        "slope_deg": {
+            "min": _wmin(["slope_deg", "min"]),
+            "max": _wmax(["slope_deg", "max"]),
+            "mean": _wmean(["slope_deg", "mean"]),
+            "std": _wmean(["slope_deg", "std"]),
+        },
+        "slope_classes_pct": {},
+        "aspect_distribution_pct": {},
+        "ruggedness_tri": {
+            "mean": _wmean(["ruggedness_tri", "mean"]),
+            "max": _wmax(["ruggedness_tri", "max"]),
+            "classification": None,
+        },
+        "area_sqm": total_px,
+        "area_ha": round(total_px / 10000, 2),
+    }
+    emin = merged["elevation"]["min"]
+    emax = merged["elevation"]["max"]
+    if emin is not None and emax is not None:
+        merged["elevation"]["range"] = round(emax - emin, 2)
+
+    # Weighted-average slope classes and aspect distribution
+    for cls_key in ["slope_classes_pct", "aspect_distribution_pct"]:
+        all_keys = set()
+        for s, _ in stats_list:
+            all_keys.update(s.get(cls_key, {}).keys())
+        for k in all_keys:
+            merged[cls_key][k] = round(
+                sum(s.get(cls_key, {}).get(k, 0) * n for s, n in stats_list) / total_px, 1)
+
+    # TRI classification from merged mean
+    tri_mean = merged["ruggedness_tri"]["mean"]
+    if tri_mean is not None:
+        if tri_mean < 0.1:
+            merged["ruggedness_tri"]["classification"] = "level"
+        elif tri_mean < 0.3:
+            merged["ruggedness_tri"]["classification"] = "nearly level"
+        elif tri_mean < 1.0:
+            merged["ruggedness_tri"]["classification"] = "slightly rugged"
+        elif tri_mean < 3.0:
+            merged["ruggedness_tri"]["classification"] = "intermediately rugged"
+        elif tri_mean < 10.0:
+            merged["ruggedness_tri"]["classification"] = "moderately rugged"
+        else:
+            merged["ruggedness_tri"]["classification"] = "highly rugged"
+
+    return merged
+
+
+# === SECTION: Encapsulated sub-tile Copernicus fetcher ===
+
+# Copernicus sub-tile fallback: split into 4 quadrants (2×2), then 16 (4×4)
+_COP_STEP_TIMEOUT = 300            # 5 min per sub-step (NDVI/WorldCover/SAR/harmonics)
+
+
+def _quadrant_split(bbox_dict: dict, n: int = 2) -> list[dict]:
+    """Split a bbox into n×n equal quadrants. Returns list of bbox dicts."""
+    w, s, e, n_ = bbox_dict["west"], bbox_dict["south"], bbox_dict["east"], bbox_dict["north"]
+    dx = (e - w) / n
+    dy = (n_ - s) / n
+    quads = []
+    for row in range(n):
+        for col in range(n):
+            quads.append({
+                "west":  w + col * dx,
+                "south": s + row * dy,
+                "east":  w + (col + 1) * dx,
+                "north": s + (row + 1) * dy,
+            })
+    return quads
+
+
+def _fetch_copernicus_for_tile(
+    bbox_dict: dict,
+    obs_year: int,
+    cop_cache,
+    report_fn=None,
+    tile_label: str = "",
+) -> dict | None:
+    """Fetch all Copernicus data for a tile bbox, with sub-tile fallback.
+
+    If the initial fetch for the full bbox times out, the bbox is
+    subdivided into smaller sub-tiles.  Each sub-tile is fetched
+    independently and the results are stitched (mosaicked) back into
+    a single set of arrays covering the original bbox.
+
+    Returns a ``copernicus_data`` dict (ndvi, landcover, vv, vh,
+    harmonics, transform, crs, sar_transform) or ``None``.
+    """
+    def _report(detail):
+        if report_fn:
+            report_fn("copernicus", f"{tile_label} — {detail}")
+
+    def _try_fetch_single(bbox, label=""):
+        """Attempt to fetch all Copernicus layers for one bbox."""
+        # Bail immediately if IP-throttled
+        import copernicus
+        if copernicus.ip_throttled:
+            from copernicus import IPThrottledError
+            raise IPThrottledError("Copernicus IP-throttled — skipping tile")
+        cop = {}
+
+        # NDVI composite (grid-snapped, usually fast)
+        _report(f"{label}NDVI" if label else "NDVI")
+        nd = cop_cache.get_ndvi(bbox, year=obs_year)
+        if nd and nd.get("ndvi") is not None:
+            cop["ndvi"] = nd["ndvi"]
+            cop["transform"] = nd.get("transform")
+            cop["crs"] = nd.get("crs")
+
+        # WorldCover
+        _report(f"{label}WorldCover" if label else "WorldCover")
+        lc = cop_cache.get_landcover(bbox)
+        if lc:
+            cop["landcover"] = lc
+
+        # SAR
+        _report(f"{label}SAR" if label else "SAR")
+        sar = cop_cache.get_sar(bbox, year=obs_year)
+        if sar:
+            cop.update({k: sar[k] for k in ["vv", "vh"] if k in sar})
+            if "transform" in sar:
+                cop["sar_transform"] = sar["transform"]
+
+        # Harmonics (slowest — uses grid-snapped cache)
+        if cop:
+            _report(f"{label}harmonics" if label else "harmonics")
+            def _harm_progress(done, total):
+                _report(f"{label}harmonics ({done}/{total} months)" if label
+                        else f"harmonics ({done}/{total} months)")
+            harm = cop_cache.get_harmonics(bbox, year=obs_year,
+                                           progress_fn=_harm_progress)
+            if harm is not None:
+                cop["harmonics"] = harm
+
+        return cop if cop else None
+
+    # --- First attempt: full bbox (inline, no thread wrapper) ---
+    try:
+        result = _try_fetch_single(bbox_dict)
+        if result is not None:
+            return result
+    except Exception as e:
+        from copernicus import CreditsExhaustedError, IPThrottledError
+        from tile_cache import CacheMissError as _CacheMissError
+        if isinstance(e, (CreditsExhaustedError, IPThrottledError)) or \
+           isinstance(e.__cause__, (CreditsExhaustedError, IPThrottledError)):
+            raise
+        # Cache-only mode: don't waste time on quadrant fallback (sub-tiles
+        # will also miss the cache).  Re-raise so the outer tile loop can
+        # mark the KG cache_incomplete and re-queue for the frontier.
+        if isinstance(e, _CacheMissError) or isinstance(e.__cause__, _CacheMissError):
+            raise
+        log.warning("Copernicus full-tile fetch failed for %s: %s — trying sub-tiles",
+                    tile_label, e)
+
+    # --- Sub-tile fallback: quadrant split and stitch ---
+    # Ladder: first try 4 quadrants (2×2), then 16 (4×4)
+    for n_split in [2, 4]:
+        sub_bboxes = _quadrant_split(bbox_dict, n=n_split)
+        n_pieces = n_split * n_split
+        _report(f"quadrant split {n_split}×{n_split} ({n_pieces} pieces)")
+        log.info("Copernicus quadrant fallback for %s: %d quadrants (%d×%d)",
+                 tile_label, n_pieces, n_split, n_split)
+
+        sub_results = []
+        for si, sb in enumerate(sub_bboxes):
+            sub_label = f"quadrant {si+1}/{n_pieces} — "
+            _report(sub_label.rstrip(" — "))
+            try:
+                sr = _try_fetch_single(sb, label=sub_label)
+                sub_results.append((sb, sr))
+            except Exception as e:
+                from copernicus import CreditsExhaustedError, IPThrottledError
+                from tile_cache import CacheMissError as _CacheMissError
+                if isinstance(e, (CreditsExhaustedError, IPThrottledError)) or \
+                   isinstance(e.__cause__, (CreditsExhaustedError, IPThrottledError)):
+                    raise
+                if isinstance(e, _CacheMissError) or isinstance(e.__cause__, _CacheMissError):
+                    raise
+                log.warning("Copernicus quadrant %d/%d failed: %s",
+                            si+1, n_pieces, e)
+                sub_results.append((sb, None))
+
+        # Stitch quadrant results back together
+        stitched = _stitch_copernicus_subtiles(
+            sub_results, bbox_dict, tile_label)
+        if stitched is not None:
+            return stitched
+
+        log.warning("Copernicus stitch failed at %d×%d for %s, trying finer split",
+                    n_split, n_split, tile_label)
+
+    return None
+
+
+def _stitch_copernicus_subtiles(
+    sub_results: list,
+    target_bbox: dict,
+    tile_label: str,
+) -> dict | None:
+    """Mosaic sub-tile Copernicus results into one dict covering target_bbox.
+
+    Each sub_result is (bbox_dict, cop_dict|None).  Arrays are placed
+    into an output grid at the correct geo-position using the transform.
+    """
+    # Collect non-None results
+    valid = [(bbox, cop) for bbox, cop in sub_results if cop is not None]
+    if not valid:
+        return None
+
+    # Determine which layers are available across sub-tiles
+    has_ndvi = any(c.get("ndvi") is not None for _, c in valid)
+    has_lc = any(c.get("landcover") is not None for _, c in valid)
+    has_vv = any(c.get("vv") is not None for _, c in valid)
+    has_vh = any(c.get("vh") is not None for _, c in valid)
+    has_harm = any(c.get("harmonics") is not None for _, c in valid)
+
+    if not (has_ndvi or has_lc or has_vv or has_vh or has_harm):
+        return None
+
+    result = {}
+
+    # For each raster layer, mosaic into a common grid
+    # Use the first available sub-tile to determine resolution
+    import rasterio
+
+    def _mosaic_layer(sub_results_with_data, layer_key, tf_key="transform"):
+        """Mosaic a single 2D layer from sub-tiles."""
+        pieces = []
+        for bbox, cop in sub_results_with_data:
+            arr = cop.get(layer_key)
+            tf = cop.get(tf_key)
+            if arr is not None and tf is not None:
+                pieces.append((arr, tf, bbox))
+        if not pieces:
+            return None, None
+
+        # Determine output resolution from first piece
+        ref_tf = pieces[0][1]
+        res_x = abs(ref_tf.a)
+        res_y = abs(ref_tf.e)
+
+        # Output grid covering target_bbox
+        tw = target_bbox["west"]
+        ts = target_bbox["south"]
+        te = target_bbox["east"]
+        tn = target_bbox["north"]
+        out_w = max(1, int(np.ceil((te - tw) / res_x)))
+        out_h = max(1, int(np.ceil((tn - ts) / res_y)))
+        out_tf = rasterio.Affine(res_x, 0, tw, 0, -res_y, tn)
+
+        out = np.full((out_h, out_w), np.nan, dtype=np.float32)
+
+        for arr, tf, bbox in pieces:
+            # Compute where this piece lands in the output grid
+            col_off = int(round((tf.c - out_tf.c) / res_x))
+            row_off = int(round((out_tf.f - tf.f) / res_y))
+            h, w = arr.shape[:2] if arr.ndim >= 2 else (1, arr.shape[0])
+            # Clamp to output bounds
+            src_r0 = max(0, -row_off)
+            src_c0 = max(0, -col_off)
+            dst_r0 = max(0, row_off)
+            dst_c0 = max(0, col_off)
+            dst_r1 = min(out_h, row_off + h)
+            dst_c1 = min(out_w, col_off + w)
+            src_r1 = src_r0 + (dst_r1 - dst_r0)
+            src_c1 = src_c0 + (dst_c1 - dst_c0)
+            if dst_r1 > dst_r0 and dst_c1 > dst_c0:
+                out[dst_r0:dst_r1, dst_c0:dst_c1] = arr[src_r0:src_r1, src_c0:src_c1]
+
+        return out, out_tf
+
+    # Mosaic NDVI
+    if has_ndvi:
+        arr, tf = _mosaic_layer(valid, "ndvi")
+        if arr is not None:
+            result["ndvi"] = arr
+            result["transform"] = tf
+            result["crs"] = valid[0][1].get("crs", "EPSG:4326")
+
+    # Mosaic WorldCover (dict with 'data' array)
+    if has_lc:
+        # WorldCover comes as a dict — extract the raster array
+        lc_pieces = []
+        for bbox, cop in valid:
+            lc = cop.get("landcover")
+            if lc is not None:
+                if isinstance(lc, dict) and "data" in lc:
+                    lc_pieces.append((bbox, {"landcover": lc["data"],
+                                             "transform": lc.get("transform",
+                                                                  cop.get("transform"))}))
+                elif isinstance(lc, np.ndarray):
+                    lc_pieces.append((bbox, {"landcover": lc,
+                                             "transform": cop.get("transform")}))
+        if lc_pieces:
+            arr, tf = _mosaic_layer(lc_pieces, "landcover")
+            if arr is not None:
+                # Re-wrap in the same format
+                result["landcover"] = valid[0][1].get("landcover")
+                if isinstance(result["landcover"], dict):
+                    result["landcover"]["data"] = arr
+                else:
+                    result["landcover"] = arr
+
+    # Mosaic SAR (VV/VH)
+    if has_vv or has_vh:
+        sar_tf_key = "sar_transform"
+        # Some sub-tiles may not have sar_transform — fall back to transform
+        for bbox, cop in valid:
+            if cop.get(sar_tf_key) is None and cop.get("transform") is not None:
+                cop[sar_tf_key] = cop["transform"]
+        if has_vv:
+            arr, tf = _mosaic_layer(valid, "vv", tf_key=sar_tf_key)
+            if arr is not None:
+                result["vv"] = arr
+                result["sar_transform"] = tf
+        if has_vh:
+            arr, tf = _mosaic_layer(valid, "vh", tf_key=sar_tf_key)
+            if arr is not None:
+                result["vh"] = arr
+                if "sar_transform" not in result:
+                    result["sar_transform"] = tf
+
+    # Mosaic harmonics (h_mean, h_amplitude, h_phase, h_rmse)
+    if has_harm:
+        harm_result = {}
+        harm_keys = ["h_mean", "h_amplitude", "h_phase", "h_rmse"]
+        # Build pseudo-results with harmonics arrays at top level
+        harm_pieces = []
+        for bbox, cop in valid:
+            h = cop.get("harmonics")
+            if h is not None:
+                flat = {}
+                for hk in harm_keys:
+                    if hk in h:
+                        flat[hk] = h[hk]
+                flat["transform"] = h.get("transform", cop.get("transform"))
+                harm_pieces.append((bbox, flat))
+        for hk in harm_keys:
+            arr, tf = _mosaic_layer(harm_pieces, hk)
+            if arr is not None:
+                harm_result[hk] = arr
+                harm_result["transform"] = tf
+        if harm_result:
+            harm_result["crs"] = valid[0][1].get("harmonics", {}).get("crs",
+                                   valid[0][1].get("crs", "EPSG:4326"))
+            result["harmonics"] = harm_result
+
+    if not result:
+        return None
+
+    # Ensure transform + crs are set
+    if "transform" not in result:
+        for _, cop in valid:
+            if cop.get("transform") is not None:
+                result["transform"] = cop["transform"]
+                break
+    if "crs" not in result:
+        result["crs"] = "EPSG:4326"
+
+    log.info("Copernicus stitched %d sub-tiles for %s: %s",
+             len(valid), tile_label,
+             [k for k in result if k not in ("transform", "crs", "sar_transform")])
+    return result
+
+
+def _v2_upload_and_finish(kg: dict, kg_code: str, result: dict, _report_step, *, v1_doc, ne_post: dict,
+                          parent_code: str, v2_upgrade: bool) -> None:
+    """Shared v2 tail (fresh, full-upgrade and v2.4 fast path): stream
+    light_gpkg_v2 → ne_h3b → json_v2 (→ json, fresh only) to Zenodo in
+    order, then — only once EVERYTHING landed — POST NEO1 to umfeld-at and
+    run the legacy clean-up.  Mutates *result* (``_uploaded_keys``,
+    ``files[..]=""``, ``legacy_cleanup`` …); the parent uploads whatever is
+    left in ``result["files"]`` if we stop early."""
+    _v2_upgrade = v2_upgrade
+    _parent_code = parent_code
+    result.setdefault("_uploaded_keys", [])
+    try:
+        from zenodo_client import (Client as _ZClientV, landscape_metadata as _lmV,
+                                    Manifest as _ZManifestV)
+        from zenodo_lock import zenodo_upload_lock as _zul
+        _zclientV = _ZClientV(token=ZENODO_TOKEN)
+        _zmanifestV = _ZManifestV(str(DATA_DIR / "zenodo_manifest.json"))
+        _qsV, _qgV = result.get("quality_score", 0), result.get("quality_grade", "")
+        _alV, _mlV = result.get("available_layers") or [], result.get("missing_layers") or []
+        with _zul(purpose="kg_upload_v2", kg=kg_code):
+            for _fk in ("light_gpkg_v2", NE_PRODUCT_KEY, "json_v2", "json"):
+                _fp = result["files"].get(_fk)
+                if not _fp or not os.path.exists(_fp) or os.path.getsize(_fp) == 0:
+                    continue
+                _ftV = "gpkg" if "gpkg" in _fk else ("h3b" if _fk == NE_PRODUCT_KEY else "json")
+                _metaV = lambda k, fn, v, _ft=_ftV: _lmV(
+                    kg_code, kg.get("kg_name", ""), v, _ft, quality_score=_qsV,
+                    quality_grade=_qgV, available_layers=_alV, missing_layers=_mlV)
+                _szV = os.path.getsize(_fp)
+                def _cbV(sent, total, _lab=_fk):
+                    _report_step(f"upload_{_lab}",
+                                 f"{total / 1e6:.0f} MB — {round(100 * sent / total) if total else 0}%")
+                _report_step(f"upload_{_fk}", f"streaming {_szV / 1e6:.1f} MB to Zenodo")
+                _zclientV.upload_stream(f"{kg_code}_{_fk}", _fp,
+                                        _product_upload_version(_fk, result.get("product_defects")),
+                                        _metaV, _zmanifestV,
+                                        delete_after=(_ftV == "gpkg"), progress_callback=_cbV)
+                result["_uploaded_keys"].append(_fk)
+                if _ftV == "gpkg":
+                    result["files"][_fk] = ""
+                if _fk == NE_PRODUCT_KEY:
+                    result["_ne_h3b_uploaded"] = True
+                _mark_cadastre_free(f"{kg_code}_{_fk}", _zmanifestV)
+                if _fk == "json":
+                    result["_json_uploaded"] = True
+                try:
+                    _push_manifest_entry_to_director(f"{kg_code}_{_fk}", _zmanifestV)
+                except Exception:
+                    pass
+                log.info("KG %s: %s streamed to Zenodo (%.1f MB)", kg_code, _fk, _szV / 1e6)
+    except Exception as _vue:  # noqa: BLE001
+        log.warning("KG %s: v2 in-subprocess upload stopped (%s) — parent uploads the rest "
+                    "in order", kg_code, _vue)
+    # --- 7b''. v2.4 post-upload: NE round-trip + legacy clean-up ---
+    # Strict order (owner rule): the v2.4 products are VERIFIED and
+    # UPLOADED first; only then is the legacy (cadastre-shaped) data
+    # touched.  Both steps are idempotent and re-run by the parent's
+    # completion sweep if this subprocess dies here.
+    _wanted = [k for k in ("light_gpkg_v2", NE_PRODUCT_KEY, "json_v2", "json")
+               if result["files"].get(k) is not None and (k in result.get("_uploaded_keys", []) or result["files"].get(k) == "")]
+    _all_up = all(k in result.get("_uploaded_keys", []) for k in ("light_gpkg_v2", "json_v2")
+                  ) and (NE_PRODUCT_KEY in result.get("_uploaded_keys", []) or not result["files"].get(NE_PRODUCT_KEY)) \
+        and (_v2_upgrade or "json" in result.get("_uploaded_keys", []))
+    if _all_up:
+        try:
+            _ne_post = ne_post or {}
+            import ne_h3 as _neh
+            if _ne_post.get("neo1_section") and _neh.ne_source() == "bevdirect":
+                # bev mode: /obs is a survey-token write umfeld's /contrib does
+                # not take; the primary's ne_ingest posts (NEC1+NEO1) after it
+                # ingested the h3b — the peer never calls umfeld's /k tier.
+                result["ne_obs_posted"] = {"deferred_to": "primary", "container": "NEC1+NEO1" if _ne_post.get("nec1_section") else "NEO1"}
+                log.info("KG %s: NEO1 post left to the primary (bev mode)", kg_code)
+            elif _ne_post.get("neo1_section"):
+                _report_step("ne_obs", "posting NEO1 to umfeld-at")
+                _nec = _ne_post.get("nec1_section")
+                _r = _neh.post_observed(_parent_code, _ne_post["neo1_section"], nec1_section=_nec)
+                result["ne_obs_posted"] = {k: _r.get(k) for k in ("unchanged", "replaced", "previous_digest", "status",
+                                                                   "declared_layer", "declared_digest", "lu_diff",
+                                                                   "bev_replaced")}
+                if _nec:
+                    result["ne_obs_posted"]["bev_digest"] = (_r.get("bev") or {}).get("digest")
+                    result["ne_obs_posted"]["container"] = "NEC1+NEO1"
+                    if _r.get("declared_layer") != "bev" or result["ne_obs_posted"]["bev_digest"] != _ne_post.get("declared_digest"):
+                        log.warning("KG %s: NEC1+NEO1 posted but umfeld answered declared_layer=%s bev=%s (ours %s)",
+                                    kg_code, _r.get("declared_layer"), result["ne_obs_posted"]["bev_digest"],
+                                    _ne_post.get("declared_digest"))
+                log.info("KG %s: NEO1 posted to umfeld-at%s: %s", kg_code, " (NEC1+NEO1)" if _nec else "",
+                         result["ne_obs_posted"])
+        except Exception as _e:  # noqa: BLE001
+            log.warning("KG %s: NEO1 post to umfeld-at failed (non-fatal, primary re-posts): %s", kg_code, _e)
+        try:
+            _report_step("legacy_cleanup", "stripping cadastre data from legacy products")
+            result["legacy_cleanup"] = remove_legacy_products(kg_code, v1_doc=v1_doc if _v2_upgrade else None)
+            log.info("KG %s: legacy clean-up: %s", kg_code, result["legacy_cleanup"])
+        except Exception as _e:  # noqa: BLE001
+            log.warning("KG %s: legacy clean-up failed (parent sweep retries): %s", kg_code, _e)
+
+
+
+
+def _process_kg_v24_fast(kg: dict, kg_code: str, result: dict, fast_inputs: dict, v1_doc,
+                         ne_declared, union_3035, parent_code: str, _report_step) -> dict:
+    """v2.4 fast upgrade: relabel the KG's existing v2.3+ products instead of
+    re-running the tile loop (``v24_fast``).  Same verify / upload / NEO1 /
+    legacy-clean-up tail as the full path; same ``result`` contract for the
+    parent (``files``, ``_uploaded_keys``, ``v2_verify``, ``product_defects``
+    …).  Runs inside the KG subprocess."""
+    import v24_fast
+    import kg_json_v2 as _kgj2
+    import v2_verify as _v2v
+    from object_segmentation import ALL_TYPE_NAMES as _ATN
+    result["v24_fast"] = True
+    result["step"] = "gpkg_light"
+    _report_step("gpkg_light", f"v2.4 fast: relabel {fast_inputs.get('light_version')} products")
+    GPKG_DIR.mkdir(parents=True, exist_ok=True)
+    JSON_DIR.mkdir(parents=True, exist_ok=True)
+    out_gpkg = str(GPKG_DIR / f"{kg_code}_light_v2.gpkg")
+    out_h3b = str(GPKG_DIR / f"{kg_code}_ne.h3b")
+    # Measured safety net behind ``v24_fast_source_ok``: the relabel copies
+    # the source ``segment_type`` raster unchanged, so a hole in the source
+    # is a hole in the product and ``segment_type_no_holes`` would strike the
+    # code deterministically.  Measure the *source* against the same union
+    # the verifier uses; on a hole, decline (no strike) and let the parent
+    # route the code to the full path from the full GPKG.
+    if union_3035 is not None and fast_inputs.get("light_src"):
+        try:
+            _report_step("gpkg_light", "v2.4 fast: source segment_type hole check")
+            _nz, _hole = _v2v._segment_type_nonzero(fast_inputs["light_src"], union_3035)
+        except Exception as _he:  # noqa: BLE001
+            log.warning("KG %s: fast source hole check failed (%s) — continuing", kg_code, _he)
+            _nz, _hole = 0, None
+        if _hole is not None and _hole > _v2v.TOL["raster_hole_frac"]:
+            _why = (f"inherited segment_type hole {100 * _hole:.2f}% of parcel union in the "
+                    f"{fast_inputs.get('light_version')} source (tol {100 * _v2v.TOL['raster_hole_frac']:.1f}%)")
+            log.warning("KG %s: v2.4 fast path declined — %s; needs the full path", kg_code, _why)
+            result["success"] = False
+            result["v24_fast_declined"] = _why
+            result["error"] = f"v24 fast declined: {_why}"
+            result["step"] = "v24_fast_declined"
+            return result
+    # Label-mix (restored-checkpoint id collision, Oct 2026): the relabel
+    # copies the source ``segments`` polygons + ``segment_type`` raster
+    # unchanged, so a source whose polygons glue unrelated objects together
+    # would re-upload the defect as v2.4 (and bake it into the NE cells).
+    # Decline (no strike) → full path re-segments from the full GPKG rasters.
+    if fast_inputs.get("light_src"):
+        try:
+            _report_step("gpkg_light", "v2.4 fast: source label consistency check")
+            _mf, _mb, _mn = _v2v.label_mix_fraction_path(fast_inputs["light_src"])
+        except Exception as _me:  # noqa: BLE001
+            log.warning("KG %s: fast source label-mix check failed (%s) — continuing", kg_code, _me)
+            _mf = 0.0
+        if _mf > _v2v.TOL["label_mix_frac"]:
+            _why = (f"label-mixed {fast_inputs.get('light_version')} source: {_mb}/{_mn} polygon parts "
+                    f"> 2x own area ({100 * _mf:.2f}%, tol {100 * _v2v.TOL['label_mix_frac']:.1f}%)")
+            log.warning("KG %s: v2.4 fast path declined — %s; needs the full path", kg_code, _why)
+            result["success"] = False
+            result["v24_fast_declined"] = _why
+            result["error"] = f"v24 fast declined: {_why}"
+            result["step"] = "v24_fast_declined"
+            return result
+    b = v24_fast.build(kg, fast_inputs, ne_declared, out_gpkg=out_gpkg, out_h3b=out_h3b,
+                       product_version=PRODUCT_VERSION, strip_fn=strip_cadastre_from_doc,
+                       type_names=_ATN, step=lambda d: _report_step("gpkg_light", d))
+    light_gpkg = b["light_gpkg"]
+    result["files"]["light_gpkg_v2"] = light_gpkg
+    result["n_segments"] = int(b.get("n_objects") or 0)
+    result["v21"] = {"n_apices": b.get("n_apices"), "det_mode": "relabel", "fast_seconds": b.get("seconds")}
+    ne_out = b["ne"] or {}
+    if ne_out.get("h3b_path") and os.path.exists(ne_out["h3b_path"]):
+        result["files"][NE_PRODUCT_KEY] = ne_out["h3b_path"]
+        result["ne"] = {"declared_digest": ne_out.get("declared_digest"), "declared_source": ne_out.get("declared_source"),
+                        "cells_observed": (ne_out.get("summary") or {}).get("observed", {}).get("cells_observed"),
+                        "seconds": ne_out.get("seconds")}
+    elif ne_out.get("error"):
+        result["ne_status"] = "error:" + ne_out["error"]
+    _light_size = os.path.getsize(light_gpkg) if os.path.exists(light_gpkg) else 0
+    _light_issues = validate_kg_outputs(kg_code, {"light_gpkg": light_gpkg}) if _light_size else ["LIGHT_GPKG: empty"]
+    for _li in _light_issues:
+        log.warning("KG %s VALIDATION (fast): %s", kg_code, _li)
+    if not _light_issues:
+        log.info("KG %s: light GPKG validated OK (%.0f MB, cadastre tables dropped: %s)",
+                 kg_code, _light_size / 1e6, ",".join(b.get("dropped") or []) or "none")
+
+    # --- JSON (relabelled v2.3 doc) ---
+    result["step"] = "json"
+    _report_step("json", "relabelling v2 JSON (cadastre-free + ne)")
+    json_summary = b["json_doc"]
+    dq = json_summary.get("data_quality", {}) or {}
+    result["quality_score"] = dq.get("quality_score", 0)
+    result["quality_grade"] = dq.get("quality_grade", "F")
+    result["available_layers"] = dq.get("available_layers", [])
+    result["missing_layers"] = dq.get("missing_layers", [])
+    result["n_upstream_failed_tiles"] = dq.get("n_upstream_failed_tiles", 0)
+    result["upstream_failed_tiles"] = dq.get("upstream_failed_tiles", [])
+    try:
+        from product_repair import defects_from_quality as _pr_defects
+        result["product_defects"] = _pr_defects(dq)
+        if not result["files"].get(NE_PRODUCT_KEY):
+            result["product_defects"] = sorted(set(result["product_defects"]) | {"ne_cells"})
+        if result["product_defects"]:
+            log.warning("KG %s: repairable layer gap(s) %s — JSON products labelled '-partial' "
+                        "(fast relabel keeps the v2.3 gaps; Copernicus repair re-upgrades later)",
+                        kg_code, ",".join(result["product_defects"]))
+    except Exception as _pe:
+        log.debug("product_defects: %s", _pe)
+    json_v2_path = str(JSON_DIR / f"{kg_code}_v2.json.gz")
+    _n_v2 = _kgj2.dump(json_summary, json_v2_path)
+    result["files"]["json_v2"] = json_v2_path
+    log.info("KG %s: kgjson/2 written (%.2f MB gz, fast relabel)", kg_code, _n_v2 / 1e6)
+
+    # --- verify (identical gates to the full path) ---
+    _report_step("v2_verify", "integrity + improvement checks")
+    _rep = _v2v.verify_before_upload(
+        kg_code, json_v2_path, light_gpkg if _light_size > 0 else None, v1_doc,
+        expected_parcels=None, union_geom_3035=union_3035,
+        h3b_path=result["files"].get(NE_PRODUCT_KEY),
+        ne_declared_digest=(ne_declared.digest if ne_declared is not None else None))
+    result["v2_verify"] = {"ok": bool(_rep["ok"]), "summary": _rep.summary(),
+                           "errors": list(_rep.get("errors", []))[:10],
+                           "warnings": list(_rep.get("warnings", []))[:10]}
+    _vmsg = f"v2verify: {kg_code} {_rep.summary()} [fast]"
+    if not _rep["ok"]:
+        log.error("KG %s: %s — NOT uploading", kg_code, _vmsg)
+        try:
+            _fdir = JSON_DIR / "v2_verify_failed"
+            _fdir.mkdir(parents=True, exist_ok=True)
+            if os.path.exists(json_v2_path):
+                os.replace(json_v2_path, _fdir / os.path.basename(json_v2_path))
+            _old = sorted(_fdir.glob("*_v2.json.gz"), key=lambda q: q.stat().st_mtime)
+            for _q in _old[:-20]:
+                _q.unlink(missing_ok=True)
+        except Exception:
+            pass
+        for _pth in (json_v2_path, light_gpkg, result["files"].get(NE_PRODUCT_KEY)):
+            try:
+                if _pth and os.path.exists(_pth):
+                    os.unlink(_pth)
+            except OSError:
+                pass
+        result["files"] = {k: v for k, v in result["files"].items()
+                           if k not in ("json_v2", "light_gpkg_v2", NE_PRODUCT_KEY)}
+        result["success"] = False
+        result["v2_verify_failed"] = True
+        result["error"] = _vmsg
+        result["step"] = "aborted_v2_verify_failed"
+        return result
+    log.info("KG %s: %s", kg_code, _vmsg)
+    _relay_subprocess_info(_vmsg, "v2_verify")
+
+    # --- uploads → NEO1 POST → legacy clean-up (shared tail) ---
+    if not THROTTLE_FILE.exists():
+        _v2_upload_and_finish(kg, kg_code, result, _report_step, v1_doc=v1_doc, ne_post=ne_out,
+                              parent_code=parent_code, v2_upgrade=True)
+    result["success"] = True
+    result["step"] = "done"
+    return result
+
+
+def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = None,
+                   mark_uncertain: bool = False, source_gpkg: str = None,
+                   v1_doc: dict = None, fast_inputs: dict = None) -> dict:
+    """Process a single KG with tiled segmentation for full coverage.
+
+    ``fast_inputs`` (v2.4 fast upgrade, ``v24_fast.fetch_inputs``): the KG
+    already has a v2.3+ pair on Zenodo — skip the tile loop entirely and
+    relabel (cadastre-free light GPKG + NE cells + JSON) from those
+    products; see ``_process_kg_v24_fast``.
+
+    ``source_gpkg`` (v2 upgrade mode): path to this KG's own v1 *full* GPKG.
+    All per-tile raster reads are served from it via ``v2_source`` (with
+    per-layer health checks + real-source fallback), the full GPKG build and
+    its upload are skipped, and the products are ``<code>_light_v2.gpkg`` +
+    ``<code>_v2.json.gz`` only (the legacy ``_json`` / ``_light_gpkg`` /
+    ``_full_gpkg`` stay untouched on Zenodo).  ``v1_doc`` is the parsed v1
+    JSON, used by ``v2_verify`` to check the v2 product is at least as good.
+
+    The full KG is divided into overlapping 1.5km tiles.  Each tile
+    undergoes the full pipeline (multi-date LiDAR, ortho, Copernicus,
+    Hansen, segmentation, classification).  Results are merged into
+    one set of vectors/stats covering the entire KG.
+
+    On retry after timeout, tile checkpoints mean completed tiles are
+    instantly restored — no bbox changes or sub-division needed.
+
+    This function runs in a subprocess for memory isolation.
+    """
+    import raster_io
+    import tile_index as ti
+    import object_segmentation as oc
+    import terrain_analysis as ta
+
+    kg_code = kg["kg_code"]
+    result = {"kg_code": kg_code, "success": False, "step": "init", "files": {}}
+
+    # --- Tile checkpoint cache for resume-on-restart ---
+    _tile_ckpt_dir = DATA_DIR / "tile_checkpoints" / kg_code
+    _tile_ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # Phase 2: if this KG was aborted by another peer, pull its tile
+    # pickles from the shared Zenodo registry before the tile loop.
+    # Cheap (KB-MB) and the on-tile restore branch handles them.
+    # Outcome is mirrored as an INFO line into subprocess_warnings.jsonl
+    # so the parent step-monitor relays it into progress.add_log —
+    # giving fleet-wide visibility in the merged 24h log of which
+    # peer restored from a chkpt bundle on which KG.
+    try:
+        import tile_checkpoint_registry as _ckpt_reg
+        _restored = _ckpt_reg.download_kg(kg_code) or {}
+        if _restored.get("n"):
+            mb = _restored.get("bytes", 0) / 1e6
+            _msg = (f"chkpt: restored {_restored['n']} tile pickle(s) "
+                    f"({mb:.1f} MB) for {kg_code} from Zenodo")
+            log.info("KG %s: %s", kg_code, _msg)
+            try:
+                import json as _j_chk
+                _warn_path = DATA_DIR / "subprocess_warnings.jsonl"
+                _entry = _j_chk.dumps({
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "level": "info",
+                    "msg": _msg,
+                    "step": "init",
+                }) + "\n"
+                with open(_warn_path, "a") as _wf:
+                    _wf.write(_entry)
+            except Exception:
+                pass
+    except Exception as _reg_e:
+        log.debug("checkpoint_registry download skipped: %s", _reg_e)
+
+    def _save_tile_checkpoint(tile_idx, seg_result_entry, core_objects,
+                              new_buildings, infra_objects, tile_avail_entry,
+                              terrain_entry, spectral_accum, cop_accum,
+                              hansen_accum, seg_pixels):
+        """Persist a completed tile to disk for crash recovery."""
+        import pickle as _pkl
+        ckpt = {
+            "seg_result": seg_result_entry,
+            "core_objects": core_objects,
+            "new_buildings": new_buildings,
+            "infrastructure": infra_objects,
+            "tile_avail": tile_avail_entry,
+            "terrain": terrain_entry,      # (stats, n_px) or None
+            "spectral_accum": spectral_accum,  # partial spectral_info entries
+            "copernicus_accum": cop_accum,      # partial copernicus_info entries
+            "hansen_accum": hansen_accum,        # partial hansen_info entries
+            "seg_pixels": seg_pixels,
+            # Model that produced the classified objects.  A v1 pickle must
+            # never be restored into a v2 run (or vice versa) — see
+            # _load_tile_checkpoint.
+            "model_version": MODEL_VERSION,
+            "classifier": _last_tile_classifier[0],   # → JSON "model" block on restore
+        }
+        tmp = _tile_ckpt_dir / f"tile_{tile_idx}.pkl.tmp"
+        dst = _tile_ckpt_dir / f"tile_{tile_idx}.pkl"
+        # The dir may have been rmtree'd earlier in the same KG run
+        # (e.g. "freed tile checkpoints after full GPKG" — happens before
+        # light GPKG / JSON, but those steps don't write checkpoints; on
+        # crash-restart the dir is recreated below). Always ensure the
+        # parent dir exists so a stale rmtree never raises ENOENT here.
+        _tile_ckpt_dir.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "wb") as f:
+            _pkl.dump(ckpt, f, protocol=_pkl.HIGHEST_PROTOCOL)
+        tmp.rename(dst)
+
+    def _remap_restored_tile_ids(cached_tile, next_id, kg_code, tile_label):
+        """Renumber every object of a restored tile checkpoint to
+        ``next_id…`` and rewrite its label raster to the same ids (old ids
+        not backed by an object → 0, exactly like the fresh path).  Returns
+        the next free id.  Objects shared between ``seg_result.objects`` and
+        ``core_objects`` keep one id even if pickling broke identity."""
+        sr = cached_tile.get("seg_result") or {}
+        core = cached_tile.get("core_objects") or []
+        objs = list(sr.get("objects") or [])
+        seen = {id(o) for o in objs}
+        objs.extend(o for o in core if id(o) not in seen)
+        id_remap = {}
+        for o in objs:
+            old = int(o.obj_id)
+            new = id_remap.get(old)
+            if new is None:
+                new = id_remap[old] = next_id
+                next_id += 1
+            o.obj_id = new
+        lab = sr.get("labels") if sr else None
+        if lab is not None and getattr(lab, "size", 0):
+            uniq = np.unique(lab)
+            mapped = np.fromiter((id_remap.get(int(u), 0) for u in uniq),
+                                 dtype=np.int32, count=len(uniq))
+            unknown = int(np.count_nonzero((mapped == 0) & (uniq != 0)))
+            sr["labels"] = mapped[np.searchsorted(uniq, lab)]
+            if unknown:
+                log.info("KG %s %s: checkpoint restore — %d label id(s) without object zeroed",
+                         kg_code, tile_label, unknown)
+        return next_id
+
+    def _load_tile_checkpoint(tile_idx):
+        """Load a cached tile result. Returns dict or None."""
+        import pickle as _pkl
+        dst = _tile_ckpt_dir / f"tile_{tile_idx}.pkl"
+        if not dst.exists():
+            return None
+        try:
+            with open(dst, "rb") as f:
+                ck = _pkl.load(f)
+            if ck.get("model_version", "v1") != MODEL_VERSION:
+                log.info("KG %s: discarding tile %d checkpoint (model %s != %s)",
+                         kg_code, tile_idx, ck.get("model_version", "v1"), MODEL_VERSION)
+                dst.unlink(missing_ok=True)
+                return None
+            # Grid anchor (2.2): checkpoints written by pre-2.2 code (or
+            # restored cross-peer from an older run) carry the fractional
+            # AOI origin while their pixel data sit on the integer BEV grid.
+            # KG 63330 (2026-09-20) stitched 18 such tiles with 2 fresh ones
+            # → full_left=x.399 → every apex X at .9, tree_id off vs live.
+            sr = ck.get("seg_result")
+            if sr is not None and sr.get("transform") is not None:
+                _tf2, _chg = raster_io.reanchor_transform(sr["transform"])
+                if _chg:
+                    import rasterio.transform as _rt
+                    th_, tw_ = sr["shape"]
+                    sr["transform"] = _tf2
+                    sr["bounds_3035"] = _rt.array_bounds(th_, tw_, _tf2)
+                    log.warning("KG %s: tile %d checkpoint re-anchored to the BEV grid "
+                                "(fractional origin from pre-2.2 code)", kg_code, tile_idx)
+            return ck
+        except Exception:
+            dst.unlink(missing_ok=True)
+            return None
+
+    def _clear_tile_checkpoints():
+        """Remove all checkpoints for this KG (after successful completion)."""
+        import shutil
+        shutil.rmtree(_tile_ckpt_dir, ignore_errors=True)
+
+    _prev_step = [None, None]  # [step_name, start_time]
+    _step_times = {}           # step_name → seconds
+
+    _tile_progress = [0, 0]  # [current_tile_idx, n_tiles]
+
+    # --- Subprocess warning/error relay ---
+    # Write WARNING+ log records to a JSONL file so the parent process
+    # step-monitor thread can relay them to progress.add_log().
+    _warnings_file = DATA_DIR / "subprocess_warnings.jsonl"
+    try:
+        _warnings_file.write_text("")  # truncate on start
+    except Exception:
+        pass
+
+    class _WarningRelayHandler(logging.Handler):
+        """Logging handler that appends WARNING+ records to a JSONL file."""
+        def __init__(self, path):
+            super().__init__(level=logging.WARNING)
+            self._path = path
+        # Known-harmless messages to suppress entirely
+        _SUPPRESS = (
+            "DeprecationWarning: 'Memory' driver is deprecated",
+            "Failed to parse API error response",
+            "NaN nodata value cannot be recorded",
+            # GDAL-internal HTTP range-request retry noise.
+            # GDAL retries these internally (GDAL_HTTP_MAX_RETRY=3); each
+            # failed attempt is logged as CPLE_AppDefined even when the
+            # overall read ultimately succeeds.  response_code=0 means a
+            # connection reset; response_code=206 is actually the correct
+            # HTTP Partial Content reply for range reads but gets logged
+            # when an interrupted transfer is retried.  Our outer
+            # bev_retry layer handles cases where GDAL exhausts its
+            # retries and raises, so surfacing these here is pure noise.
+            "CPLE_AppDefined:Request for ",
+            # ortho_io operate coverage gaps: the tile bbox slightly exceeds
+            # a BEV RGBI operate's raster extent, so Window.intersection()
+            # raises WindowError("Intersection is empty").  ortho_io catches
+            # this in its operate fallback loop and continues to the next
+            # operate — the read is never actually retried despite bev_retry
+            # logging "attempt 1/N read failed" before re-raising.  All tiles
+            # complete successfully; this is expected at operate boundaries.
+            "Intersection is empty Window(",
+            # urllib3 transient retry chatter — emitted per retry attempt
+            # for any HTTP connection blip (RemoteDisconnected, read timeout,
+            # connection reset). The retries are handled internally and the
+            # call usually succeeds. Real Copernicus throttling surfaces as
+            # 402 / CreditsExhaustedError / IPThrottledError through other
+            # log paths. Treating these as copernicus warnings dragged the
+            # fleet capacity_factor EMA down to ~0.2 even when nothing was
+            # actually failing.
+            "urllib3.connectionpool: Retrying (Retry(",
+            # GDAL >=3.11 emits a one-shot deprecation warning the
+            # first time rasterio writes via the legacy 'Memory'
+            # driver. Self-suppresses after the first hit (the message
+            # itself says so) but the first emission still spams the
+            # log on every fresh subprocess. Pure cosmetic.
+            "rasterio._env: CPLE_AppDefined in DeprecationWarning: 'Memory' driver is deprecated",
+        )
+        # Messages to downgrade from error → warning (non-fatal)
+        _DOWNGRADE = (
+            "Preflight process graph validation failed",
+        )
+        def emit(self, record):
+            try:
+                msg = self.format(record)
+                if any(s in msg for s in self._SUPPRESS):
+                    return
+                lvl = "error" if record.levelno >= logging.ERROR else "warning"
+                # Downgrade non-fatal errors to warnings
+                if lvl == "error" and any(s in msg for s in self._DOWNGRADE):
+                    lvl = "warning"
+                import json as _j
+                entry = _j.dumps({
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "level": lvl,
+                    "msg": msg,
+                    "step": _prev_step[0] or "",
+                }) + "\n"
+                with open(self._path, "a") as f:
+                    f.write(entry)
+            except Exception:
+                pass
+
+    _relay_handler = _WarningRelayHandler(str(_warnings_file))
+    _relay_handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+    logging.getLogger().addHandler(_relay_handler)
+
+    _subtile_progress = [None]  # [dict | None] — set when processing a sub-tile
+    _tile_statuses = []  # [{lat, lng, status, issues, subtile_info}] — per-tile dots for map
+
+    def _relay_info(msg, step=""):
+        """Mirror an INFO line into subprocess_warnings.jsonl so the parent
+        step-monitor relays it into progress.add_log (merged fleet log)."""
+        try:
+            import json as _json_ri
+            with open(_warnings_file, "a") as _wf:
+                _wf.write(_json_ri.dumps({
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "level": "info", "msg": msg, "step": step}) + "\n")
+        except Exception:
+            pass
+
+    def _report_step(step, detail=""):
+        try:
+            now = time.time()
+            now_iso = datetime.now(timezone.utc).isoformat()
+            # Record elapsed time for previous step
+            if _prev_step[0] is not None and _prev_step[1] is not None:
+                elapsed = round(now - _prev_step[1], 1)
+                _step_times[_prev_step[0]] = round(
+                    _step_times.get(_prev_step[0], 0) + elapsed, 1)
+            _prev_step[0] = step
+            _prev_step[1] = now
+            step_file = DATA_DIR / "current_step.json"
+            import json as _json
+            payload = {"step": step, "detail": detail,
+                       "ts": now_iso, "step_times": _step_times,
+                       "current_tile": _tile_progress[0],
+                       "n_tiles": _tile_progress[1]}
+            if _subtile_progress[0] is not None:
+                payload["subtile"] = _subtile_progress[0]
+            if _tile_statuses:
+                payload["tile_statuses"] = _tile_statuses
+            _json.dump(payload, open(str(step_file) + ".tmp", "w"))
+            os.rename(str(step_file) + ".tmp", str(step_file))
+        except Exception:
+            pass
+
+    # Register the step reporter for module-level GPKG builders so their
+    # multi-hour stitches can heartbeat step_detail_ts (stuck-KG watchdog
+    # liveness — see _gpkg_heartbeat). Re-reports the CURRENT step name
+    # (from _prev_step) so shared helpers never flip the step label.
+    # One subprocess per KG, so plain module state is safe.
+    _STEP_REPORT_HOOK[0] = lambda detail: _report_step(
+        _prev_step[0] or "gpkg_full", detail)
+    _HB_LAST[0] = 0.0
+
+    try:
+        # --- Determine bbox ---
+        result["step"] = "bbox"
+        bb = kg.get("bbox", {})
+        if isinstance(bb, dict) and "min_lon" in bb:
+            west, south = bb["min_lon"], bb["min_lat"]
+            east, north = bb["max_lon"], bb["max_lat"]
+        else:
+            bb = _kg_bbox_lookup(kg_code)
+            if not bb:
+                result["error"] = "KG not found"
+                return result
+            west, south = bb["min_lon"], bb["min_lat"]
+            east, north = bb["max_lon"], bb["max_lat"]
+
+        full_west, full_south, full_east, full_north = west, south, east, north
+        obs_year = ti.dataset_to_year(ti.DEFAULT_DATASET)
+
+        # --- 1. Cadastre ---
+        result["step"] = "cadastre"
+        _report_step("cadastre")
+        # For blocks, fetch cadastre using parent KG code
+        _parent_code = kg.get("_parent_kg_code", kg_code)
+        # The PARENT bbox: a bevdirect viewport / NEC1 build keyed by the
+        # parent must cover the whole parent, never the block's bbox (the
+        # Oct-07 75110/57010 failure).
+        _ne_bbox = (full_west, full_south, full_east, full_north)
+        if kg.get("_parent_kg_code"):
+            _ne_bbox = _parent_bbox_wgs(_parent_code) or _ne_bbox
+        import ne_h3 as _neh_cad
+        _cad_src = _neh_cad.cadastre_source()
+        if _cad_src != "bevdirect":
+            # umfeld's /k cadastre routes answer 410 since the Kataster purge
+            # (2026-10-13): bev mode is the ONLY cadastre source for a peer.
+            # A fresh start right after an auto-update races the director's
+            # live sidecar flip (processing/start wrote ``umfeld`` because the
+            # re-pinned bevdirect-serve was still installing) — self-heal
+            # here: tooling present → flip the sidecar and run bev mode;
+            # otherwise defer the KG (never a cadastre-less product).
+            try:
+                _bd = _neh_cad.bevdirect_ready(probe_server=False)
+            except Exception as _e:  # noqa: BLE001
+                _bd = {"error": str(_e)[:120]}
+            if _bd.get("binary") and _bd.get("package"):
+                try:
+                    (DATA_DIR / "ne_source").write_text("bevdirect")
+                except Exception:
+                    pass
+                log.warning("KG %s: ne_source sidecar was %s but bevdirect tooling is ready — "
+                            "switched to bev mode (umfeld cadastre is retired, 410)", kg_code, _cad_src)
+                _cad_src = _neh_cad.cadastre_source()
+            else:
+                log.error("KG %s: not in bev mode and bevdirect tooling not ready (%s) — "
+                          "umfeld cadastre is retired (410); deferring KG", kg_code,
+                          {k: _bd.get(k) for k in ("binary", "binary_version", "package", "package_stale", "error")})
+        if _cad_src == "bevdirect":
+            # bev mode: parcels + footprints from the parent's ONE viewport
+            # grid (the same run that builds the NEC1 below; blocks use the
+            # parent bbox) — umfeld's /k tier is never called from a peer.
+            _report_step("cadastre", f"bevdirect viewport {_parent_code}")
+            cadastre_data = fetch_cadastre_data_bevdirect(_parent_code, _ne_bbox)
+        else:
+            cadastre_data = {"parcels": [], "building_footprints": [], "landuse": [],
+                             "parcels_geojson": [], "buildings_geojson": [],
+                             "building_addresses": [], "_fetch_failed": True, "_retired": True}
+        _v2_ctx = None            # segv2.inference.Context (v2 only, built on first tile)
+        _v2_ctx_failed = False
+        _outline_prof = None      # segv2.parcel_elevation.ParcelOutlineProfiler (v2 only)
+        # --- 1b. NE declared layer (v2.4) ---
+        # The frozen NEC1 of the PARENT KG (blocks share the parent's cell
+        # set; unseen cells are nodata and the primary merges the blocks).
+        # Upgrade units arrive with ``kg["_ne_declared_path"]`` (parent
+        # fetched it with the inputs — a 404 there defers the unit); fresh
+        # KGs fetch here and, when umfeld has not built the KG yet, finish
+        # without NE as a '-partial' product (defect ``ne_cells``).
+        _ne_declared = None
+        _ne_status = "disabled"
+        if MODEL_VERSION == "v2":
+            result["step"] = "ne_declared"
+            _report_step("ne_declared", f"fetching NEC1 {_parent_code} ({__import__('ne_h3').ne_source()})")
+            try:
+                import ne_h3 as _neh
+                _nep = kg.get("_ne_declared_path")
+                if _nep and os.path.exists(_nep):
+                    _secs = [x for x in _neh.unpack_sections(open(_nep, "rb").read()) if x.magic == _neh.MAGIC_LU]
+                    _ne_declared = _secs[0] if _secs else None
+                if _ne_declared is None:
+                    _ne_declared = _neh.fetch_declared(_parent_code, _ne_bbox, code=kg_code)
+                _ne_status = "ok"
+                result["ne_declared_source"] = _ne_declared.header.get("source")
+                log.info("KG %s: NE declared layer %s cells=%s digest=%s source=%s epoch=%s", kg_code,
+                         _parent_code, _ne_declared.header.get("cells_n"), _ne_declared.digest,
+                         _ne_declared.header.get("source"), _ne_declared.header.get("epoch"))
+            except Exception as _e:  # noqa: BLE001
+                import ne_h3 as _neh
+                if isinstance(_e, _neh.NENotBuilt):
+                    _ne_status = f"not_built:{_e.status}"
+                    log.warning("KG %s: NE declared layer not built at umfeld (%s, retry_after=%s) — "
+                                "retried once more before gpkg_light; else '-partial' (defect ne_cells)",
+                                kg_code, _e.status, _e.retry_after_s)
+                else:
+                    _ne_status = f"error:{str(_e)[:120]}"
+                    log.warning("KG %s: NE declared layer unavailable: %s — product labelled -partial", kg_code, _e)
+                _ne_declared = None
+            result["ne_status"] = _ne_status
+            result["ne_status_initial"] = _ne_status
+            # --- 1c. VTC pilot (docs/vct-pilot.md): on pilot peers, derive the
+            # parent's declared layer from the public BEV vector tiles
+            # (vtcseamless, in memory, one viewport request) and report the
+            # digests to umfeld-at /contrib.  Bounded helper subprocess in a
+            # thread; the product keeps umfeld's NEC1 above.  Never raises.
+            try:
+                import vct_pilot as _vct
+                # ne_source=bevdirect: the declared layer above IS the pilot
+                # run (viewport + report happened in build_declared) — nothing
+                # to compare against umfeld here (lu_diff comes from /obs).
+                if _vct.enabled() and not (_ne_declared is not None and _neh.is_bev_declared(_ne_declared)):
+                    _nec_bytes = None
+                    if _ne_declared is not None:
+                        try:
+                            _nec_bytes = _neh.pack_section(_neh.MAGIC_LU, _ne_declared.header, _ne_declared.raw)
+                        except Exception:
+                            _nec_bytes = None
+                    # Blocks of a split parent carry the BLOCK bbox in
+                    # kg["bbox"]; the pilot (and its /contrib report, keyed by
+                    # the parent) must cover the whole parent — a block-sized
+                    # viewport reported under the parent's code was the Oct-07
+                    # 75110/57010 failure (cells=0 → HTTP 400, only_umfeld≫0).
+                    _vct_bbox = (full_west, full_south, full_east, full_north)
+                    if kg.get("_parent_kg_code"):
+                        _pb = _parent_bbox_wgs(_parent_code)
+                        if _pb is None:
+                            raise RuntimeError(f"parent bbox for {_parent_code} unknown — pilot skipped for block")
+                        _vct_bbox = _pb
+                    _vct_thread = _vct.run_async(_parent_code, _vct_bbox,
+                                                 _nec_bytes, is_block=bool(kg.get("_parent_kg_code")), on_done=lambda r: result.__setitem__("vct_pilot", {
+                                                     k: r.get(k) for k in ("ok", "cells", "requests", "net_bytes_est",
+                                                                           "report_http", "wall_s", "error")}))
+                    if _vct_thread is not None:
+                        log.info("KG %s: vct_pilot started for parent %s (vtcseamless, in-memory, one viewport)",
+                                 kg_code, _parent_code)
+            except Exception as _e:  # noqa: BLE001
+                log.warning("KG %s: vct_pilot hook failed (ignored): %s", kg_code, _e)
+        if MODEL_VERSION == "v2" and cadastre_data.get("parcels") and CADASTRE_PRODUCTS:
+            try:
+                import sys as _sys
+                _sv2 = str(Path(__file__).resolve().parent / "segv2")
+                if _sv2 not in _sys.path:
+                    _sys.path.insert(0, _sv2)
+                import parcel_elevation as _pe
+                _outline_prof = _pe.ParcelOutlineProfiler(
+                    (p["parcel_id"], p["geometry"]) for p in cadastre_data["parcels"] if p.get("geometry") is not None)
+                log.info("KG %s: parcel outline profiler: %d parcels", kg_code, len(_outline_prof))
+            except Exception as _e:  # noqa: BLE001
+                log.warning("KG %s: parcel outline profiler unavailable: %s", kg_code, _e)
+        _classifier_used: dict = {}   # classifier string -> #tiles (→ JSON "model" block)
+        _last_tile_classifier = [None]  # set per tile, persisted in the tile checkpoint
+
+        # --- 1.5. Abort + requeue on transient cadastre-API failure ---
+        # The cadastre-process-api can be briefly overloaded (503/timeout).
+        # fetch_cadastre_data() already retried with backoff; if it still
+        # failed it sets _fetch_failed. Proceeding would emit a degraded
+        # KG (GPKG missing the 'parcels'/'buildings' vector layers), which
+        # the validator flags but which still uploads. Abort instead so the
+        # director defers the KG for retry once the API recovers.
+        if cadastre_data.get("_fetch_failed"):
+            log.error("KG %s: aborting — cadastre API unavailable after retries; "
+                      "deferring for retry", kg_code)
+            result["cadastre_failed"] = True
+            result["success"] = False
+            result["error"] = "cadastre-process-api unavailable (overloaded?) after retries"
+            result["step"] = "aborted_cadastre_failed"
+            return result
+
+        # --- 1a. Block parcel filtering ---
+        # If this is a block (split from a larger KG), filter cadastre
+        # to parcels whose centroid falls within the block's bbox.
+        _is_block = kg.get("_parent_kg_code") is not None
+        if _is_block:
+            from shapely.geometry import box as _shapely_box
+            _block_bb = kg["bbox"]
+            _block_env_wgs = _shapely_box(
+                _block_bb["min_lon"], _block_bb["min_lat"],
+                _block_bb["max_lon"], _block_bb["max_lat"],
+            )
+            # Use WGS84 geometries for bbox test (block bbox is in WGS84)
+            _n_before = len(cadastre_data["parcels"])
+            _kept_parcel_ids = set()
+            _filtered_parcels = []
+            _filtered_parcels_geojson = []
+            for _i, p in enumerate(cadastre_data["parcels"]):
+                _pg = p.get("geometry_wgs") or p.get("geometry")
+                if _pg is None:
+                    continue
+                try:
+                    if _pg.centroid.within(_block_env_wgs):
+                        _filtered_parcels.append(p)
+                        _kept_parcel_ids.add(p.get("parcel_id", ""))
+                        if _i < len(cadastre_data["parcels_geojson"]):
+                            _filtered_parcels_geojson.append(
+                                cadastre_data["parcels_geojson"][_i])
+                except Exception:
+                    pass
+            cadastre_data["parcels"] = _filtered_parcels
+            cadastre_data["parcels_geojson"] = _filtered_parcels_geojson
+
+            # Filter buildings, addresses, landuse to block bbox
+            if _filtered_parcels:
+                from shapely.ops import unary_union as _block_uu
+                from shapely.validation import make_valid as _block_mv
+                _block_geoms = []
+                for p in _filtered_parcels:
+                    try:
+                        g = p["geometry"]
+                        _block_geoms.append(_block_mv(g) if not g.is_valid else g)
+                    except Exception:
+                        _block_geoms.append(p["geometry"].buffer(0))
+                _block_union = _block_uu(_block_geoms).buffer(10)  # 10m buffer
+                cadastre_data["building_footprints"] = [
+                    b for b in cadastre_data["building_footprints"]
+                    if b["geometry"].intersects(_block_union)
+                ]
+                cadastre_data["buildings_geojson"] = [
+                    f for f in cadastre_data["buildings_geojson"]
+                    if True  # keep all — footprint filter above is primary
+                ]
+                cadastre_data["building_addresses"] = [
+                    a for a in cadastre_data["building_addresses"]
+                    if a["geometry_3035"].intersects(_block_union)
+                ]
+                cadastre_data["landuse"] = [
+                    lu for lu in cadastre_data["landuse"]
+                    if lu["geometry"].intersects(_block_union)
+                ]
+            else:
+                cadastre_data["building_footprints"] = []
+                cadastre_data["buildings_geojson"] = []
+                cadastre_data["building_addresses"] = []
+                cadastre_data["landuse"] = []
+            log.info("KG %s: block parcel filter: %d → %d parcels, %d buildings",
+                     kg_code, _n_before, len(cadastre_data["parcels"]),
+                     len(cadastre_data["building_footprints"]))
+
+        result["n_parcels"] = len(cadastre_data["parcels"])
+        result["n_buildings"] = len(cadastre_data["building_footprints"])
+        _report_step("cadastre", f"{len(cadastre_data['parcels'])} parcels, "
+                     f"{len(cadastre_data['building_footprints'])} buildings")
+
+        # --- 1b. Refine bbox from cadastre geometry union ---
+        # For blocks, SKIP bbox expansion — the block bbox is fixed by the
+        # splitter and must not grow back to the full KG extent.
+        if not _is_block:
+            all_cad_geoms = ([p["geometry"] for p in cadastre_data["parcels"]]
+                             + [b["geometry"] for b in cadastre_data["building_footprints"]])
+            if all_cad_geoms:
+                try:
+                    from shapely.ops import unary_union as _unary_union
+                    from shapely.validation import make_valid
+                    valid_geoms = []
+                    for g in all_cad_geoms:
+                        try:
+                            valid_geoms.append(make_valid(g) if not g.is_valid else g)
+                        except Exception:
+                            valid_geoms.append(g.buffer(0))
+                    cad_union_3035 = _unary_union(valid_geoms)
+                    cad_union_wgs = transform_to_wgs(cad_union_3035)
+                    cb = cad_union_wgs.bounds
+                    full_west = min(full_west, cb[0])
+                    full_south = min(full_south, cb[1])
+                    full_east = max(full_east, cb[2])
+                    full_north = max(full_north, cb[3])
+                    log.info("KG %s: full bbox from cadastre union: %.4f,%.4f → %.4f,%.4f",
+                             kg_code, full_west, full_south, full_east, full_north)
+                except Exception as e:
+                    log.warning("KG %s: cadastre union failed, using API bbox: %s",
+                                kg_code, e)
+        else:
+            log.info("KG %s: block mode — using fixed bbox (no expansion)", kg_code)
+
+        # --- 1c. v2 upgrade: serve rasters from the KG's own v1 full GPKG ---
+        _v2_upgrade = bool(source_gpkg) or fast_inputs is not None
+        # Parcel ∪ building union in EPSG:3035 — drives the v2 raster health
+        # checks *and* the ``segment_type_no_holes`` verify gate.  Computed
+        # for every v2 KG (fresh and upgrade): without it ``v2_verify`` has
+        # no shape and falls back to the grid-only area-ratio floor, which
+        # struck the healthy 15-tile block 57210-south twice (0.745 / 0.780
+        # vs floor 0.828, 2026-09-23/24) on the *fresh* path after eb29c7b
+        # had only fixed upgrades.
+        _v2_union_3035 = None
+        if MODEL_VERSION == "v2":
+            try:
+                from shapely.ops import unary_union as _uu_v2
+                _geoms_v2 = [p["geometry"] for p in cadastre_data.get("parcels", [])
+                             if p.get("geometry") is not None]
+                _geoms_v2 += [b["geometry"] for b in cadastre_data.get("building_footprints", [])
+                              if b.get("geometry") is not None]
+                if _geoms_v2:
+                    _v2_union_3035 = _uu_v2([g if g.is_valid else g.buffer(0) for g in _geoms_v2])
+                # Blocks keep parcels by *centroid*, so the union sticks out
+                # west/south of the block bbox where no tile is ever
+                # segmented (tiles only overshoot east/north).  Those slivers
+                # are inherited v1 behaviour, not holes — 34043-south v1 and
+                # v2 both read 0.80 %, 47221-northeast 2.79/2.83 % (2026-09-21,
+                # 27 block upgrades struck for segment_type_no_holes).  Clip
+                # to the block bbox so the health / hole checks only judge
+                # the area the block is responsible for.
+                if _v2_union_3035 is not None and _is_block and kg.get("bbox"):
+                    try:
+                        from shapely.geometry import box as _sbox_v2
+                        from shapely.ops import transform as _stf_v2
+                        from pyproj import Transformer as _Tr_v2
+                        _bbv2 = kg["bbox"]
+                        _tr_v2 = _Tr_v2.from_crs(4326, 3035, always_xy=True).transform
+                        _bbox_3035_v2 = _stf_v2(_tr_v2, _sbox_v2(
+                            _bbv2["min_lon"], _bbv2["min_lat"], _bbv2["max_lon"], _bbv2["max_lat"]))
+                        _clipped_v2 = _v2_union_3035.intersection(_bbox_3035_v2)
+                        if not _clipped_v2.is_empty:
+                            _out_frac = 1.0 - _clipped_v2.area / max(_v2_union_3035.area, 1.0)
+                            if _out_frac > 0.001:
+                                log.info("KG %s: v2 union clipped to block bbox (%.2f%% of parcel "
+                                         "area lies outside the block)", kg_code, 100 * _out_frac)
+                            _v2_union_3035 = _clipped_v2
+                    except Exception as _ce:  # noqa: BLE001
+                        log.warning("KG %s: v2 union block clip failed (%s) — using unclipped union",
+                                    kg_code, _ce)
+            except Exception as _e:  # noqa: BLE001
+                log.warning("KG %s: v2 union failed (%s) — health checks use whole windows", kg_code, _e)
+        if _v2_upgrade:
+            if MODEL_VERSION != "v2":
+                result["error"] = "v2 upgrade requested but MODEL_VERSION != v2 (lightgbm / model missing?)"
+                result["step"] = "aborted_v2_unavailable"
+                return result
+            if fast_inputs is not None:
+                # --- v2.4 fast path: relabel from the existing v2.3+ products ---
+                return _process_kg_v24_fast(kg, kg_code, result, fast_inputs, v1_doc, _ne_declared,
+                                            _v2_union_3035, _parent_code, _report_step)
+            result["step"] = "v2_source"
+            _report_step("v2_source", f"installing GPKG source {Path(source_gpkg).name}")
+            import v2_source as _v2src
+            _inv = _v2src.install(source_gpkg, union_3035=_v2_union_3035, proc_globals=globals())
+            result["v2_source_inventory"] = {k: v for k, v in _inv.items() if k != "path"}
+            log.info("KG %s: v2 upgrade from %s (%d layers, ortho %s, CIR %s)", kg_code,
+                     Path(source_gpkg).name, len(_inv["layers"]), _inv["ortho_years"], _inv["cir_years"])
+
+        # --- 2. Compute tile grid ---
+        tile_km = max_km if max_km is not None else MAX_KG_AREA_KM
+        base_tiles_wgs = _compute_tile_grid(
+            full_west, full_south, full_east, full_north,
+            tile_km=tile_km, overlap_km=0.1)
+
+        tiles_wgs = base_tiles_wgs
+        n_tiles = len(tiles_wgs)
+        log.info("KG %s: %d tiles (%.1fkm base) covering %.4f,%.4f → %.4f,%.4f",
+                 kg_code, n_tiles, tile_km,
+                 full_west, full_south, full_east, full_north)
+
+        # --- 2a. Runtime oversize guard (needs_split) ---
+        # The splitter (maybe_split_kg) estimates tiles from the KG *API*
+        # bbox, but the cadastre-union expansion above can grow the grid
+        # far past that estimate (91017 Schröcken: 20 estimated → 30
+        # runtime tiles). Such KGs overrun peer disk during gpkg_full and
+        # wedge (stuck-kg hard restarts) without ever accumulating the
+        # strikes needed for an adaptive split — each interruption lands
+        # on a different peer's local strike file. Abort *before* the
+        # tile loop, force the strike counter to the split threshold, and
+        # let the parent requeue the split blocks. Copernicus/Hansen/WC
+        # data is NOT wasted: the tile_cache + Zenodo cache are keyed by
+        # geographic 0.1° cells, so the blocks re-read the exact same
+        # cached cells any earlier whole-KG attempt already fetched.
+        if not _is_block and not _v2_upgrade:
+            from kg_splitter import runtime_tile_limit, force_split
+            _rt_limit = runtime_tile_limit()
+            if n_tiles > _rt_limit:
+                _msg = (f"runtime grid {n_tiles} tiles > {_rt_limit} limit "
+                        f"(post-cadastre-expansion) — aborting for split")
+                log.warning("KG %s: %s", kg_code, _msg)
+                try:
+                    force_split(kg_code)
+                except Exception:
+                    pass
+                result["needs_split"] = True
+                result["success"] = False
+                result["error"] = _msg
+                result["n_tiles_runtime"] = n_tiles
+                result["step"] = "aborted_needs_split"
+                return result
+
+        _tile_progress[1] = n_tiles
+        _report_step("tiles", f"{n_tiles} tiles @ {tile_km}km")
+
+        # --- Accumulators for merging tile results ---
+        all_objects = []          # SegmentedObject list
+        all_new_buildings = []    # vectorised new buildings
+        all_infrastructure = []   # vectorised infrastructure
+        terrain_stats_list = []   # (stats, n_px) for merging
+        all_spectral_info = {}    # for JSON ndvi section
+        all_copernicus_info = {}  # for JSON sar/harmonics
+        all_hansen_info = {}      # for JSON hansen section
+        tile_seg_results = []     # (tile_bbox_3035, labels, objects, transform, shape, ndsm, mask)
+        tile_data_availability = []  # per-tile data source tracking
+        total_seg_pixels = 0
+        next_obj_id = 1           # global unique obj_id counter
+
+        # --- 3. Process each tile ---
+        for tile_idx, (tw, ts, te, tn) in enumerate(tiles_wgs):
+            _tile_progress[0] = tile_idx + 1
+            tile_label = f"tile {tile_idx+1}/{n_tiles}"
+            _subtile_progress[0] = None
+            _last_tile_classifier[0] = None
+            result["step"] = f"tile_{tile_idx+1}"
+            # Track tile centroid + status for dashboard map
+            _tile_lat = (ts + tn) / 2
+            _tile_lng = (tw + te) / 2
+            _tile_entry = {"lat": round(_tile_lat, 5), "lng": round(_tile_lng, 5),
+                          "status": "current", "issues": {},
+                          "idx": tile_idx + 1}
+            _tile_statuses.append(_tile_entry)
+
+            # --- Check for cached tile checkpoint ---
+            cached_tile = _load_tile_checkpoint(tile_idx)
+            if cached_tile is not None:
+                log.info("KG %s %s: restored from checkpoint", kg_code, tile_label)
+                if cached_tile.get("classifier"):
+                    _classifier_used[cached_tile["classifier"]] = _classifier_used.get(cached_tile["classifier"], 0) + 1
+                if cached_tile["seg_result"] is not None:
+                    _strip_object_features(cached_tile["seg_result"].get("objects"))
+                    tile_seg_results.append(cached_tile["seg_result"])
+                # core_objects may be distinct instances after unpickling
+                _strip_object_features(cached_tile.get("core_objects"))
+                all_objects.extend(cached_tile.get("core_objects", []))
+                # Remap obj_ids to avoid collisions with fresh tiles — AND
+                # remap the tile's label raster to the same new ids.  The
+                # stitchers (build_full/light_gpkg_tiled, ne_h3.build_observed)
+                # paint ``labels_full`` from every tile and resolve pixels
+                # through ONE global ``obj_map`` keyed by obj_id, so a label
+                # raster still carrying the ids of the *original* run (which
+                # counted every tile object, not just the core ones) collides
+                # with the ids handed out here: pixels of tile A get the type /
+                # polygon of an unrelated object of tile B.  KG 63330 (Oct
+                # 2026): 15.8k of 403k segments with polygon area > 2× their
+                # own, 27 ha of flat pasture rendered as "roof", NE cells
+                # 36 % geb at h_max = 0.  Found by umfeld's glyph.
+                next_obj_id = _remap_restored_tile_ids(
+                    cached_tile, next_obj_id, kg_code, tile_label)
+                all_new_buildings.extend(cached_tile.get("new_buildings", []))
+                all_infrastructure.extend(cached_tile.get("infrastructure", []))
+                tile_data_availability.append(cached_tile["tile_avail"])
+                t_terrain_entry = cached_tile.get("terrain")
+                if t_terrain_entry is not None:
+                    terrain_stats_list.append(t_terrain_entry)
+                total_seg_pixels += cached_tile.get("seg_pixels", 0)
+                # Merge accumulated info dicts
+                for k, v in cached_tile.get("spectral_accum", {}).items():
+                    all_spectral_info.setdefault(k, []).extend(v)
+                for k, v in cached_tile.get("copernicus_accum", {}).items():
+                    all_copernicus_info.setdefault(k, []).extend(v)
+                for k, v in cached_tile.get("hansen_accum", {}).items():
+                    if k in ("loss_years",):
+                        all_hansen_info.setdefault(k, []).extend(v)
+                    elif k == "cf_sum":
+                        all_hansen_info.setdefault("cf_sum", [0])
+                        all_hansen_info["cf_sum"][0] += v[0] if v else 0
+                    else:
+                        all_hansen_info.setdefault(k, []).extend(v)
+                # Mark tile as done-from-cache on dashboard map
+                _tile_avail = cached_tile.get("tile_avail", {})
+                _tile_entry["status"] = "done"
+                _tile_entry["issues"] = {
+                    k: ("ok" if _tile_avail.get(k) else "miss")
+                    for k in ["dtm", "ortho", "copernicus_ndvi", "worldcover", "sar", "hansen"]
+                }
+                _tile_entry["n_objects"] = len(cached_tile.get("core_objects", []))
+                continue
+
+            _report_step(f"tile_{tile_idx+1}", f"processing {tile_label}")
+
+            # Per-tile data availability tracker
+            tile_avail = {
+                "tile_index": tile_idx + 1,
+                "bbox_wgs": [round(tw, 5), round(ts, 5), round(te, 5), round(tn, 5)],
+                "dtm": False, "dsm": False, "multi_date_dtm": False,
+                "ortho": False, "copernicus_ndvi": False,
+                "worldcover": False, "sar": False, "harmonics": False,
+                "hansen": False, "cadastre_buildings": False,
+                "infrastructure": False, "terrain": False,
+                "segmentation": False, "n_objects": 0,
+                "valid_pixels": 0,
+            }
+
+            # Per-tile accumulator snapshots (for checkpoint)
+            _tile_spectral = {}
+            _tile_copernicus = {}
+            _tile_hansen = {}
+
+            tile_geom_wgs = box(tw, ts, te, tn)
+            tile_geom_3035 = transform_to_3035(tile_geom_wgs)
+
+            # --- 3a. LiDAR (default date) ---
+            # DTM+DSM are essential — segmentation fails without them.
+            # Retry with escalating timeouts to handle BEV slowness.
+            # 2026-05-28: extended from 2→ 3 attempts (5/10/20m). The
+            # first two cover transient route flaps; the 20-min attempt
+            # gives the per-NAT-IP throttle bucket time to refill on
+            # busy pools. On final exhaustion we ABORT the KG for
+            # deferred retry rather than emit a partial — LiDAR is
+            # essential, so a tile-skip is never an acceptable outcome.
+            _report_step("lidar", f"{tile_label} — reading DTM/DSM")
+            tdata = None
+            _lidar_last_exc = None
+            _LIDAR_TIMEOUTS = [300, 600, 1200]  # 5m, 10m, 20m
+            for _lidar_attempt, _lidar_timeout in enumerate(_LIDAR_TIMEOUTS, 1):
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _lidar_ex:
+                        _lidar_fut = _lidar_ex.submit(
+                            raster_io.read_dtm_dsm, tile_geom_3035, ti.DEFAULT_DATASET
+                        )
+                        tdata = _lidar_fut.result(timeout=_lidar_timeout)
+                    break  # success
+                except concurrent.futures.TimeoutError as e:
+                    _lidar_last_exc = e
+                    if _lidar_attempt < len(_LIDAR_TIMEOUTS):
+                        log.warning(
+                            "KG %s %s: LiDAR read attempt %d/%d timed out after %ds, retrying...",
+                            kg_code, tile_label, _lidar_attempt, len(_LIDAR_TIMEOUTS),
+                            _lidar_timeout,
+                        )
+                    else:
+                        log.error(
+                            "KG %s %s: LiDAR read FAILED after %d attempts (timeout %ds)",
+                            kg_code, tile_label, _lidar_attempt, _lidar_timeout,
+                        )
+                except Exception as e:
+                    _lidar_last_exc = e
+                    log.warning("KG %s %s: LiDAR read failed: %s", kg_code, tile_label, e)
+                    break  # non-timeout errors are not retried
+            if tdata is None:
+                # Distinguish (a) tile outside Austria / BEV tile-index coverage
+                # (raster_io raises ValueError 'No tiles cover bbox ...') —
+                # this is a benign boundary tile, NOT a failure; vs
+                # (b) any other exception (timeout, 5xx, connection reset)
+                # which IS an upstream-side failure we need to remember
+                # for partial-KG re-queue logic.
+                _exc_str = str(_lidar_last_exc) if _lidar_last_exc else ""
+                _outside = (
+                    isinstance(_lidar_last_exc, ValueError)
+                    and "No tiles cover bbox" in _exc_str
+                )
+                if _outside:
+                    tile_avail["outside_austria"] = True
+                    log.info("KG %s %s: tile outside BEV LiDAR coverage — boundary",
+                             kg_code, tile_label)
+                    tile_data_availability.append(tile_avail)
+                    _tile_entry["status"] = "skip"
+                    _tile_entry["issues"]["lidar"] = "boundary"
+                    continue
+                # Real LiDAR fetch failure on an in-Austria tile. LiDAR
+                # is the foundation layer (segmentation depends on it),
+                # so a tile-skip would guarantee a partial KG and waste
+                # the wall-time already spent on the upstream layers.
+                # Abort the KG instead so it gets deferred for retry
+                # — the tile checkpoints already written are preserved,
+                # so on the next attempt only this (and later) tiles
+                # need re-fetching.
+                tile_avail["upstream_fail"] = True
+                tile_avail["upstream_fail_reason"] = (
+                    f"lidar: {type(_lidar_last_exc).__name__}: {_exc_str[:200]}"
+                    if _lidar_last_exc else "lidar: unknown"
+                )
+                log.error(
+                    "KG %s %s: LiDAR unavailable after %d attempts — "
+                    "aborting KG for deferred retry (would emit partial)",
+                    kg_code, tile_label, len(_LIDAR_TIMEOUTS),
+                )
+                tile_data_availability.append(tile_avail)
+                _tile_entry["status"] = "error"
+                _tile_entry["issues"]["lidar"] = "fail"
+                result["lidar_failed"] = True
+                result["success"] = False
+                result["error"] = (
+                    f"LiDAR unavailable for tile {tile_idx+1}/{n_tiles} "
+                    f"after {len(_LIDAR_TIMEOUTS)} attempts: "
+                    f"{tile_avail['upstream_fail_reason']}"
+                )
+                result["step"] = f"lidar_failed_tile_{tile_idx+1}"
+                break  # abort tile loop — KG will be deferred
+            th, tw_ = tdata["shape"]
+            tvalid = int(tdata["mask"].sum())
+            if tvalid < 100:
+                log.info("KG %s %s: skipping (only %d valid px)", kg_code, tile_label, tvalid)
+                # The BEV tile-index *covers* this bbox but the raster is
+                # all-NoData -- i.e. we are past the national border inside
+                # a tile that nominally exists (South Tyrol, Bavaria...).
+                # Flag it like a boundary tile so the all-tiles-empty gate
+                # in the merge step can emit an out-of-coverage product
+                # instead of raising. Without this the 564a696 fix never
+                # fires for Soelden's -southeast-3/-6: raster_io returns a
+                # valid window (no "No tiles cover bbox" ValueError), so
+                # ``outside_austria`` was never set and the block failed
+                # permanently -- leaving the parent's coverage oracle
+                # unsatisfiable forever.
+                tile_avail["outside_austria"] = True
+                tile_avail["no_valid_pixels"] = True
+                tile_data_availability.append(tile_avail)
+                # Cache empty tiles — deterministic, no point retrying
+                _save_tile_checkpoint(tile_idx, None, [], [], [], tile_avail, None, {}, {}, {}, 0)
+                _tile_entry["status"] = "skip"
+                continue
+
+            t_transform = tdata["transform"]
+            t_mask = tdata["mask"]
+            t_ndsm = tdata["ndsm"]
+            tile_avail["dtm"] = True
+            tile_avail["dsm"] = True
+            tile_avail["valid_pixels"] = tvalid
+
+            # Phase 1: persist default-date DTM/DSM/ndsm as a per-tile
+            # raster sidecar. Lets gpkg_full skip the BEV re-read entirely.
+            # Fail-soft + disk-budget gated inside the helper.
+            try:
+                import tile_raster_sidecar as _trs
+                _trs.persist_dtm_dsm(
+                    DATA_DIR / "tile_checkpoints", kg_code, tile_idx,
+                    tdata, "default")
+            except Exception:
+                pass
+
+            # --- 3b. Terrain stats for this tile ---
+            _report_step("terrain", tile_label)
+            _tile_terrain_entry = None
+            try:
+                t_terrain = ta.characterise_terrain(tdata["dtm"], t_mask)
+                _tile_terrain_entry = (t_terrain, tvalid)
+                terrain_stats_list.append(_tile_terrain_entry)
+                tile_avail["terrain"] = True
+            except Exception as e:
+                log.warning("KG %s %s: terrain failed: %s", kg_code, tile_label, e)
+
+            # --- 3c. Multi-date DTM/DSM ---
+            _report_step("lidar", f"{tile_label} — multi-date")
+            dtm_dates = None
+            dsm_dates = None
+            try:
+                other_dates = sorted(d for d in ti.DATASETS if d != ti.DEFAULT_DATASET)
+                if other_dates:
+                    dtm_dates = {}
+                    dsm_dates = {}
+                    for date_key in other_dates:
+                        try:
+                            d2 = raster_io.read_dtm_dsm(tile_geom_3035, date_key)
+                            mh = min(th, d2["shape"][0])
+                            mw = min(tw_, d2["shape"][1])
+                            dtm_dates[date_key] = d2["dtm"][:mh, :mw]
+                            dsm_dates[date_key] = d2["dsm"][:mh, :mw]
+                            # Phase 1: persist multi-date DTM/DSM sidecar
+                            try:
+                                import tile_raster_sidecar as _trs
+                                _trs.persist_dtm_dsm(
+                                    DATA_DIR / "tile_checkpoints",
+                                    kg_code, tile_idx, d2, date_key)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                    if dtm_dates:
+                        mh = min(th, *(a.shape[0] for a in dtm_dates.values()))
+                        mw = min(tw_, *(a.shape[1] for a in dtm_dates.values()))
+                        dtm_dates[ti.DEFAULT_DATASET] = tdata["dtm"][:mh, :mw]
+                        dsm_dates[ti.DEFAULT_DATASET] = tdata["dsm"][:mh, :mw]
+                        for dk in list(dtm_dates):
+                            dtm_dates[dk] = dtm_dates[dk][:mh, :mw]
+                            dsm_dates[dk] = dsm_dates[dk][:mh, :mw]
+                    else:
+                        dtm_dates = dsm_dates = None
+            except Exception:
+                dtm_dates = dsm_dates = None
+            if dtm_dates and len(dtm_dates) > 1:
+                tile_avail["multi_date_dtm"] = True
+
+            # --- 3d. Orthophoto ---
+            # Ortho is critical for segmentation quality (spectral features,
+            # NDVI, texture).  Retry aggressively with escalating timeouts.
+            # BEV servers occasionally go slow (not failing — just throttled),
+            # so GDAL HTTP timeouts (set in ortho_io.GDAL_ENV) prevent
+            # individual HTTP requests from hanging forever, while the
+            # per-attempt timeout here caps the total wall-clock per try.
+            _report_step("ortho", tile_label)
+            spectral = None
+            _ortho_last_exc = None
+            _ortho_year_used = None
+            import ortho_io  # noqa: lazy import (subprocess boundary)
+            _ORTHO_TIMEOUTS = [300, 600, 900]  # 5m, 10m, 15m — escalating
+            for _ortho_attempt, _ortho_timeout in enumerate(_ORTHO_TIMEOUTS, 1):
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
+                        fut = exe.submit(ortho_io.read_ortho_for_als, tdata)
+                        try:
+                            rgb, nir = fut.result(timeout=_ortho_timeout)
+                            spectral = ortho_io.compute_spectral_indices(rgb, nir=nir)
+                            if rgb is not None:
+                                spectral["red"] = rgb[0].astype(np.float32)
+                                spectral["green"] = rgb[1].astype(np.float32)
+                                spectral["blue"] = rgb[2].astype(np.float32)
+                            if nir is not None:
+                                spectral["nir"] = nir.astype(np.float32)
+                            # Phase 1: persist ortho RGB(+NIR) sidecar for
+                            # the year actually read, so gpkg_full can
+                            # find it in ``_stitch_ortho_for_year``.
+                            try:
+                                _yr_used = ortho_io.pick_rgbi_year_for_als(tdata)
+                                _ortho_year_used = _yr_used
+                                if _yr_used is not None and rgb is not None:
+                                    import tile_raster_sidecar as _trs
+                                    _trs.persist_ortho(
+                                        DATA_DIR / "tile_checkpoints",
+                                        kg_code, tile_idx, rgb, nir, _yr_used)
+                            except Exception:
+                                pass
+                            break  # success
+                        except concurrent.futures.TimeoutError as e:
+                            _ortho_last_exc = e
+                            if _ortho_attempt < len(_ORTHO_TIMEOUTS):
+                                log.warning(
+                                    "KG %s %s: ortho attempt %d/%d timed out after %ds, retrying with %ds...",
+                                    kg_code, tile_label, _ortho_attempt, len(_ORTHO_TIMEOUTS),
+                                    _ortho_timeout, _ORTHO_TIMEOUTS[_ortho_attempt],
+                                )
+                            else:
+                                log.error(
+                                    "KG %s %s: ortho FAILED after %d attempts (last timeout %ds) — "
+                                    "tile will lack spectral features",
+                                    kg_code, tile_label, _ortho_attempt, _ortho_timeout,
+                                )
+                except Exception as e:
+                    _ortho_last_exc = e
+                    if _ortho_attempt < len(_ORTHO_TIMEOUTS):
+                        log.warning(
+                            "KG %s %s: ortho attempt %d/%d failed (%s), retrying...",
+                            kg_code, tile_label, _ortho_attempt, len(_ORTHO_TIMEOUTS), e,
+                        )
+                    else:
+                        log.error(
+                            "KG %s %s: ortho FAILED after %d attempts: %s",
+                            kg_code, tile_label, _ortho_attempt, e,
+                        )
+            if spectral is not None:
+                tile_avail["ortho"] = True
+            else:
+                # Distinguish boundary (no DOP tile covers — outside Austria)
+                # from upstream failure (timeout, 5xx, connection reset).
+                # read_ortho_for_als raises ValueError("No DOP tiles cover bbox …")
+                # when bbox falls outside BEV's ortho tile index.
+                _exc_str = str(_ortho_last_exc) if _ortho_last_exc else ""
+                _outside = (
+                    isinstance(_ortho_last_exc, ValueError)
+                    and ("No DOP tiles cover bbox" in _exc_str
+                         or "No tiles cover bbox" in _exc_str)
+                )
+                if _outside:
+                    # Benign — bbox falls outside BEV DOP coverage.
+                    # Segmentation still runs on LiDAR-only features.
+                    tile_avail["ortho_outside_austria"] = True
+                elif _ortho_last_exc is not None:
+                    # Real upstream failure (timeout / 5xx / reset)
+                    # after escalating attempts. Mirror the LiDAR
+                    # policy: abort the KG for deferred retry rather
+                    # than emit a partial. RGB+NIR drive ~half the
+                    # spectral features and all ortho-based products
+                    # — a tile without them downgrades the whole KG.
+                    tile_avail["upstream_fail"] = True
+                    tile_avail.setdefault(
+                        "upstream_fail_reason",
+                        f"ortho: {type(_ortho_last_exc).__name__}: {_exc_str[:200]}",
+                    )
+                    log.error(
+                        "KG %s %s: ortho unavailable after %d attempts — "
+                        "aborting KG for deferred retry (would emit partial)",
+                        kg_code, tile_label, len(_ORTHO_TIMEOUTS),
+                    )
+                    _tile_entry["status"] = "error"
+                    _tile_entry["issues"]["ortho"] = "fail"
+                    result["ortho_failed"] = True
+                    result["success"] = False
+                    result["error"] = (
+                        f"Ortho unavailable for tile {tile_idx+1}/{n_tiles} "
+                        f"after {len(_ORTHO_TIMEOUTS)} attempts: "
+                        f"{tile_avail['upstream_fail_reason']}"
+                    )
+                    result["step"] = f"ortho_failed_tile_{tile_idx+1}"
+                    tile_data_availability.append(tile_avail)
+                    break  # abort tile loop — KG will be deferred
+
+            # Accumulate spectral info for JSON
+            if spectral and spectral.get("ndvi") is not None:
+                ndvi_arr = spectral["ndvi"]
+                v = ndvi_arr[t_mask[:ndvi_arr.shape[0], :ndvi_arr.shape[1]]]
+                v = v[np.isfinite(v)]
+                if len(v) > 0:
+                    subsample = v[::max(1, len(v)//5000)].tolist()
+                    all_spectral_info.setdefault("_vals", []).extend(subsample)
+                    _tile_spectral.setdefault("_vals", []).extend(subsample)
+
+            # --- 3e. Copernicus ---
+            _report_step("copernicus", f"{tile_label} — NDVI")
+            copernicus_data = None
+            if include_copernicus:
+                c_breaker = _read_circuit_breaker()
+                if c_breaker["consecutive_failures"] < 3 or \
+                   (time.time() - c_breaker["last_failure"]) >= c_breaker["cooldown"]:
+                    try:
+                        bbox_dict = {"west": tw, "south": ts, "east": te, "north": tn}
+                        cop_cache = _get_cop_cache()
+                        copernicus_data = _fetch_copernicus_for_tile(
+                            bbox_dict, obs_year, cop_cache,
+                            report_fn=_report_step,
+                            tile_label=tile_label,
+                        )
+                        # Update circuit breaker
+                        if copernicus_data:
+                            c_breaker["consecutive_failures"] = 0
+                        elif _v2_upgrade:
+                            # Upgrade mode: the v1 GPKG carried no Copernicus
+                            # layers for this tile and the tile cache has none
+                            # either.  v1 was built without them here too, so
+                            # proceed (v2_verify enforces coverage >= v1).
+                            log.warning("KG %s %s: no Copernicus layers in GPKG/cache — "
+                                        "tile proceeds without (as v1 did)", kg_code, tile_label)
+                        else:
+                            c_breaker["consecutive_failures"] += 1
+                            c_breaker["last_failure"] = time.time()
+                            c_breaker["cooldown"] = min(600, 60 * (2 ** min(c_breaker["consecutive_failures"], 4)))
+                            # Copernicus returned None (batch/server failure, not throttle).
+                            # Abort KG so it gets deferred for retry rather than producing
+                            # an incomplete result without Copernicus data.
+                            log.warning(
+                                "KG %s %s: Copernicus returned no data (server/batch failure) "
+                                "— aborting KG for deferred retry (circuit breaker: %d consecutive failures)",
+                                kg_code, tile_label, c_breaker["consecutive_failures"],
+                            )
+                            result["copernicus_failed"] = True
+                            result["success"] = False
+                            result["error"] = "Copernicus data unavailable (batch/server failure)"
+                            result["step"] = f"copernicus_failed_tile_{tile_idx+1}"
+                        _write_circuit_breaker(c_breaker)
+                        if result.get("copernicus_failed"):
+                            break  # abort tile loop — defer KG for retry
+                    except Exception as e:
+                        from copernicus import CreditsExhaustedError, IPThrottledError, ip_throttled as _cop_throttled
+                        from tile_cache import CacheMissError as _CacheMissError
+                        if isinstance(e, _CacheMissError) or isinstance(e.__cause__, _CacheMissError):
+                            # Cache-only peer hit a missing tile — abort KG
+                            # so the director re-queues it for the primary.
+                            log.warning("KG %s: cache-only mode hit a miss — aborting (%s)",
+                                        kg_code, e)
+                            result["cache_incomplete"] = True
+                            result["success"] = False
+                            result["error"] = str(e)
+                            result["step"] = f"cache_miss_tile_{tile_idx+1}"
+                            break
+                        try:
+                            from copernicus import UpstreamStressError as _UpstreamStress
+                        except ImportError:  # pragma: no cover
+                            _UpstreamStress = ()
+                        if _UpstreamStress and (isinstance(e, _UpstreamStress) or
+                                                isinstance(e.__cause__, _UpstreamStress)):
+                            # openEO origin slow/5xx cascade — NOT a credit or
+                            # IP-throttle problem.  Defer the KG (checkpoints
+                            # kept) and let the peer move on; no pause file,
+                            # no 15-min probe loop.  Keep "due to Copernicus
+                            # throttle" out of the message: /process.txt's
+                            # openeo kg_defers counter keys on the deferred
+                            # abort line below.
+                            log.warning("KG %s: openEO upstream stress (%s) — deferring KG, "
+                                        "peer continues with next KG", kg_code, e)
+                            result["copernicus_failed"] = True
+                            result["success"] = False
+                            result["error"] = f"Copernicus data unavailable (upstream stress: {e})"
+                            result["step"] = f"copernicus_stress_tile_{tile_idx+1}"
+                            break
+                        if isinstance(e, (CreditsExhaustedError, IPThrottledError)) or \
+                           isinstance(e.__cause__, (CreditsExhaustedError, IPThrottledError)):
+                            log.error("KG %s: Copernicus throttled/exhausted — aborting KG for retry", kg_code)
+                            result["copernicus_exhausted"] = True
+                            result["success"] = False
+                            result["error"] = str(e)
+                            result["step"] = f"copernicus_throttled_tile_{tile_idx+1}"
+                            COPERNICUS_PAUSE_FILE.write_text(
+                                f"Throttled at {datetime.now(timezone.utc).isoformat()}\n")
+                            # ABORT tile loop — completed tiles have checkpoints;
+                            # this tile will be re-processed on retry
+                            break
+                        elif _cop_throttled or 'IP-throttled' in str(e):
+                            log.warning("KG %s: Copernicus IP-throttled — aborting KG for retry", kg_code)
+                            result["copernicus_exhausted"] = True
+                            result["success"] = False
+                            result["error"] = str(e)
+                            result["step"] = f"copernicus_throttled_tile_{tile_idx+1}"
+                            COPERNICUS_PAUSE_FILE.write_text(
+                                f"IP throttled at {datetime.now(timezone.utc).isoformat()}\n")
+                            break
+                        else:
+                            log.warning("KG %s %s: Copernicus failed: %s",
+                                        kg_code, tile_label, e)
+                        c_breaker["consecutive_failures"] += 1
+                        c_breaker["last_failure"] = time.time()
+                        _write_circuit_breaker(c_breaker)
+
+            # Accumulate Copernicus info + track availability
+            if copernicus_data:
+                if copernicus_data.get("ndvi") is not None:
+                    tile_avail["copernicus_ndvi"] = True
+                if copernicus_data.get("landcover") is not None:
+                    tile_avail["worldcover"] = True
+                if copernicus_data.get("vv") is not None or copernicus_data.get("vh") is not None:
+                    tile_avail["sar"] = True
+                if copernicus_data.get("harmonics") is not None:
+                    tile_avail["harmonics"] = True
+                for band in ['vv', 'vh']:
+                    arr = copernicus_data.get(band)
+                    if arr is not None:
+                        v = arr[np.isfinite(arr)]
+                        if len(v) > 0:
+                            ss = v[::max(1, len(v)//2000)].tolist()
+                            all_copernicus_info.setdefault(f"{band}_vals", []).extend(ss)
+                            _tile_copernicus.setdefault(f"{band}_vals", []).extend(ss)
+                if copernicus_data.get("ndvi") is not None:
+                    cv = copernicus_data["ndvi"]
+                    cv = cv[np.isfinite(cv)]
+                    if len(cv) > 0:
+                        ss = cv[::max(1, len(cv)//2000)].tolist()
+                        all_copernicus_info.setdefault("cop_ndvi_vals", []).extend(ss)
+                        _tile_copernicus.setdefault("cop_ndvi_vals", []).extend(ss)
+                if copernicus_data.get("harmonics"):
+                    harm = copernicus_data["harmonics"]
+                    for hk in ['h_mean', 'h_amplitude', 'h_phase', 'h_rmse']:
+                        arr = harm.get(hk)
+                        if arr is not None:
+                            v = arr[np.isfinite(arr)]
+                            if len(v) > 0:
+                                ss = v[::max(1, len(v)//2000)].tolist()
+                                all_copernicus_info.setdefault(f"{hk}_vals", []).extend(ss)
+                                _tile_copernicus.setdefault(f"{hk}_vals", []).extend(ss)
+
+            # --- 3f. Hansen ---
+            _report_step("hansen", tile_label)
+            hansen_data = None
+            try:
+                hc = _get_hansen_cache()
+                hansen_data = hc.get_forest_prior(
+                    (tw, ts, te, tn), t_transform, (th, tw_))
+            except Exception as e:
+                log.warning("KG %s %s: Hansen failed: %s", kg_code, tile_label, e)
+            # Accumulate Hansen
+            if hansen_data:
+                tile_avail["hansen"] = True
+                ly = hansen_data.get("loss_year")
+                if ly is not None:
+                    all_hansen_info.setdefault("loss_years", []).append(ly)
+                    _tile_hansen.setdefault("loss_years", []).append(ly)
+                tc = hansen_data.get("treecover2000")
+                if tc is not None:
+                    ss = tc[np.isfinite(tc)].ravel()[::max(1, tc.size//2000)].tolist()
+                    all_hansen_info.setdefault("tc_vals", []).extend(ss)
+                    _tile_hansen.setdefault("tc_vals", []).extend(ss)
+                cf = hansen_data.get("current_forest")
+                if cf is not None:
+                    cf_val = int(cf.sum())
+                    all_hansen_info.setdefault("cf_sum", [0])
+                    all_hansen_info["cf_sum"][0] += cf_val
+                    _tile_hansen["cf_sum"] = [cf_val]
+
+            # --- 3g. Segmentation ---
+            _report_step("segment", f"{tile_label} — rasterise cadastre")
+
+            building_fp_mask = None
+            # KG footprints (products) ∪ neighbour-KG footprints inside this
+            # tile (cadastre fast path /spatial/footprints, ~0.1 s).  The KG
+            # export only carries *this* KG's buildings, so roofs just across
+            # the KG line used to have no footprint and were emitted as
+            # "new buildings" (2026-09-17).  The viewport set is used ONLY for
+            # the raster mask (calibration + new-building matching), never
+            # written to the buildings layer.
+            _fp_pairs = [(b["geometry"], 1) for b in cadastre_data["building_footprints"]
+                         if not b["geometry"].is_empty]
+            try:
+                if cadastre_data.get("_source") == "bevdirect":
+                    # bev mode: the parent's viewport documents already carry
+                    # the neighbours' footprints (padded bbox) — no network.
+                    _own_ids = {id(b) for b in cadastre_data["building_footprints"]}
+                    _vp = [b["geometry"] for b in cadastre_data.get("building_footprints_viewport", [])
+                           if id(b) not in _own_ids]
+                else:
+                    import cadastre as _cad_mod
+                    _vp = _cad_mod.fetch_building_footprints((tw, ts, te, tn), use_cache=False)
+                if _vp:
+                    _fp_pairs.extend((g, 1) for g in _vp if not g.is_empty)
+                    tile_avail["cadastre_buildings_viewport"] = True
+            except Exception as _e:  # noqa: BLE001
+                log.debug("KG %s %s: viewport footprints skipped: %s", kg_code, tile_label, _e)
+            if _fp_pairs:
+                try:
+                    from rasterio.features import rasterize as rio_rasterize
+                    building_fp_mask = rio_rasterize(
+                        _fp_pairs, out_shape=(th, tw_), transform=t_transform,
+                        fill=0, dtype=np.uint8, all_touched=True,
+                    ).astype(bool)
+                    tile_avail["cadastre_buildings"] = bool(cadastre_data["building_footprints"])
+                except Exception:
+                    pass
+            # KG parcel-union mask: new-building candidates must lie (mostly)
+            # inside this KG's parcels — anything outside belongs to the
+            # neighbouring KG's run.
+            kg_parcel_mask = None
+            if cadastre_data.get("parcels"):
+                try:
+                    from rasterio.features import rasterize as rio_rasterize
+                    _pp = [(p["geometry"], 1) for p in cadastre_data["parcels"]
+                           if p.get("geometry") is not None and not p["geometry"].is_empty]
+                    if _pp:
+                        kg_parcel_mask = rio_rasterize(
+                            _pp, out_shape=(th, tw_), transform=t_transform,
+                            fill=0, dtype=np.uint8, all_touched=True,
+                        ).astype(bool)
+                except Exception as _e:  # noqa: BLE001
+                    log.debug("KG %s %s: parcel mask skipped: %s", kg_code, tile_label, _e)
+
+            infra = None
+            try:
+                from infrastructure_lookup import InfrastructureLookup
+                infra = InfrastructureLookup.for_bbox(tw, ts, te, tn)
+                if infra and len(infra) > 0:
+                    tile_avail["infrastructure"] = True
+            except Exception:
+                pass
+
+            _report_step("segment", f"{tile_label} — classify")
+            # v2: one OSM/cadastre/INVEKOS context per KG (parcels + footprints
+            # come from the cadastre_data we already hold; OSM + INVEKOS are
+            # fetched once for the KG bbox and rasterised per tile).
+            if MODEL_VERSION == "v2" and _v2_ctx is None and not _v2_ctx_failed:
+                try:
+                    import sys as _sys
+                    _sv2 = str(Path(__file__).resolve().parent / "segv2")
+                    if _sv2 not in _sys.path:
+                        _sys.path.insert(0, _sv2)
+                    import inference as _v2inf
+                    _kgb = transform_to_3035(box(full_west, full_south, full_east, full_north)).bounds
+                    _v2_ctx = _v2inf.Context(
+                        _kgb,
+                        parcels=[p["geometry"] for p in cadastre_data.get("parcels", []) if p.get("geometry") is not None],
+                        footprints=[b["geometry"] for b in cadastre_data.get("building_footprints", []) if b.get("geometry") is not None],
+                        strict=True)
+                    tile_avail["v2_context"] = True
+                except Exception as _e:  # noqa: BLE001
+                    try:
+                        import labels as _v2lab
+                        _is_upstream = isinstance(_e, _v2lab.UpstreamUnavailable)
+                    except Exception:  # noqa: BLE001
+                        _is_upstream = False
+                    if _is_upstream:
+                        # umfeld-at (OSM geometry) is down/restarting: the
+                        # strict fetch already retried ~4 min.  Never bake
+                        # a KG on an empty road/rail/water context — defer
+                        # (checkpoints of restored tiles are kept).
+                        log.warning("KG %s: v2 context upstream unavailable (%s) — deferring KG, "
+                                    "peer continues with next KG", kg_code, _e)
+                        result["context_failed"] = True
+                        result["success"] = False
+                        result["error"] = f"v2 context upstream (umfeld OSM / INVEKOS) unavailable: {_e}"
+                        result["step"] = f"context_failed_tile_{tile_idx+1}"
+                        break
+                    _v2_ctx_failed = True
+                    log.warning("KG %s: v2 context failed (%s) — tiles fall back to per-tile context", kg_code, _e)
+            try:
+                seg_result = oc.segment_and_classify(
+                    tdata["dtm"], tdata["dsm"], t_mask, t_transform,
+                    dtm_dates=dtm_dates, dsm_dates=dsm_dates,
+                    spectral=spectral, copernicus=copernicus_data,
+                    building_footprints=building_fp_mask,
+                    hansen=hansen_data,
+                    observation_year=obs_year,
+                    infra_lookup=infra,
+                    mark_uncertain=mark_uncertain,
+                    model=MODEL_VERSION,
+                    v2_context=_v2_ctx,
+                    parcels=[p["geometry"] for p in cadastre_data.get("parcels", [])] if MODEL_VERSION == "v2" else None,
+                    footprints=[b["geometry"] for b in cadastre_data.get("building_footprints", [])] if MODEL_VERSION == "v2" else None,
+                )
+                _st = seg_result.get("stats") or {}
+                _last_tile_classifier[0] = _st.get("classifier") or None
+                if _st.get("classifier"):
+                    _classifier_used[_st["classifier"]] = _classifier_used.get(_st["classifier"], 0) + 1
+            except Exception as e:
+                log.warning("KG %s %s: segmentation failed: %s", kg_code, tile_label, e)
+                tile_data_availability.append(tile_avail)
+                continue
+
+            t_objects = seg_result["objects"]
+            t_labels = seg_result["labels"]
+            tile_avail["segmentation"] = True
+            # v2: the feature vectors are dead weight from here on (see
+            # _strip_object_features) — ~60 % of per-object RAM and of the
+            # core_objects pickle in every tile checkpoint.
+            _strip_object_features(t_objects)
+            if _outline_prof is not None:
+                try:
+                    _outline_prof.sample(tdata["dtm"], tdata.get("dsm"), t_transform)
+                except Exception as _e:  # noqa: BLE001
+                    log.debug("KG %s %s: outline sampling failed: %s", kg_code, tile_label, _e)
+            tile_avail["n_objects"] = len(t_objects)
+
+            # Remap obj_ids to global unique range
+            id_remap = {}
+            for obj in t_objects:
+                old_id = obj.obj_id
+                obj.obj_id = next_obj_id
+                id_remap[old_id] = next_obj_id
+                next_obj_id += 1
+            # Remap label array
+            new_labels = np.zeros_like(t_labels)
+            for old_id, new_id in id_remap.items():
+                new_labels[t_labels == old_id] = new_id
+            t_labels = new_labels
+
+            # Store tile segmentation result for parcel enrichment
+            # Compute tile bounds in EPSG:3035 from transform + shape
+            import rasterio.transform
+            t_bounds_3035 = rasterio.transform.array_bounds(th, tw_, t_transform)
+            tile_seg_results.append({
+                "bounds_3035": t_bounds_3035,  # (left, bottom, right, top)
+                "labels": t_labels,
+                "objects": t_objects,
+                "transform": t_transform,
+                "shape": (th, tw_),
+                "ndsm": t_ndsm,
+                "mask": t_mask,
+                "bbox_wgs": (tw, ts, te, tn),
+                "hansen_loss_year": hansen_data.get("loss_year") if hansen_data else None,
+            })
+            total_seg_pixels += tvalid
+            # v2.1: per-tile coarse terrain + tree evidence from the SAME
+            # arrays the segmenter used (no second raster read); pickled with
+            # the tile checkpoint.  See docs/v2.1-product-spec.md.
+            if MODEL_VERSION == "v2":
+                try:
+                    import v21_products as _v21
+                    tile_seg_results[-1]["v21"] = _v21.tile_coarse(
+                        tdata, dsm_dates=dsm_dates, dtm_dates=dtm_dates,
+                        dataset=ti.DEFAULT_DATASET, spectral=spectral,
+                        geom_3035=tile_geom_3035, ortho_year=_ortho_year_used)
+                except Exception as _e:  # noqa: BLE001
+                    log.warning("KG %s %s: v2.1 tile evidence failed: %s", kg_code, tile_label, _e)
+
+            # Filter objects: keep only those whose centroid is inside
+            # the non-overlap core of this tile (avoid double-counting
+            # at tile boundaries).
+            # Core = tile shrunk by half the overlap on each side.
+            core_shrink = 50  # 50m = half of 100m overlap
+            core_left = t_bounds_3035[0] + core_shrink
+            core_bottom = t_bounds_3035[1] + core_shrink
+            core_right = t_bounds_3035[2] - core_shrink
+            core_top = t_bounds_3035[3] - core_shrink
+            # For edge tiles (first/last row/col), don't shrink outward
+            if tile_idx == 0 or tw <= full_west + 0.0001:
+                core_left = t_bounds_3035[0]
+            if tile_idx == 0 or ts <= full_south + 0.0001:
+                core_bottom = t_bounds_3035[1]
+            if te >= full_east - 0.0001:
+                core_right = t_bounds_3035[2]
+            if tn >= full_north - 0.0001:
+                core_top = t_bounds_3035[3]
+
+            core_objects = []
+            for obj in t_objects:
+                if (core_left <= obj.centroid_e <= core_right and
+                        core_bottom <= obj.centroid_n <= core_top):
+                    core_objects.append(obj)
+            all_objects.extend(core_objects)
+
+            # --- 3h. Vectorise new buildings & infrastructure (this tile) ---
+            _report_step("vectorise", f"{tile_label} — new buildings")
+            _tile_nb = []
+            _tile_iv = []
+            try:
+                _tile_nb = vectorise_unmatched_buildings(
+                    t_objects, t_labels, t_mask, t_transform,
+                    building_fp_mask, t_ndsm, kg_mask=kg_parcel_mask)
+                all_new_buildings.extend(_tile_nb)
+            except Exception as e:
+                log.warning("KG %s %s: new buildings failed: %s", kg_code, tile_label, e)
+            _report_step("vectorise", f"{tile_label} — infrastructure")
+            try:
+                _tile_iv = vectorise_infrastructure(
+                    t_objects, t_labels, t_mask, t_transform, t_ndsm, tdata["dtm"])
+                all_infrastructure.extend(_tile_iv)
+            except Exception as e:
+                log.warning("KG %s %s: infrastructure failed: %s", kg_code, tile_label, e)
+
+            # Record tile data availability
+            tile_data_availability.append(tile_avail)
+
+            # Save tile checkpoint for crash recovery
+            _save_tile_checkpoint(
+                tile_idx,
+                seg_result_entry=tile_seg_results[-1],
+                core_objects=core_objects,
+                new_buildings=_tile_nb,
+                infra_objects=_tile_iv,
+                tile_avail_entry=tile_avail,
+                terrain_entry=_tile_terrain_entry,
+                spectral_accum=_tile_spectral,
+                cop_accum=_tile_copernicus,
+                hansen_accum=_tile_hansen,
+                seg_pixels=tvalid,
+            )
+
+            # Per-tile flushes removed — _ZENODO_CACHE_FLUSH_INTERVAL
+            # (30 min) and the per-KG flush in main() are sufficient to
+            # protect tiles from OOM. Flushing every tile floods the
+            # Zenodo lock with 50 × (tiles/KG) acquire requests.
+
+            # Free tile memory
+            del tdata, t_labels, t_objects, seg_result, spectral
+            del copernicus_data, hansen_data, dtm_dates, dsm_dates
+            del building_fp_mask, t_mask, t_ndsm
+            gc.collect()
+            _malloc_trim()
+
+            log.info("KG %s %s: done (%d objects, %d core) rss=%dM",
+                     kg_code, tile_label, len(id_remap), len(core_objects), _rss_mb())
+            # Update tile status for dashboard map
+            _tile_entry["status"] = "done"
+            _tile_entry["issues"] = {
+                k: ("ok" if tile_avail.get(k) else "miss")
+                for k in ["dtm", "ortho", "copernicus_ndvi", "worldcover", "sar", "hansen"]
+            }
+            _tile_entry["n_objects"] = len(core_objects)
+            _report_step(f"tile_{tile_idx+1}",
+                         f"done: {len(core_objects)} objects")
+
+        # --- Abort early if cache-only peer hit a miss ---
+        if result.get("cache_incomplete") and result.get("success") is False:
+            log.warning("KG %s: aborting after tile %d/%d due to cache miss — "
+                        "will be re-queued for the frontier (primary) peer",
+                        kg_code, tile_idx + 1, n_tiles)
+            result["step"] = "aborted_cache_incomplete"
+            return result
+        # --- Abort early if Copernicus throttled or failed mid-KG ---
+        if result.get("copernicus_exhausted") and result.get("success") is False:
+            log.warning("KG %s: aborting after tile %d/%d due to Copernicus throttle — "
+                        "tile checkpoints preserved for retry",
+                        kg_code, tile_idx + 1, n_tiles)
+            result["step"] = "aborted_copernicus"
+            return result
+        if result.get("copernicus_failed") and result.get("success") is False:
+            log.warning("KG %s: aborting after tile %d/%d due to Copernicus batch/server failure — "
+                        "tile checkpoints preserved for deferred retry",
+                        kg_code, tile_idx + 1, n_tiles)
+            result["step"] = "aborted_copernicus_failed"
+            return result
+        if result.get("context_failed") and result.get("success") is False:
+            log.warning("KG %s: aborting at tile %d/%d — v2 context upstream (umfeld OSM / INVEKOS) unavailable; "
+                        "tile checkpoints preserved for deferred retry",
+                        kg_code, tile_idx + 1, n_tiles)
+            result["step"] = "aborted_context_failed"
+            return result
+        if result.get("lidar_failed") and result.get("success") is False:
+            log.warning("KG %s: aborting after tile %d/%d due to LiDAR fetch exhaustion — "
+                        "tile checkpoints preserved for deferred retry",
+                        kg_code, tile_idx + 1, n_tiles)
+            result["step"] = "aborted_lidar_failed"
+            return result
+        if result.get("ortho_failed") and result.get("success") is False:
+            log.warning("KG %s: aborting after tile %d/%d due to ortho fetch exhaustion — "
+                        "tile checkpoints preserved for deferred retry",
+                        kg_code, tile_idx + 1, n_tiles)
+            result["step"] = "aborted_ortho_failed"
+            return result
+
+        # --- 4. Merge terrain stats ---
+        terrain_stats = _merge_terrain_stats(terrain_stats_list)
+        result["n_segments"] = len(all_objects)
+        result["n_new_buildings"] = len(all_new_buildings)
+        result["n_infrastructure"] = len(all_infrastructure)
+        log.info("KG %s: merged %d objects from %d tiles, %d new buildings, %d infra",
+                 kg_code, len(all_objects), n_tiles,
+                 len(all_new_buildings), len(all_infrastructure))
+
+        # --- Compute full-KG raster extent for memory decisions ---
+        from gpkg_streamed import _MAX_FULL_GPKG_PIXELS
+        _all_lefts = [tr["bounds_3035"][0] for tr in tile_seg_results]
+        _all_rights = [tr["bounds_3035"][2] for tr in tile_seg_results]
+        _all_bottoms = [tr["bounds_3035"][1] for tr in tile_seg_results]
+        _all_tops = [tr["bounds_3035"][3] for tr in tile_seg_results]
+        if not _all_rights:
+            # No tile produced a raster. Two very different causes:
+            #
+            #  (a) every tile is a genuine *boundary* tile — the block
+            #      lies entirely outside BEV LiDAR coverage (across the
+            #      national border). Deterministic and permanent: there
+            #      is no data to fetch, ever. Sinking this into the
+            #      failure path makes the block permanently failed,
+            #      which leaves the PARENT KG geometrically incomplete
+            #      forever — it can never drain from retry_queue.json,
+            #      and the director keeps a cell alive (and a peer
+            #      restart-looping) for work that cannot exist.
+            #      Aug 2026: 80110-southeast-3 / -6 (Sölden, 11.09-11.15E
+            #      x 46.77-46.85N — 100% NoData in the BEV DTM, i.e.
+            #      South Tyrol) wedged Sölden and burned a Copernicus
+            #      credential on at106 for hours.
+            #      Correct outcome: emit an EMPTY-coverage product so
+            #      the parent's coverage oracle closes over this
+            #      rectangle, exactly like a zero-object tile does
+            #      inside a normal block.
+            #
+            #  (b) at least one tile hit a real upstream failure —
+            #      transient, must be retried. Keep the hard failure so
+            #      the deferred-retry path runs.
+            # A tile counts as "no data exists here" when it is either
+            # outside the BEV tile index (raster_io ValueError) or the
+            # window read back all-NoData (``valid_pixels == 0`` -- past
+            # the national border inside a tile that nominally exists).
+            # The valid_pixels arm also covers tile_avail dicts RESTORED
+            # from checkpoints written before the flag existed, so an
+            # already-checkpointed block (Soelden -southeast-3/-6) is
+            # classified correctly on its next attempt without an
+            # operator having to clear its tile pickles.
+            _n_boundary = sum(
+                1 for t in tile_data_availability
+                if (t.get('outside_austria')
+                    or t.get('ortho_outside_austria')
+                    or not (t.get('valid_pixels') or 0))
+                and not t.get('upstream_fail')
+            )
+            _n_upstream = sum(1 for t in tile_data_availability
+                              if t.get('upstream_fail'))
+            if _n_upstream == 0 and _n_boundary >= n_tiles:
+                log.warning(
+                    "KG %s: all %d tiles are outside BEV coverage — "
+                    "emitting empty-coverage product (no data exists "
+                    "for this area; not a failure)", kg_code, n_tiles)
+                result['out_of_coverage'] = True
+                result['success'] = True
+                result['step'] = 'json'
+                _report_step('json', 'empty (outside BEV coverage)')
+                _empty = {
+                    'version': VERSION,
+                    'kg_code': kg_code,
+                    'kg_name': kg.get('kg_name', ''),
+                    'state': kg.get('state_name', ''),
+                    'gemeinde': kg.get('gemeinde_name', ''),
+                    'district': kg.get('district_name', ''),
+                    'bbox': kg.get('bbox', {}),
+                    'total_area_sqm': 0,
+                    'generated_at': datetime.now(timezone.utc).isoformat(),
+                    'out_of_coverage': True,
+                    'objects': [],
+                    'area_summary': {},
+                    # Same dict shapes as normal products so index
+                    # merge / consumers never see legacy list shapes
+                    # (see search_index._merge_block_data hardening).
+                    'parcels': {'count': 0, 'total_area_sqm': 0,
+                                'details': []},
+                    'buildings': [],
+                    'building_footprints': {'count': 0, 'details': []},
+                    'new_buildings': {'count': 0, 'features': []},
+                    'infrastructure': {'total': 0, 'by_type': {}},
+                    'data_quality': {
+                        'quality_score': 0.0,
+                        'quality_grade': 'N',
+                        'available_layers': [],
+                        'missing_layers': [],
+                        'n_tiles': n_tiles,
+                        'n_boundary_tiles': _n_boundary,
+                        'n_upstream_failed_tiles': 0,
+                        'upstream_failed_tiles': [],
+                        'note': ('all tiles outside BEV LiDAR coverage '
+                                 '(outside Austria) — no data exists for '
+                                 'this area'),
+                    },
+                }
+                JSON_DIR.mkdir(parents=True, exist_ok=True)
+                _ep = str(JSON_DIR / f"{kg_code}.json")
+                with open(_ep, 'w') as _f:
+                    json.dump(_empty, _f, indent=2, default=str)
+                result['files']['json'] = _ep
+                result['quality_score'] = 0.0
+                result['quality_grade'] = 'N'
+                result['n_segments'] = 0
+                return result
+            # All tiles were skipped (boundary or upstream-fail) — nothing to
+            # segment.  Abort cleanly so the partial-KG path can record this.
+            raise RuntimeError(
+                f"KG {kg_code}: no usable tiles — "
+                f"all {n_tiles} tiles were skipped (boundary or upstream-fail)"
+            )
+        _full_w = int(round((max(_all_rights) - min(_all_lefts))))
+        _full_h = int(round((max(_all_tops) - min(_all_bottoms))))
+        _n_pixels = _full_w * _full_h
+        log.info("  Full-KG raster: %d x %d px (%.0f Mpx), %d tiles",
+                 _full_w, _full_h, _n_pixels / 1e6, len(tile_seg_results))
+
+        # For monster KGs (>200 Mpx), free heavy arrays from tile_seg_results
+        # BEFORE GPKG phases.  The tile loop accumulated labels/ndsm/mask
+        # arrays for ALL tiles; at 10 bytes/px per tile, 200+ tiles
+        # exhausts a 7 GB cgroup.  Checkpoints on disk retain full data.
+        _monster_kg = _n_pixels > _MAX_FULL_GPKG_PIXELS
+        if _monster_kg:
+            _freed_bytes = 0
+            for tr in tile_seg_results:
+                for key in ("labels", "ndsm", "mask"):
+                    arr = tr.pop(key, None)
+                    if arr is not None:
+                        _freed_bytes += arr.nbytes
+                # v2.1 per-tree evidence rasters (no apex inventory without
+                # the stitched nDSM anyway); keep the tiny coarse5 + acq so
+                # terrain grid25 / terrain_coarse still get written.
+                for key in ("dh_cm", "ndvi_i8", "nir_u8"):
+                    arr = (tr.get("v21") or {}).pop(key, None)
+                    if arr is not None:
+                        _freed_bytes += arr.nbytes
+            gc.collect()
+            log.info("  Monster KG: freed %.0f MB of tile arrays (%.0f Mpx > %.0f Mpx limit)",
+                     _freed_bytes / 1e6, _n_pixels / 1e6, _MAX_FULL_GPKG_PIXELS / 1e6)
+
+        # --- 4b. Evict caches not needed for GPKG build ---
+        # The GPKG build phase can produce multi-GB files.  Free disk
+        # space by evicting stale data caches.  Tile checkpoints are
+        # intentionally kept here — if the GPKG build times out the
+        # retry attempt can restore all tiles and only redo the build.
+        # Checkpoints are deleted after the full GPKG is written (step 5b).
+        _report_step("disk_cleanup", "freeing disk for GPKG build")
+        try:
+            import shutil as _shutil_ev
+            # Budget for the GPKG build phase. The *final* full GPKG is
+            # ~20 bytes/px, but SQLite needs substantially more transient
+            # working space while building it: the R-tree spatial index,
+            # the gpkg_ogr_contents triggers, and the rollback/WAL journal
+            # can transiently hold 1.5-2x the final file on top of the
+            # file itself. We also build the light GPKG (segments +
+            # parcels + buildings) right after, before the full GPKG's
+            # local copy is always freed. Underestimating here is what let
+            # at2 hit `database or disk is full` mid-segment_points on KG
+            # 90102-southwest (2026-06-07) with a 1.5 GB final file and
+            # 3.2 GB free — the build peaked above the old
+            # `final + 2 GB` budget. Use a multiplier + larger fixed
+            # headroom so the eviction actually triggers in time.
+            _GPKG_BUILD_MULTIPLIER = 2.5   # transient SQLite working space
+            _GPKG_BUILD_HEADROOM_GB = 4.0  # light GPKG + journal + slack
+            _usage = _shutil_ev.disk_usage("/")
+            _free_gb = _usage.free / (1024 ** 3)
+            _final_gpkg_gb = _n_pixels * 20 / 1e9  # final full GPKG size
+            _need_gb = _final_gpkg_gb * _GPKG_BUILD_MULTIPLIER + _GPKG_BUILD_HEADROOM_GB
+            if _free_gb < _need_gb:
+                log.info("  Disk: %.1f GB free, need ~%.1f GB for GPKG build "
+                         "(final~%.1f GB × %.1f + %.1f GB headroom) — evicting caches",
+                         _free_gb, _need_gb, _final_gpkg_gb,
+                         _GPKG_BUILD_MULTIPLIER, _GPKG_BUILD_HEADROOM_GB)
+                for _cache_name in ["bev_tile_cache", "ortho_tile_cache",
+                                    "copernicus_tiles", "hansen_tiles"]:
+                    _cache_dir = DATA_DIR / _cache_name
+                    if _cache_dir.exists():
+                        _csz = sum(f.stat().st_size for f in _cache_dir.iterdir() if f.is_file())
+                        if _csz > 0:
+                            for _cf in sorted(_cache_dir.iterdir(),
+                                              key=lambda f: f.stat().st_mtime):
+                                if _cf.is_file():
+                                    try:
+                                        _cf.unlink()
+                                    except OSError:
+                                        pass
+                            log.info("    Evicted %s (%.0f MB)", _cache_name, _csz / 1e6)
+                _usage2 = _shutil_ev.disk_usage("/")
+                _free_after = _usage2.free / (1024 ** 3)
+                log.info("  Disk after eviction: %.1f GB free", _free_after)
+                # If the cheap caches weren't enough, fall back to the
+                # full tiered cleanup: it flushes the tile cache to Zenodo
+                # (so tiles are restorable via HTTP range reads) before
+                # evicting the expensive openEO/Hansen caches, and purges
+                # stale tile_checkpoint dirs. This is the last line of
+                # defence against an ENOSPC mid-build.
+                if _free_after < _need_gb:
+                    log.warning("  Disk still tight (%.1f GB < %.1f GB needed) "
+                                "after cheap eviction — running tiered cleanup",
+                                _free_after, _need_gb)
+                    try:
+                        _disk_ok = check_disk_space(current_kg_code=kg_code)
+                        _usage3 = _shutil_ev.disk_usage("/")
+                        log.info("  Disk after tiered cleanup: %.1f GB free",
+                                 _usage3.free / (1024 ** 3))
+                        if not _disk_ok:
+                            # Cleanup couldn't free enough for a safe GPKG
+                            # build. Don't barrel into gpkg_full and risk an
+                            # ENOSPC that permanently fails the KG. Abort
+                            # cleanly: every tile pickle is already on disk,
+                            # so the parent publishes them to the shared
+                            # registry and a disk-healthy peer restores them
+                            # and resumes straight at the GPKG build.
+                            log.warning("KG %s: disk still critically low after "
+                                        "cleanup (%.1f GB) — aborting before "
+                                        "GPKG build for cross-peer handoff",
+                                        kg_code, _usage3.free / (1024 ** 3))
+                            result["disk_low"] = True
+                            result["success"] = False
+                            result["error"] = ("disk critically low before GPKG "
+                                               "build — deferred for handoff")
+                            result["step"] = "aborted_disk_low"
+                            return result
+                    except Exception as _tc_e:
+                        log.warning("  Tiered cleanup failed: %s", _tc_e)
+        except Exception as _ev_e:
+            log.warning("  Cache eviction failed: %s", _ev_e)
+
+        # --- 5. Build full GPKG ---
+        # Skipped entirely in v2 upgrade mode: the rasters are identical to
+        # the v1 full GPKG we are reading from, so there is nothing new to
+        # write or upload.  The light GPKG runs the boundary merge itself
+        # when label_remap is None.
+        if _v2_upgrade:
+            _boundary_remap = None
+            full_gpkg = None
+            _light_size = 0
+            _report_step("gpkg_full", "skipped (v2 upgrade — rasters unchanged)")
+        else:
+            # --- 5. Build full GPKG ---
+            result["step"] = "gpkg_full"
+            gc.collect()
+            _malloc_trim()
+            log.info("KG %s: entering gpkg_full with %d tiles, %d objects at rss=%dM",
+                     kg_code, len(tile_seg_results), len(all_objects), _rss_mb())
+            _report_step("gpkg_full", f"{len(tile_seg_results)} tiles, {len(all_objects)} objects")
+            # Reuse the full GPKG from a previous attempt if it survived
+            # on disk (subprocess restart between gpkg_full and upload).
+            # The boundary remap is only used to renumber light-GPKG /
+            # JSON labels so they match the full-GPKG raster; if we skip
+            # the rebuild we also skip remap and tile labels stay as-is
+            # — acceptable since the canonical labels live in the full
+            # GPKG that we reuse verbatim.
+            _existing_full = str(GPKG_DIR / f"{kg_code}_full.gpkg")
+            _reuse_full = False
+            _full_already_on_zenodo = False
+            try:
+                if os.path.exists(_existing_full) and os.path.getsize(_existing_full) > 0:
+                    # Integrity gate before reuse. A stuck-KG hard restart
+                    # (SIGKILL mid-build) leaves a structurally incomplete
+                    # GPKG — possibly with a hot -wal/-journal — and blind
+                    # reuse would upload a corrupt product. Cheap checks:
+                    # GPKG magic application_id + SQLite quick_check + the
+                    # expected final layers (segment vectors are written
+                    # near the end of the build, so their presence implies
+                    # the build ran to completion).
+                    _reuse_full = _gpkg_reuse_ok(_existing_full)
+                    if _reuse_full:
+                        full_gpkg = _existing_full
+                        _boundary_remap = {}
+                        log.info("KG %s: reusing existing full GPKG from prior attempt (%.0f MB) — skipping rebuild",
+                                kg_code, os.path.getsize(_existing_full) / 1e6)
+                        _report_step("gpkg_full",
+                                     f"reusing prior build ({os.path.getsize(_existing_full) / 1e6:.0f} MB)")
+                    else:
+                        log.warning("KG %s: existing full GPKG failed integrity/completeness "
+                                    "check (likely interrupted build) — purging and rebuilding",
+                                    kg_code)
+                        _purge_stale_gpkg(_existing_full)
+            except Exception:
+                _reuse_full = False
+            # Manifest-aware reuse: a prior run (possibly on another peer)
+            # streamed the full GPKG to Zenodo early -- to free disk -- and then
+            # deleted the local file. Without this check a fresh peer that picks
+            # the KG up rebuilds the full GPKG from scratch AND replaces the
+            # Zenodo file (a 1-15 GB re-upload) every retry. If the run then gets
+            # interrupted before the JSON step (big KGs frequently do -- auto-park
+            # on throughput collapse, cred rotation, role eviction), the KG never
+            # produces a ``_json`` entry, never drains from the priority queue,
+            # and the rebuild+re-upload loops indefinitely (KG 40016, Jun 2026).
+            # If the manifest already has a non-error ``{kg}_full_gpkg`` entry,
+            # skip BOTH the rebuild and the re-upload and proceed straight to
+            # light + JSON so the run can actually complete and the KG drains.
+            # A genuine operator force-requeue deletes the manifest entry, so a
+            # real rebuild is unaffected (no entry -> falls through to build).
+            if not _reuse_full:
+                try:
+                    _mf_raw = json.loads(MANIFEST_PATH.read_text()) if MANIFEST_PATH.exists() else {}
+                    _mf_entries = _mf_raw.get("entries", _mf_raw) or {}
+                    _fe = _mf_entries.get(f"{kg_code}_full_gpkg")
+                    _fe_ok = (isinstance(_fe, dict) and (_fe.get("size") or 0) > 0
+                              and "error" not in (_fe.get("status", "") or ""))
+                    # Timestamp guard against an operator force-requeue. The
+                    # requeue handler (app.py) DELETES the manifest entry AND
+                    # stamps a PRODUCT-level tombstone ``{kg_code}_full_gpkg`` at
+                    # the requeue instant. The entry deletion is the primary
+                    # rebuild signal (propagates via peer-sync -> no entry ->
+                    # rebuild); the product tombstone is the secondary defence for
+                    # the window where the tombstone has propagated but the
+                    # deletion hasn't. Reuse ONLY when the entry's upload is
+                    # strictly newer than its product tombstone (== genuine
+                    # re-completion after the last invalidation). Same semantics as
+                    # app.py peer-sync's ``entry_ts <= tombstone_ts`` gate.
+                    #
+                    # CRUCIAL: do NOT gate on the ``_requeue`` tombstone. That one
+                    # is re-stamped to ``now`` on every queue push (the documented
+                    # force-requeue self-perpetuation), so an entry would always
+                    # look older than it and we'd rebuild forever -- recreating the
+                    # exact loop this fix removes. Split blocks are covered because
+                    # a parent requeue tombstones each block's OWN product key.
+                    if _fe_ok:
+                        _entry_ts = str(_fe.get("uploaded_at", "") or "")
+                        _tomb_ts = ""
+                        try:
+                            _tp = DATA_DIR / "manifest_tombstones.json"
+                            if _tp.exists():
+                                _td = json.loads(_tp.read_text())
+                                if isinstance(_td, dict):
+                                    _tomb_ts = str(_td.get(f"{kg_code}_full_gpkg", "") or "")
+                            # Drop journal wins over a stale product tombstone
+                            # (see the completed_codes gate in main()): a dropped
+                            # tombstone must not force a 1-15 GB GPKG rebuild.
+                            _dp2 = DATA_DIR / "manifest_tombstone_drops.json"
+                            if _tomb_ts and _dp2.exists():
+                                _dj2 = json.loads(_dp2.read_text())
+                                _d2 = (str(_dj2.get(f"{kg_code}_full_gpkg", "") or "")
+                                       if isinstance(_dj2, dict) else "")
+                                if _d2 and not _tomb_ts > _d2:
+                                    _tomb_ts = ""
+                        except Exception:
+                            _tomb_ts = ""
+                        if _tomb_ts and not (_entry_ts and _entry_ts > _tomb_ts):
+                            log.info("KG %s: full GPKG on Zenodo but product "
+                                     "tombstone (%s) >= entry (%s) -- rebuilding",
+                                     kg_code, _tomb_ts, _entry_ts or "<none>")
+                            _fe_ok = False
+                    if _fe_ok:
+                        _full_already_on_zenodo = True
+                        full_gpkg = ""
+                        _boundary_remap = {}
+                        log.info("KG %s: full GPKG already on Zenodo (depo=%s, %.0f MB) -- "
+                                 "skipping rebuild + re-upload",
+                                 kg_code, _fe.get("depo_id"), (_fe.get("size") or 0) / 1e6)
+                        _report_step("gpkg_full",
+                                     f"already on Zenodo ({(_fe.get('size') or 0) / 1e6:.0f} MB) -- skip")
+                except Exception as _mfe:
+                    log.warning("KG %s: manifest reuse check failed: %s", kg_code, _mfe)
+                    _full_already_on_zenodo = False
+            try:
+                if not _reuse_full and not _full_already_on_zenodo:
+                    full_gpkg, _boundary_remap = build_full_gpkg_tiled(
+                        kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=mark_uncertain)
+            except Exception as _bge:
+                from tile_cache import CacheMissError as _CacheMissError
+                if isinstance(_bge, _CacheMissError) or isinstance(getattr(_bge, '__cause__', None), _CacheMissError):
+                    # Cache-only peer hit a missing tile while building the full
+                    # GPKG (e.g. tiles restored from checkpoint did not re-fetch
+                    # Copernicus/Hansen, and those layers were not in the local
+                    # or Zenodo cache).  Abort so the director re-queues the KG
+                    # for the frontier (primary) peer.
+                    log.warning("KG %s: cache-only mode hit a miss during gpkg_full \u2014 aborting (%s)",
+                                kg_code, _bge)
+                    result["cache_incomplete"] = True
+                    result["success"] = False
+                    result["error"] = str(_bge)
+                    result["step"] = "aborted_cache_incomplete_gpkg_full"
+                    return result
+                raise
+            result["files"]["full_gpkg"] = full_gpkg
+
+            # If the full GPKG was already on Zenodo (manifest reuse above), it is
+            # neither rebuilt nor re-uploaded. Signal the parent to reload the
+            # manifest and skip its own upload attempt -- exactly as for the
+            # subprocess early-upload path.
+            if _full_already_on_zenodo:
+                result["_full_gpkg_uploaded"] = True
+                result["files"]["full_gpkg"] = ""
+
+            # --- 5b. Validate full GPKG, then stream to Zenodo ---
+            _full_size = os.path.getsize(full_gpkg) if os.path.exists(full_gpkg) else 0
+            if _full_size > 0:
+                _report_step("validate_full_gpkg", "checking full GPKG")
+                _full_issues = validate_kg_outputs(kg_code, {"full_gpkg": full_gpkg})
+                if _full_issues:
+                    for _fi in _full_issues:
+                        log.warning("KG %s VALIDATION (subprocess): %s", kg_code, _fi)
+                else:
+                    log.info("KG %s: full GPKG validated OK (%.0f MB)", kg_code, _full_size / 1e6)
+            # Stream full GPKG to Zenodo immediately.  For large KGs the
+            # full GPKG can be 4-15 GB.  Upload it now and delete the local
+            # copy BEFORE building the light GPKG, so both products never
+            # coexist on disk simultaneously.
+            if _full_size > 0:
+                if THROTTLE_FILE.exists():
+                    _report_step("upload_full_gpkg", "throttle mode \u2014 skipping GPKG upload")
+                    log.info("KG %s: throttle mode \u2014 deleting full GPKG locally (%.0f MB saved)",
+                             kg_code, _full_size / 1e6)
+                    try:
+                        os.unlink(full_gpkg)
+                    except OSError:
+                        pass
+                    result["_full_gpkg_uploaded"] = True
+                else:
+                    _report_step("upload_full_gpkg",
+                                 f"streaming {_full_size / 1e6:.0f} MB to Zenodo")
+                    try:
+                        from zenodo_client import Client as _ZClient, landscape_metadata as _lm
+                        _zclient = _ZClient(token=ZENODO_TOKEN)
+                        _zmeta = lambda k, fn, v, _kg=kg_code, _name=kg.get("kg_name", ""), \
+                            _qs=0, _qg="": \
+                            _lm(_kg, _name, v, "gpkg")
+                        from zenodo_client import Manifest as _ZManifest
+                        _zmanifest = _ZManifest(str(DATA_DIR / "zenodo_manifest.json"))
+                        def _sub_upload_cb(sent, total):
+                            pct = round(100 * sent / total) if total else 0
+                            _report_step("upload_full_gpkg",
+                                         f"streaming {total / 1e6:.0f} MB \u2014 {pct}% ({sent / 1e6:.0f}/{total / 1e6:.0f} MB)")
+                        _zclient.upload_stream(
+                            f"{kg_code}_full_gpkg", full_gpkg, VERSION, _zmeta,
+                            _zmanifest, delete_after=True,
+                            progress_callback=_sub_upload_cb)
+                        log.info("  Full GPKG streamed to Zenodo and deleted locally")
+                        # Mark as already uploaded so upload_kg_to_zenodo skips it
+                        result["_full_gpkg_uploaded"] = True
+                    except Exception as _ue:
+                        log.warning("  Early full GPKG upload failed: %s \u2014 will retry later", _ue)
+                        # Signal Zenodo problem to the parent process so it can
+                        # pause + switch peers.  Keep the local full GPKG on
+                        # disk so the parent can re-upload later.  We still
+                        # let light GPKG + JSON build complete so we don't
+                        # waste an hour of compute; if Zenodo recovers in the
+                        # meantime the parent uploads everything together.
+                        _reason = _classify_zenodo_error(_ue)
+                        try:
+                            ZENODO_PAUSE_FILE.write_text(json.dumps({
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                                "kg": kg_code,
+                                "step": "upload_full_gpkg",
+                                "reason": _reason,
+                                "error": str(_ue),
+                            }))
+                        except Exception:
+                            pass
+                        result["zenodo_failed"] = True
+                        result["zenodo_error"] = str(_ue)
+                        result["zenodo_reason"] = _reason
+            gc.collect()
+
+            # --- 5c. Free tile checkpoints now that full GPKG is written ---
+            # The full GPKG (or its upload) is the last step that needs raster
+            # data from the tile results.  Deleting checkpoints here lets the
+            # retry path skip all tiles if it only timed out during the GPKG
+            # build phase.
+            #
+            # SKIP this cleanup if the early full-GPKG upload failed:
+            # the parent will re-queue the KG and a fresh subprocess will
+            # then need the tile checkpoints to skip the tile loop (and
+            # the rebuilt full GPKG step is skipped via our reuse path).
+            if result.get("zenodo_failed"):
+                # Keep metadata pickles (needed for the next attempt's tile loop
+                # restore) but ALWAYS drop raster sidecars — they cost the most
+                # disk and the GPKG was rebuilt successfully or will be re-built
+                # by the same code path. If the rasters are missing on retry
+                # the GPKG step falls back to the existing BEV re-read.
+                try:
+                    import tile_raster_sidecar as _trs
+                    _trs.release_kg(DATA_DIR / "tile_checkpoints", kg_code)
+                except Exception:
+                    pass
+                log.info("KG %s: keeping tile checkpoints (Zenodo upload failed; will retry)",
+                         kg_code)
+            elif result.get("_full_gpkg_uploaded") and n_tiles >= PRE_JSON_CHKPT_PUBLISH_MIN_TILES:
+                # Full GPKG is already on Zenodo but the JSON product hasn't
+                # landed yet: we are entering the "gpkg(s)-present, json-missing"
+                # limbo window (see 7fed914 / f59511d). The light + json builds
+                # below can still be interrupted before the early json upload
+                # (big split blocks take ~30 min to build json and a frontier
+                # peer auto-parks / rotates a credential / is role-evicted every
+                # couple of hours), and those interruptions are SIGKILLs — no
+                # cleanup handler runs, so we get exactly ONE chance to preserve
+                # cross-peer recoverability, and it is HERE.
+                #
+                # At this point ALL tiles have valid checkpoints on disk (they
+                # were just used to build the full GPKG). Publish the COMPLETE
+                # bundle to the cross-peer registry now so the next peer can
+                # restore every tile and finish light + json with ZERO
+                # Copernicus — completable on a cache-only peer instead of
+                # being reprocessed as frontier work that burns a credential
+                # slot. Without this we rmtree'd the checkpoints the instant
+                # the full GPKG was uploaded, so the only bundle left for the
+                # next peer was whatever a PRIOR interrupted attempt happened
+                # to publish — e.g. 90013-northwest: a stale 12/20-tile bundle,
+                # forcing tiles 13-20 to be re-fetched via NDVI/SAR on at42
+                # (Jun 2026). Keep the metadata pickles for the same-subprocess
+                # json build; release only the heavy raster sidecars (the
+                # registry is metadata-only anyway). On the happy path the
+                # "done" step clears them locally and the parent evicts the
+                # registry bundle, so this only costs a one-off ~metadata-sized
+                # PUT that is reclaimed on completion.
+                try:
+                    import tile_raster_sidecar as _trs
+                    _trs.release_kg(DATA_DIR / "tile_checkpoints", kg_code)
+                except Exception:
+                    pass
+                try:
+                    # NB: ``progress`` (main()'s ProgressTracker) is NOT in scope
+                    # in this subprocess; the upload still surfaces fleet-wide via
+                    # the cache_manifest mirror + chkpt_registry log line.
+                    _publish_checkpoints_to_registry(kg_code)
+                    log.info("KG %s: publishing complete checkpoint bundle before "
+                             "json (full GPKG on Zenodo, json pending) so an "
+                             "interrupted finish stays cache-only-completable",
+                             kg_code)
+                except Exception as _pe:
+                    log.warning("KG %s: pre-json checkpoint publish failed: %s",
+                                kg_code, _pe)
+            else:
+                try:
+                    import shutil as _shutil_ckpt
+                    _ckpt_dir = DATA_DIR / "tile_checkpoints" / kg_code
+                    if _ckpt_dir.exists():
+                        _ckpt_sz = sum(f.stat().st_size for f in _ckpt_dir.rglob("*") if f.is_file())
+                        _shutil_ckpt.rmtree(_ckpt_dir, ignore_errors=True)
+                        log.info("  Freed %.0f MB tile checkpoints after full GPKG written",
+                                 _ckpt_sz / 1e6)
+                except Exception as _ckpt_e:
+                    log.warning("  Failed to free tile checkpoints: %s", _ckpt_e)
+
+        # --- 5b. v2: top up parcel outline profiles for tiles restored from
+        # checkpoints (they never went through the tile loop's sampler) ---
+        if _outline_prof is not None and _outline_prof.summary()["missing"]:
+            try:
+                for _ti_idx, _tr in enumerate(tile_seg_results):
+                    if not _outline_prof.summary()["missing"]:
+                        break
+                    _td = _read_dtm_for_tile(_tr, kg_code=kg_code, tile_idx=_ti_idx)
+                    _outline_prof.sample(_td["dtm"], _td.get("dsm"), _td["transform"])
+                log.info("KG %s: outline profiles topped up: %s", kg_code, _outline_prof.summary())
+            except Exception as _e:  # noqa: BLE001
+                log.warning("KG %s: outline profile top-up failed: %s", kg_code, _e)
+
+        # --- 5c. v2.1: top up per-tile coarse evidence for tiles restored
+        # from pre-2.1 checkpoints (sidecar-first read; dates/spectral n/a) ---
+        _v21_extras = None
+        if MODEL_VERSION == "v2":
+            _v21_extras = {}
+            _missing_v21 = [i for i, _tr in enumerate(tile_seg_results) if not _tr.get("v21")]
+            if _missing_v21:
+                try:
+                    import v21_products as _v21
+                    for _ti_idx in _missing_v21:
+                        _tr = tile_seg_results[_ti_idx]
+                        _td = _read_dtm_for_tile(_tr, kg_code=kg_code, tile_idx=_ti_idx)
+                        _tr["v21"] = _v21.tile_coarse(_td, dataset=ti.DEFAULT_DATASET)
+                    log.info("KG %s: v2.1 tile evidence topped up for %d restored tile(s)",
+                             kg_code, len(_missing_v21))
+                except Exception as _e:  # noqa: BLE001
+                    log.warning("KG %s: v2.1 tile evidence top-up failed: %s", kg_code, _e)
+
+        # --- 6. Build light GPKG ---
+        # v2 (fresh or upgrade) writes ``<code>_light_v2.gpkg`` under the
+        # product key ``light_gpkg_v2``; the legacy ``_light_gpkg`` is never
+        # produced by v2 (the triple-done logic accepts either).
+        # --- 5c. NE declared layer, late retry (the "ne_declared step issue") ---
+        # umfeld builds ~1 KG / 33 s in sorted order, so a fresh KG that was
+        # "not built" at step 1b is frequently built by the time the tile
+        # loop (1-3 h) is done.  One more fetch here turns a '-partial'
+        # (defect ne_cells → full re-upgrade later) into a complete 2.4
+        # product for the cost of one GET.  Same source rules as step 1b.
+        if MODEL_VERSION == "v2" and _ne_declared is None and not str(_ne_status).startswith("disabled"):
+            try:
+                import ne_h3 as _neh
+                _report_step("ne_declared_late", f"retrying NEC1 {_parent_code} ({_neh.ne_source()})")
+                _ne_declared = _neh.fetch_declared(_parent_code, _ne_bbox, code=kg_code)
+                _ne_status = "ok_late"
+                result["ne_status"] = _ne_status
+                log.info("KG %s: NE declared layer %s fetched late (cells=%s digest=%s) — was %s at start",
+                         kg_code, _parent_code, _ne_declared.header.get("cells_n"), _ne_declared.digest,
+                         result.get("ne_status_initial") or "unavailable")
+            except Exception as _e:  # noqa: BLE001
+                _ne_declared = None
+                log.info("KG %s: NE declared layer still unavailable at gpkg_light (%s) — '-partial' (defect ne_cells)",
+                         kg_code, str(_e)[:120])
+        result["step"] = "gpkg_light"
+        _report_step("gpkg_light", f"{len(cadastre_data['parcels'])} parcels, {len(all_new_buildings)} new bldg")
+        _is_v2 = MODEL_VERSION == "v2"
+        _light_key = "light_gpkg_v2" if _is_v2 else "light_gpkg"
+        light_gpkg = build_light_gpkg_tiled(
+            kg_code, tile_seg_results, all_objects,
+            cadastre_data, all_new_buildings, all_infrastructure,
+            obs_year=obs_year, mark_uncertain=mark_uncertain,
+            label_remap=_boundary_remap, outline_profiler=_outline_prof,
+            out_path=(GPKG_DIR / f"{kg_code}_light_v2.gpkg") if _is_v2 else None,
+            v21_out=_v21_extras, report_step=_report_step, ne_declared=_ne_declared)
+        result["files"][_light_key] = light_gpkg
+        if _v21_extras:
+            result["v21"] = {k: v for k, v in _v21_extras.items()
+                             if k in ("n_apices", "det_mode", "terrain_coarse_tables", "apex_seconds")}
+            _ne_out = _v21_extras.get("ne") or {}
+            if _ne_out.get("h3b_path") and os.path.exists(_ne_out["h3b_path"]):
+                result["files"][NE_PRODUCT_KEY] = _ne_out["h3b_path"]
+                result["ne"] = {"declared_digest": _ne_out.get("declared_digest"), "declared_source": _ne_out.get("declared_source"),
+                                "cells_observed": (_ne_out.get("summary") or {}).get("observed", {}).get("cells_observed"),
+                                "seconds": _ne_out.get("seconds")}
+            elif _ne_out.get("error"):
+                result["ne_status"] = "error:" + _ne_out["error"]
+
+        # --- 6b. Validate light GPKG ---
+        _light_size = os.path.getsize(light_gpkg) if os.path.exists(light_gpkg) else 0
+        if _light_size > 0:
+            _light_issues = validate_kg_outputs(kg_code, {"light_gpkg": light_gpkg})
+            if _light_issues:
+                for _li in _light_issues:
+                    log.warning("KG %s VALIDATION (subprocess): %s", kg_code, _li)
+            else:
+                log.info("KG %s: light GPKG validated OK (%.0f MB)", kg_code, _light_size / 1e6)
+
+        # Throttle mode: delete light GPKG immediately
+        if THROTTLE_FILE.exists() and _light_size > 0:
+            log.info("KG %s: throttle mode \u2014 deleting light GPKG locally (%.0f MB saved)",
+                     kg_code, _light_size / 1e6)
+            try:
+                os.unlink(light_gpkg)
+            except OSError:
+                pass
+            result["files"][_light_key] = ""  # prevent parent upload attempt
+        elif _light_size > 0 and result.get("_full_gpkg_uploaded") \
+                and not result.get("zenodo_failed") and not _is_v2:
+            # --- 6c. Early light GPKG upload (ordering invariant) ---
+            # The _json product is the canonical completion marker; the
+            # coverage oracle treats a KG as done the moment json is on
+            # Zenodo. We must therefore guarantee BOTH GPKGs are uploaded
+            # BEFORE json, so an interruption can only ever leave the safe
+            # "gpkg(s) present, json missing" state (re-queue + reprocess),
+            # never "json present, gpkg missing" (silently-complete hole).
+            # Upload light here, in strict order after full, and only attempt
+            # the early json upload below when both flags are set. Gated on
+            # _full_gpkg_uploaded so we never put light ahead of a full that
+            # hasn't landed yet.
+            _report_step("upload_light_gpkg",
+                         f"streaming {_light_size / 1e6:.0f} MB to Zenodo")
+            try:
+                from zenodo_client import (Client as _ZClientL,
+                                            landscape_metadata as _lmL,
+                                            Manifest as _ZManifestL)
+                _zclientL = _ZClientL(token=ZENODO_TOKEN)
+                _zmetaL = lambda k, fn, v, _kg=kg_code, _name=kg.get("kg_name", ""): \
+                    _lmL(_kg, _name, v, "gpkg")
+                _zmanifestL = _ZManifestL(str(DATA_DIR / "zenodo_manifest.json"))
+                def _sub_light_cb(sent, total):
+                    pct = round(100 * sent / total) if total else 0
+                    _report_step("upload_light_gpkg",
+                                 f"streaming {total / 1e6:.0f} MB \u2014 {pct}% "
+                                 f"({sent / 1e6:.0f}/{total / 1e6:.0f} MB)")
+                _zclientL.upload_stream(
+                    f"{kg_code}_light_gpkg", light_gpkg, VERSION, _zmetaL,
+                    _zmanifestL, delete_after=True,
+                    progress_callback=_sub_light_cb)
+                result["_light_gpkg_uploaded"] = True
+                result["files"]["light_gpkg"] = ""  # parent skips re-upload
+                log.info("KG %s: light GPKG streamed to Zenodo early", kg_code)
+            except Exception as _lue:
+                # Non-fatal: keep the file on disk and let the parent upload
+                # it (in order) later. Do NOT set zenodo_failed here -- a
+                # light failure shouldn't trigger the full re-queue path; we
+                # simply skip the early json upload below so ordering holds.
+                log.warning("KG %s: early light GPKG upload failed (%s) -- "
+                            "parent will retry", kg_code, _lue)
+
+        # --- 7. Build JSON summary ---
+        result["step"] = "json"
+        _report_step("json", "building summary")
+        json_summary = build_json_summary_tiled(
+            kg_code, kg, tile_seg_results, all_objects,
+            cadastre_data, terrain_stats,
+            all_spectral_info, all_copernicus_info, all_hansen_info,
+            all_new_buildings, all_infrastructure, obs_year,
+            n_tiles=n_tiles, tile_km=tile_km,
+            total_seg_pixels=total_seg_pixels,
+            tile_data_availability=tile_data_availability,
+            outline_profiler=_outline_prof, classifier_used=_classifier_used,
+            v21_extras=_v21_extras)
+
+        # Store quality info in result for logging / Zenodo
+        dq = json_summary.get("data_quality", {})
+        result["quality_score"] = dq.get("quality_score", 0)
+        result["quality_grade"] = dq.get("quality_grade", "F")
+        result["available_layers"] = dq.get("available_layers", [])
+        result["missing_layers"] = dq.get("missing_layers", [])
+        result["n_upstream_failed_tiles"] = dq.get("n_upstream_failed_tiles", 0)
+        result["upstream_failed_tiles"] = dq.get("upstream_failed_tiles", [])
+        try:
+            from product_repair import defects_from_quality as _pr_defects
+            result["product_defects"] = _pr_defects(dq)
+            if _is_v2 and not result["files"].get(NE_PRODUCT_KEY):
+                # v2.4: no NE product (declared layer not built yet / build failed)
+                result["product_defects"] = sorted(set(result["product_defects"]) | {"ne_cells"})
+            if result["product_defects"]:
+                log.warning("KG %s: repairable layer gap(s) %s — JSON products labelled "
+                            "'-partial' (re-upgrade once cells cached)",
+                            kg_code, ",".join(result["product_defects"]))
+        except Exception as _pe:
+            log.debug("product_defects: %s", _pe)
+
+        if _is_v2:
+            # --- 7a. v2 products: kgjson/2 blob (+ compact legacy json for
+            # fresh KGs, which stays the fleet-wide completion marker) ---
+            import kg_json_v2 as _kgj2
+            if _v2_upgrade:
+                try:
+                    json_summary.setdefault("data_quality", {})["v2_source"] = _v2src.summary()
+                except Exception:  # noqa: BLE001
+                    pass
+                json_summary["upgraded_from"] = {
+                    "source": "zenodo_full_gpkg_v1",
+                    "v1_version": (v1_doc or {}).get("version"),
+                    "v1_generated_at": (v1_doc or {}).get("generated_at"),
+                }
+            json_v2_path = str(JSON_DIR / f"{kg_code}_v2.json.gz")
+            _n_v2 = _kgj2.dump(json_summary, json_v2_path)
+            result["files"]["json_v2"] = json_v2_path
+            log.info("KG %s: kgjson/2 written (%.2f MB gz)", kg_code, _n_v2 / 1e6)
+            json_path = ""
+            if not _v2_upgrade:
+                json_path = str(JSON_DIR / f"{kg_code}.json")
+                with open(json_path, 'w') as f:
+                    json.dump(json_summary, f, separators=(",", ":"), default=str)
+                result["files"]["json"] = json_path
+
+            # --- 7b. v2 verification gate: nothing uploads unless it passes ---
+            _report_step("v2_verify", "integrity + improvement checks")
+            import v2_verify as _v2v
+            _rep = _v2v.verify_before_upload(
+                kg_code, json_v2_path,
+                light_gpkg if (_light_size > 0 and os.path.exists(light_gpkg)) else None,
+                v1_doc, expected_parcels=None,
+                union_geom_3035=_v2_union_3035,
+                h3b_path=result["files"].get(NE_PRODUCT_KEY),
+                ne_declared_digest=(_ne_declared.digest if _ne_declared is not None else None))
+            result["v2_verify"] = {"ok": bool(_rep["ok"]), "summary": _rep.summary(),
+                                   "errors": list(_rep.get("errors", []))[:10],
+                                   "warnings": list(_rep.get("warnings", []))[:10]}
+            _vmsg = f"v2verify: {kg_code} {_rep.summary()}"
+            if _rep["ok"]:
+                log.info("KG %s: %s", kg_code, _vmsg)
+                _relay_info(_vmsg, "v2_verify")
+            elif not _v2_upgrade:
+                # Fresh KG: the gate is advisory for *completion*.  Before
+                # 2026-09-18 a FAIL here discarded everything incl. the
+                # legacy ``_json`` completion marker, so the frontier
+                # re-picked the same KG and re-failed it every ~1 h (45410-
+                # north / -northwest / 45631-northeast looped for 9 h, zero
+                # fleet completions).  Now: drop only the v2 products, keep
+                # ``_json`` (+ the already-uploaded full GPKG) so the KG
+                # completes as v1-shaped; the code stays upgrade-eligible
+                # (``_json`` + ``_full_gpkg``, no ``_json_v2``) so the
+                # cache-only upgrade path regenerates light_v2/json_v2 from
+                # the full GPKG under its own strike budget.  The parent
+                # records one strike so a systematically failing code does
+                # not spin there either.
+                log.error("KG %s: %s — dropping v2 products, completing with legacy json only "
+                          "(upgrade path retries light_v2/json_v2)", kg_code, _vmsg)
+                for _pth in (json_v2_path, light_gpkg):
+                    try:
+                        if _pth and os.path.exists(_pth):
+                            os.unlink(_pth)
+                    except OSError:
+                        pass
+                result["files"] = {k: v for k, v in result["files"].items()
+                                   if k not in ("json_v2", _light_key)}
+                result["v2_verify_degraded"] = _vmsg
+                _light_size = 0
+            else:
+                log.error("KG %s: %s — NOT uploading", kg_code, _vmsg)
+                # Keep the failed v2 JSON (small) for forensics — it is the
+                # only artefact that shows *which* parcels/tiles regressed.
+                # Ring of the 20 most recent under json/v2_verify_failed/.
+                try:
+                    _fdir = JSON_DIR / "v2_verify_failed"
+                    _fdir.mkdir(parents=True, exist_ok=True)
+                    if json_v2_path and os.path.exists(json_v2_path):
+                        os.replace(json_v2_path, _fdir / os.path.basename(json_v2_path))
+                    _old = sorted(_fdir.glob("*_v2.json.gz"), key=lambda q: q.stat().st_mtime)
+                    for _q in _old[:-20]:
+                        _q.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                for _pth in (json_v2_path, json_path, light_gpkg):
+                    try:
+                        if _pth and os.path.exists(_pth):
+                            os.unlink(_pth)
+                    except OSError:
+                        pass
+                result["files"] = {k: v for k, v in result["files"].items()
+                                   if k not in ("json_v2", "json", _light_key)}
+                result["success"] = False
+                result["v2_verify_failed"] = True
+                result["error"] = _vmsg
+                result["step"] = "aborted_v2_verify_failed"
+                return result
+        else:
+            json_path = str(JSON_DIR / f"{kg_code}.json")
+            with open(json_path, 'w') as f:
+                json.dump(json_summary, f, indent=2, default=str)
+            result["files"]["json"] = json_path
+
+        # --- 7b. Validate JSON ---
+        _json_issues = validate_kg_outputs(kg_code, {"json": json_path}) if json_path else []
+        if _json_issues:
+            for _ji in _json_issues:
+                log.warning("KG %s VALIDATION (subprocess): %s", kg_code, _ji)
+        elif json_path:
+            log.info("KG %s: JSON validated OK", kg_code)
+
+        # --- 7b'. v2 ordered in-subprocess upload ---
+        # light_gpkg_v2 → json_v2 → json (fresh only).  ``_json`` stays the
+        # completion marker and MUST land last; a failure stops the chain
+        # and the parent uploads the rest in the same order.  In upgrade
+        # mode nothing else is on Zenodo yet for this KG, so this is the
+        # whole upload.  Fresh v2 additionally has the early full GPKG
+        # upload above (gate: it must have landed).
+        if _is_v2 and not THROTTLE_FILE.exists() and not result.get("zenodo_failed") \
+                and (_v2_upgrade or result.get("_full_gpkg_uploaded")):
+            _v2_upload_and_finish(kg, kg_code, result, _report_step,
+                                  v1_doc=v1_doc if _v2_upgrade else None,
+                                  ne_post=((_v21_extras or {}).get("ne") or {}),
+                                  parent_code=_parent_code, v2_upgrade=_v2_upgrade)
+        # --- 7c. Early JSON upload (interruption resilience) ---
+        # The ``_json`` product is the canonical completion marker: a KG only
+        # drains from the priority queue / counts as done once its json is on
+        # Zenodo (see app._get_completed_kgs / _kg_coverage_complete). Until
+        # now json was uploaded ONLY by the parent, AFTER this subprocess
+        # returned -- i.e. after the (now deadline-capped) frontier pre-warm.
+        # For big split blocks the json BUILD itself takes ~30 min, so a
+        # frontier peer that auto-parks on throughput collapse (every ~2h),
+        # rotates a credential, or is role-evicted mid-build kills the
+        # subprocess before json ever reaches the parent. The full + light
+        # GPKG were already streamed to Zenodo early, so the block lands in a
+        # "gpkg-but-no-json" limbo: never complete, re-queued forever,
+        # re-processed from scratch each time (49006-south, 63304-center,
+        # 90102-southeast et al., Jun 2026). Stream json to Zenodo HERE, the
+        # instant it is validated, so any later interruption can't lose it.
+        # Small file (~KB-MB) so the extra upload is negligible; on the happy
+        # path the parent skips its own json upload via ``_json_uploaded``.
+        #
+        # ORDERING INVARIANT: json is the completion marker, so it must be
+        # the LAST product on Zenodo. Only upload it early once BOTH GPKGs
+        # are already up (full via the early-upload block above; light via
+        # the early-upload block we just added). A light product with size 0
+        # (genuinely absent) counts as satisfied -- there is nothing to be
+        # out-of-order with. If either GPKG hasn't landed early (upload
+        # failed / deferred), we skip the early json upload and let the
+        # parent upload everything in order (full, light, json).
+        _gpkgs_on_zenodo = (
+            result.get("_full_gpkg_uploaded")
+            and (result.get("_light_gpkg_uploaded") or _light_size == 0)
+            and not result.get("zenodo_failed")
+        )
+        if THROTTLE_FILE.exists() or _is_v2:
+            # Throttle mode never uploads json (matches parent behaviour);
+            # leave it for the parent's throttle handling.  v2 handled its
+            # ordered upload in 7b' above.
+            pass
+        elif not _gpkgs_on_zenodo:
+            # GPKG(s) not yet on Zenodo -- defer json to the parent so it is
+            # uploaded strictly after the GPKGs (ordering invariant).
+            log.info("KG %s: deferring JSON upload to parent (GPKGs not yet "
+                     "on Zenodo) to preserve full\u2192light\u2192json order",
+                     kg_code)
+        else:
+            try:
+                from zenodo_client import (Client as _ZClientJ,
+                                            landscape_metadata as _lmJ,
+                                            Manifest as _ZManifestJ)
+                _zclientJ = _ZClientJ(token=ZENODO_TOKEN)
+                _qsJ = result.get("quality_score", 0)
+                _qgJ = result.get("quality_grade", "")
+                _alJ = result.get("available_layers") or []
+                _mlJ = result.get("missing_layers") or []
+                _zmetaJ = lambda k, fn, v, _kg=kg_code, _name=kg.get("kg_name", ""), \
+                    _qs=_qsJ, _qg=_qgJ, _al=_alJ, _ml=_mlJ: \
+                    _lmJ(_kg, _name, v, "json", quality_score=_qs,
+                         quality_grade=_qg, available_layers=_al,
+                         missing_layers=_ml)
+                _zmanifestJ = _ZManifestJ(str(DATA_DIR / "zenodo_manifest.json"))
+                # Keep json on local disk (delete_after=False) so the parent
+                # can still run log_kg_stats_from_json afterwards.
+                _zclientJ.upload_stream(
+                    f"{kg_code}_json", json_path, VERSION, _zmetaJ,
+                    _zmanifestJ, delete_after=False)
+                result["_json_uploaded"] = True
+                log.info("KG %s: JSON streamed to Zenodo early (interruption-safe)",
+                         kg_code)
+            except Exception as _jue:
+                # Non-fatal: the parent will upload json the usual way. We
+                # just lose the early-upload safety net for this run.
+                log.warning("KG %s: early JSON upload failed (%s) -- "
+                            "parent will retry", kg_code, _jue)
+
+        result["success"] = True
+        result["step"] = "done"
+        # Clean up tile checkpoints on success
+        _clear_tile_checkpoints()
+
+        # End-of-KG flush: only forced when our local cache has grown
+        # significantly since the last upload. Otherwise rely on the
+        # 30 min interval. Cuts upload-lock contention by ~3x.
+        try:
+            if _local_cache_grew_since_last_flush():
+                flush_tile_cache_to_zenodo(force=True)
+            else:
+                flush_tile_cache_to_zenodo()  # honours interval
+        except Exception as _zfe:
+            log.debug("Zenodo cache flush at KG end: %s", _zfe)
+
+        # Fix #2: frontier cell pre-warm. Proactively densify the shared
+        # Zenodo cache around this peer's owning cell so cache-only peers
+        # can find whole KGs ready. Gated + bounded by the director via
+        # the synced 'prewarm' flag; no-op in cache-only mode.
+        try:
+            prewarm_cell_tiles(kg, obs_year)
+        except Exception as _pwe:
+            log.debug("Frontier cell pre-warm at KG end: %s", _pwe)
+
+    except Exception as e:
+        result["error"] = str(e)
+        result["traceback"] = traceback.format_exc()
+        log.error("KG %s failed at step %s: %s", kg_code, result["step"], e)
+
+    # Clean up the warning relay handler
+    try:
+        logging.getLogger().removeHandler(_relay_handler)
+    except Exception:
+        pass
+
+    gc.collect()
+    return result
+
+# === SECTION: Output validation ===
+
+def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
+    """Validate KG output products present in *files* dict.
+
+    Only products whose key appears in *files* are checked.  This allows
+    callers to validate a single product (e.g. full_gpkg) without
+    spurious "missing" warnings for products not yet built.
+    """
+    issues = []
+
+    # --- Full GPKG ---
+    full_path = files.get("full_gpkg", "")
+    if "full_gpkg" in files:
+      if not full_path or not os.path.exists(full_path):
+        issues.append("FULL_GPKG: missing")
+      else:
+        try:
+            expected_raster = ["DTM", "DSM", "nDSM", "segment_type", "segment_height"]
+            found_layers = set()
+            try:
+                import sqlite3
+                conn = sqlite3.connect(full_path)
+                tables = [r[0] for r in conn.execute(
+                    "SELECT table_name FROM gpkg_contents "
+                    "WHERE data_type IN ('tiles', '2d-gridded-coverage')").fetchall()]
+                vector_tabs = [r[0] for r in conn.execute(
+                    "SELECT table_name FROM gpkg_contents WHERE data_type='features'").fetchall()]
+                conn.close()
+                found_layers = set(tables)
+            except Exception:
+                vector_tabs = []
+            # Check required raster layers (stitched single layers)
+            for layer in expected_raster:
+                if layer not in found_layers:
+                    issues.append(f"FULL_GPKG: missing raster layer '{layer}'")
+            # Ortho is optional but note if missing
+            has_ortho = any(t.startswith('Ortho_') for t in found_layers)
+            if not has_ortho:
+                log.info("  FULL_GPKG: no ortho layer (may not be available for this KG)")
+            # Check segments vector layer
+            if 'segments' not in vector_tabs:
+                issues.append("FULL_GPKG: missing vector layer 'segments'")
+            else:
+                try:
+                    import fiona as _fiona_val
+                    with _fiona_val.open(full_path, layer='segments') as src:
+                        flds = set(src.schema['properties'].keys())
+                        for rf in ['aspect_mean_deg','aspect_dominant','elevation_mean_m',
+                                   'tri_mean','tpi_mean','terrain_class']:
+                            if rf not in flds:
+                                issues.append(f"FULL_GPKG: segments missing field '{rf}'")
+                except Exception:
+                    pass
+            fsize = os.path.getsize(full_path)
+            if fsize < 10_000:
+                issues.append(f"FULL_GPKG: suspiciously small ({fsize} bytes)")
+            log.info("  FULL_GPKG: %.1f MB, layers=%s", fsize/1e6, sorted(found_layers))
+        except Exception as e:
+            issues.append(f"FULL_GPKG: cannot open: {e}")
+
+    # --- Light GPKG ---
+    light_path = files.get("light_gpkg", "")
+    if "light_gpkg" in files:
+      if not light_path or not os.path.exists(light_path):
+        issues.append("LIGHT_GPKG: missing")
+      else:
+        try:
+            import sqlite3
+            conn = sqlite3.connect(light_path)
+            # Raster tables
+            raster_tables = [r[0] for r in conn.execute(
+                "SELECT table_name FROM gpkg_contents "
+                    "WHERE data_type IN ('tiles', '2d-gridded-coverage')").fetchall()]
+            # Vector tables
+            vector_tables = [r[0] for r in conn.execute(
+                "SELECT table_name FROM gpkg_contents WHERE data_type='features'").fetchall()]
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            conn.close()
+
+            # segment_type and segment_height rasters (stitched single layers)
+            if 'segment_type' not in raster_tables:
+                issues.append("LIGHT_GPKG: missing segment_type raster")
+            if 'segment_height' not in raster_tables:
+                issues.append("LIGHT_GPKG: missing segment_height raster")
+
+            # segments vector (single stitched layer)
+            if 'segments' not in vector_tables:
+                issues.append("LIGHT_GPKG: missing vector layer 'segments'")
+
+            # 2.4: no cadastre-shaped layer may exist
+            for _forb in ("parcels", "buildings", "parcel_outline_z"):
+                if _forb in vector_tables or _forb in tables:
+                    issues.append(f"LIGHT_GPKG: FORBIDDEN cadastre layer '{_forb}' present (2.4)")
+
+            # Count features in vector layers + check schemas
+            try:
+                import fiona
+                for vt in vector_tables:
+                    with fiona.open(light_path, layer=vt) as src:
+                        n = len(src)
+                        log.info("  LIGHT_GPKG: layer '%s' → %d features", vt, n)
+                        if n == 0:
+                            issues.append(f"LIGHT_GPKG: layer '{vt}' is empty")
+                        # Check required terrain fields
+                        flds = set(src.schema['properties'].keys())
+                        if vt == 'segments':
+                            for rf in ['aspect_mean_deg','aspect_dominant','elevation_mean_m',
+                                       'tri_mean','tpi_mean','terrain_class']:
+                                if rf not in flds:
+                                    issues.append(f"LIGHT_GPKG: segments missing field '{rf}'")
+                        if vt == 'parcels':
+                            for rf in ['slope_mean_deg','aspect_mean_deg','aspect_dominant',
+                                       'elevation_min_m','elevation_max_m','tri_mean',
+                                       'terrain_class','vertex_heights']:
+                                if rf not in flds:
+                                    issues.append(f"LIGHT_GPKG: parcels missing field '{rf}'")
+                            # Spot-check: at least 50% of parcels have terrain_class
+                            n_tc = 0
+                            for feat in src:
+                                if feat['properties'].get('terrain_class'):
+                                    n_tc += 1
+                            if n > 0 and n_tc < n * 0.5:
+                                issues.append(f"LIGHT_GPKG: only {n_tc}/{n} parcels have terrain_class")
+            except Exception as e:
+                issues.append(f"LIGHT_GPKG: cannot read vector layers: {e}")
+
+            fsize = os.path.getsize(light_path)
+            log.info("  LIGHT_GPKG: %.1f MB, rasters=%s, vectors=%s",
+                     fsize/1e6, raster_tables, vector_tables)
+        except Exception as e:
+            issues.append(f"LIGHT_GPKG: cannot open: {e}")
+
+    # --- JSON summary ---
+    json_path = files.get("json", "")
+    if "json" in files:
+      if not json_path or not os.path.exists(json_path):
+        issues.append("JSON: missing")
+      else:
+        try:
+            with open(json_path) as f:
+                js = json.load(f)
+
+            # Out-of-coverage marker product: a block that lies entirely
+            # outside BEV LiDAR coverage (across the national border).
+            # It intentionally carries no objects / area / parcels — its
+            # only job is to close the parent KG's geographic coverage
+            # so the parent can drain from the priority queue. Every
+            # check below (area_summary non-empty, total_area_sqm > 0,
+            # per-layer presence) is meaningless here and would emit a
+            # wall of false-positive validation warnings.
+            if js.get("out_of_coverage"):
+                for k in ("version", "kg_code", "bbox", "data_quality"):
+                    if k not in js:
+                        issues.append(
+                            f"JSON(out_of_coverage): missing key '{k}'")
+                log.info("  JSON: out-of-coverage marker product — "
+                         "schema checks skipped")
+                return issues
+
+            # Required top-level keys
+            required_keys = [
+                "version", "kg_code", "kg_name", "bbox", "total_area_sqm",
+                "observation_period", "area_summary", "height_distribution",
+                "landscape", "top_10_objects", "top_10_trees", "tree_stats",
+                "terrain", "ndvi", "sar", "ndvi_harmonics",
+                "temporal_change", "phenology",
+                "hansen", "new_buildings", "infrastructure",
+                "methods", "coverage", "data_quality",
+            ]
+            for k in required_keys:
+                if k not in js:
+                    issues.append(f"JSON: missing top-level key '{k}'")
+            # 2.4: cadastre-shaped sections are forbidden
+            for k in ("parcels", "building_footprints"):
+                if k in js:
+                    issues.append(f"JSON: FORBIDDEN cadastre section '{k}' present (2.4)")
+            if not js.get("cadastre_free"):
+                issues.append("JSON: cadastre_free flag missing (2.4)")
+
+            # Check area_summary not empty
+            area_sum = js.get("area_summary", {})
+            if not area_sum:
+                issues.append("JSON: area_summary is empty")
+
+            # Check total_area_sqm > 0
+            if js.get("total_area_sqm", 0) <= 0:
+                issues.append("JSON: total_area_sqm is zero or negative")
+
+            # Check parcels have details
+            parcels = js.get("parcels", {})
+            p_details = parcels.get("details", [])
+            if parcels.get("count", 0) > 0 and not p_details:
+                issues.append("JSON: parcels.details is empty despite count>0")
+            else:
+                # Spot-check parcels
+                if p_details:
+                    n_with_elev = sum(1 for p in p_details if p.get("elevation_m") is not None)
+                    n_with_area = sum(1 for p in p_details if p.get("area_summary"))
+                    log.info("  JSON: %d/%d parcels with elevation, %d/%d with area_summary",
+                             n_with_elev, len(p_details), n_with_area, len(p_details))
+                    if n_with_elev == 0:
+                        issues.append("JSON: no parcels have elevation_m")
+                    elif n_with_elev < len(p_details) * 0.8:
+                        issues.append(f"JSON: only {n_with_elev}/{len(p_details)} parcels have elevation_m (expect >80% with full-KG DTM)")
+                    if n_with_area == 0 and len(p_details) > 5:
+                        # area_summary only available for parcels inside segmentation window
+                        log.info("  JSON: no parcels have area_summary (may be outside seg window)")
+                    # Terrain enrichment checks
+                    n_with_terrain = sum(1 for p in p_details if p.get("terrain_class"))
+                    n_with_aspect = sum(1 for p in p_details if p.get("aspect_dominant"))
+                    n_with_verts = sum(1 for p in p_details if p.get("vertex_heights"))
+                    log.info("  JSON: %d/%d parcels with terrain_class, %d/%d with aspect, %d/%d with vertex_heights",
+                             n_with_terrain, len(p_details), n_with_aspect, len(p_details),
+                             n_with_verts, len(p_details))
+                    if n_with_terrain == 0:
+                        issues.append("JSON: no parcels have terrain_class")
+                    elif n_with_terrain < len(p_details) * 0.5:
+                        issues.append(f"JSON: only {n_with_terrain}/{len(p_details)} parcels have terrain_class")
+                    if n_with_aspect == 0:
+                        issues.append("JSON: no parcels have aspect_dominant")
+                    if n_with_verts == 0:
+                        issues.append("JSON: no parcels have vertex_heights")
+                    elif n_with_verts < len(p_details) * 0.5:
+                        issues.append(f"JSON: only {n_with_verts}/{len(p_details)} parcels have vertex_heights")
+                    # Check largest parcel has full data
+                    biggest = max(p_details, key=lambda p: p.get("area_sqm", 0))
+                    if not biggest.get("parcel_id"):
+                        issues.append("JSON: largest parcel missing parcel_id")
+                    if not biggest.get("centroid"):
+                        issues.append("JSON: largest parcel missing centroid")
+
+            # Check building_footprints have details
+            bfp = js.get("building_footprints", {})
+            bf_details = bfp.get("details", [])
+            if bfp.get("count", 0) > 0 and not bf_details:
+                issues.append("JSON: building_footprints.details empty despite count>0")
+            else:
+                if bf_details:
+                    b0 = bf_details[0]
+                    if not b0.get("centroid"):
+                        issues.append("JSON: first building missing centroid")
+                    if b0.get("max_height_m") is None:
+                        issues.append("JSON: first building missing max_height_m")
+                    n_bld_verts = sum(1 for b in bf_details if b.get("vertex_heights"))
+                    n_bld_dtm = sum(1 for b in bf_details if b.get("centroid_dtm_m") is not None)
+                    n_bld_roof = sum(1 for b in bf_details if b.get("roof_type_hint"))
+                    log.info("  JSON: %d/%d buildings with vertex_heights, %d with centroid_dtm, %d with roof_type",
+                             n_bld_verts, len(bf_details), n_bld_dtm, n_bld_roof)
+                    if n_bld_verts == 0 and len(bf_details) > 5:
+                        issues.append("JSON: no buildings have vertex_heights")
+                    if n_bld_dtm == 0 and len(bf_details) > 5:
+                        issues.append("JSON: no buildings have centroid_dtm_m")
+
+            # Check for NaN/None in critical numeric fields
+            for t, vals in js.get("height_distribution", {}).items():
+                for fk in ["min", "max", "mean"]:
+                    v = vals.get(fk)
+                    if v is None or (isinstance(v, float) and (v != v)):  # NaN check
+                        issues.append(f"JSON: height_distribution[{t}].{fk} is NaN/None")
+
+            # Check terrain populated
+            terrain = js.get("terrain", {})
+            if not terrain or terrain.get("steepness_mean_deg") is None:
+                issues.append("JSON: terrain stats missing/empty")
+
+            # Check new enriched sections (SAR, harmonics, temporal, phenology)
+            sar = js.get("sar", {})
+            if not sar:
+                issues.append("JSON: sar section missing/empty (Copernicus may have been skipped)")
+            else:
+                if sar.get("vv_mean_db") is None and sar.get("method"):
+                    issues.append("JSON: sar has method but no vv_mean_db")
+
+            harmonics = js.get("ndvi_harmonics", {})
+            if not harmonics:
+                issues.append("JSON: ndvi_harmonics section missing/empty")
+            else:
+                for hk in ["mean_mean", "amplitude_mean", "phase_mean"]:
+                    v = harmonics.get(hk)
+                    if v is not None and isinstance(v, float) and v != v:
+                        issues.append(f"JSON: ndvi_harmonics.{hk} is NaN")
+
+            temporal = js.get("temporal_change", {})
+            if not temporal:
+                issues.append("JSON: temporal_change section missing/empty")
+
+            phenology = js.get("phenology", {})
+            # Phenology may be empty if no vegetated objects — not an error, just note
+            if not phenology:
+                log.info("  JSON: phenology section empty (may be ok for non-vegetated KGs)")
+
+            # Check tree_stats
+            tree_stats = js.get("tree_stats", {})
+            if not tree_stats:
+                issues.append("JSON: tree_stats section missing")
+
+            # Check observation_period
+            obs = js.get("observation_period", {})
+            if not obs or not obs.get("start"):
+                issues.append("JSON: observation_period missing/empty")
+
+            # Deep NaN scan on all numeric values
+            def _scan_nan(obj, path=""):
+                nan_paths = []
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        nan_paths.extend(_scan_nan(v, f"{path}.{k}"))
+                elif isinstance(obj, list):
+                    for i, v in enumerate(obj[:5]):  # sample first 5
+                        nan_paths.extend(_scan_nan(v, f"{path}[{i}]"))
+                elif isinstance(obj, float) and obj != obj:
+                    nan_paths.append(path)
+                return nan_paths
+            nan_paths = _scan_nan(js)
+            if nan_paths:
+                issues.append(f"JSON: NaN found at {len(nan_paths)} path(s): {', '.join(nan_paths[:5])}")
+
+            # Check methods present
+            methods = js.get("methods", {})
+            if len(methods) < 5:
+                issues.append(f"JSON: methods section sparse ({len(methods)} entries)")
+            # Check new method keys exist
+            for mk in ["sar", "ndvi_harmonics", "temporal_change", "phenology"]:
+                if mk not in methods:
+                    issues.append(f"JSON: methods missing '{mk}' key")
+
+            # Summary stats
+            n_parcel_details = len(p_details)
+            n_bfp_details = len(bf_details)
+            n_types = len(area_sum)
+            log.info("  JSON: %.1f KB, %d types, %d parcel details, %d building details",
+                     os.path.getsize(json_path)/1024, n_types,
+                     n_parcel_details, n_bfp_details)
+
+        except json.JSONDecodeError as e:
+            issues.append(f"JSON: parse error: {e}")
+        except Exception as e:
+            issues.append(f"JSON: validation error: {e}")
+
+    return issues
+
+
+def log_kg_stats_from_json(kg_code: str, json_path: str, elapsed: float):
+    """Read the output JSON and log key stats. Keeps log concise."""
+    try:
+        with open(json_path) as f:
+            js = json.load(f)
+    except Exception as e:
+        log.warning("KG %s: cannot read JSON for stats: %s", kg_code, e)
+        return
+
+    # An out-of-coverage product (all tiles NoData -- see the
+    # empty-coverage gate in process_one_kg) carries plain LISTS where a
+    # normal product carries summary dicts (parcels/new_buildings/
+    # infrastructure). Coerce so a legitimately-empty KG can't crash the
+    # stats logger -- which it did on at11 for 80110-southeast-3:
+    # ``AttributeError: 'list' object has no attribute 'get'`` was raised
+    # AFTER the JSON had been written and validated, so the KG was booked
+    # as a failure and the block never drained.
+    def _d(key):
+        v = js.get(key)
+        return v if isinstance(v, dict) else {}
+
+    def _l(key):
+        v = js.get(key)
+        return v if isinstance(v, list) else []
+
+    def _n(key, *names):
+        """Count from either a summary dict or a raw list."""
+        v = js.get(key)
+        if isinstance(v, list):
+            return len(v)
+        if isinstance(v, dict):
+            for nm in names:
+                if nm in v:
+                    return v.get(nm) or 0
+        return 0
+
+    landscape = _d("landscape")
+    terrain = _d("terrain")
+    area_sum = _d("area_summary")
+    tree_stats = _d("tree_stats")
+    top_obj = _l("top_10_objects") or [{}]
+    top_tree = _l("top_10_trees") or [{}]
+    hansen = _d("hansen")
+    ndvi = _d("ndvi")
+
+    n_seg = landscape.get("n_segments", 0) or len(_l("objects"))
+    n_par = _n("parcels", "count")
+    n_bld = _n("building_footprints", "count") or _n("buildings", "count")
+    n_new = _n("new_buildings", "count")
+    n_inf = _n("infrastructure", "total", "count")
+
+    log.info("KG %s: SUCCESS in %.0fs", kg_code, elapsed)
+    log.info("  %d segments | %d parcels | %d buildings | %d new buildings | %d infrastructure",
+             n_seg, n_par, n_bld, n_new, n_inf)
+    log.info("  area=%.0f m\u00b2 | dominant=%s | vegetated=%.0f%% | shannon=%.2f",
+             js.get("total_area_sqm", 0),
+             landscape.get("dominant_type", "?"),
+             (landscape.get("vegetated_fraction", 0) or 0) * 100,
+             landscape.get("shannon_diversity", 0) or 0)
+    top5 = list(area_sum.items())[:5]
+    if top5:
+        log.info("  top types: %s",
+                 ", ".join(
+                     f"{t}={(v.get('area_sqm', 0) if isinstance(v, dict) else v)}"
+                     f"m\u00b2" for t, v in top5))
+    log.info("  tallest=%.1fm | tallest_tree=%.1fm | trees=%d | stem_vol=%.0f m\u00b3",
+             top_obj[0].get("height_max_m", 0) if top_obj else 0,
+             top_tree[0].get("height_m", 0) if top_tree else 0,
+             tree_stats.get("count", 0),
+             tree_stats.get("est_stem_volume_m3", 0) or 0)
+    log.info("  elev=[%.0f,%.0f]m range=%.0fm | slope=%.1f\u00b0 | aspect=%s",
+             terrain.get("elevation_min_m") or 0,
+             terrain.get("elevation_max_m") or 0,
+             terrain.get("elevation_range_m") or 0,
+             terrain.get("steepness_mean_deg") or 0,
+             terrain.get("aspect_dominant", "?"))
+    log.info("  ndvi: bev=%.3f cop=%.3f | hansen_loss=%d px",
+             ndvi.get("bev_nir_mean", 0) or 0,
+             ndvi.get("copernicus_mean", 0) or 0,
+             hansen.get("total_loss_pixels", 0) or 0)
+    # New enriched sections
+    sar = js.get("sar", {})
+    if sar:
+        log.info("  sar: VV=%.3f VH=%.3f (linear sigma0)",
+                 sar.get("vv_mean_db", 0) or 0,
+                 sar.get("vh_mean_db", 0) or 0)
+    else:
+        log.info("  sar: (empty)")
+    harm = js.get("ndvi_harmonics", {})
+    if harm:
+        log.info("  harmonics: mean=%.4f amp=%.4f phase=%.4f",
+                 harm.get("mean_mean", 0) or 0,
+                 harm.get("amplitude_mean", 0) or 0,
+                 harm.get("phase_mean", 0) or 0)
+    else:
+        log.info("  harmonics: (empty)")
+    temporal = js.get("temporal_change", {})
+    if temporal:
+        log.info("  temporal: %d event types, dtm_dates=%s",
+                 len(temporal.get("events", [])),
+                 temporal.get("dtm_dates", []))
+    else:
+        log.info("  temporal: (empty)")
+    pheno = js.get("phenology", {})
+    if pheno:
+        log.info("  phenology: %s", dict(pheno))
+    # Data quality
+    dq = js.get("data_quality", {})
+    if dq:
+        log.info("  quality: %.1f%% grade=%s | available=%s | missing=%s",
+                 (dq.get("quality_score", 0)) * 100,
+                 dq.get("quality_grade", "?"),
+                 ",".join(dq.get("available_layers", [])) or "none",
+                 ",".join(dq.get("missing_layers", [])) or "none")
+
+
+# === SECTION: Zenodo upload helpers ===
+
+def _push_manifest_entry_to_director(zenodo_key: str, manifest) -> None:
+    """Best-effort push of a freshly-saved manifest entry to the director.
+
+    Uses ZENODO_LOCK_URL (set on peers) or http://127.0.0.1:8000 (primary)
+    as the director endpoint.  Director's /api/v1/manifest/push merges the
+    entry with timestamp-aware overwrite. Silent failures are fine — the
+    5-minute peer-sync poll is the safety net.
+    """
+    import os as _os, requests as _req, json as _j
+    director_url = _os.environ.get('ZENODO_LOCK_URL') or 'http://127.0.0.1:8000'
+    director_url = director_url.rstrip('/')
+    entry = manifest.get(zenodo_key) if hasattr(manifest, 'get') else None
+    if entry is None:
+        return
+    payload = {'key': zenodo_key,
+               'entry': entry.to_dict() if hasattr(entry, 'to_dict') else entry}
+    # v2.4: tell the director WHO holds the local copy, so the primary's
+    # ne_ingest / v2_ingest can pull <code>_ne.h3b / <code>_v2.json.gz
+    # from this peer (GET /api/v1/processing/product) instead of Zenodo.
+    try:
+        _self = _j.loads((DATA_DIR / 'self.json').read_text())
+        if _self.get('id'):
+            payload['peer'] = str(_self['id'])
+    except Exception:
+        pass
+    headers = {'Content-Type': 'application/json'}
+    # Forward admin token if available (peers carry it via env or file)
+    tok = _os.environ.get('ADMIN_TOKEN', '')
+    if not tok:
+        try:
+            tp = Path('data/admin_token')
+            if tp.exists():
+                tok = tp.read_text().strip()
+        except Exception:
+            pass
+    if tok:
+        headers['X-Admin-Token'] = tok
+    try:
+        _req.post(director_url + '/api/v1/manifest/push',
+                  data=_j.dumps(payload), headers=headers, timeout=8)
+    except Exception as e:
+        log.debug('manifest push to %s: %s', director_url, e)
+
+
+# === SECTION: v2.4 legacy clean-up (cadastre-shaped files off Zenodo) ===
+
+LEGACY_JSON_SECTIONS = ("parcels", "building_footprints")
+_CUTOVER_V24 = "2026-10-04T00:00:00+00:00"   # products uploaded before this may carry cadastre data
+
+
+def _mark_cadastre_free(zenodo_key: str, manifest) -> None:
+    """Every product written by 2.4+ code carries ``status=cf`` (cadastre-free) in
+    its manifest record (JSON / light / h3b; the full GPKG never had cadastre
+    data).  The director's ``legacy:`` audit and ``legacy_pending`` treat a
+    record WITHOUT this marker (and without ``stripped``/``removed``) as
+    possibly cadastre-shaped — independent of timestamps, so products that
+    old-code peers finished after the cutover are still caught."""
+    try:
+        if zenodo_key.endswith("_full_gpkg"):
+            return
+        e = manifest.get(zenodo_key)
+        if e is None or e.status in ("removed", "stripped"):
+            return
+        e.status = "cf"
+        manifest.set(zenodo_key, e)
+        manifest.save()
+    except Exception as ex:  # noqa: BLE001
+        log.debug("_mark_cadastre_free %s: %s", zenodo_key, ex)
+
+
+def strip_cadastre_from_doc(doc: dict) -> dict:
+    """Return a copy of a v1/v2.x KG JSON without any cadastre-shaped data.
+    Removes ``parcels`` / ``building_footprints`` wholesale (details carry
+    parcel ids, vertex geometry, footprints, addresses), the parcel
+    coverage percentages and the cadastre wording; keeps everything else
+    (bbox, area_summary, terrain, trees, grid25 …) so the file stays a valid
+    verify baseline and completion marker."""
+    import copy as _copy
+    d = _copy.deepcopy(doc)
+    for k in LEGACY_JSON_SECTIONS:
+        d.pop(k, None)
+    cov = d.get("coverage")
+    if isinstance(cov, dict):
+        for k in ("parcel_elevation_coverage_pct", "parcel_segmentation_coverage_pct",
+                  "building_height_coverage_pct"):
+            cov.pop(k, None)
+        cov["note"] = "cadastre data removed 2.4 (stripped in place); sub-KG detail: NE cells (_ne_h3b)"
+    op = d.get("observation_period")
+    if isinstance(op, dict):
+        op.pop("cadastre", None)
+    m = d.get("methods")
+    if isinstance(m, dict):
+        m.pop("cadastre_source", None)
+        m.pop("calibration", None)
+        if isinstance(m.get("data_sources"), list):
+            m["data_sources"] = [x for x in m["data_sources"] if "adastre" not in str(x)]
+    dq = d.get("data_quality")
+    if isinstance(dq, dict):
+        dq.pop("cadastre_buildings", None)
+    try:
+        d["attribution"] = __import__("attributions").attribution_dict()
+    except Exception:  # noqa: BLE001
+        pass
+    d["cadastre_free"] = True
+    d["cadastre_stripped_at"] = datetime.now(timezone.utc).isoformat()
+    return d
+
+
+def _doc_has_cadastre(doc: dict) -> bool:
+    return any(k in doc for k in LEGACY_JSON_SECTIONS) and not doc.get("cadastre_free")
+
+
+def legacy_pending(code: str, manifest) -> dict:
+    """Which legacy clean-up steps are still open for *code* (manifest view):
+    ``json_strip`` (v1 ``_json`` older than the cutover, not stripped) and
+    ``light_remove`` (committed v1 ``_light_gpkg`` while a committed
+    ``_light_gpkg_v2`` exists).  Mirrors the director's ``legacy:`` audit."""
+    out = {}
+    ej = manifest.get(f"{code}_json")
+    if ej is not None and getattr(ej, "size", 0) \
+            and getattr(ej, "status", "") not in ("stripped", "cf"):
+        out["json_strip"] = True
+    el = manifest.get(f"{code}_light_gpkg")
+    el2 = manifest.get(f"{code}_light_gpkg_v2")
+    if el is not None and getattr(el, "size", 0) and getattr(el, "status", "") != "removed" \
+            and el2 is not None and getattr(el2, "size", 0):
+        out["light_remove"] = True
+    return out
+
+
+def remove_legacy_products(kg_code: str, v1_doc: dict | None = None, manifest=None, client=None) -> dict:
+    """v2.4 clean-up for ONE product code, strictly AFTER its v2.4 pair
+    (+ h3b) is verified and uploaded (caller guarantees; we re-check the
+    manifest):
+
+    1. v1 ``_json`` still cadastre-shaped → strip in place (same filename
+       PUT into the same bucket; the manifest record keeps its original
+       stamp in ``prev_uploaded_at`` and gets ``status=stripped``) — the
+       completion marker never disappears.
+    2. v1 ``_light_gpkg`` (parcels/buildings/parcel_outline_z layers) →
+       deposition DELETED, record kept as ``status=removed`` (size 0).
+
+    Older ``_json_v2`` / ``_light_gpkg_v2`` were replaced in place by the
+    upload itself (same filename → one PUT).  Idempotent; returns what was
+    done.  Serialised through the fleet Zenodo lock like every write."""
+    from zenodo_client import Client as _ZC, Manifest as _ZM, landscape_metadata as _lm
+    from zenodo_lock import zenodo_upload_lock as _zul
+    manifest = manifest or _ZM(str(DATA_DIR / "zenodo_manifest.json"))
+    client = client or _ZC(token=ZENODO_TOKEN)
+    done = {"json_strip": None, "light_remove": None}
+    from v21_products import v2_products_complete as _v2c
+    if not _v2c(manifest, kg_code):
+        done["skipped"] = "v2 pair not current/committed"
+        return done
+    pend = legacy_pending(kg_code, manifest)
+    if not pend:
+        done["skipped"] = "nothing pending"
+        return done
+    with _zul(purpose="legacy_cleanup", kg=kg_code):
+        if pend.get("json_strip"):
+            ej = manifest.get(f"{kg_code}_json")
+            doc = v1_doc
+            if doc is None:
+                _ddir = JSON_DIR / "legacy_tmp"
+                _ddir.mkdir(parents=True, exist_ok=True)
+                _dl = client.download(f"{kg_code}_json", _ddir, manifest, verify_checksum=False)
+                with open(_dl) as fh:
+                    doc = json.load(fh)
+                try:
+                    os.unlink(_dl)
+                except OSError:
+                    pass
+            if _doc_has_cadastre(doc) or not doc.get("cadastre_free"):
+                stripped = strip_cadastre_from_doc(doc)
+                out_p = JSON_DIR / ej.filename          # same filename → in-place PUT
+                JSON_DIR.mkdir(parents=True, exist_ok=True)
+                with open(out_p, "w") as fh:
+                    json.dump(stripped, fh, separators=(",", ":"), default=str)
+                prev_ts = ej.prev_uploaded_at or ej.uploaded_at
+                meta = lambda k, fn, v, _n=doc.get("kg_name", ""): _lm(kg_code, _n, v, "json")  # noqa: E731
+                ent = client.upload_stream(f"{kg_code}_json", str(out_p), ej.version or VERSION, meta,
+                                           manifest, delete_after=True)
+                ent.status = "stripped"
+                ent.stripped_at = datetime.now(timezone.utc).isoformat()
+                ent.prev_uploaded_at = prev_ts
+                manifest.set(f"{kg_code}_json", ent)
+                manifest.save()
+                _push_manifest_entry_to_director(f"{kg_code}_json", manifest)
+                done["json_strip"] = {"size": ent.size, "prev_uploaded_at": prev_ts}
+                log.info("KG %s: v1 _json stripped of cadastre data and re-PUT in place (%d B)", kg_code, ent.size)
+            else:
+                done["json_strip"] = "already clean"
+        if pend.get("light_remove"):
+            rec = client.remove_deposition_keep_record(f"{kg_code}_light_gpkg", manifest, reason="v2.4 cadastre layers")
+            _push_manifest_entry_to_director(f"{kg_code}_light_gpkg", manifest)
+            done["light_remove"] = {"depo_id": rec.depo_id, "removed_at": rec.removed_at}
+            log.info("KG %s: legacy _light_gpkg deposition %d removed (record kept)", kg_code, rec.depo_id)
+    return done
+
+
+def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
+                        manifest, quality_score: float = 0.0,
+                        quality_grade: str = "",
+                        available_layers: list = None,
+                        missing_layers: list = None,
+                        progress_callback=None,
+                        defects: list = None) -> dict:
+    """Upload KG files to Zenodo via streaming, verify, delete local GPKGs.
+
+    Uses ``Client.upload_stream()`` to stream files directly from disk
+    to Zenodo without loading them into memory.  This is critical for
+    large GPKGs (multi-GB) on a disk-constrained VM.
+    """
+    from zenodo_client import Client, landscape_metadata
+    from zenodo_lock import zenodo_upload_lock
+
+    client = Client(token=ZENODO_TOKEN)
+    upload_stats = {"uploaded": [], "errors": [], "total_bytes": 0}
+
+    _avail = available_layers or []
+    _miss = missing_layers or []
+
+    # Acquire fleet-wide Zenodo upload lease.  Single token + sometimes
+    # a shared draft deposition mean concurrent peers must serialise.
+    _lock_ctx = zenodo_upload_lock(purpose='kg_upload', kg=kg_code)
+    _lock_ctx.__enter__()
+    try:
+      for file_key, local_path in files.items():
+        if not local_path or not os.path.exists(local_path):
+            continue
+        if os.path.getsize(local_path) == 0:
+            log.info("KG %s: skipping upload for %s (empty file)", kg_code, file_key)
+            continue
+
+        if THROTTLE_FILE.exists() and 'gpkg' in file_key:
+            log.info("KG %s: throttle mode \u2014 skipping %s upload", kg_code, file_key)
+            # Still delete local GPKG to free disk
+            if local_path and os.path.exists(local_path):
+                os.unlink(local_path)
+                log.info("KG %s: deleted local %s (throttle mode)", kg_code, local_path)
+            continue
+
+        zenodo_key = f"{kg_code}_{file_key}"
+        file_type = "gpkg" if "gpkg" in file_key else ("h3b" if file_key == NE_PRODUCT_KEY else "json")
+
+        meta_func = lambda k, fn, v, _kg=kg_code, _name=kg_name, _ft=file_type, \
+            _qs=quality_score, _qg=quality_grade, _al=_avail, _ml=_miss: \
+            landscape_metadata(_kg, _name, v, _ft,
+                               quality_score=_qs, quality_grade=_qg,
+                               available_layers=_al, missing_layers=_ml)
+
+        try:
+            fsize = os.path.getsize(local_path)
+            # Stream upload: file is read from disk in chunks, never fully
+            # loaded into memory.  GPKGs are deleted immediately after
+            # upload to free disk for the next product.
+            # v2.4: the NE product (``<code>_ne.h3b``, 1-3 MB) is KEPT so the
+            # primary's ``ne_ingest`` can pull it from this peer instead of
+            # Zenodo (one shared token / ~5000 req/h is the fleet-wide
+            # bottleneck); ``cleanup_ne_dir`` GCs it after NE_KEEP_DAYS.
+            delete_local = not (file_key.startswith("json") or file_key == NE_PRODUCT_KEY)
+            _file_cb = None
+            if progress_callback:
+                _file_label = file_key
+                def _cb(sent, total, _label=_file_label):
+                    progress_callback(_label, sent, total)
+                _file_cb = _cb
+            client.upload_stream(
+                zenodo_key, local_path, _product_upload_version(file_key, defects), meta_func, manifest,
+                delete_after=delete_local,
+                progress_callback=_file_cb)
+
+            # Verify
+            status = client.head_file(zenodo_key, manifest)
+            if status < 200 or status >= 300:
+                upload_stats["errors"].append({
+                    "key": zenodo_key, "error": f"verify failed: HTTP {status}"})
+                log.warning("KG %s: %s verify failed (HTTP %s) — stopping the upload "
+                            "chain so later products (json = completion marker) don't "
+                            "land ahead of it", kg_code, file_key, status)
+                break
+
+            upload_stats["uploaded"].append(zenodo_key)
+            upload_stats["total_bytes"] += fsize
+            _mark_cadastre_free(zenodo_key, manifest)
+            if file_key == NE_PRODUCT_KEY and os.path.exists(local_path):
+                # Park the committed h3b where disk_cleanup's "old GPKG
+                # temp" sweep won't touch it (served by
+                # GET /api/v1/processing/product?key=<code>_ne_h3b).
+                try:
+                    NE_KEEP_DIR.mkdir(parents=True, exist_ok=True)
+                    shutil.move(local_path, str(NE_KEEP_DIR / os.path.basename(local_path)))
+                except Exception as _me:  # noqa: BLE001
+                    log.debug("KG %s: could not park %s: %s", kg_code, local_path, _me)
+
+            # Push the freshly-uploaded manifest entry to the director so
+            # the fleet learns of it within seconds rather than waiting
+            # ~5 min for the next peer-sync tick.  Best-effort — if the
+            # broker is unreachable, peer-sync will catch it later.
+            try:
+                _push_manifest_entry_to_director(zenodo_key, manifest)
+            except Exception as _e:
+                log.debug("KG %s: manifest push failed for %s: %s", kg_code, zenodo_key, _e)
+
+        except Exception as e:
+            upload_stats["errors"].append({
+                "key": zenodo_key,
+                "error": str(e),
+                "status_code": int(getattr(e, "status_code", 0) or 0),
+                "reason": _classify_zenodo_error(e),
+                # Retry-After (seconds) if Zenodo provided one. The
+                # peer director uses this to size its cooldown rather
+                # than the default ZENODO_NETWORK_COOLDOWN_MIN.
+                "retry_after": float(getattr(e, "retry_after", 0) or 0),
+            })
+            log.error("KG %s: Zenodo upload failed for %s: %s",
+                      kg_code, file_key, e)
+            # ORDERING INVARIANT: products land full → light → json (v1) /
+            # light_v2 → json_v2 → json (v2); json is the completion marker
+            # and every "already done?" gate keys on it.  Uploading the
+            # remaining products after a failure produced KGs with a
+            # ``_json_v2`` but no ``_light_gpkg_v2`` (60 of them during the
+            # Sep 2026 Zenodo slowdown) that nothing ever re-dispatched.
+            # Stop here; the KG is re-queued by the caller and the next
+            # run re-uploads the missing products in order.
+            log.warning("KG %s: stopping upload chain after %s failure (%d product(s) "
+                        "left un-uploaded, KG will be re-queued)", kg_code, file_key,
+                        sum(1 for k, v in files.items() if v and os.path.exists(v)
+                            and f"{kg_code}_{k}" != zenodo_key
+                            and f"{kg_code}_{k}" not in upload_stats["uploaded"]))
+            break
+    finally:
+        _lock_ctx.__exit__(None, None, None)
+
+    return upload_stats
+
+
+# === SECTION: JSON dir cleanup (4GB cap, LRU eviction) ===
+
+def cleanup_json_dir():
+    """Delete oldest JSON files if dir exceeds 4GB."""
+    total = sum(f.stat().st_size for f in JSON_DIR.glob("*.json") if f.is_file())
+    if total <= JSON_DIR_MAX_BYTES:
+        return
+
+    files = sorted(JSON_DIR.glob("*.json"), key=lambda f: f.stat().st_mtime)
+    while total > JSON_DIR_MAX_BYTES * 0.8 and files:  # trim to 80%
+        f = files.pop(0)
+        total -= f.stat().st_size
+        f.unlink()
+        log.info("JSON cleanup: deleted %s", f.name)
+
+
+NE_KEEP_DAYS = float(os.environ.get("NE_KEEP_DAYS", "7"))
+NE_DIR_MAX_BYTES = 2 * 1024 ** 3
+NE_KEEP_DIR = DATA_DIR / "ne_products"     # uploaded h3b kept for the primary's peer-first ingest
+
+
+def cleanup_ne_dir():
+    """GC uploaded ``<code>_ne.h3b`` products kept for the primary's
+    peer-first ingest: older than ``NE_KEEP_DAYS`` or beyond 2 GB (LRU)."""
+    try:
+        files = sorted(NE_KEEP_DIR.glob("*_ne.h3b"), key=lambda f: f.stat().st_mtime)
+    except OSError:
+        return
+    now = time.time()
+    total = sum(f.stat().st_size for f in files)
+    for f in list(files):
+        try:
+            if now - f.stat().st_mtime > NE_KEEP_DAYS * 86400 or total > NE_DIR_MAX_BYTES:
+                total -= f.stat().st_size
+                f.unlink()
+                log.info("NE cleanup: deleted %s", f.name)
+        except OSError:
+            pass
+
+
+def _save_tile_history(kg_code: str, tile_statuses: list, status: str = "completed"):
+    """Append completed/failed KG tile positions to tile_history.json."""
+    try:
+        history = {}
+        if TILE_HISTORY_FILE.exists():
+            history = json.loads(TILE_HISTORY_FILE.read_text())
+        if status == "completed" and tile_statuses:
+            history[kg_code] = [[round(t["lat"], 5), round(t["lng"], 5)]
+                                for t in tile_statuses if "lat" in t and "lng" in t]
+        else:
+            history[kg_code] = status  # "failed"
+        tmp = str(TILE_HISTORY_FILE) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(history, f)
+        os.rename(tmp, str(TILE_HISTORY_FILE))
+    except Exception as e:
+        log.warning("Failed to save tile history for %s: %s", kg_code, e)
+
+
+# === SECTION: v2 upgrade — re-classify v1 KGs from their own Zenodo full GPKG ===
+#
+# An "upgrade unit" is a code (parent or split block) that already has
+# ``_json`` + ``_full_gpkg`` on Zenodo but no ``_json_v2``.  The parent
+# downloads the v1 JSON (bbox + verify baseline) and the full GPKG (all
+# rasters) into V2_GPKG_DIR, runs ``process_one_kg(source_gpkg=…)`` — the
+# subprocess installs ``v2_source`` so every tile read is served from the
+# GPKG with health checks — and deletes the GPKG afterwards.  No BEV, no
+# openEO, no credential: any idle cache-only peer can do it.  Codes that
+# cannot be upgraded (GPKG gone from Zenodo, verify failed twice, …) are
+# recorded in ``v2_upgrade_failed.json`` so they are not re-picked forever.
+
+# Strike amnesty (Oct 2026).  Verify-FAIL strikes are deterministic verdicts
+# of the *gate code at that time*: when a gate is relaxed (grid25_finite →
+# relative to tile valid_pixels, segment_type_raster_area → advisory) the
+# strike is stale, but until now it lived forever unless an operator ran
+# ``scripts/clear_v2_strikes_fleet.py`` — 15121-north / 57210-south /
+# 06106-south sat as ``v2heal`` for weeks with the fix already deployed.
+# Two automatic releases, applied on every load:
+#  * ``verify_rev`` (md5 of v2_verify.py at strike time) differs from the
+#    running one and the reason is a ``v2verify:`` FAIL → the gate changed,
+#    re-try (deterministic re-strike costs one upgrade attempt);
+#  * any strike older than V2_STRIKE_TTL_DAYS → re-try (cheap insurance
+#    against causes we did not think of).
+# Fatal "gone" strikes are left to v2_regen (it requeues them itself).
+V2_STRIKE_TTL_DAYS = 14
+_V2_VERIFY_REV: str | None = None
+
+
+def _v2_verify_rev() -> str:
+    global _V2_VERIFY_REV
+    if _V2_VERIFY_REV is None:
+        try:
+            import hashlib
+            _V2_VERIFY_REV = hashlib.md5(
+                (Path(__file__).parent / "v2_verify.py").read_bytes()).hexdigest()[:12]
+        except Exception:
+            _V2_VERIFY_REV = ""
+    return _V2_VERIFY_REV
+
+
+def _v2_strike_amnesty(d: dict) -> tuple[dict, list]:
+    """Return ``(kept, released)`` — see the amnesty note above."""
+    rev = _v2_verify_rev()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=V2_STRIKE_TTL_DAYS)
+    kept, released = {}, []
+    for code, e in d.items():
+        if not isinstance(e, dict):
+            continue
+        reason = str(e.get("reason") or "")
+        why = ""
+        if reason.startswith("v2verify:") and rev and e.get("verify_rev") and e["verify_rev"] != rev:
+            why = f"verify_rev {e['verify_rev']}→{rev}"
+        else:
+            try:
+                ts = datetime.fromisoformat(str(e.get("ts")).replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts < cutoff and " gone" not in reason and "404" not in reason:
+                    why = f"older than {V2_STRIKE_TTL_DAYS}d"
+            except Exception:
+                pass
+        if why:
+            released.append(f"{code} ({why}; n={e.get('n')})")
+        else:
+            kept[code] = e
+    return kept, released
+
+
+def _load_v2_upgrade_failed() -> dict:
+    try:
+        if V2_UPGRADE_FAILED_FILE.exists():
+            d = json.loads(V2_UPGRADE_FAILED_FILE.read_text())
+            if not isinstance(d, dict):
+                return {}
+            kept, released = _v2_strike_amnesty(d)
+            if released:
+                try:
+                    tmp = V2_UPGRADE_FAILED_FILE.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(kept, indent=1))
+                    tmp.replace(V2_UPGRADE_FAILED_FILE)
+                except Exception as ex:
+                    log.warning("could not persist v2_upgrade_failed amnesty: %s", ex)
+                log.info("v2 strike amnesty: released %d stale strike(s): %s",
+                         len(released), "; ".join(released[:8])
+                         + (" …" if len(released) > 8 else ""))
+            return kept
+    except Exception:
+        pass
+    return {}
+
+
+def _record_v2_upgrade_failed(code: str, reason: str, fatal: bool = False,
+                              transient: bool = False) -> int:
+    """Bump the per-code strike counter.  Returns the new count.  ``fatal``
+    (GPKG gone / no v1 product) jumps straight to the give-up threshold.
+
+    ``transient`` (input download 5xx / timeout / disk pressure — the unit
+    was *deferred*, nothing was verified) does NOT strike: it bumps a
+    separate ``defer`` counter and only converts into a strike-out once
+    ``V2_UPGRADE_MAX_DEFERS`` deferrals accumulate.  Before 2026-09-21 a
+    deferral counted as a full strike, so a 4 h Zenodo 504 outage struck
+    out every code a peer touched twice."""
+    d = _load_v2_upgrade_failed()
+    e = d.get(code) or {"n": 0}
+    if transient:
+        e["defer"] = int(e.get("defer", 0)) + 1
+        if e["defer"] >= V2_UPGRADE_MAX_DEFERS:
+            e["n"] = max(int(e.get("n", 0)), V2_UPGRADE_MAX_STRIKES)
+    else:
+        e["n"] = int(e.get("n", 0)) + (V2_UPGRADE_MAX_STRIKES if fatal else 1)
+    e["reason"] = str(reason)[:300]
+    e["ts"] = datetime.now(timezone.utc).isoformat()
+    if str(reason).startswith("v2verify:"):
+        e["verify_rev"] = _v2_verify_rev()
+    d[code] = e
+    try:
+        tmp = V2_UPGRADE_FAILED_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, indent=1))
+        tmp.replace(V2_UPGRADE_FAILED_FILE)
+    except Exception as ex:
+        log.warning("could not persist v2_upgrade_failed: %s", ex)
+    return e["n"]
+
+
+V2_UPGRADE_MAX_STRIKES = 2
+V2_UPGRADE_MAX_DEFERS = 8       # transient input failures before giving up
+
+
+def v2_product_is_current(entry) -> bool:
+    """A ``_json_v2`` manifest entry (Entry or dict) is current iff its
+    ``version`` equals the running product version (``v2.1``)."""
+    if entry is None:
+        return False
+    v = entry.get("version") if isinstance(entry, dict) else getattr(entry, "version", "")
+    return str(v or "") == V2_PRODUCT_MANIFEST_VERSION
+
+
+def v2_upgrade_eligible(code: str, manifest, failed: dict | None = None) -> bool:
+    """True iff *code* has committed v1 products, no *complete current* v2
+    pair (``_json_v2`` @ %s **and** committed ``_light_gpkg_v2`` — see
+    ``v21_products.v2_products_complete``) and has not struck out.""" % PRODUCT_VERSION
+    from v21_products import v2_products_complete as _v2c
+    if _v2c(manifest, code) and code not in _repair_override_codes():
+        return False
+    ej = manifest.get(f"{code}_json")
+    eg = manifest.get(f"{code}_full_gpkg")
+    if eg is None or not getattr(eg, "size", 0):
+        # No committed full GPKG (hundreds 404 on Zenodo while their
+        # light_v2 is fine): the v2.4 fast path can still relabel the
+        # existing v2.3+ pair — see ``v24_fast.eligible``.
+        try:
+            import v24_fast as _v24
+            if not _v24.eligible(code, manifest)[0]:
+                return False
+        except Exception:
+            return False
+    elif ej is None:
+        return False
+    if failed is None:
+        failed = _load_v2_upgrade_failed()
+    return int((failed.get(code) or {}).get("n", 0)) < V2_UPGRADE_MAX_STRIKES
+
+
+def v24_fast_defects_ok(doc: dict) -> tuple[bool, list]:
+    """Operator decision (2026-10-04): a ``-partial`` product whose defects
+    come from Copernicus gaps (harmonics / NDVI / SAR / WorldCover / Hansen)
+    must NOT be relabelled by the fast path — it waits for its cells and
+    is repaired via the full path.  Only clean v2.3+ docs and docs whose
+    sole defect is ``ne_cells`` may go fast.  Returns ``(ok, defects)``."""
+    try:
+        from product_repair import defects as _pr_defects
+        dfx = list(_pr_defects(doc))
+    except Exception:
+        dfx = []
+    return (not (set(dfx) - {"ne_cells"})), dfx
+
+
+# v2.4 fast-path source gate.  Fresh v2 runs whose v2.3 light GPKG was built
+# before a7d15ee (2026-09-24 19:31 UTC; fleet rollout finished within hours)
+# carry a baked-in ``segment_type`` hole: the pre-fix light stitcher painted
+# type 0 for every tile segment the *full-GPKG* boundary merge had absorbed
+# (its id was gone from ``obj_map``), so any object straddling a tile seam
+# vanished from the raster while its merged polygon survived in ``segments``.
+# Alpine KGs with 20–50 ha rock / grass objects crossing seams lose 4–10 %%
+# of the parcel union (85207-northwest 9.58 %%, 82106-southwest 6.53 %%,
+# 83113 3.97 %%).  The fast path only relabels the inherited raster, so
+# ``segment_type_no_holes`` fails deterministically and the code struck out
+# instead of taking the full path, which re-stitches from the full GPKG
+# with the merge inside the light builder and passes.  Upgrades *from v1*
+# (``_full_gpkg`` version v1) never had the bug — their light GPKG was
+# built by that same in-builder merge.
+V24_FAST_SOURCE_MIN_TS = "2026-09-25T06:00:00+00:00"
+V24_FAST_DECLINED_FILE = Path("data/austria_processor") / "v24_fast_declined.json"
+
+
+def _load_v24_fast_declined() -> dict:
+    try:
+        d = json.loads(V24_FAST_DECLINED_FILE.read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _record_v24_fast_declined(code: str, reason: str) -> None:
+    """Remember that *code*'s existing light GPKG measured an inherited
+    ``segment_type`` hole, so the next dispatch skips the fast path."""
+    d = _load_v24_fast_declined()
+    d[str(code)] = {"reason": str(reason)[:200], "ts": datetime.now(timezone.utc).isoformat()}
+    try:
+        tmp = V24_FAST_DECLINED_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, indent=1))
+        tmp.replace(V24_FAST_DECLINED_FILE)
+    except Exception as ex:
+        log.warning("could not persist v24_fast_declined: %s", ex)
+
+
+def v24_fast_source_ok(code: str, manifest) -> tuple[bool, str]:
+    """(ok, reason).  False when the existing light GPKG is known / measured
+    to carry a stitcher hole the relabel cannot heal AND a committed full GPKG
+    lets the full path rebuild it.  Without a full GPKG there is no better
+    path, so the fast path still runs (verify decides)."""
+    def _ent(e, k, d=None):
+        if e is None:
+            return d
+        return e.get(k, d) if isinstance(e, dict) else getattr(e, k, d)
+    fg = manifest.get(f"{code}_full_gpkg")
+    if fg is None or not int(_ent(fg, "size", 0) or 0):
+        return True, "no full GPKG — fast is the only path"
+    dec = _load_v24_fast_declined().get(str(code))
+    if dec:
+        return False, f"measured inherited hole ({dec.get('reason', '')[:80]})"
+    g2 = manifest.get(f"{code}_light_gpkg_v2")
+    if (str(_ent(fg, "version", "") or "") == "v2"
+            and str(_ent(g2, "version", "") or "") == "v2.3"
+            and str(_ent(g2, "uploaded_at", "") or "") < V24_FAST_SOURCE_MIN_TS):
+        return False, (f"light v2.3 built {str(_ent(g2, 'uploaded_at', ''))[:16]} by the pre-a7d15ee "
+                       f"stitcher (seam-hole bug) — full path from v2 full GPKG")
+    return True, "ok"
+
+
+def _repair_override_codes() -> set:
+    """Codes the director wants re-upgraded although this peer's manifest
+    copy says the v2 pair is current: products relabelled ``-partial`` by
+    the primary's one-shot ``product_repair.py scan --apply`` (equal
+    ``uploaded_at`` → the relabel never reaches peer manifests).  Rides
+    ``prewarm.repair_codes`` in the synced cache_manifest.json."""
+    try:
+        return {str(c) for c in (_read_prewarm_flag().get("repair_codes") or [])}
+    except Exception:
+        return set()
+
+
+def _v2_upgrade_units(codes: list, manifest, kg_index: dict) -> list:
+    """Build processor kg-dicts for the eligible *codes* (whitelist order).
+    ``kg_index`` maps parent code → kg dict from get_all_kgs().  The bbox is
+    filled from the v1 JSON at fetch time (blocks carry their own bbox)."""
+    from kg_splitter import is_block_code, parent_kg_code
+    failed = _load_v2_upgrade_failed()
+    units, seen = [], set()
+    for code in codes:
+        if code in seen or not v2_upgrade_eligible(code, manifest, failed):
+            continue
+        seen.add(code)
+        parent = parent_kg_code(code) if is_block_code(code) else code
+        base = kg_index.get(parent) or {"kg_code": parent, "kg_name": parent}
+        unit = {k: v for k, v in base.items() if not k.startswith("_")}
+        unit["kg_code"] = code
+        unit.pop("bbox", None)          # from the v1 JSON, see _v2_fetch_inputs
+        if is_block_code(code):
+            unit["_parent_kg_code"] = parent
+            unit["_block_label"] = code.split("-", 1)[1]
+            unit["kg_name"] = f"{base.get('kg_name', parent)} ({unit['_block_label']})"
+        unit["_v2_upgrade"] = True
+        units.append(unit)
+    return units
+
+
+def _v2_free_gb() -> float:
+    import shutil as _sh
+    return _sh.disk_usage("/").free / (1024 ** 3)
+
+
+def _parent_bbox_wgs(parent_code: str):
+    """(W, S, E, N) of a PARENT KG from the cached kg_list.json (no network);
+    None when unknown.  Used where a split block must act for its parent
+    (vct_pilot viewport + /contrib report)."""
+    try:
+        for k in json.loads(KG_LIST_FILE.read_text()):
+            if str(k.get("kg_code")) == str(parent_code):
+                b = k.get("bbox") or {}
+                return (float(b["min_lon"]), float(b["min_lat"]), float(b["max_lon"]), float(b["max_lat"]))
+    except Exception as e:  # noqa: BLE001
+        log.debug("parent bbox %s: %s", parent_code, e)
+    return None
+
+
+def _bbox_tuple(kg: dict):
+    bb = kg.get("bbox") or {}
+    if isinstance(bb, dict) and "min_lon" in bb:
+        return (bb["min_lon"], bb["min_lat"], bb["max_lon"], bb["max_lat"])
+    return None
+
+
+def _v2_fetch_inputs(kg: dict, manifest, progress=None) -> tuple:
+    """Download the v1 JSON + full GPKG for an upgrade unit.
+
+    Returns ``(gpkg_path, v1_doc)``.  Raises ``FileNotFoundError`` when a
+    product is gone from Zenodo (fatal for this code), ``RuntimeError`` on
+    disk pressure / transient download failure (retry later)."""
+    import sys as _sys
+    _sv2 = str(Path(__file__).resolve().parent / "segv2")
+    if _sv2 not in _sys.path:
+        _sys.path.insert(0, _sv2)
+    import gpkg_fetch as _gf
+    from zenodo_client import Client as _ZC
+    code = kg["kg_code"]
+    V2_GPKG_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _step(detail):
+        if progress is not None:
+            progress.set_step("v2_fetch", detail)
+            progress.save()
+
+    v1_doc = _v2_fetch_v1_json(kg, manifest, _step)
+
+    # 2) full GPKG (the big one) — disk-checked, few streams.
+    eg = manifest.get(f"{code}_full_gpkg")
+    if eg is None or not eg.size:
+        raise FileNotFoundError(f"{code}: no _full_gpkg in manifest")
+    gpath = V2_GPKG_DIR / eg.filename
+    if gpath.exists() and gpath.stat().st_size == eg.size:
+        log.info("KG %s: reusing downloaded %s (%.0f MB)", code, gpath.name, eg.size / 1e6)
+        return str(gpath), v1_doc
+    need_gb = eg.size / (1024 ** 3) + V2_UPGRADE_MIN_FREE_GB
+    free = _v2_free_gb()
+    if free < need_gb:
+        # Drop stale downloads from earlier units first (every file not
+        # belonging to this code — v1json/ and v24 .src.* inputs too).
+        _evict_stale_v2_inputs(code, 0, log, max_age_s=0.0)
+        free = _v2_free_gb()
+        if free < need_gb:
+            raise RuntimeError(f"{code}: disk {free:.1f} GB free < {need_gb:.1f} GB needed for GPKG")
+    _step(f"full GPKG {eg.size / 1e6:.0f} MB ({V2_UPGRADE_STREAMS} streams)")
+    entry = {"bucket_url": eg.bucket_url, "filename": eg.filename, "size": eg.size,
+             "checksum": eg.checksum}
+    t0 = time.time()
+    try:
+        rec = _gf.download(entry, gpath, n_streams=V2_UPGRADE_STREAMS)
+    except FileNotFoundError as e:
+        # A 404 while the fleet Zenodo circuit is tripped is NOT evidence
+        # the product is gone — treat as transient (defer, no strike).
+        # A stable "gone" is confirmed twice by the director against the
+        # deposition API before it auto-requeues the KG for a fresh v2.2
+        # run (peer_director._check_v2_regen, ``v2regen:`` log lines).
+        try:
+            from zenodo_cache import zenodo_degraded as _zdeg
+            _deg = bool(_zdeg())
+        except Exception:
+            _deg = False
+        if _deg:
+            raise RuntimeError(f"{code}_full_gpkg 404 during Zenodo-degraded circuit: {e}") from e
+        raise FileNotFoundError(f"{code}_full_gpkg gone from Zenodo: {e}") from e
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"{code}_full_gpkg download: {e}") from e
+    want = (eg.checksum or "").replace("md5:", "")
+    if want and rec.get("md5") != want and not _gf.md5_acceptable(entry, rec.get("md5"), code):
+        gpath.unlink(missing_ok=True)
+        raise RuntimeError(f"{code}_full_gpkg md5 mismatch ({rec.get('md5')} != {want})")
+    log.info("KG %s: v2 inputs ready — %s %.0f MB in %.0fs (%.1f MB/s)", code, gpath.name,
+             eg.size / 1e6, time.time() - t0, eg.size / 1e6 / max(time.time() - t0, 1e-3))
+    return str(gpath), v1_doc
+
+
+def _v2_fetch_v1_json(kg: dict, manifest, _step=lambda d: None):
+    """Download + parse the v1 ``_json`` of an upgrade unit (bbox + verify
+    baseline); fills ``kg["bbox"]`` / names.  Returns the doc or ``None``
+    (unreadable).  ``FileNotFoundError`` when gone / no bbox at all."""
+    from zenodo_client import Client as _ZC
+    code = kg["kg_code"]
+    V2_GPKG_DIR.mkdir(parents=True, exist_ok=True)
+    ej = manifest.get(f"{code}_json")
+    if ej is None:
+        raise FileNotFoundError(f"{code}: no _json in manifest")
+    _step(f"v1 json {ej.size / 1e6:.1f} MB")
+    jdir = V2_GPKG_DIR / "v1json"
+    jpath = jdir / ej.filename
+    if not (jpath.exists() and jpath.stat().st_size == ej.size):
+        try:
+            try:
+                _ZC(token=ZENODO_TOKEN).download(f"{code}_json", jdir, manifest)
+            except ValueError as _ce:
+                if "Checksum mismatch" not in str(_ce):
+                    raise
+                # The manifest md5 can be stale (JSON re-uploaded in place,
+                # e.g. 14132/14167/05007/46171 — Zenodo's own checksum
+                # matches the bytes).  The v1 JSON is only the verify
+                # baseline, so accept the bytes if they parse as this KG.
+                log.warning("KG %s: v1 JSON manifest md5 stale (%s) — accepting Zenodo bytes",
+                            code, str(_ce)[:120])
+                _ZC(token=ZENODO_TOKEN).download(f"{code}_json", jdir, manifest,
+                                                 verify_checksum=False)
+                with open(jpath) as _f:
+                    _chk = json.load(_f)
+                if not isinstance(_chk, dict) or str(_chk.get("kg_code", code)) != str(code):
+                    jpath.unlink(missing_ok=True)
+                    raise RuntimeError(f"{code}_json: unverifiable bytes (md5 stale, kg_code mismatch)")
+        except Exception as e:  # noqa: BLE001
+            sc = int(getattr(e, "status_code", 0) or 0)
+            if sc in (403, 404, 410):
+                # Same wording as the _full_gpkg case so app.py's status
+                # push reports it as ``v2_gone`` and the director's
+                # v2_regen verifies + requeues the parent (19704: v1 JSON
+                # 404 on Zenodo, manifest still listed it — struck out
+                # twice, nothing re-dispatched it).
+                raise FileNotFoundError(f"{code}_json gone from Zenodo: HTTP {sc}") from e
+            raise RuntimeError(f"{code}_json download: {e}") from e
+    try:
+        with open(jpath) as f:
+            v1_doc = json.load(f)
+        if not isinstance(v1_doc, dict):
+            raise ValueError("not a JSON object")
+    except (ValueError, OSError) as _je:
+        # A corrupt / truncated v1 JSON must not block the upgrade: the
+        # full GPKG is the real input and the bbox can come from the kg
+        # dict.  Verify then runs without a baseline (absolute checks only).
+        log.warning("KG %s: v1 JSON unreadable (%s) — upgrading without baseline", code, _je)
+        v1_doc = {}
+        try:
+            jpath.unlink()
+        except OSError:
+            pass
+    bb = v1_doc.get("bbox") or {}
+    if all(k in bb for k in ("min_lon", "min_lat", "max_lon", "max_lat")):
+        kg["bbox"] = {k: float(bb[k]) for k in ("min_lon", "min_lat", "max_lon", "max_lat")}
+    elif not kg.get("bbox"):
+        raise FileNotFoundError(f"{code}: v1 JSON has no bbox and none known for the kg")
+    for k in ("kg_name", "state", "gemeinde", "district"):
+        if v1_doc.get(k) and not kg.get(k):
+            kg[k] = v1_doc[k]
+    if not v1_doc:
+        v1_doc = None
+    return v1_doc
+
+
+def _v2_release_inputs(kg: dict) -> None:
+    """Delete the downloaded GPKG (+ v1 JSON) of an upgrade unit."""
+    code = kg.get("kg_code", "")
+    try:
+        for f in V2_GPKG_DIR.glob(f"{code}_full.gpkg*"):
+            f.unlink(missing_ok=True)
+        for f in V2_GPKG_DIR.glob(f"{code}_*.src.*"):      # v24_fast inputs
+            f.unlink(missing_ok=True)
+        for f in (V2_GPKG_DIR / "v1json").glob(f"{code}.json*"):
+            f.unlink(missing_ok=True)
+    except Exception as e:  # noqa: BLE001
+        log.debug("v2 release %s: %s", code, e)
+
+
+V2_UPGRADE_MIN_FREE_GB = float(os.environ.get("V2_UPGRADE_MIN_FREE_GB", "3"))
+
+
+# === SECTION: main() — KG iteration, retry loop, subprocess management ===
+
+RETRIED_KGS_FILE = DATA_DIR / "retried_kgs.json"
+DEFER_GAP = 5  # re-insert transient failures this many KGs later
+
+# Graceful shutdown flag
+_shutdown_requested = False
+
+# Track the in-flight Pool so signal/atexit handlers can drain it.
+_active_pool = None
+
+
+def _pool_worker_init():
+    """Pool worker initializer: kernel-level guarantee that the worker dies
+    if the parent dies (Linux PR_SET_PDEATHSIG). Without this, a worker
+    blocked in C-level I/O (SQLite/SSL/GDAL) can outlive a SIGKILLed
+    parent and keep GPKG file descriptors open — corrupting the next
+    parent's Zenodo upload of the same path.
+    """
+    try:
+        PR_SET_PDEATHSIG = 1
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+    except Exception:
+        pass
+    # Leave the parent's process group so a *group-broadcast* SIGTERM
+    # can't kill us mid-KG. The API's graceful stop
+    # (``/processing/stop?graceful=1``) does ``os.killpg(pgid, SIGTERM)``
+    # — SIGTERM to the WHOLE process group — intending only to set the
+    # parent's ``_shutdown_requested`` so it finishes the current KG and
+    # exits at the next loop boundary. But the worker is in that same
+    # group and (below) maps SIGTERM→SIG_DFL, so the broadcast used to
+    # kill the worker instantly, mid-KG. The parent then saw the worker
+    # die, recorded a failure, and re-queued — and if both GPKGs had
+    # already streamed to Zenodo (they have, by the json-build stage),
+    # the KG stranded as "gpkg present, json missing" and was
+    # re-processed from scratch forever (63304-center + ~95 others,
+    # Jun 2026). PR_SET_PDEATHSIG above still guarantees we die if the
+    # parent dies, and ``Pool.terminate()`` cancels us by PID (not via
+    # the group), so real hard-stops / timeouts / postpone are
+    # unaffected — only the graceful group-SIGTERM now correctly skips
+    # the worker.
+    try:
+        os.setpgrp()
+    except Exception:
+        pass
+    # Workers must not handle SIGTERM/SIGINT themselves — the parent
+    # owns shutdown and will terminate() the pool. Inheriting the
+    # parent's handler would set _shutdown_requested in the worker copy
+    # (harmless) but ignoring is cleaner.
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+    except Exception:
+        pass
+
+
+class PoolWorkerDied(RuntimeError):
+    """The single Pool worker running ``process_one_kg`` exited (SIGKILL/OOM)
+    while its task was pending. ``multiprocessing.Pool`` silently respawns
+    a fresh idle worker and the lost task's ``AsyncResult`` never
+    completes — ``get(timeout=...)`` keeps raising TimeoutError until
+    ``KG_TIMEOUT_SECONDS`` (16 h). Oct 2026: that is what every "stuck-kg
+    … frozen for 12 h" director restart was (80110-* blocks OOM-ing in the
+    NE cells build, big gpkg_full KGs) — the 12 h watchdog was merely the
+    first thing to notice a worker that had been dead for 12 h."""
+
+
+def _cgroup_mem_evidence() -> str:
+    """``oom_kill=N peak=M MB high/max`` of our own cgroup (the systemd-run
+    scope on peers) for the dead-worker error message; '' when unknown."""
+    try:
+        cg = None
+        for ln in open('/proc/self/cgroup').read().splitlines():
+            cg = ln.split(':', 2)[-1]
+        if not cg:
+            return ''
+        base = f'/sys/fs/cgroup{cg}'
+        ev = dict(l.split() for l in open(f'{base}/memory.events').read().splitlines())
+        def _mb(f):
+            v = open(f'{base}/{f}').read().strip()
+            return f'{int(v) >> 20}M' if v.isdigit() else v
+        return (f"cgroup oom_kill={ev.get('oom_kill', '?')} peak={_mb('memory.peak')} "
+                f"high={_mb('memory.high')} max={_mb('memory.max')}")
+    except Exception:
+        return ''
+
+
+def _pool_worker_died(workers: list) -> str | None:
+    """Return a description if any of the Pool's *original* worker
+    processes (snapshotted right after ``apply_async``) has exited; else
+    None. ``exitcode`` is populated by the pool's own maintenance thread
+    (``_join_exited_workers``) within a second of the death."""
+    for w in workers:
+        rc = getattr(w, 'exitcode', None)
+        if rc is not None:
+            sig = f' (signal {-rc})' if rc < 0 else ''
+            return f'pool worker pid={w.pid} exited rc={rc}{sig}'
+    return None
+
+
+def _oneshot_child(conn, initializer, func, args, kwds) -> None:
+    """Child side of :class:`_OneShotPool`: run the initializer, then the
+    task, and ship ``(ok, value)`` back through *conn*. Module-level so the
+    ``spawn`` start method can pickle the target."""
+    try:
+        if initializer is not None:
+            initializer()
+        try:
+            payload = (True, func(*args, **(kwds or {})))
+        except Exception as e:  # noqa: BLE001 — forwarded to the parent verbatim
+            from multiprocessing.pool import ExceptionWithTraceback
+            payload = (False, ExceptionWithTraceback(e, e.__traceback__))
+        try:
+            conn.send(payload)
+        except Exception as e:  # unpicklable result — tell the parent why
+            from multiprocessing.pool import MaybeEncodingError
+            conn.send((False, MaybeEncodingError(e, repr(payload[1])[:500])))
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+class _OneShotResult:
+    """``AsyncResult`` look-alike for :class:`_OneShotPool` (only
+    ``get(timeout)`` is needed by the KG loop)."""
+
+    def __init__(self, conn, proc):
+        self._conn = conn
+        self._proc = proc
+        self._done = False
+        self._value = None
+
+    def get(self, timeout=None):
+        if self._done:
+            ok, val = self._value
+            if ok:
+                return val
+            raise val
+        if not self._conn.poll(timeout):
+            raise multiprocessing.TimeoutError("oneshot task still running")
+        try:
+            self._value = self._conn.recv()
+        except (EOFError, OSError) as e:
+            # The child died without sending a result (SIGKILL / OOM) —
+            # its end of the pipe closed. Surface it like a dead worker.
+            rc = self._proc.exitcode
+            raise PoolWorkerDied(
+                f"oneshot worker pid={self._proc.pid} exited rc={rc} before "
+                f"sending a result ({type(e).__name__}); "
+                f"{_cgroup_mem_evidence() or 'no cgroup evidence'}")
+        self._done = True
+        return self.get()
+
+
+class _OneShotPool:
+    """Minimal single-task replacement for ``multiprocessing.Pool(1)``.
+
+    Why not ``Pool``: when the KG worker is SIGKILLed mid-task (cgroup
+    OOM), ``Pool``'s ``_handle_workers`` thread respawns an idle
+    replacement; that replacement runs ``_pool_worker_init`` which sets
+    ``PR_SET_PDEATHSIG`` — and Linux ties the parent-death signal to the
+    *creating thread*, i.e. the handler thread. ``Pool.terminate()`` then
+    stops that thread first, the kernel SIGKILLs the replacement while it
+    sits in ``SimpleQueue.get()`` holding ``inqueue._rlock`` (a POSIX
+    semaphore nobody can release any more), and ``_terminate_pool →
+    _help_stuff_finish`` blocks on that lock forever. The parent froze on
+    the KG until the director's 12 h stuck-KG watchdog hard-restarted it
+    (at227/23020-north, at208/56221-east, at241/15105-east, Oct 2026 —
+    py-spy: MainThread in ``_help_stuff_finish``, one zombie child, no
+    worker/task handler threads). Reproducible in ~20 lines with
+    spawn + PDEATHSIG initializer + kill worker + ``terminate()``.
+
+    One ``Process`` started from the *main* thread + one ``Pipe`` has none
+    of that: no respawn, no shared semaphores, PDEATHSIG tied to the main
+    thread as intended, and a dead child shows up as EOF on the pipe
+    within the same 5 s poll slice. Exposes the subset of the ``Pool``
+    interface the KG loop and ``_drain_pool`` use (``apply_async``,
+    ``close``, ``join``, ``terminate``, ``_pool``).
+    """
+
+    def __init__(self, processes: int = 1, initializer=None):
+        self._ctx = multiprocessing.get_context("spawn")
+        self._initializer = initializer
+        self._pool: list = []
+        self._conns: list = []
+
+    def apply_async(self, func, args=(), kwds=None):
+        parent_conn, child_conn = self._ctx.Pipe(duplex=False)
+        proc = self._ctx.Process(
+            target=_oneshot_child,
+            args=(child_conn, self._initializer, func, tuple(args), dict(kwds or {})),
+            daemon=True)
+        proc.start()
+        child_conn.close()  # parent keeps only the read end → EOF when the child dies
+        self._pool.append(proc)
+        self._conns.append(parent_conn)
+        return _OneShotResult(parent_conn, proc)
+
+    def close(self):
+        pass
+
+    def join(self):
+        for p in self._pool:
+            p.join()
+        self._close_conns()
+
+    def terminate(self):
+        for p in self._pool:
+            try:
+                if p.is_alive():
+                    p.terminate()
+            except Exception:
+                pass
+        self._close_conns()
+
+    def _close_conns(self):
+        for c in self._conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+
+def _drain_pool(pool, *, hard_timeout: float = 30.0) -> bool:
+    """terminate() + join() a multiprocessing.Pool with a hard deadline.
+
+    Returns True if the pool exited cleanly within the deadline, False if
+    we had to escalate to SIGKILL on surviving worker PIDs.
+
+    The default ``Pool.join()`` blocks indefinitely. A worker stuck in
+    SQLite/SSL I/O on a GPKG would otherwise prevent the parent from
+    exiting — and once the parent is SIGKILLed, that worker becomes an
+    init-reparented orphan still holding GPKG handles, which is exactly
+    how Zenodo uploads got corrupted (KG 01507: 0-byte file overwrote a
+    243 MB upload because a stale worker still had the fd open).
+    """
+    if pool is None:
+        return True
+    # Snapshot worker PIDs *before* terminate() — _pool gets cleared.
+    worker_pids = []
+    try:
+        worker_pids = [p.pid for p in getattr(pool, "_pool", []) if p.pid]
+    except Exception:
+        pass
+    # Bounded terminate()+join() via a watchdog thread. terminate() is
+    # inside the thread on purpose: a real multiprocessing.Pool can hang
+    # forever in _terminate_pool → _help_stuff_finish when a worker died
+    # holding inqueue._rlock (see _OneShotPool) — the deadline below must
+    # cover that too, not only Pool.join().
+    joined = threading.Event()
+
+    def _joiner():
+        try:
+            try:
+                pool.terminate()
+            except Exception:
+                pass
+            pool.join()
+        finally:
+            joined.set()
+
+    t = threading.Thread(target=_joiner, daemon=True)
+    t.start()
+    if joined.wait(timeout=hard_timeout):
+        return True
+
+    # terminate()/join() didn't return — escalate to SIGKILL on each worker.
+    log.error("Pool terminate()+join() exceeded %.1fs — "
+              "SIGKILLing %d stuck worker(s) %s",
+              hard_timeout, len(worker_pids), worker_pids)
+    for pid in worker_pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    # Best-effort second join; don't block forever.
+    joined.wait(timeout=10.0)
+    # Reap any direct children that became zombies.
+    try:
+        while True:
+            wpid, _ = os.waitpid(-1, os.WNOHANG)
+            if wpid == 0:
+                break
+    except (ChildProcessError, OSError):
+        pass
+    return False
+
+
+def _atexit_kill_children():
+    """Last-ditch: at parent exit (clean or uncaught), make sure no Pool
+    workers (or their grandchildren) outlive us. multiprocessing's own
+    atexit only runs ``terminate()`` on each Process — it does NOT wait
+    and does NOT escalate, so a wedged worker simply gets reparented to
+    init. This handler escalates with SIGKILL on the whole process group
+    (we are the session leader by virtue of start_new_session=True at
+    spawn time).
+    """
+    try:
+        if _active_pool is not None:
+            _drain_pool(_active_pool, hard_timeout=10.0)
+    except Exception:
+        pass
+    # Final sweep: kill anything else in our process group except us.
+    try:
+        children = multiprocessing.active_children()
+        for c in children:
+            try:
+                if c.is_alive():
+                    os.kill(c.pid, signal.SIGKILL)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _is_transient_error(error: str, step: str, is_timeout: bool = False) -> bool:
+    """Classify whether a KG failure is transient (worth auto-retrying).
+
+    Transient errors are server-side / network issues that are likely to
+    resolve on their own after a few minutes.  The KG is re-inserted into
+    the pending queue ``DEFER_GAP`` positions later so the caches are
+    still warm.
+
+    Returns True for transient, False for permanent.
+    """
+    err_lower = error.lower() if error else ""
+    step_lower = step.lower() if step else ""
+
+    # --- Timeouts at network-heavy steps are almost always transient ---
+    _transient_steps = {"copernicus", "harmonics", "hansen", "ortho", "lidar"}
+    if is_timeout and step_lower in _transient_steps:
+        return True
+
+    # --- Server errors in the error message ---
+    _server_patterns = [
+        "500", "502", "503", "429",
+        "server error", "internal server error", "bad gateway",
+        "service unavailable", "too many requests",
+        "connection reset", "connectionreset",
+        "connection refused", "connectionrefused",
+        "connection aborted", "connectionaborted",
+        "broken pipe", "brokenpipe",
+        "remote end closed", "remotedisconnected",
+        "read timed out", "readtimeout",
+        "connect timeout", "connecttimeout",
+        "connection timed out",
+        "timeout",  # generic network timeouts
+        "ssl", "certificate",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "network is unreachable",
+        "no route to host",
+    ]
+    for pat in _server_patterns:
+        if pat in err_lower:
+            return True
+
+    # --- openEO / Copernicus transient issues ---
+    _openeo_patterns = [
+        "openeo", "batch job failed", "job timed out",
+        "synchronous download timed out",
+        "batch/server failure", "copernicus data unavailable",
+        "didn't finish successfully",
+    ]
+    for pat in _openeo_patterns:
+        if pat in err_lower:
+            return True
+
+    # --- BEV data server hiccups ---
+    if "rasterio" in err_lower and ("http" in err_lower or "curl" in err_lower):
+        return True
+
+    # --- Local disk exhaustion is transient (peer-specific) ---
+    # A peer that hits ENOSPC mid-build hasn't found a *bad* KG — it just
+    # ran out of space. Defer + republish checkpoints so a disk-healthy
+    # peer can finish it, rather than burning a permanent-fail strike.
+    _disk_patterns = [
+        "no space left", "enospc", "disk is full", "disk full",
+        "database or disk is full", "out of disk", "errno 28",
+    ]
+    for pat in _disk_patterns:
+        if pat in err_lower:
+            return True
+
+    return False
+
+
+RETRY_QUEUE_FILE = DATA_DIR / "retry_queue.json"
+
+
+def _classify_zenodo_error(exc_or_msg) -> str:
+    """Classify a Zenodo failure as 'rate_limit', 'auth', 'server', or 'network'.
+
+    'rate_limit' / 'auth' / 'server' are GLOBAL (token-wide) \u2014 every peer
+    using the same token will hit the same problem.  The director should
+    keep ALL peers paused until Zenodo recovers.
+
+    'network' is LOCAL (peer-side connectivity) \u2014 only that peer is
+    affected, so the director should switch to another peer.
+    """
+    status = 0
+    try:
+        status = int(getattr(exc_or_msg, "status_code", 0) or 0)
+    except Exception:
+        status = 0
+    msg = str(exc_or_msg).lower() if exc_or_msg else ""
+    # HTTP codes must match as standalone numbers: KG codes / deposit ids /
+    # byte counts embed them ("04016-north_full.gpkg" → "401" → a bogus
+    # token-wide 'auth' pause that held the peer, 2026-10-14).
+    import re as _re
+    def _code(*codes):
+        return any(_re.search(rf"(?<![\d.]){c}(?![\d])", msg) for c in codes)
+    if status == 429 or _code(429) or "too many requests" in msg or "rate limit" in msg:
+        return "rate_limit"
+    if status in (401, 403) or _code(401, 403) or "unauthorized" in msg or "forbidden" in msg:
+        return "auth"
+    if status in (500, 502, 503, 504) or _code(500, 502, 503, 504) or "server error" in msg or "bad gateway" in msg or "service unavailable" in msg:
+        return "server"
+    # Connection / timeout / SSL = peer-local network
+    return "network"
+
+
+def _zenodo_pause_is_global(reason: str) -> bool:
+    """Token-wide problem? All peers are blocked, no point switching."""
+    return reason in ("rate_limit", "auth")
+
+
+def _zenodo_probe(token: str = None) -> tuple[bool, str]:
+    """Cheap GET to Zenodo to check whether our token is usable.
+
+    Returns (ok, reason).  reason is one of: 'ok', 'rate_limit', 'auth',
+    'server', 'network'.
+    """
+    import requests as _requests
+    tok = token or ZENODO_TOKEN
+    try:
+        r = _requests.get("https://zenodo.org/api/deposit/depositions",
+                          params={"access_token": tok, "size": 1},
+                          timeout=20)
+        if r.status_code < 300:
+            return True, "ok"
+        if r.status_code == 429:
+            return False, "rate_limit"
+        if r.status_code in (401, 403):
+            return False, "auth"
+        if r.status_code >= 500:
+            return False, "server"
+        return False, f"http_{r.status_code}"
+    except Exception as e:
+        return False, _classify_zenodo_error(e)
+
+
+
+def _read_retry_queue() -> list[str]:
+    """Read the retry queue file WITHOUT clearing it.
+
+    Returns the current list of KG codes.  The file is preserved so that
+    priority KGs survive processor restarts and remain visible in the
+    dashboard.  Individual KGs are removed via _remove_from_retry_queue()
+    after they succeed or permanently fail.
+    """
+    try:
+        if RETRY_QUEUE_FILE.exists():
+            codes = json.loads(RETRY_QUEUE_FILE.read_text())
+            return [c for c in codes if isinstance(c, str)]
+    except Exception:
+        pass
+    return []
+
+
+def _remove_from_retry_queue(kg_code: str):
+    """Remove a KG code (or its parent) from the retry queue file (atomic).
+
+    For block codes like '49006-south', also removes the parent '49006'
+    once all sibling blocks are done.
+    """
+    try:
+        if not RETRY_QUEUE_FILE.exists():
+            return
+        codes = json.loads(RETRY_QUEUE_FILE.read_text())
+        from kg_splitter import is_block_code, parent_kg_code
+        to_remove = {kg_code}
+        # Also remove the parent code — blocks are expanded from the parent
+        # at runtime, so the parent in the queue is consumed
+        if is_block_code(kg_code):
+            to_remove.add(parent_kg_code(kg_code))
+        new_codes = [c for c in codes if c not in to_remove]
+        if len(new_codes) < len(codes):
+            tmp = RETRY_QUEUE_FILE.with_suffix('.tmp')
+            tmp.write_text(json.dumps(new_codes))
+            tmp.replace(RETRY_QUEUE_FILE)
+    except Exception:
+        pass
+
+
+def _clear_tombstones(kg_code: str):
+    """Remove manifest tombstone entries for a KG after successful reprocessing."""
+    tombstone_path = DATA_DIR / "manifest_tombstones.json"
+    try:
+        if not tombstone_path.exists():
+            return
+        tombstones = json.loads(tombstone_path.read_text())
+        # Match both exact code and parent code for block completions
+        from kg_splitter import is_block_code, parent_kg_code
+        _prefixes = [kg_code + '_']
+        if is_block_code(kg_code):
+            # A block finished: also clear parent-prefixed tombstones, but
+            # NOT sibling blocks (they may still be legitimately pending).
+            _prefixes.append(parent_kg_code(kg_code) + '_')
+            keys_to_remove = [k for k in tombstones
+                              if any(k.startswith(p) for p in _prefixes)]
+        else:
+            # A *whole* KG finished (processed unsplit). This supersedes any
+            # orphan block-suffixed tombstones left over from an earlier,
+            # abandoned split attempt of the same KG (e.g. '45005-south_*'
+            # stranded when the redo runs '45005' unsplit). Match both the
+            # 'NNNNN_' product prefix and the 'NNNNN-' block prefix.
+            _block_prefix = kg_code + '-'
+            keys_to_remove = [k for k in tombstones
+                              if any(k.startswith(p) for p in _prefixes)
+                              or k.startswith(_block_prefix)]
+        if not keys_to_remove:
+            return
+        for k in keys_to_remove:
+            del tombstones[k]
+        tmp = tombstone_path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(tombstones, indent=2))
+        tmp.replace(tombstone_path)
+        log.info("KG %s: cleared %d tombstone(s): %s", kg_code, len(keys_to_remove), keys_to_remove)
+    except Exception as e:
+        log.warning("KG %s: failed to clear tombstones: %s", kg_code, e)
+
+
+def _append_retry_queue(kg_code: str):
+    """Append a KG code to the retry queue file (atomic)."""
+    try:
+        existing = []
+        if RETRY_QUEUE_FILE.exists():
+            existing = json.loads(RETRY_QUEUE_FILE.read_text())
+        if kg_code not in existing:
+            existing.append(kg_code)
+        RETRY_QUEUE_FILE.write_text(json.dumps(existing))
+    except Exception:
+        pass
+
+
+def _push_strikes_to_director() -> None:
+    """Push the local kg_strikes.json to the director (best-effort,
+    fire-and-forget in a daemon thread — never blocks the KG loop and a
+    slow/unreachable director costs nothing).
+
+    The director's copy is the authoritative one: it is HA-snapshotted
+    and synced to every peer at dispatch time (_sync_kg_strikes_to_peer,
+    max-merge). Without this push, strikes observed on THIS peer (e.g.
+    a runtime-oversize needs_split, or repeated disk-low handoffs) stay
+    local and the next peer to receive the same parent KG re-runs it
+    whole. One tiny PUT per rare event — negligible director load.
+
+    No-op on the primary/director itself (loopback would merge the
+    file into itself — harmless but pointless).
+    """
+    def _bg():
+        try:
+            p = DATA_DIR / "kg_strikes.json"
+            if not p.exists():
+                return
+            data = json.loads(p.read_text() or "{}")
+            if not data:
+                return
+            director_url = (os.environ.get("ZENODO_LOCK_URL", "").strip()
+                            or "http://127.0.0.1:8000")
+            if "127.0.0.1" in director_url or "localhost" in director_url:
+                return  # we ARE the director/primary; file is already local
+            headers = {}
+            try:
+                tok = Path("data/admin_token").read_text().strip()
+                if tok:
+                    headers["X-Admin-Token"] = tok
+            except Exception:
+                pass
+            r = requests.put(
+                director_url.rstrip("/") + "/api/v1/processing/kg_strikes",
+                json=data, timeout=15, headers=headers)
+            if r.ok:
+                log.info("kg_strikes pushed to director (%d updated)",
+                         (r.json() or {}).get("updated", 0))
+            else:
+                log.warning("kg_strikes push to director: HTTP %d",
+                            r.status_code)
+        except Exception as e:
+            log.warning("kg_strikes push to director failed: %s", e)
+
+    threading.Thread(target=_bg, name="kg_strikes_push", daemon=True).start()
+
+
+def _publish_checkpoints_to_registry(kg_code: str, progress=None) -> None:
+    """Upload this KG's tile pickles to the shared Zenodo registry.
+
+    Called when a KG is deferred / re-queued. Best-effort — if the
+    upload fails the local checkpoints still work for same-peer
+    retries; we only lose the cross-peer benefit. Skipped on the
+    primary (it is the lock broker and almost never processes), and
+    when the directory is empty.
+
+    *progress* is ``main()``'s ``ProgressTracker`` — when supplied, the
+    upload outcome surfaces as an INFO/WARNING line in the merged 24h
+    log (fleet-wide visibility). Optional so legacy callers still work.
+    """
+    try:
+        kg_dir = DATA_DIR / "tile_checkpoints" / kg_code
+        if not kg_dir.exists():
+            return
+        pkls = [p for p in kg_dir.iterdir()
+                if p.is_file() and p.name.startswith("tile_")
+                and p.name.endswith(".pkl")]
+        if not pkls:
+            return
+        import threading as _th
+        # Run in a background thread so the iteration loop isn't blocked
+        # on the fleet-wide lock + multi-second Zenodo PUT. Outcome is
+        # surfaced via progress.add_log so the merged 24h log + Live Log
+        # tail show one INFO line per chkpt upload across the fleet.
+        progress_ref = progress
+        def _bg(progress_ref=progress_ref):
+            try:
+                import tile_checkpoint_registry as _ckpt_reg
+                res = _ckpt_reg.upload_kg(kg_code)
+                if progress_ref is None:
+                    return  # nothing to log
+                if res and res.get("ok"):
+                    mb = res.get("bytes", 0) / 1e6
+                    verb = "refreshed" if res.get("skipped") else "uploaded"
+                    progress_ref.add_log(
+                        "info",
+                        f"chkpt: {verb} {kg_code} tile-tar to Zenodo "
+                        f"({res.get('n_tiles')} tiles, {mb:.1f} MB)",
+                        kg_code)
+                else:
+                    progress_ref.add_log(
+                        "warning",
+                        f"chkpt: upload of {kg_code} tile-tar to Zenodo failed",
+                        kg_code)
+            except Exception as _e:
+                log.debug("checkpoint_registry upload skipped: %s", _e)
+        _th.Thread(target=_bg, name=f"chkpt_pub_{kg_code}", daemon=True).start()
+    except Exception:
+        pass
+
+
+def _save_deferred_kgs(deferred_retries: list):
+    """Persist deferred KG codes to disk so the queue API can read them."""
+    try:
+        codes = [d[1]["kg_code"] for d in deferred_retries]
+        DEFERRED_FILE.write_text(json.dumps(codes))
+    except Exception:
+        pass
+
+
+def _append_deferred(deferred_retries: list, entry: tuple):
+    """Append to deferred list and persist to disk."""
+    deferred_retries.append(entry)
+    _save_deferred_kgs(deferred_retries)
+
+
+def _load_failed_kgs() -> set:
+    """Load permanently-failed KG codes from file."""
+    try:
+        if FAILED_KGS_FILE.exists():
+            return set(json.loads(FAILED_KGS_FILE.read_text()))
+    except Exception:
+        pass
+    return set()
+
+
+def _save_failed_kgs(codes: set):
+    """Save permanently-failed KG codes."""
+    try:
+        FAILED_KGS_FILE.write_text(json.dumps(sorted(codes), indent=2))
+    except Exception:
+        pass
+
+
+def _load_partial_kgs() -> dict:
+    """Load per-KG partial-completion records.
+
+    Schema: {kg_code: {name, quality_score, quality_grade,
+                       n_upstream_failed_tiles, upstream_failed_tiles,
+                       missing_layers, elapsed_s, ts}}
+    """
+    try:
+        if PARTIAL_KGS_FILE.exists():
+            d = json.loads(PARTIAL_KGS_FILE.read_text())
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
+def _partial_kgs_mutate(fn):
+    """Run ``fn(dict)`` under an fcntl lock; persist atomically.
+
+    Safe across the two gunicorn workers AND the austria_processor
+    subprocess (which all share the same filesystem). ``fn`` may mutate
+    the dict in place and/or return a replacement.
+    """
+    import fcntl
+    PARTIAL_KGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = PARTIAL_KGS_FILE.with_suffix('.lock')
+    with open(lock_path, 'w') as _lk:
+        try:
+            fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
+            cur = {}
+            if PARTIAL_KGS_FILE.exists():
+                try:
+                    cur = json.loads(PARTIAL_KGS_FILE.read_text()) or {}
+                except Exception:
+                    cur = {}
+            new = fn(cur)
+            if new is None:
+                new = cur
+            fd, tmp = tempfile.mkstemp(
+                dir=str(PARTIAL_KGS_FILE.parent),
+                prefix='.partial_', suffix='.tmp',
+            )
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(new, f, indent=2, sort_keys=True)
+                os.replace(tmp, PARTIAL_KGS_FILE)
+            except BaseException:
+                try: os.unlink(tmp)
+                except OSError: pass
+                raise
+        finally:
+            try:
+                fcntl.flock(_lk.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+
+
+def _record_partial_kg(kg_code, kg_name, *, quality_score, quality_grade,
+                       n_upstream_failed_tiles, upstream_failed_tiles,
+                       missing_layers, elapsed_s):
+    rec = {
+        "code": kg_code,
+        "name": kg_name or "",
+        "quality_score": round(float(quality_score or 0), 3),
+        "quality_grade": quality_grade or "",
+        "n_upstream_failed_tiles": int(n_upstream_failed_tiles or 0),
+        "upstream_failed_tiles": upstream_failed_tiles or [],
+        "missing_layers": missing_layers or [],
+        "elapsed_s": round(float(elapsed_s or 0), 1),
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    def _upd(d):
+        d[kg_code] = rec
+        return d
+    _partial_kgs_mutate(_upd)
+
+
+def _clear_partial_kg(kg_code):
+    def _upd(d):
+        d.pop(kg_code, None)
+        return d
+    _partial_kgs_mutate(_upd)
+
+
+def _load_retried_kgs() -> set:
+    """Load KG codes that already got a retry pass (so we don't retry again)."""
+    try:
+        if RETRIED_KGS_FILE.exists():
+            return set(json.loads(RETRIED_KGS_FILE.read_text()))
+    except Exception:
+        pass
+    return set()
+
+
+def _save_retried_kgs(codes: set):
+    try:
+        RETRIED_KGS_FILE.write_text(json.dumps(sorted(codes), indent=2))
+    except Exception:
+        pass
+
+
+MAX_FAILURES = 3  # after this many failures, KG is permanently failed
+
+
+def _load_failure_counts() -> dict:
+    """Load per-KG failure counts: {kg_code: count}."""
+    try:
+        if FAILURE_COUNTS_FILE.exists():
+            return json.loads(FAILURE_COUNTS_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_failure_counts(counts: dict):
+    try:
+        FAILURE_COUNTS_FILE.write_text(json.dumps(counts, indent=2))
+    except Exception:
+        pass
+
+
+def _record_failure(kg_code: str, failure_counts: dict,
+                    failed_kgs: set, progress, kg_name: str,
+                    error: str, step: str) -> bool:
+    """Record a KG failure.  Returns True if permanently failed (>= MAX_FAILURES)."""
+    failure_counts[kg_code] = failure_counts.get(kg_code, 0) + 1
+    count = failure_counts[kg_code]
+    _save_failure_counts(failure_counts)
+
+    if count >= MAX_FAILURES:
+        failed_kgs.add(kg_code)
+        _save_failed_kgs(failed_kgs)
+        _remove_from_retry_queue(kg_code)
+        progress.add_failure(kg_code, kg_name, error, step)
+        progress.add_log(
+            "error",
+            f"KG {kg_code} permanently failed ({count} failures): {error}",
+            kg_code)
+        log.error("KG %s: PERMANENTLY FAILED (%d failures) at %s: %s",
+                  kg_code, count, step, error)
+        return True
+    else:
+        # Bump strike count so the splitter can adapt on next attempt.
+        try:
+            from kg_splitter import bump_strike
+            bump_strike(kg_code)
+            _push_strikes_to_director()
+        except Exception:
+            pass
+        progress.add_log(
+            "warning",
+            f"KG {kg_code} failed ({count}/{MAX_FAILURES}) at {step}: {error}",
+            kg_code)
+        log.warning("KG %s: failure %d/%d at %s: %s",
+                    kg_code, count, MAX_FAILURES, step, error)
+        return False
+
+
+def _copernicus_probe() -> bool:
+    """Try a tiny Copernicus request to check if credits are back.
+
+    Reloads the on-disk credential store first so a parent stuck in the
+    pause loop picks up credentials added to the fleet *after* it paused
+    (e.g. operator tops up the pool while frontiers are parked at a
+    credit wall). Without this the frozen in-memory ``_CREDENTIALS`` list
+    means a wedged frontier probes the same dead creds forever and can
+    never self-heal — see the 2026-06-19 incident where 21 frontiers
+    parked on an exhausted 10-cred account while 30 fresh creds sat
+    unused on disk.
+    """
+    try:
+        import copernicus
+        try:
+            copernicus._reload_credentials_from_disk()
+        except Exception as _re:
+            log.warning("probe: credential reload failed: %s", _re)
+        copernicus.credits_exhausted = False
+        copernicus.ip_throttled = False  # Reset throttle flag for fresh probe
+        copernicus._connection = None
+        for k in list(copernicus._connections.keys()):
+            copernicus._connections.pop(k, None)
+        conn = copernicus._get_connection()
+        # Representative probe (2026-09-23): the old 0.01° / one-band /
+        # max_time request answered in seconds even while every real
+        # 0.05° NDVI-month request timed out, so a paused frontier peer
+        # "recovered" every 15 min, burned two month timeouts + one
+        # tile of BEV reads, and re-paused — a 25 min hammer loop on
+        # a struggling openEO. Probe with the exact workload shape
+        # (quadrant-sized cell, SCL-masked NDVI monthly median) and the
+        # quadrant timeout; stay paused while that still can't finish.
+        s2 = conn.load_collection(
+            'SENTINEL2_L2A',
+            spatial_extent={'west': 15.0, 'south': 47.0,
+                            'east': 15.05, 'north': 47.05},
+            temporal_extent=['2024-06-01', '2024-07-01'],
+            bands=['B04', 'B08', 'SCL'],
+        )
+        s2m = s2.process('mask_scl_dilation', data=s2, scl_band_name='SCL')
+        cube = s2m.ndvi(nir='B08', red='B04').reduce_dimension(
+            dimension='t', reducer='median')
+        import tempfile as _tf
+        with _tf.NamedTemporaryFile(suffix='.tif', delete=True) as _t:
+            conn.download(cube.save_result(format='GTiff').flat_graph(),
+                          _t.name, timeout=copernicus._MONTH_SYNC_TIMEOUT_QUAD)
+            ok = os.path.getsize(_t.name) > 0
+        log.info("probe: representative openEO NDVI-month request %s",
+                 "OK" if ok else "returned empty file")
+        return ok
+    except Exception as _pe:
+        log.info("probe: representative openEO request failed: %s",
+                 str(_pe)[:160])
+        return False
+
+
+# === SECTION: Peer coordination ===
+
+# Cache for peer state — refreshed every 60s to avoid hammering peers
+_peer_cache: dict = {}       # url → {data, fetched_at}
+_PEER_POLL_INTERVAL = 60     # seconds between polls per peer
+_PEER_TIMEOUT = 10           # HTTP timeout for peer requests
+
+
+def _fetch_peer_state(peer_url: str) -> dict | None:
+    """Fetch peer's processing state. Returns None on failure (peer unreachable)."""
+    now = time.time()
+    cached = _peer_cache.get(peer_url)
+    if cached and (now - cached['fetched_at']) < _PEER_POLL_INTERVAL:
+        return cached['data']
+
+    # Claims only (completed/current/priority/failed) — the manifest
+    # table is ~0.9 MB gzipped and unused here.
+    url = peer_url.rstrip('/') + '/api/v1/processing/peers?manifest=0'
+    try:
+        r = requests.get(url, timeout=_PEER_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        _peer_cache[peer_url] = {'data': data, 'fetched_at': now}
+        return data
+    except Exception as e:
+        log.debug("Peer %s unreachable: %s", peer_url, e)
+        # Keep stale cache if available (graceful degradation)
+        if cached:
+            return cached['data']
+        return None
+
+
+def _get_peer_claims_detailed(peer_urls: list[str]) -> dict:
+    """Return structured peer claims so split-KG blocks can parallelise.
+
+    A peer that is mid-work on ``92117-west`` should not block another
+    peer from picking up ``92117-east`` — they cover disjoint geography.
+    But the same peer's current claim *should* block any peer that has
+    not split the parent KG (legacy peer running pre-splitter code, or
+    a director that put the bare parent code in the queue).
+
+    Returns dict with sets:
+      * ``blocks`` — explicit block codes a peer is currently processing
+        (e.g. ``92117-west``).
+      * ``parents_with_block_claim`` — parent codes for which at least
+        one peer claims a specific block. The bare parent code is
+        blocked (we don't want a legacy peer to grab the unsplit KG)
+        but sibling blocks of these parents stay eligible.
+      * ``parents_unsplit`` — parent codes claimed in non-block form
+        (a peer is processing the whole KG without splitting). All
+        sibling blocks of these are blocked.
+      * ``completed`` — codes any peer reports as completed.
+    """
+    import re as _re
+    block_re = _re.compile(r'^(\d+)-[a-z][-a-z0-9]*$')
+    blocks: set[str] = set()
+    parents_with_block_claim: set[str] = set()
+    parents_unsplit: set[str] = set()
+    completed: set[str] = set()
+
+    def _classify_current(c):
+        if not c:
+            return
+        s = str(c)
+        m = block_re.match(s)
+        if m:
+            blocks.add(s)
+            parents_with_block_claim.add(m.group(1))
+        else:
+            parents_unsplit.add(s)
+
+    for url in peer_urls:
+        state = _fetch_peer_state(url)
+        if state is None:
+            continue
+        for c in state.get('completed', []) or []:
+            if c:
+                completed.add(str(c))
+        _classify_current(state.get('current'))
+        _classify_current(state.get('in_progress'))
+        cp = state.get('current_parent')
+        if cp:
+            cps = str(cp)
+            # Only treat as unsplit if no block-form claim exists for
+            # the same parent (avoid clobbering sibling-block parallelism).
+            if cps not in parents_with_block_claim:
+                parents_unsplit.add(cps)
+    return {
+        'blocks': blocks,
+        'parents_with_block_claim': parents_with_block_claim,
+        'parents_unsplit': parents_unsplit,
+        'completed': completed,
+    }
+
+
+def _block_codes_collide(a: str, b: str) -> bool:
+    """True when two codes cover overlapping geography: equal, or one is a
+    sub-block of the other (``90013-southwest`` ⊃ ``90013-southwest-1``).
+    Mirrors ``peer_director._check_duplicate_kgs._collides`` — the
+    splitter names doubled blocks ``<base>-<n>``, so prefix is overlap."""
+    a, b = str(a), str(b)
+    return a == b or a.startswith(b + '-') or b.startswith(a + '-')
+
+
+def _code_claimed_by_peer(code: str, claims: dict) -> bool:
+    """Exact claim OR geometric overlap with a block another peer is
+    *currently* running. Peers split the same parent at different strike
+    counts (5 blocks on one, 10 "doubled" blocks on another), so a plain
+    set lookup let at123 start ``90013-southwest-1`` while at100 was mid
+    ``90013-southwest``; the director's dup-kg reconciler hard-stopped
+    at123, the restart re-picked the same block (first in its cell), and
+    the pair looped every ~10 min (Oct 2026). Blocks ⊂ a live claim are
+    now skipped like the claim itself."""
+    code = str(code)
+    if (code in claims['blocks'] or code in claims['parents_unsplit']
+            or code in claims['completed']):
+        return True
+    for b in claims['blocks']:
+        if _block_codes_collide(code, b):
+            return True
+    for p in claims['parents_unsplit']:
+        if _block_codes_collide(code, p):  # whole parent running → every block
+            return True
+    return False
+
+
+def _get_peer_claimed_kgs(peer_urls: list[str]) -> set[str]:
+    """Flat claimed-set used for the cheap pending-list pre-filter.
+
+    Excludes the bare parent of a block claim so sibling blocks remain
+    eligible — the per-iteration check uses the detailed view to enforce
+    finer-grained de-duplication (incl. overlap, ``_code_claimed_by_peer``).
+    """
+    d = _get_peer_claims_detailed(peer_urls)
+    # Block siblings stay eligible: don't fold parent_with_block_claim
+    # into the flat set. Only fully-unsplit parent claims block siblings.
+    return d['blocks'] | d['parents_unsplit'] | d['completed']
+
+
+def main():
+    global _active_pool
+
+    parser = argparse.ArgumentParser(description="Austria Landscape Processor")
+    parser.add_argument("--kg", help="Process single KG code")
+    parser.add_argument("--state", help="Process KGs in one state")
+    parser.add_argument("--retry-failed", action="store_true",
+                        help="Retry only previously failed KGs")
+    parser.add_argument("--no-copernicus", action="store_true",
+                        help="Skip Copernicus data (faster)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="List KGs without processing")
+    parser.add_argument("--mark-uncertain", action="store_true",
+                        help="Label low-confidence RF segments as 'unclassified' instead of rule-based fallback")
+    parser.add_argument("--cache-only", action="store_true",
+                        help="Refuse remote Copernicus/Hansen fetches; only "
+                             "process KGs whose tiles are fully present in the "
+                             "local + Zenodo cache.  Cache misses re-queue the "
+                             "KG for the frontier (primary) peer.")
+    parser.add_argument("--v2-upgrade", action="store_true",
+                        help="Also upgrade whitelisted KGs that already have v1 "
+                             "products on Zenodo to v2, from their own full GPKG "
+                             "(no BEV/openEO). With --kg: upgrade that single code. "
+                             "Env V2_UPGRADE=1 is equivalent.")
+    parser.add_argument("--peers", nargs='*', default=[],
+                        help="Peer instance URLs for coordination (e.g. https://example.invalid:8000)")
+    parser.add_argument("--instance-id", default=None,
+                        help="Instance identifier (default: hostname)")
+    args = parser.parse_args()
+
+    try:
+        multiprocessing.set_start_method("spawn")
+    except RuntimeError:
+        pass
+
+    # --- Signal handling for graceful shutdown ---
+    def _handle_signal(signum, frame):
+        global _shutdown_requested
+        sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+        log.warning("Received %s — will finish current KG then exit", sig_name)
+        _shutdown_requested = True
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+    # SIGHUP arrives when the controlling terminal goes away (and is what
+    # ``systemctl kill --signal=HUP`` would deliver). SIGQUIT is what an
+    # operator types as Ctrl-\. Treat both as graceful: better to finish
+    # the current KG than to leave a half-uploaded GPKG behind.
+    try:
+        signal.signal(signal.SIGHUP, _handle_signal)
+        signal.signal(signal.SIGQUIT, _handle_signal)
+    except Exception:
+        pass
+
+    # Last-ditch worker reaper. multiprocessing's own atexit only calls
+    # terminate() (no join, no escalate), so a wedged C-level worker
+    # would otherwise be reparented to PID 1 and keep GPKG fds open.
+    atexit.register(_atexit_kill_children)
+
+    # --- Single-instance lock ---
+    # Prevent two processor instances from racing on shared GPKG paths.
+    # We saw real Zenodo data loss when two parents were both finalising
+    # the same KG (KG 01507 — a 0-byte file overwrote a 243 MB upload
+    # because two processes had handles on the same SQLite file when one
+    # of them unlinked it post-upload).
+    import fcntl as _fcntl
+    _processor_lock_fd = None
+    try:
+        _processor_lock_path = DATA_DIR / "processor.lock"
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _processor_lock_fd = open(_processor_lock_path, "w")
+        _fcntl.flock(_processor_lock_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        _processor_lock_fd.write(f"{os.getpid()}\n")
+        _processor_lock_fd.flush()
+    except (BlockingIOError, OSError) as _le:
+        log.error("Another austria_processor is already running on this VM "
+                  "(could not acquire %s): %s. Refusing to start to prevent "
+                  "GPKG/Zenodo races.", _processor_lock_path, _le)
+        sys.exit(2)
+
+    # --- GDAL config for large raster I/O ---
+    # Suppress GDAL 3.11 deprecation warning for 'Memory' driver (used internally by rasterio)
+    os.environ.setdefault('GDAL_DEPRECATION_WARNING_THRESHOLD', '99999')
+    os.environ.setdefault('GDAL_CACHEMAX', '256')
+    os.environ.setdefault('VSI_CACHE', 'TRUE')
+    os.environ.setdefault('VSI_CACHE_SIZE', '33554432')  # 32 MB
+    os.environ.setdefault('GDAL_HTTP_MULTIPLEX', 'YES')
+    os.environ.setdefault('GDAL_HTTP_MERGE_CONSECUTIVE_RANGES', 'YES')
+    os.environ.setdefault('CPL_VSIL_CURL_ALLOWED_EXTENSIONS', '.tif,.tiff')
+
+    # Set instance ID for the API to report
+    import socket as _socket
+    _instance_id = args.instance_id or _socket.gethostname()
+    os.environ['INSTANCE_ID'] = _instance_id
+    # Cache-only mode propagates to subprocesses via env var.
+    if args.cache_only:
+        os.environ['COPERNICUS_FORBIDDEN'] = '1'
+        import tile_cache as _tc
+        _tc.set_forbid_remote(True)
+        log.info("🔒 Cache-only mode: will refuse Copernicus/Hansen API fetches")
+    peer_urls = args.peers or []
+    v2_upgrade = bool(args.v2_upgrade or os.environ.get("V2_UPGRADE", "") == "1")
+    if v2_upgrade and MODEL_VERSION != "v2":
+        log.error("--v2-upgrade requested but MODEL_VERSION=%s (lightgbm or "
+                  "data/segv2/models/model_G.joblib missing?) — disabling upgrade mode",
+                  MODEL_VERSION)
+        v2_upgrade = False
+
+    log.info("=" * 70)
+    log.info("🇦🇹 Austria Landscape Processor starting (instance=%s, model=%s%s)",
+             _instance_id, MODEL_VERSION, ", v2-upgrade" if v2_upgrade else "")
+    if peer_urls:
+        log.info("Peers: %s", peer_urls)
+    log.info("=" * 70)
+
+    # --- Load/create manifest ---
+    from zenodo_client import Manifest
+    manifest = Manifest(str(MANIFEST_PATH))
+    log.info("Zenodo manifest: %d entries", len(manifest))
+
+    # --- Initialize counters from manifest + local JSON files ---
+    # Count already-uploaded KGs from manifest (entries ending with _json)
+    _uploaded_kgs = sum(1 for k in manifest.keys() if k.endswith('_json'))
+    _upload_bytes = sum(
+        e.size for k in manifest.keys()
+        if (e := manifest.get(k)) is not None
+    )
+    # Count completed KGs from local JSON files on disk
+    _local_jsons = list(JSON_DIR.glob("*.json")) if JSON_DIR.is_dir() else []
+    _completed = len(_local_jsons)
+    # Restore last_kg_code from most recent JSON so the dashboard's
+    # "Last Completed KG" card shows after a restart, before the next
+    # KG finishes in the current session.
+    _last_kg_code = None
+    if _local_jsons:
+        try:
+            _last_kg_code = max(_local_jsons, key=lambda p: p.stat().st_mtime).stem
+        except Exception:
+            _last_kg_code = None
+    log.info(
+        "Resuming state: %d uploaded KGs, %d bytes, %d local JSONs",
+        _uploaded_kgs, _upload_bytes, _completed,
+    )
+
+    # --- Load progress tracker (reset stale state from previous run) ---
+    progress = ProgressTracker(PROGRESS_FILE)
+    progress.update(
+        failed_kgs=[],
+        failed=0,
+        completed=_completed,
+        success=_completed,
+        uploaded=_uploaded_kgs,
+        upload_size_bytes=_upload_bytes,
+        last_kg_code=_last_kg_code,
+        last_kg_seconds=0,
+        n_new_buildings_total=0,
+        n_infrastructure_total=0,
+        parcels_total=0,
+        buildings_total=0,
+        recent_log=[],
+        current_kg=None,
+    )
+    progress.save()
+
+    # --- Get KG list ---
+    if args.kg:
+        kgs = [k for k in get_all_kgs(state_filter=None) if str(k.get("kg_code")) == str(args.kg)]
+        if not kgs:
+            bb = _kg_bbox_lookup(args.kg)
+            if bb:
+                kgs = [{"kg_code": str(args.kg).zfill(5), "bbox": bb}]
+        if not kgs:
+            log.error("KG %s not found", args.kg)
+            return
+    else:
+        kgs = get_all_kgs(state_filter=args.state)
+
+    if not kgs:
+        log.error("No KGs to process")
+        return
+
+    # --- Filter ---
+    if args.retry_failed:
+        failed_keys = set()
+        for key in manifest.keys():
+            if key.endswith("_error"):
+                failed_keys.add(key.replace("_error", ""))
+        kgs = [kg for kg in kgs if kg["kg_code"] in failed_keys]
+        log.info("Retry mode: %d failed KGs to reprocess", len(kgs))
+
+    # --- Determine already-completed KGs (Zenodo manifest + local JSON) ---
+    # Honor manifest_tombstones.json: KGs with a fresh tombstone were
+    # force-requeued by an operator and must be reprocessed even if a
+    # local JSON or manifest entry exists.  Without this, a peer with a
+    # stale local JSON for a re-queued KG would silently drop it from
+    # the priority list.
+    tombstoned_kgs: set[str] = set()
+    tombstone_path = DATA_DIR / "manifest_tombstones.json"
+    # Negative tombstones ("drop journal", app.py). A tombstone that an
+    # operator explicitly dropped must NOT force a reprocess, even if a
+    # stale copy of it is still sitting in our local tombstone file or
+    # arrives from a peer that hasn't converged yet. Aug 2026: the 117
+    # Soelden/80110 product tombstones were dropped fleet-wide, came back
+    # via peer-sync, and this loop then removed ~40 finished blocks from
+    # completed_codes -- re-running ~9 h of work per block for products
+    # that were intact on Zenodo. Honour the journal here too so the
+    # processor can never be the one to act on a superseded tombstone.
+    _tomb_drops: dict = {}
+    try:
+        _dp = DATA_DIR / "manifest_tombstone_drops.json"
+        if _dp.exists():
+            _dj = json.loads(_dp.read_text())
+            if isinstance(_dj, dict):
+                _tomb_drops = {k: str(v) for k, v in _dj.items()
+                               if isinstance(v, str)}
+    except Exception:
+        _tomb_drops = {}
+    if tombstone_path.exists():
+        try:
+            _tdata = json.loads(tombstone_path.read_text())
+            if isinstance(_tdata, dict):
+                import re as _re_t
+                _n_sup = 0
+                for _tk in list(_tdata.keys()):
+                    # Superseded == drop is newer than (or equal to) the
+                    # tombstone. A genuine later requeue has ts > drop.
+                    _dts = _tomb_drops.get(_tk)
+                    if _dts and not str(_tdata.get(_tk, "")) > _dts:
+                        _tdata.pop(_tk, None)
+                        _n_sup += 1
+                if _n_sup:
+                    log.info("Ignoring %d tombstone(s) superseded by the "
+                             "drop journal", _n_sup)
+                for _tk in _tdata.keys():
+                    _m = _re_t.match(r'^(\d+(?:-[a-z][-a-z0-9]*)?)_', _tk)
+                    if _m:
+                        tombstoned_kgs.add(_m.group(1))
+        except Exception as _e:
+            log.warning("Could not read tombstones: %s", _e)
+
+    completed_codes = set()
+    for key in manifest.keys():
+        if key.endswith("_json"):
+            completed_codes.add(key.replace("_json", ""))
+    for jf in JSON_DIR.glob("*.json"):
+        completed_codes.add(jf.stem)
+    if tombstoned_kgs:
+        re_count = len(completed_codes & tombstoned_kgs)
+        completed_codes -= tombstoned_kgs
+        if re_count:
+            log.info("Tombstones force-requeue %d KG(s) ignoring local copies: %s",
+                     re_count, sorted(tombstoned_kgs)[:10])
+    log.info("Already completed: %d (manifest + local JSON, %d tombstoned)",
+             len(completed_codes), len(tombstoned_kgs))
+
+    # --- Load failed KGs + handle crash recovery ---
+    failed_kgs = _load_failed_kgs()
+    retried_kgs = _load_retried_kgs()
+    failure_counts = _load_failure_counts()
+
+    # On restart, give previously-failed KGs one fresh attempt.
+    # KGs that already got a retry pass stay permanently skipped.
+    prev_failed = failed_kgs.copy()
+    to_retry = prev_failed - retried_kgs
+    if to_retry:
+        log.info("Clearing %d previously-failed KGs for retry: %s",
+                 len(to_retry), sorted(to_retry)[:10])
+        retried_kgs |= to_retry
+        failed_kgs -= to_retry
+        _save_retried_kgs(retried_kgs)
+        _save_failed_kgs(failed_kgs)
+
+    # Crash recovery: check IN_PROGRESS_FILE for interrupted KG
+    if IN_PROGRESS_FILE.exists():
+        interrupted_kg = IN_PROGRESS_FILE.read_text().strip()
+        if interrupted_kg:
+            try:
+                from kg_splitter import bump_strike
+                strikes = bump_strike(interrupted_kg)
+                # Propagate to the director's authoritative strike file —
+                # crash-recovery strikes otherwise stay peer-local and
+                # never accumulate for a KG that bounces between peers.
+                _push_strikes_to_director()
+            except Exception:
+                strikes = 0
+            log.info("Previous run interrupted during KG %s — will retry "
+                     "(strike %d, not marking as failed)",
+                     interrupted_kg, strikes)
+            # Make sure it's not in the failed set so it gets retried
+            failed_kgs.discard(interrupted_kg)
+            completed_codes.discard(interrupted_kg)
+            # Clear any stale `step_issues` left in progress.json for the
+            # interrupted KG. They reflect transient errors from the
+            # previous attempt (e.g. fiona writes interrupted by SIGTERM)
+            # that the dashboard would otherwise render as red ✗ chips on
+            # the carousel even though the KG will be cleanly retried.
+            # Mark the previous attempt as `interrupted` so the dashboard
+            # can render a distinct (yellow) chip if the entry is still
+            # the most-recent thing it knows about.
+            try:
+                ckg = progress._state.get("current_kg")
+                if ckg and ckg.get("code") == interrupted_kg:
+                    ckg["step_issues"] = {ckg.get("step", ""): "interrupted"} \
+                        if ckg.get("step") else {}
+                    ckg["interrupted"] = True
+                    progress.save()
+            except Exception:
+                pass
+        IN_PROGRESS_FILE.unlink()
+
+    if failed_kgs:
+        log.info("Skipping %d permanently-failed KGs: %s",
+                 len(failed_kgs), sorted(failed_kgs)[:20])
+
+    # --- Filter out KGs claimed by peers ---
+    peer_claimed = _get_peer_claimed_kgs(peer_urls) if peer_urls else set()
+    if peer_claimed:
+        log.info("Peers claim %d KGs (completed + in-progress + priority)",
+                 len(peer_claimed))
+
+    pending = [kg for kg in kgs
+               if kg["kg_code"] not in completed_codes
+               and kg["kg_code"] not in failed_kgs
+               and kg["kg_code"] not in peer_claimed]
+
+    # --- Optional cell filter (per-peer dedication) ---
+    # Preferred: KG_CELL_FILTER=[[s,n,w,e],...] -- 1° lat × 2° lon
+    # cells matching the Zenodo cache bundle layout. Each frontier
+    # peer owns disjoint cells so two peers never write the same
+    # Zenodo ZIP simultaneously.
+    # Legacy: KG_LAT_STRIP_FILTER=[[s,n],...] -- pre-cell layout,
+    # still honored so a rolling restart works without churn.
+    _cell_raw = os.environ.get("KG_CELL_FILTER", "").strip()
+    if _cell_raw:
+        try:
+            _cells = json.loads(_cell_raw)
+            _cells = [(float(s), float(n), float(w), float(e))
+                      for s, n, w, e in _cells]
+        except Exception as e:
+            log.warning("Bad KG_CELL_FILTER=%r: %s", _cell_raw, e)
+            _cells = []
+        if _cells:
+            def _kg_in_cells(kg):
+                bb = kg.get("bbox") or {}
+                s = bb.get("min_lat"); n = bb.get("max_lat")
+                w = bb.get("min_lon"); e = bb.get("max_lon")
+                if None in (s, n, w, e):
+                    return False
+                lat_mid = 0.5 * (s + n)
+                lon_mid = 0.5 * (w + e)
+                for cs, cn, cw, ce in _cells:
+                    if (cs - 1e-9 <= lat_mid < cn - 1e-9
+                            and cw - 1e-9 <= lon_mid < ce - 1e-9):
+                        return True
+                return False
+            before = len(pending)
+            pending = [kg for kg in pending if _kg_in_cells(kg)]
+            log.info("KG_CELL_FILTER active (%d cells): %d -> %d KGs",
+                     len(_cells), before, len(pending))
+
+    _strip_raw = os.environ.get("KG_LAT_STRIP_FILTER", "").strip()
+    if _strip_raw and not _cell_raw:
+        try:
+            _strips = json.loads(_strip_raw)
+            _strips = [(float(s), float(n)) for s, n in _strips]
+        except Exception as e:
+            log.warning("Bad KG_LAT_STRIP_FILTER=%r: %s", _strip_raw, e)
+            _strips = []
+        if _strips:
+            # Assign each KG to exactly one strip via its bbox centroid
+            # latitude. Using full bbox containment would exclude KGs
+            # that straddle a 0.5° boundary (~6% of Austria) from every
+            # peer. Centroid ownership is unambiguous: every KG goes to
+            # exactly one strip's owner, and that peer fetches a few
+            # overlap tiles from the neighbouring strip's cache. Zenodo
+            # strip ZIPs are independent and writes are serialised by
+            # the upload mutex, so this is safe.
+            def _kg_in_strips(kg):
+                bb = kg.get("bbox") or {}
+                s = bb.get("min_lat")
+                n = bb.get("max_lat")
+                if s is None or n is None:
+                    return False
+                mid = 0.5 * (s + n)
+                for ls, ln in _strips:
+                    if ls - 1e-9 <= mid < ln - 1e-9:
+                        return True
+                return False
+            before = len(pending)
+            pending = [kg for kg in pending if _kg_in_strips(kg)]
+            log.info("KG_LAT_STRIP_FILTER active (%d strips): %d -> %d KGs",
+                     len(_strips), before, len(pending))
+
+    # --- Expand large KGs into blocks ---
+    from kg_splitter import maybe_split_kg, is_block_code, parent_kg_code
+
+    # Check if parent KGs are fully done (all blocks completed)
+    # Also recognize parent codes that were completed as a whole (no blocks)
+    _parent_codes_with_blocks = set()
+    for c in completed_codes:
+        if is_block_code(c):
+            _parent_codes_with_blocks.add(parent_kg_code(c))
+
+    # A parent KG is effectively completed if its base code is in
+    # completed_codes OR all its blocks are completed.  We can't know
+    # the expected block count without re-splitting, so we check lazily
+    # during expansion below.
+
+    _expanded_pending = []
+    _n_split = 0
+    for kg_item in pending:
+        code = kg_item["kg_code"]
+        # If another peer is mid-work on the *parent* code (e.g. an old
+        # pre-splitter peer reports current=60336), skip the entire
+        # split set: we'd otherwise spawn a block-level race against the
+        # peer's whole-KG processing. The parent-code check is in addition
+        # to the per-block check so block siblings still parallelise when
+        # a different peer holds one specific block.
+        if code in peer_claimed:
+            log.debug("  Skipping split of %s — parent claimed by peer", code)
+            continue
+        blocks = maybe_split_kg(kg_item)
+        if len(blocks) > 1:
+            _n_split += 1
+            # Filter out already-completed or failed blocks
+            for blk in blocks:
+                bc = blk["kg_code"]
+                if (bc not in completed_codes
+                        and bc not in failed_kgs
+                        and bc not in peer_claimed):
+                    _expanded_pending.append(blk)
+                else:
+                    log.debug("  Block %s already done/failed — skipping", bc)
+        else:
+            _expanded_pending.append(kg_item)
+
+    if _n_split:
+        log.info("Expanded %d large KGs into blocks: %d → %d items",
+                 _n_split, len(pending), len(_expanded_pending))
+    pending = _expanded_pending
+
+    # --- Re-apply lat-strip filter to *blocks* ---
+    # The first strip filter ran on parent KG bboxes (centroid). For
+    # very large KGs (Ramsau, Sölden) the parent bbox can span several
+    # strips, but we sent it to one strip owner via centroid. Now that
+    # we've expanded into blocks, distribute blocks across frontier
+    # peers by block centroid so each peer only does blocks in its
+    # assigned strips. Without this, one peer ends up with all 30
+    # Ramsau blocks while others sit idle.
+    if _strip_raw:
+        try:
+            _strips_for_blocks = json.loads(_strip_raw)
+            _strips_for_blocks = [(float(s), float(n))
+                                  for s, n in _strips_for_blocks]
+        except Exception:
+            _strips_for_blocks = []
+        if _strips_for_blocks:
+            def _block_in_strips(kg):
+                bb = kg.get("bbox") or {}
+                s = bb.get("min_lat")
+                n = bb.get("max_lat")
+                if s is None or n is None:
+                    return True  # be permissive on malformed
+                mid = 0.5 * (s + n)
+                for ls, ln in _strips_for_blocks:
+                    if ls - 1e-9 <= mid < ln - 1e-9:
+                        return True
+                return False
+            before_blk = len(pending)
+            pending = [kg for kg in pending if _block_in_strips(kg)]
+            n_dropped = before_blk - len(pending)
+            if n_dropped:
+                log.info("Lat-strip filter on blocks: %d → %d items "
+                         "(dropped %d blocks outside strips)",
+                         before_blk, len(pending), n_dropped)
+
+    # --- Load priority queue and prepend to pending ---
+    priority_codes = _read_retry_queue()
+    # Filter out completed / permanently-failed from the file too
+    priority_codes = [c for c in priority_codes
+                      if c not in completed_codes and c not in failed_kgs]
+    priority_set = set(priority_codes)
+
+    if priority_codes:
+        log.info("Priority queue: %d KGs to process first: %s",
+                 len(priority_codes),
+                 priority_codes[:10])
+        # Build parent-code set for matching blocks to queued parents
+        _priority_parents = set()
+        for pc in priority_codes:
+            _priority_parents.add(pc)
+            if is_block_code(pc):
+                _priority_parents.add(parent_kg_code(pc))
+
+        # Separate priority KGs from the rest.
+        # A block matches if its own code OR its parent code is in queue.
+        priority_kgs = []
+        non_priority = []
+        for kg_item in pending:
+            _code = kg_item["kg_code"]
+            _parent = kg_item.get("_parent_kg_code", _code)
+            if _code in priority_set or _parent in priority_set:
+                priority_kgs.append(kg_item)
+            else:
+                non_priority.append(kg_item)
+        # Build lookup for ordering priority_kgs to match the file order
+        prio_order = {c: idx for idx, c in enumerate(priority_codes)}
+        # Blocks inherit their parent's priority position
+        def _prio_key(k):
+            c = k["kg_code"]
+            p = k.get("_parent_kg_code", c)
+            base = min(prio_order.get(c, 999999), prio_order.get(p, 999999))
+            # Sub-sort blocks by index within parent
+            return (base, k.get("_block_index", 0))
+        priority_kgs.sort(key=_prio_key)
+    else:
+        priority_kgs = []
+        non_priority = pending
+
+    # Cache-only peers run *only* the director-provided whitelist.
+    # We deliberately drop the NN fallback so two cache-only peers
+    # can't race on the same KG when they fall through their slices.
+    # When the priority list is drained the loop exits and the peer
+    # idles, awaiting the next /processing/start from the director.
+    if args.cache_only:
+        if non_priority:
+            log.info("Cache-only mode: dropping %d non-priority KGs — "
+                     "will only process the director-provided whitelist",
+                     len(non_priority))
+        non_priority = []
+        pending = list(priority_kgs)
+    else:
+        # Sort non-priority by nearest-neighbor traversal for maximum cache reuse
+        from tile_cache import order_kgs_nearest_neighbor
+        # Resume from last completed KG if available
+        resume_from = None
+        if completed_codes:
+            # Find the last completed KG that has a local JSON
+            json_files = sorted(JSON_DIR.glob("*.json"), key=lambda f: f.stat().st_mtime)
+            if json_files:
+                resume_from = json_files[-1].stem
+                log.info("Resuming nearest-neighbor traversal from last KG: %s", resume_from)
+        non_priority = order_kgs_nearest_neighbor(non_priority, start_code=resume_from)
+        log.info("Non-priority KGs ordered by nearest-neighbor traversal for cache locality")
+
+        # Priority KGs go first, then nearest-neighbor ordered rest
+        pending = priority_kgs + non_priority
+    if priority_kgs:
+        log.info("Pending starts with %d priority KGs, then %d nearest-neighbor",
+                 len(priority_kgs), len(non_priority))
+
+    # --- v2 upgrade units ---
+    # Whitelisted codes that are v1-complete on Zenodo (json + full GPKG)
+    # and have no _json_v2 yet.  They were filtered OUT of ``pending``
+    # above (they are in completed_codes), so add them back here as
+    # upgrade units in whitelist order.  With --kg the single code is
+    # upgraded regardless of the whitelist.
+    _v2_units = []
+    _kg_index = {k["kg_code"]: k for k in kgs}
+    if v2_upgrade:
+        if args.kg:
+            _v2_codes = [args.kg]
+        else:
+            _v2_codes = list(_read_retry_queue())
+        _v2_units = _v2_upgrade_units(_v2_codes, manifest, _kg_index)
+        if _v2_units:
+            _pend_codes = {k["kg_code"] for k in pending}
+            _v2_units = [u for u in _v2_units if u["kg_code"] not in _pend_codes]
+            pending = pending + _v2_units
+            log.info("v2 upgrade: %d unit(s) appended after %d fresh KG(s): %s",
+                     len(_v2_units), len(pending) - len(_v2_units),
+                     [u["kg_code"] for u in _v2_units[:10]])
+        else:
+            log.info("v2 upgrade: no eligible units in whitelist (%d codes)", len(_v2_codes))
+
+    log.info("Total KGs: %d, completed: %d, failed (permanent): %d, pending: %d",
+             len(kgs), len(completed_codes), len(failed_kgs), len(pending))
+
+    if args.dry_run:
+        for kg in pending[:20]:
+            log.info("  Would process: %s (%s)", kg["kg_code"], kg.get("kg_name", ""))
+        if len(pending) > 20:
+            log.info("  ... and %d more", len(pending) - 20)
+        return
+
+    # Count completed KGs — normalize block codes to parent codes
+    _completed_parents = set()
+    for c in completed_codes:
+        _completed_parents.add(parent_kg_code(c) if is_block_code(c) else c)
+    _n_completed = len(_completed_parents)
+
+    progress.update(
+        state="running",
+        total_kgs=len(kgs),
+        completed=_n_completed,
+        success=_n_completed,
+        _completed_at_start=_n_completed,
+        started_at=datetime.now(timezone.utc).isoformat(),
+        pending_blocks=len(pending),
+        cache_only=bool(args.cache_only),
+        # v2 telemetry for /api/v1/processing/status → process.html peer
+        # badges. ``v2_upgraded`` is bumped per successful upgrade unit.
+        model_version=MODEL_VERSION,
+        v2_upgrade=bool(v2_upgrade and MODEL_VERSION == "v2"),
+        v2_upgraded=0,
+        v2_fast=0,
+    )
+    progress.save()
+
+    # --- Clean up orphan tile cache files (legacy variable-bbox tiles) ---
+    try:
+        from zenodo_cache import cleanup_orphan_tiles
+        cleanup_orphan_tiles()
+    except Exception as _e:
+        log.debug("Orphan tile cleanup: %s", _e)
+
+    t_start = time.time()
+    include_cop = not args.no_copernicus
+    mark_uncertain = args.mark_uncertain
+
+    # Deferred retry queue: list of (inject_after_index, kg_dict, attempt_num)
+    _deferred_retries: list[tuple[int, dict, int]] = []
+    _save_deferred_kgs(_deferred_retries)  # clear stale deferred state
+
+    # Track which retry-queue KG codes we've already injected into pending,
+    # so we only pick up *new* additions from the file each iteration.
+    _known_queue_codes: set[str] = set(priority_codes)
+
+    i = 0
+    while i < len(pending):
+        # --- Check for deferred retries ready to be injected ---
+        ready = [d for d in _deferred_retries if d[0] <= i]
+        for defer_idx, defer_kg, defer_attempt in ready:
+            _deferred_retries.remove((defer_idx, defer_kg, defer_attempt))
+            # Insert right after current position so it's picked up next
+            pending.insert(i + 1, defer_kg)
+            # Tag with defer metadata for logging / attempt tracking
+            defer_kg["_defer_attempt"] = defer_attempt
+            log.info("↻ Deferred retry: KG %s re-inserted at position %d "
+                     "(attempt %d)",
+                     defer_kg["kg_code"], i + 1, defer_attempt)
+        if ready:
+            _save_deferred_kgs(_deferred_retries)
+
+        kg = pending[i]
+
+        # --- Check graceful shutdown ---
+        if _shutdown_requested:
+            log.info("Shutdown requested — stopping after %d KGs", i)
+            break
+
+        kg_code = kg["kg_code"]
+        kg_name = kg.get("kg_name", "")
+        kg_state = kg.get("state_name", "")
+
+        # --- Peer coordination: skip if a peer has claimed this KG ---
+        if peer_urls:
+            if kg.get("_v2_upgrade"):
+                # A v2 upgrade unit is *by definition* v1-complete, so every
+                # reachable peer advertises it in ``completed`` — the flat
+                # claimed-set would block every upgrade forever (Sep 2026:
+                # fleet doubled, new peers reachable → every cache-only
+                # start exited with "claimed by peer" and the director
+                # re-started the same 24 codes every tick). Only a live
+                # in-progress claim on another peer counts here.
+                _d = _get_peer_claims_detailed(peer_urls)
+                _d = dict(_d, completed=set())
+            else:
+                _d = _get_peer_claims_detailed(peer_urls)
+            if _code_claimed_by_peer(kg_code, _d):
+                log.info("Skipping KG %s — claimed by peer (exact or "
+                         "overlapping block)", kg_code)
+                i += 1
+                continue
+
+        log.info("-" * 50)
+        log.info("[%d/%d] Processing KG %s (%s, %s)",
+                 i + 1, len(pending), kg_code, kg_name, kg_state)
+
+        # Memory check
+        gc.collect()
+        try:
+            rss_mb = int(open("/proc/self/status").read().split("VmRSS:")[1].split()[0]) / 1024
+            log.info("  Parent RSS: %.0f MB", rss_mb)
+        except Exception:
+            pass
+
+        # --- Flush tile cache to Zenodo (throttled, max once per 5 min) ---
+        flush_tile_cache_to_zenodo()
+
+        # --- Orphaned v2-upgrade inputs from earlier units (hard stops
+        #     skip ``_v2_release_inputs``) — always GC at the KG boundary,
+        #     not only once the disk is already tight.
+        try:
+            _evict_stale_v2_inputs(kg_code, 0, log, max_age_s=3 * 3600)
+        except Exception as _e:  # noqa: BLE001
+            log.debug("v2_source GC: %s", _e)
+
+        # --- Disk space check before starting KG ---
+        if not check_disk_space(kg_code):
+            progress.add_log("error", "Disk critically low — pausing processor", kg_code)
+            progress.update(state="paused_disk")
+            progress.save()
+            log.error("Disk critically low after cleanup — pausing")
+            break
+
+        progress.set_current_kg(kg_code, kg_name, kg_state, "starting",
+                                v2_upgrade=bool(kg.get("_v2_upgrade")))
+        progress.add_log("info", f"Starting KG {kg_code} ({kg_name})", kg_code)
+        progress.save()
+
+        IN_PROGRESS_FILE.write_text(kg_code)
+
+        # --- v2 upgrade unit: pull the v1 JSON + full GPKG from Zenodo ---
+        _v2_source_gpkg = None
+        _v2_v1_doc = None
+        _v2_fast = None
+        if kg.get("_v2_upgrade"):
+            # v2.4: the declared NE layer of the parent must exist BEFORE we
+            # pull gigabytes of GPKG — umfeld-at builds all KGs over ~3 days;
+            # an unbuilt KG is simply skipped this round (no strike, no
+            # deferral count: the director gates candidates on the umfeld
+            # manifest, so this is rare).
+            try:
+                import ne_h3 as _neh
+                _ne_parent = kg.get("_parent_kg_code") or kg_code.split("-")[0]
+                _ne_dir = V2_GPKG_DIR / "ne"
+                _ne_dir.mkdir(parents=True, exist_ok=True)
+                _ne_path = _ne_dir / f"{_ne_parent}.nec"
+                if not _ne_path.exists() or time.time() - _ne_path.stat().st_mtime > 6 * 3600:
+                    progress.set_step("v2_fetch", f"NE declared layer {_ne_parent}")
+                    progress.save()
+                    # bev mode builds the NEC1 locally and needs the PARENT
+                    # bbox (upgrade units often carry no bbox at all, and a
+                    # block's bbox must never key a parent build — the
+                    # Oct-07 75110/57010 failure).  kg_list → bevdirect
+                    # /kg → public API; never umfeld's /k.
+                    _ne_bb = None
+                    if _neh.ne_source() == "bevdirect":
+                        _ne_bb = _parent_bbox_wgs(_ne_parent)
+                        if _ne_bb is None:
+                            _d = _kg_bbox_lookup(_ne_parent)
+                            if _d:
+                                _ne_bb = (_d["min_lon"], _d["min_lat"], _d["max_lon"], _d["max_lat"])
+                        if _ne_bb is None and not kg.get("_parent_kg_code"):
+                            _ne_bb = _bbox_tuple(kg)
+                    _sec = _neh.fetch_declared(_ne_parent, _ne_bb, code=kg_code)
+                    _ne_path.write_bytes(_neh.pack_section(_neh.MAGIC_LU, _sec.header, _sec.raw))
+                kg["_ne_declared_path"] = str(_ne_path)
+            except Exception as _ne_e:  # noqa: BLE001
+                import ne_h3 as _neh
+                if isinstance(_ne_e, _neh.NENotBuilt):
+                    log.info("KG %s: NE declared layer not built yet at umfeld (%s, retry_after=%s) — skipping unit this round",
+                             kg_code, _ne_e.status, _ne_e.retry_after_s)
+                    progress.add_log("info", f"v2up: {kg_code} waits for NE cells ({_ne_e.status})", kg_code)
+                    _v2_release_inputs(kg)
+                    IN_PROGRESS_FILE.unlink(missing_ok=True)
+                    i += 1
+                    continue
+                log.warning("KG %s: NE declared layer fetch failed (%s) — deferring unit", kg_code, _ne_e)
+                progress.add_log("warning", f"v2up: {kg_code} deferred — NE: {str(_ne_e)[:120]}", kg_code)
+                _record_v2_upgrade_failed(kg_code, f"ne: {_ne_e}", transient=True)
+                _v2_release_inputs(kg)
+                IN_PROGRESS_FILE.unlink(missing_ok=True)
+                i += 1
+                continue
+            # --- v2.4 fast path: relabel the existing v2.3+ pair when the
+            # code qualifies (clean, or ne_cells-only partial).  Falls back
+            # to the full path (full GPKG re-run) when the inputs are gone
+            # or the doc carries Copernicus gaps (operator decision).
+            _v2_fast = None
+            try:
+                import v24_fast as _v24
+                _fast_ok, _fast_why = _v24.eligible(kg_code, manifest)
+                if _fast_ok:
+                    _fast_ok, _src_why = v24_fast_source_ok(kg_code, manifest)
+                    if not _fast_ok:
+                        log.info("KG %s: v2.4 fast path declined — %s", kg_code, _src_why)
+                        progress.add_log("info", f"v2up: {kg_code} fast declined → full path: {_src_why[:140]}",
+                                         kg_code)
+                if _fast_ok:
+                    def _fast_step(detail, _p=progress):
+                        _p.set_step("v2_fetch", f"fast: {detail}")
+                        _p.save()
+                    try:
+                        _v2_v1_doc = _v2_fetch_v1_json(kg, manifest, _fast_step)
+                    except FileNotFoundError as _je:
+                        log.info("KG %s: no v1 JSON baseline (%s) — fast relabel without baseline", kg_code, _je)
+                        _v2_v1_doc = None
+                    _v2_fast = _v24.fetch_inputs(kg_code, manifest, V2_GPKG_DIR, ZENODO_TOKEN,
+                                                 n_streams=V2_UPGRADE_STREAMS,
+                                                 min_free_gb=V2_UPGRADE_MIN_FREE_GB, step=_fast_step,
+                                                 doc_gate=lambda _d: v24_fast_defects_ok(_d)[0])
+                    _fdoc = _v2_fast.get("json_v2_doc") or {}
+                    _bb = _fdoc.get("bbox") or {}
+                    if not kg.get("bbox") and all(k in _bb for k in ("min_lon", "min_lat", "max_lon", "max_lat")):
+                        kg["bbox"] = {k: float(_bb[k]) for k in ("min_lon", "min_lat", "max_lon", "max_lat")}
+                    for _k in ("kg_name", "state", "gemeinde", "district"):
+                        if _fdoc.get(_k) and not kg.get(_k):
+                            kg[_k] = _fdoc[_k]
+                    _dok, _dfx = v24_fast_defects_ok(_fdoc)
+                    if not _dok or _v2_fast.get("declined"):
+                        log.info("KG %s: v2.4 fast path declined — Copernicus gap(s) %s need the full path",
+                                 kg_code, ",".join(_dfx))
+                        progress.add_log("info", f"v2up: {kg_code} gaps {','.join(_dfx)} → full path", kg_code)
+                        _v24.release_inputs(kg_code, V2_GPKG_DIR)
+                        _v2_fast = None
+                    else:
+                        progress.add_log("info", f"v2up: {kg_code} fast inputs ready ({_fast_why}, "
+                                         f"{os.path.getsize(_v2_fast['light_src']) / 1e6:.0f} MB light)", kg_code)
+            except FileNotFoundError as _fe:
+                log.warning("KG %s: v2.4 fast inputs gone (%s) — falling back to the full path", kg_code, _fe)
+                _v2_fast = None
+            except Exception as _fe:  # noqa: BLE001
+                log.warning("KG %s: v2.4 fast inputs unavailable (%s) — deferring", kg_code, _fe)
+                progress.add_log("warning", f"v2up: {kg_code} deferred — fast: {str(_fe)[:120]}", kg_code)
+                _record_v2_upgrade_failed(kg_code, f"fast: {_fe}", transient=True)
+                _v2_release_inputs(kg)
+                IN_PROGRESS_FILE.unlink(missing_ok=True)
+                i += 1
+                continue
+            try:
+                if _v2_fast is None:
+                    _v2_source_gpkg, _v2_v1_doc = _v2_fetch_inputs(kg, manifest, progress)
+                    progress.add_log("info", f"v2up: {kg_code} inputs ready "
+                                     f"({os.path.getsize(_v2_source_gpkg) / 1e6:.0f} MB GPKG)", kg_code)
+            except FileNotFoundError as _fe:
+                log.error("KG %s: v2 upgrade impossible — %s", kg_code, _fe)
+                progress.add_log("warning", f"v2up: {kg_code} skipped — {_fe}", kg_code)
+                _record_v2_upgrade_failed(kg_code, str(_fe), fatal=True)
+                _v2_release_inputs(kg)
+                IN_PROGRESS_FILE.unlink(missing_ok=True)
+                i += 1
+                continue
+            except Exception as _fe:  # noqa: BLE001
+                log.warning("KG %s: v2 inputs unavailable (%s) — skipping for now", kg_code, _fe)
+                progress.add_log("warning", f"v2up: {kg_code} deferred — {str(_fe)[:120]}", kg_code)
+                _record_v2_upgrade_failed(kg_code, str(_fe), transient=True)
+                _v2_release_inputs(kg)
+                IN_PROGRESS_FILE.unlink(missing_ok=True)
+                i += 1
+                continue
+
+        # Truncate stale subprocess warnings so the monitor thread
+        # doesn't replay errors from a previous KG / run.
+        _warn_file = DATA_DIR / "subprocess_warnings.jsonl"
+        try:
+            _warn_file.write_text("")
+        except OSError:
+            pass
+
+        # Start background thread to monitor subprocess step reporting
+        import threading
+        _step_monitor_stop = threading.Event()
+
+        def _monitor_step_file(_stop=_step_monitor_stop, _code=kg_code):
+            step_file = DATA_DIR / "current_step.json"
+            warnings_file = DATA_DIR / "subprocess_warnings.jsonl"
+            last_step = ""
+            _warn_offset = 0  # track read position in warnings file
+            # Track per-step worst issue level: {step: "warning"|"error"}
+            _step_issues = {}
+            _last_detail = ""  # track detail changes for save
+            while not _stop.is_set():
+                try:
+                    if step_file.exists():
+                        sd = json.loads(step_file.read_text())
+                        s = sd.get("step", "")
+                        detail = sd.get("detail", "")
+                        step_changed = bool(s and s != last_step)
+                        detail_changed = (detail != _last_detail)
+                        # Always merge step_times + tile progress from subprocess
+                        sub_times = sd.get("step_times", {})
+                        with progress._lock:
+                            ckg = progress._state.get("current_kg")
+                            if ckg:
+                                if sub_times:
+                                    ckg["step_times"] = sub_times
+                                ct = sd.get("current_tile", 0)
+                                nt = sd.get("n_tiles", 0)
+                                if nt > 0:
+                                    ckg["current_tile"] = ct
+                                    ckg["n_tiles"] = nt
+                                # Relay sub-tile info for dashboard
+                                st_info = sd.get("subtile")
+                                if st_info:
+                                    ckg["subtile"] = st_info
+                                else:
+                                    ckg.pop("subtile", None)
+                                # Pass detail through for display
+                                if detail:
+                                    ckg["step_detail"] = detail
+                                    if detail_changed:
+                                        ckg["step_detail_ts"] = sd.get("ts") or datetime.now(timezone.utc).isoformat()
+                                else:
+                                    ckg.pop("step_detail", None)
+                                    ckg.pop("step_detail_ts", None)
+                                # Parse upload progress from subprocess step detail
+                                if s.startswith("upload_") and "%" in detail:
+                                    import re as _re
+                                    _up_match = _re.search(r'(\d+)%.*?(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)\s*MB', detail)
+                                    if _up_match:
+                                        _sent_mb = float(_up_match.group(2))
+                                        _total_mb = float(_up_match.group(3))
+                                        ckg["upload_progress"] = {
+                                            "file": "full_gpkg",
+                                            "sent": int(_sent_mb * 1e6),
+                                            "total": int(_total_mb * 1e6),
+                                        }
+                                elif s == "upload" or not s.startswith("upload_"):
+                                    ckg.pop("upload_progress", None)
+                                # Expose step issues to frontend
+                                ckg["step_issues"] = dict(_step_issues)
+                                # Relay per-tile statuses for map dots
+                                ts_list = sd.get("tile_statuses")
+                                if ts_list is not None:
+                                    ckg["tile_statuses"] = ts_list
+                        if step_changed:
+                            prev_step = last_step
+                            last_step = s
+                            progress.set_step(s, detail)
+                            # Log the NEW step starting
+                            if detail:
+                                progress.add_log("info", f"KG {_code}: {s} \u2014 {detail}", _code)
+                            # The previous step cleanly transitioned to the next,
+                            # which means it completed successfully (otherwise the
+                            # subprocess would have raised and aborted the KG).
+                            # Any ERROR-level issues observed during that step were
+                            # therefore transient (e.g., Zenodo 500 then 200 retry,
+                            # fiona warn-as-error, BrokenPipe in pool teardown).
+                            # Downgrade error -> warning so the chip is yellow (⚠)
+                            # not red (✗) on a successful step.
+                            if prev_step and prev_step in _step_issues:
+                                if _step_issues[prev_step] == "error":
+                                    _step_issues[prev_step] = "warning"
+                                    ckg["step_issues"] = dict(_step_issues)
+                                issue_lvl = _step_issues[prev_step]
+                                step_label = prev_step
+                                step_time = sd.get("step_times", {}).get(prev_step)
+                                time_str = f" ({step_time}s)" if step_time else ""
+                                progress.add_log(
+                                    issue_lvl,
+                                    f"KG {_code}: {step_label}{time_str} completed with {issue_lvl}s",
+                                    _code,
+                                )
+                        # Save whenever step or detail changed
+                        if step_changed or detail_changed:
+                            _last_detail = detail
+                            progress.save()
+                except Exception:
+                    pass
+                # --- Relay subprocess warnings/errors to dashboard ---
+                try:
+                    if warnings_file.exists():
+                        with open(warnings_file, "r") as wf:
+                            wf.seek(_warn_offset)
+                            new_lines = wf.readlines()
+                            _warn_offset = wf.tell()
+                        for line in new_lines:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                entry = json.loads(line)
+                                lvl = entry.get("level", "warning")
+                                progress.add_log(
+                                    lvl,
+                                    f"KG {_code}: {entry.get('msg', '')}",
+                                    _code,
+                                )
+                                # Attribute warning/error to the step that emitted it.
+                                # INFO relay (e.g. chkpt restored) MUST NOT colour
+                                # the step chip — it's a success signal, not an issue.
+                                if lvl in ("warning", "error"):
+                                    warn_step = entry.get("step") or last_step
+                                    if warn_step:
+                                        cur = _step_issues.get(warn_step, "")
+                                        if lvl == "error" or cur != "error":
+                                            _step_issues[warn_step] = lvl
+                            except json.JSONDecodeError:
+                                pass
+                        if new_lines:
+                            progress.save()
+                except Exception:
+                    pass
+                _stop.wait(2)
+
+        _step_monitor_stop.clear()
+        step_thread = threading.Thread(target=_monitor_step_file, daemon=True)
+        step_thread.start()
+
+        t_kg = time.time()
+        result = None
+
+        try:
+            # ---- Simple retry: on timeout, retry once with same
+            #      tile grid (checkpoints restore completed tiles). ----
+            max_attempts = 2  # initial + one retry
+
+            for attempt_idx in range(max_attempts):
+                if attempt_idx > 0:
+                    gc.collect()
+                    log.info("  → Retrying KG %s (attempt %d/%d, tile checkpoints will restore completed tiles)",
+                             kg_code, attempt_idx + 1, max_attempts)
+                    progress.add_log("info",
+                                     f"Retry KG {kg_code} (attempt {attempt_idx + 1}/{max_attempts})",
+                                     kg_code)
+                    progress.save()
+
+                # _OneShotPool, not multiprocessing.Pool(1): Pool's worker
+                # respawn + PDEATHSIG deadlocked terminate() after every
+                # OOM-killed worker (12 h stuck-kg restarts, Oct 2026).
+                pool = _OneShotPool(
+                    processes=1, initializer=_pool_worker_init)
+                _active_pool = pool
+                try:
+                    async_result = pool.apply_async(
+                        process_one_kg, args=(kg,),
+                        kwds={"include_copernicus": include_cop,
+                              "mark_uncertain": mark_uncertain,
+                              "source_gpkg": _v2_source_gpkg,
+                              "v1_doc": _v2_v1_doc,
+                              "fast_inputs": _v2_fast})
+                    # Snapshot the worker Process objects: if the worker is
+                    # SIGKILLed the Pool replaces it with a fresh idle one and
+                    # the pending task is lost forever (see PoolWorkerDied).
+                    _pool_workers = list(getattr(pool, '_pool', []) or [])
+                    try:
+                        _timeout = KG_TIMEOUT_SECONDS if attempt_idx == 0 else KG_RETRY_TIMEOUT_SECONDS
+                        # Poll with 5s slices so we can detect postpone signal
+                        _deadline = time.time() + _timeout
+                        _postponed = False
+                        while True:
+                            try:
+                                result = async_result.get(timeout=5)
+                                break  # success
+                            except multiprocessing.TimeoutError:
+                                if time.time() >= _deadline:
+                                    raise  # real timeout — handled below
+                                _died = _pool_worker_died(_pool_workers)
+                                if _died:
+                                    # One more short get(): the result may
+                                    # have landed in the same instant.
+                                    try:
+                                        result = async_result.get(timeout=2)
+                                        break
+                                    except multiprocessing.TimeoutError:
+                                        pass
+                                    raise PoolWorkerDied(
+                                        f"{_died}; {_cgroup_mem_evidence() or 'no cgroup evidence'}")
+                                # Check postpone signal
+                                if POSTPONE_SIGNAL_FILE.exists():
+                                    try:
+                                        _psig = json.loads(POSTPONE_SIGNAL_FILE.read_text())
+                                        if _psig.get("kg_code") == kg_code:
+                                            POSTPONE_SIGNAL_FILE.unlink(missing_ok=True)
+                                            _postponed = True
+                                            raise multiprocessing.TimeoutError("postponed")
+                                    except (json.JSONDecodeError, OSError):
+                                        pass
+                        if not _postponed:
+                            break  # success — exit retry loop
+                    except multiprocessing.TimeoutError:
+                        _step_monitor_stop.set()
+                        step_thread.join(timeout=3)
+                        # Read which step was in progress
+                        last_step = "unknown"
+                        try:
+                            sd = json.loads((DATA_DIR / "current_step.json").read_text())
+                            last_step = sd.get("step", "unknown")
+                        except Exception:
+                            pass
+                        _drain_pool(pool)
+
+                        if _postponed:
+                            # User-requested postpone — defer without fail count bump
+                            log.info("KG %s: POSTPONED by user at step %s — "
+                                     "re-queuing %d KGs later (tile checkpoints preserved)",
+                                     kg_code, last_step, DEFER_GAP)
+                            # Remove first so it moves to the end of the file
+                            _remove_from_retry_queue(kg_code)
+                            _append_retry_queue(kg_code)
+                            _publish_checkpoints_to_registry(kg_code, progress)
+                            _deferred_kg: dict = dict(kg)
+                            _deferred_kg["_defer_attempt"] = 0  # reset
+                            _append_deferred(_deferred_retries, 
+                                (i + DEFER_GAP, _deferred_kg, 0))
+                            progress.add_log(
+                                "info",
+                                f"KG {kg_code} postponed — "
+                                f"will retry in {DEFER_GAP} KGs",
+                                kg_code)
+                            progress.save()
+                            with progress._lock:
+                                _ckg = progress._state.get("current_kg") or {}
+                                _ts = _ckg.get("tile_statuses", [])
+                            _save_tile_history(kg_code, _ts, "postponed")
+                            result = None
+                            break
+
+                        if attempt_idx == 0:
+                            # First timeout — retry once
+                            log.warning("  → TIMEOUT after %d min at step %s — "
+                                        "will retry (tile checkpoints preserved)",
+                                        KG_TIMEOUT_SECONDS // 60, last_step)
+                        else:
+                            # Second timeout — check if transient
+                            _err_msg = f"timeout at {last_step} (after retry)"
+                            _defer_n = kg.get("_defer_attempt", 0)
+                            if _defer_n < 2 and _is_transient_error(
+                                    _err_msg, last_step, is_timeout=True):
+                                log.warning(
+                                    "KG %s: TIMEOUT at step %s — transient, "
+                                    "deferring %d KGs (attempt %d)",
+                                    kg_code, last_step, DEFER_GAP, _defer_n + 1)
+                                failure_counts[kg_code] = failure_counts.get(kg_code, 0) + 1
+                                _save_failure_counts(failure_counts)
+                                _append_retry_queue(kg_code)
+                                _publish_checkpoints_to_registry(kg_code, progress)
+                                _deferred: dict = dict(kg)
+                                _deferred["_defer_attempt"] = _defer_n + 1
+                                _append_deferred(_deferred_retries, 
+                                    (i + DEFER_GAP, _deferred, _defer_n + 1))
+                                progress.add_log(
+                                    "warning",
+                                    f"KG {kg_code} timeout at {last_step} — "
+                                    f"deferred retry in {DEFER_GAP} KGs",
+                                    kg_code)
+                                progress.save()
+                            else:
+                                _record_failure(
+                                    kg_code, failure_counts, failed_kgs,
+                                    progress, kg_name, _err_msg, last_step)
+                                progress.save()
+                            with progress._lock:
+                                _ckg = progress._state.get("current_kg") or {}
+                                _ts = _ckg.get("tile_statuses", [])
+                            _save_tile_history(kg_code, _ts, "failed")
+                            result = None
+                            break
+
+                        # Reset step monitor for next attempt
+                        _step_monitor_stop.clear()
+                        step_thread = threading.Thread(target=_monitor_step_file, daemon=True)
+                        step_thread.start()
+                        continue
+                    except Exception as pool_exc:
+                        # Worker died unexpectedly — likely OOM kill (SIGKILL)
+                        _step_monitor_stop.set()
+                        step_thread.join(timeout=3)
+                        last_step = "unknown"
+                        try:
+                            sd = json.loads((DATA_DIR / "current_step.json").read_text())
+                            last_step = sd.get("step", "unknown")
+                        except Exception:
+                            pass
+                        _drain_pool(pool)
+
+                        _err_msg = f"worker killed (OOM?) at {last_step}: {pool_exc}"
+                        log.error("KG %s: %s", kg_code, _err_msg)
+                        _record_failure(
+                            kg_code, failure_counts, failed_kgs,
+                            progress, kg_name, _err_msg, last_step)
+                        with progress._lock:
+                            _ckg = progress._state.get("current_kg") or {}
+                            _ts = _ckg.get("tile_statuses", [])
+                        _save_tile_history(kg_code, _ts, "failed")
+                        progress.save()
+                        result = None
+                        break
+                finally:
+                    # Always fully drain: close() + bounded join, escalate
+                    # to terminate()+SIGKILL if a worker is stuck. We must
+                    # not leave a worker holding GPKG SQLite handles when
+                    # we move on to the next KG (or exit).
+                    try:
+                        pool.close()
+                    except Exception:
+                        pass
+                    _joined = threading.Event()
+
+                    def _soft_join():
+                        try:
+                            pool.join()
+                        finally:
+                            _joined.set()
+                    _t = threading.Thread(target=_soft_join, daemon=True)
+                    _t.start()
+                    if not _joined.wait(timeout=15.0):
+                        log.warning("Pool soft-join timed out — escalating")
+                        _drain_pool(pool)
+                    _active_pool = None
+
+
+            # Stop step monitor
+            _step_monitor_stop.set()
+            step_thread.join(timeout=3)
+
+            if result is not None and result.get("v2_verify_degraded"):
+                # Fresh v2 KG whose v2 products failed the gate: it completes
+                # as legacy json (+ full GPKG) and stays upgrade-eligible.
+                # One strike so the upgrade path has exactly one more try
+                # before it stops re-dispatching a systematically bad code.
+                _n_strk = _record_v2_upgrade_failed(kg_code, str(result["v2_verify_degraded"]))
+                progress.add_log("warning",
+                                 f"v2verify: {kg_code} fresh FAIL — completed legacy-only, "
+                                 f"v2 products left to upgrade path (strike {_n_strk}/"
+                                 f"{V2_UPGRADE_MAX_STRIKES}) — {str(result['v2_verify_degraded'])[:160]}",
+                                 kg_code)
+
+            if kg.get("_v2_upgrade"):
+                # The downloaded GPKG is per-unit; never keep it around
+                # (multi-GB).  Verify failures strike the code so a
+                # systematically bad input is not re-tried forever.
+                _v2_release_inputs(kg)
+                if result is not None and result.get("v24_fast_declined"):
+                    # Inherited stitcher hole in the existing light GPKG: not a
+                    # strike — remember it so the next dispatch (director
+                    # re-dispatches on the unchanged manifest) takes the full
+                    # path from the full GPKG.
+                    _record_v24_fast_declined(kg_code, result["v24_fast_declined"])
+                    progress.add_log("warning",
+                                     f"v2up: {kg_code} fast declined → full path next: "
+                                     f"{str(result['v24_fast_declined'])[:160]}", kg_code)
+                elif result is not None and result.get("v2_verify_failed"):
+                    _n_strk = _record_v2_upgrade_failed(kg_code, result.get("error", "verify"))
+                    progress.add_log("warning",
+                                     f"v2up: {kg_code} verify FAILED (strike {_n_strk}/"
+                                     f"{V2_UPGRADE_MAX_STRIKES}) — {str(result.get('error', ''))[:160]}",
+                                     kg_code)
+
+            if result is None:
+                # All retries exhausted or permanent failure — already logged
+                pass
+            elif result.get("success"):
+                elapsed_kg = time.time() - t_kg
+
+                # --- Validate outputs ---
+                # Validation now runs in the subprocess (before early
+                # GPKG upload deletes files).  Here we only validate
+                # files that still exist on disk (light GPKG + JSON).
+                progress.set_step("validate")
+                progress.save()
+                _files_on_disk = {k: v for k, v in result["files"].items()
+                                  if v and os.path.exists(v)}
+                issues = validate_kg_outputs(kg_code, _files_on_disk)
+                if issues:
+                    for iss in issues:
+                        log.warning("KG %s VALIDATION: %s", kg_code, iss)
+                    progress.add_log("warning",
+                                     f"KG {kg_code}: {len(issues)} validation issue(s)",
+                                     kg_code)
+                else:
+                    log.info("KG %s: all outputs validated OK", kg_code)
+
+                # --- Log stats from JSON ---
+                json_path = result["files"].get("json", "")
+                if json_path and os.path.exists(json_path):
+                    log_kg_stats_from_json(kg_code, json_path, elapsed_kg)
+
+                # --- Upload to Zenodo ---
+                progress.set_step("upload")
+                progress.save()
+
+                def _upload_progress_cb(file_key, bytes_sent, total_bytes):
+                    """Write upload progress into current_kg for dashboard."""
+                    with progress._lock:
+                        ckg = progress._state.get("current_kg")
+                        if ckg:
+                            ckg["upload_progress"] = {
+                                "file": file_key,
+                                "sent": bytes_sent,
+                                "total": total_bytes,
+                            }
+                    progress.save()
+
+                # If the subprocess already streamed the full GPKG to
+                # Zenodo (to free disk), reload the manifest so we see
+                # the entry and don't try to re-upload a deleted file.
+                if (result.get("_full_gpkg_uploaded")
+                        or result.get("_light_gpkg_uploaded")
+                        or result.get("_json_uploaded")
+                        or result.get("_uploaded_keys")):
+                    manifest = Manifest(str(MANIFEST_PATH))
+                    log.info("KG %s: subprocess pre-uploaded product(s) — manifest reloaded",
+                             kg_code)
+
+                # Drop json from the parent's upload set when the subprocess
+                # already streamed it early (interruption-safe path). The
+                # file stays on disk for log_kg_stats_from_json above; we
+                # just don't re-upload it. full_gpkg is handled in the
+                # subprocess (it blanks result['files']['full_gpkg']).
+                _upload_files = result["files"]
+                if result.get("_json_uploaded"):
+                    _upload_files = {k: v for k, v in result["files"].items()
+                                     if k != "json"}
+                if result.get("_uploaded_keys"):
+                    _upload_files = {k: v for k, v in _upload_files.items()
+                                     if k not in set(result["_uploaded_keys"])}
+
+                upload_stats = upload_kg_to_zenodo(
+                    kg_code, kg_name, _upload_files, manifest,
+                    quality_score=result.get("quality_score", 0),
+                    quality_grade=result.get("quality_grade", ""),
+                    available_layers=result.get("available_layers"),
+                    missing_layers=result.get("missing_layers"),
+                    progress_callback=_upload_progress_cb,
+                    defects=result.get("product_defects"))
+
+                # Clear upload progress
+                with progress._lock:
+                    ckg = progress._state.get("current_kg")
+                    if ckg:
+                        ckg.pop("upload_progress", None)
+                progress.save()
+
+                if upload_stats["errors"]:
+                    for err in upload_stats["errors"]:
+                        log.warning("KG %s upload error: %s", kg_code, err)
+
+                # --- Detect transient Zenodo failures and re-queue ---
+                _zenodo_transient = False
+                _zenodo_reason = result.get("zenodo_reason", "")
+                for _err in upload_stats["errors"]:
+                    _r = _err.get("reason") or _classify_zenodo_error(_err.get("error", ""))
+                    if _is_transient_error(str(_err.get("error", "")), "upload") or _r in ("rate_limit", "auth", "server", "network"):
+                        _zenodo_transient = True
+                        # Prefer the most-global reason
+                        if _zenodo_reason != "rate_limit" and _r in ("rate_limit", "auth"):
+                            _zenodo_reason = _r
+                        elif not _zenodo_reason:
+                            _zenodo_reason = _r
+                if result.get("zenodo_failed") and not _zenodo_transient:
+                    _zenodo_transient = True
+                    if not _zenodo_reason:
+                        _zenodo_reason = "network"
+
+                if _zenodo_transient:
+                    _global = _zenodo_pause_is_global(_zenodo_reason)
+                    # Propagate max Retry-After if Zenodo gave one, so
+                    # the director can size the per-peer cooldown to
+                    # match exactly what the server asked for.
+                    _retry_after = 0.0
+                    for _e in upload_stats["errors"]:
+                        try:
+                            _retry_after = max(_retry_after,
+                                                float(_e.get("retry_after", 0) or 0))
+                        except Exception:
+                            pass
+                    log.warning("KG %s: Zenodo upload failure (reason=%s, global=%s, retry_after=%.0fs) \u2014 re-queuing",
+                                kg_code, _zenodo_reason, _global, _retry_after)
+                    progress.add_log("warning",
+                                     f"KG {kg_code}: Zenodo {_zenodo_reason} \u2014 re-queued",
+                                     kg_code)
+                    try:
+                        ZENODO_PAUSE_FILE.write_text(json.dumps({
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "kg": kg_code,
+                            "step": "upload",
+                            "reason": _zenodo_reason,
+                            "global": _global,
+                            "retry_after": _retry_after,
+                            "error": "; ".join(str(e.get('error', '')) for e in upload_stats["errors"]) or result.get("zenodo_error", ""),
+                        }))
+                    except Exception:
+                        pass
+                    _append_retry_queue(kg_code)
+                    # Publish tile checkpoints to the cross-peer Zenodo
+                    # registry so the NEXT peer that picks this KG up
+                    # resumes mid-KG instead of reprocessing every tile
+                    # from scratch. Without this, a transient Zenodo
+                    # upload failure after a fully-built KG (GPKGs + JSON
+                    # done, only the upload timed out) silently discarded
+                    # all the completed work (e.g. KG 63302, Jun 2026:
+                    # at91 finished json at 15:41 then re-queued, and
+                    # at37/at35 started tile 1/9 from zero). This is the
+                    # only re-queue site that was missing the publish call
+                    # — every other path (postpone/timeout/abort) already
+                    # publishes. The subprocess keeps the metadata pickles
+                    # on zenodo_failed (see the gpkg_full block), so they
+                    # are on disk and ready to upload here.
+                    _publish_checkpoints_to_registry(kg_code, progress)
+                    with progress._lock:
+                        _ckg = progress._state.get("current_kg") or {}
+                        _ts = _ckg.get("tile_statuses", [])
+                    _save_tile_history(kg_code, _ts, "postponed")
+                    # Skip record_success path; fall through so the
+                    # post-iteration pause check picks up the flag file.
+
+                # Subprocess flagged early-upload failure but parent succeeded:
+                # clear the pause file (Zenodo recovered).
+                if result.get("zenodo_failed") and not upload_stats["errors"]:
+                    try:
+                        if ZENODO_PAUSE_FILE.exists():
+                            ZENODO_PAUSE_FILE.unlink()
+                            log.info("Zenodo upload recovered \u2014 cleared pause file")
+                    except Exception:
+                        pass
+
+                # --- v2.4 parent-side legacy sweep (idempotent fallback) ---
+                # The subprocess normally strips/removes legacy files right
+                # after its own upload chain; if it died, or the parent had
+                # to finish the uploads, do it here — still strictly AFTER
+                # every v2.4 product is on Zenodo and verified (the manifest
+                # gate inside remove_legacy_products re-checks this).
+                if not _zenodo_transient and not upload_stats["errors"] and MODEL_VERSION == "v2" \
+                        and not (result.get("legacy_cleanup") or {}).get("json_strip") \
+                        and not (result.get("legacy_cleanup") or {}).get("light_remove"):
+                    try:
+                        manifest = Manifest(str(MANIFEST_PATH))
+                        _lc = remove_legacy_products(kg_code, v1_doc=_v2_v1_doc, manifest=manifest)
+                        if _lc.get("json_strip") or _lc.get("light_remove"):
+                            progress.add_log("info", f"legacy: {kg_code} {_lc}", kg_code)
+                            log.info("KG %s: parent legacy sweep: %s", kg_code, _lc)
+                    except Exception as _le:  # noqa: BLE001
+                        log.warning("KG %s: parent legacy sweep failed: %s", kg_code, _le)
+                if not _zenodo_transient:
+                    progress.record_success(
+                        parcels=result.get("n_parcels", 0),
+                        buildings=result.get("n_buildings", 0),
+                        upload_bytes=upload_stats["total_bytes"],
+                        last_kg_code=kg_code,
+                        last_kg_name=kg_name,
+                        last_kg_seconds=elapsed_kg,
+                        n_new_buildings=result.get("n_new_buildings", 0),
+                        n_infrastructure=result.get("n_infrastructure", 0),
+                    )
+                    _qg = result.get('quality_grade', '')
+                    _qs = result.get('quality_score', 0)
+                    if kg.get("_v2_upgrade"):
+                        with progress._lock:
+                            progress._state["v2_upgraded"] = int(progress._state.get("v2_upgraded", 0)) + 1
+                            if result.get("v24_fast"):
+                                progress._state["v2_fast"] = int(progress._state.get("v2_fast", 0)) + 1
+                        _v2s = (result.get("v2_verify") or {}).get("summary", "")
+                        progress.add_log(
+                            "success",
+                            f"v2up: KG {kg_code} upgraded to v2 in {elapsed_kg:.0f}s "
+                            f"({result.get('n_segments', 0)} segs, {_v2s})"
+                            + (" (fast)" if result.get("v24_fast") else ""),
+                            kg_code)
+                    else:
+                        progress.add_log(
+                            "success",
+                            f"KG {kg_code} done in {elapsed_kg:.0f}s "
+                            f"({result.get('n_segments', 0)} segs, "
+                            f"{result.get('n_parcels', 0)} par, "
+                            f"{result.get('n_buildings', 0)} bldg, "
+                            f"quality={_qs:.0%} {_qg})",
+                            kg_code,
+                        )
+                    # Persist tile dots for completed KG
+                    with progress._lock:
+                        _ckg = progress._state.get("current_kg") or {}
+                        _ts = _ckg.get("tile_statuses", [])
+                    _save_tile_history(kg_code, _ts, "completed")
+
+                    # Phase 2: KG done — evict its bundle from the shared
+                    # Zenodo checkpoint registry. Best-effort, parent-side
+                    # so the network round-trip never blocks the next KG.
+                    # Run in a background thread (Zenodo DELETE can take
+                    # multiple seconds + acquires the fleet lock) and
+                    # surface the outcome as one INFO line in the merged
+                    # log so we can audit eviction fleet-wide tomorrow.
+                    try:
+                        import threading as _th_del
+                        def _bg_del(_kg=kg_code, _pr=progress):
+                            try:
+                                import tile_checkpoint_registry as _ckpt_reg
+                                ok = _ckpt_reg.delete_kg(_kg)
+                                _pr.add_log(
+                                    "info" if ok else "warning",
+                                    ("chkpt: deleted " + _kg +
+                                     " tile-tar from Zenodo") if ok
+                                    else ("chkpt: delete of " + _kg +
+                                          " tile-tar from Zenodo failed"),
+                                    _kg)
+                            except Exception:
+                                pass
+                        _t_del = _th_del.Thread(target=_bg_del,
+                                                name=f"chkpt_del_{kg_code}",
+                                                daemon=True)
+                        _t_del.start()
+                        _BG_ZENODO_THREADS.append(_t_del)
+                    except Exception:
+                        pass
+
+                    # --- Persistent partial-KG marker ---
+                    # If any tile failed upstream (BEV outage, ortho 5xx, etc.)
+                    # the KG still completed with degraded coverage.  Record
+                    # this in partial_kgs.json so the dashboard can flag it
+                    # and the operator can re-queue with one click.
+                    _n_up = int(result.get("n_upstream_failed_tiles", 0) or 0)
+                    if _n_up > 0:
+                        try:
+                            _record_partial_kg(
+                                kg_code, kg_name,
+                                quality_score=_qs,
+                                quality_grade=_qg,
+                                n_upstream_failed_tiles=_n_up,
+                                upstream_failed_tiles=result.get("upstream_failed_tiles", []),
+                                missing_layers=result.get("missing_layers", []),
+                                elapsed_s=elapsed_kg,
+                            )
+                            progress.add_log(
+                                "warning",
+                                f"KG {kg_code}: PARTIAL ({_n_up} tile(s) upstream-failed; "
+                                f"quality={_qs:.0%} {_qg}) — logged to partial_kgs.json",
+                                kg_code,
+                            )
+                        except Exception as _e:
+                            log.warning("KG %s: failed to record partial: %s", kg_code, _e)
+                    else:
+                        # Clean prior partial marker if this run was clean.
+                        try:
+                            _clear_partial_kg(kg_code)
+                        except Exception:
+                            pass
+
+                    # Remove from priority queue file now that it's done
+                    _remove_from_retry_queue(kg_code)
+
+                    # Clear any tombstone entries so the dashboard stops showing
+                    # this KG as pending reprocessing.
+                    _clear_tombstones(kg_code)
+
+                    # Reset adaptive-split strike counter on success.
+                    # For a block: clear the BLOCK's own strikes always,
+                    # but the PARENT's only once every sibling block is
+                    # complete — clearing early would collapse the split
+                    # (maybe_split_kg reverts to 1 block for strike-driven
+                    # splits) while siblings are still pending, so a
+                    # parent-code requeue in that window would re-run the
+                    # oversize whole KG. (The runtime oversize guard would
+                    # catch it again, but don't rely on the backstop.)
+                    try:
+                        from kg_splitter import (clear_strikes,
+                                                 clear_single_strike,
+                                                 parent_kg_code,
+                                                 is_block_code)
+                        if is_block_code(kg_code):
+                            _sp = parent_kg_code(kg_code)
+                            _parent_kg_d = next(
+                                (k for k in kgs if k["kg_code"] == _sp), None)
+                            _done_now = completed_codes | {kg_code}
+                            _sibs = ([b["kg_code"] for b
+                                      in maybe_split_kg(_parent_kg_d)]
+                                     if _parent_kg_d is not None else [])
+                            if _sibs and all(b in _done_now for b in _sibs):
+                                clear_strikes(_sp)  # drops block keys too
+                            else:
+                                clear_single_strike(kg_code)
+                        else:
+                            clear_strikes(kg_code)
+                    except Exception:
+                        pass
+
+                    # Proactively flush tile cache to Zenodo so tiles
+                    # survive disk cleanup between KGs.
+                    flush_tile_cache_to_zenodo()
+            elif (result.get("v2_verify_failed") or result.get("v24_fast_declined")
+                    or result.get("step") == "aborted_v2_unavailable"):
+                # v2 upgrade gate tripped: nothing was uploaded, the code was
+                # struck in v2_upgrade_failed.json above.  This is NOT a v1
+                # failure — never touch failed_kgs / failure_counts.  Drop it
+                # from the whitelist so the peer moves on; the director
+                # re-dispatches (or not) based on the strike file.
+                log.warning("KG %s: v2 upgrade not completed — %s", kg_code,
+                            str(result.get("error", ""))[:200])
+                _remove_from_retry_queue(kg_code)
+                with progress._lock:
+                    _ckg = progress._state.get("current_kg") or {}
+                    _ts = _ckg.get("tile_statuses", [])
+                _save_tile_history(kg_code, _ts, "v2_verify_failed")
+            else:
+                # --- Copernicus credits exhausted? Don't mark as permanently failed ---
+                is_credits_issue = (result.get("copernicus_exhausted")
+                                    or '402' in str(result.get("error", ""))
+                                    or 'PaymentRequired' in str(result.get("error", "")))
+                is_cop_batch_failure = result.get("copernicus_failed", False)
+                is_lidar_failure = result.get("lidar_failed", False)
+                is_ortho_failure = result.get("ortho_failed", False)
+                is_cadastre_failure = result.get("cadastre_failed", False)
+                is_context_failure = result.get("context_failed", False)
+                is_cache_incomplete = result.get("cache_incomplete", False)
+                is_disk_low = result.get("disk_low", False)
+                is_needs_split = result.get("needs_split", False)
+                if is_needs_split:
+                    # Runtime grid (post-cadastre-expansion) exceeded the
+                    # oversize limit — the subprocess aborted before the
+                    # tile loop and forced the strike counter to the split
+                    # threshold. Split NOW and insert the blocks right
+                    # after the current queue position so this peer keeps
+                    # working the same KG (as blocks) without a director
+                    # round-trip. Push the strike file to the director so
+                    # any future dispatch of the parent (by any peer)
+                    # expands into blocks too. Copernicus / Hansen / WC
+                    # tiles are reused via the geographic 0.1° tile_cache
+                    # + Zenodo cache — no upstream cost is repeated.
+                    _n_rt = result.get("n_tiles_runtime", "?")
+                    log.warning("KG %s: runtime oversize (%s tiles) — "
+                                "splitting into blocks", kg_code, _n_rt)
+                    _push_strikes_to_director()
+                    _split_blocks = maybe_split_kg(kg)
+                    if len(_split_blocks) <= 1:
+                        # Defensive: force_split should have guaranteed a
+                        # split; if not, defer like a transient failure so
+                        # we never tight-loop start→abort→start.
+                        log.error("KG %s: needs_split but splitter returned "
+                                  "%d block(s) — deferring",
+                                  kg_code, len(_split_blocks))
+                        _defer_n = kg.get("_defer_attempt", 0)
+                        _deferred = dict(kg)
+                        _deferred["_defer_attempt"] = _defer_n + 1
+                        _append_deferred(_deferred_retries,
+                                         (i + DEFER_GAP, _deferred, _defer_n + 1))
+                    else:
+                        _ins = 0
+                        for _blk in _split_blocks:
+                            _bc = _blk["kg_code"]
+                            if (_bc in completed_codes or _bc in failed_kgs
+                                    or any(p.get("kg_code") == _bc
+                                           for p in pending[i + 1:])):
+                                continue
+                            _blk = dict(_blk)
+                            _blk["_defer_attempt"] = 0
+                            pending.insert(i + 1 + _ins, _blk)
+                            _ins += 1
+                        progress.add_log(
+                            "warning",
+                            f"KG {kg_code}: runtime grid too large "
+                            f"({_n_rt} tiles) — split into "
+                            f"{len(_split_blocks)} blocks, "
+                            f"{_ins} queued here",
+                            kg_code)
+                        log.info("KG %s: split into %d blocks, %d inserted "
+                                 "into local queue", kg_code,
+                                 len(_split_blocks), _ins)
+                    # Parent code must leave the priority queue — the
+                    # blocks replace it. (Director-side GET-prune keeps
+                    # coverage-incomplete parents; the strike sync makes
+                    # any re-dispatch expand to blocks, so no orphan.)
+                    _remove_from_retry_queue(kg_code)
+                    progress.save()
+                elif is_disk_low:
+                    # This peer ran out of disk before/while building the
+                    # GPKG. Every tile pickle is on disk — publish them to
+                    # the shared Zenodo registry and defer so a disk-healthy
+                    # peer can restore + resume at the GPKG build instead of
+                    # re-fetching every tile. Not a permanent failure.
+                    log.warning("KG %s: disk low — deferring for cross-peer "
+                                "handoff (tile checkpoints preserved)", kg_code)
+                    progress.add_log("warning",
+                                     f"KG {kg_code}: disk critically low — "
+                                     f"deferred for handoff (checkpoints kept)",
+                                     kg_code)
+                    # A disk-low abort is soft evidence the KG's working
+                    # set exceeds peer capacity. Bump a strike and push to
+                    # the director's authoritative file: after the second
+                    # handoff (on any peer) the adaptive splitter kicks in
+                    # and the KG is re-dispatched as blocks. Blocks skip
+                    # this for their parent — a block that still overruns
+                    # disk accrues strikes under its own block code.
+                    try:
+                        from kg_splitter import bump_strike as _bs
+                        _n_str = _bs(str(kg_code))
+                        log.info("KG %s: disk-low strike %d recorded",
+                                 kg_code, _n_str)
+                        _push_strikes_to_director()
+                    except Exception as _bs_e:
+                        log.warning("KG %s: disk-low strike bump failed: %s",
+                                    kg_code, _bs_e)
+                    _append_retry_queue(kg_code)
+                    _publish_checkpoints_to_registry(kg_code, progress)
+                    with progress._lock:
+                        _ckg = progress._state.get("current_kg") or {}
+                        _ts = _ckg.get("tile_statuses", [])
+                    _save_tile_history(kg_code, _ts, "postponed")
+                    _defer_n = kg.get("_defer_attempt", 0)
+                    _remove_from_retry_queue(kg_code)
+                    _append_retry_queue(kg_code)
+                    _deferred = dict(kg)
+                    _deferred["_defer_attempt"] = _defer_n + 1
+                    _append_deferred(_deferred_retries,
+                                     (i + DEFER_GAP, _deferred, _defer_n + 1))
+                elif is_cache_incomplete:
+                    # Cache-only peer hit a missing tile.  The KG must be
+                    # processed by the frontier (primary) peer, which has
+                    # Copernicus credentials.  Re-queue without marking
+                    # as failed; do NOT defer locally — the director will
+                    # exclude this KG from cache-only peers.
+                    log.info("KG %s: cache miss in cache-only mode — "
+                             "re-queueing for the frontier peer", kg_code)
+                    progress.add_log("info",
+                                     f"KG {kg_code}: cache miss — deferred to frontier",
+                                     kg_code)
+                    _append_retry_queue(kg_code)
+                    # Tell the director (primary) to exclude this KG
+                    # from cache-only whitelists until the relevant
+                    # Zenodo cache strip updates. Avoids hammering the
+                    # APIs by re-running KGs we already know we can't
+                    # complete in cache-only mode.
+                    try:
+                        import pathlib as _pl
+                        import socket as _sock
+                        _director_url = (os.environ.get('ZENODO_LOCK_URL', '').strip()
+                                         or 'http://127.0.0.1:8000')
+                        _admin_tok = ''
+                        try:
+                            _admin_tok = _pl.Path('data/admin_token').read_text().strip()
+                        except Exception:
+                            pass
+                        _payload = {
+                            'kg_code': str(kg_code),
+                            'peer_id': os.environ.get('INSTANCE_ID', _sock.gethostname()),
+                            'bbox': kg.get('bbox'),
+                            'tile_info': str(result.get('step', '')),
+                        }
+                        _headers = {'Content-Type': 'application/json'}
+                        if _admin_tok:
+                            _headers['X-Admin-Token'] = _admin_tok
+                        _r = requests.post(
+                            _director_url.rstrip('/') + '/api/v1/processing/cache_misses',
+                            json=_payload, headers=_headers, timeout=10,
+                        )
+                        if not _r.ok:
+                            log.debug('cache_miss POST status=%s body=%s',
+                                      _r.status_code, _r.text[:200])
+                    except Exception as _e:
+                        log.debug('cache_miss POST failed: %s', _e)
+                elif is_lidar_failure or is_ortho_failure:
+                    _what = "LiDAR" if is_lidar_failure else "ortho"
+                    log.warning("KG %s: %s fetch exhausted — deferring for retry",
+                                kg_code, _what)
+                    progress.add_log("warning",
+                                     f"KG {kg_code}: {_what} upstream exhausted — "
+                                     f"deferred retry (tile checkpoints preserved)",
+                                     kg_code)
+                    _append_retry_queue(kg_code)
+                    log.info("KG %s: added to retry queue (checkpoints preserved)", kg_code)
+                    _publish_checkpoints_to_registry(kg_code, progress)
+                    with progress._lock:
+                        _ckg = progress._state.get("current_kg") or {}
+                        _ts = _ckg.get("tile_statuses", [])
+                    _save_tile_history(kg_code, _ts, "postponed")
+                    _defer_n = kg.get("_defer_attempt", 0)
+                    _remove_from_retry_queue(kg_code)
+                    _append_retry_queue(kg_code)
+                    _deferred: dict = dict(kg)
+                    _deferred["_defer_attempt"] = _defer_n + 1
+                    _append_deferred(_deferred_retries,
+                                     (i + DEFER_GAP, _deferred, _defer_n + 1))
+                    progress.add_log(
+                        "warning",
+                        f"KG {kg_code}: {_what} upstream exhausted — "
+                        f"deferred retry in {DEFER_GAP} KGs",
+                        kg_code,
+                    )
+                elif is_cadastre_failure or is_context_failure:
+                    # cadastre-process-api / umfeld OSM geometry was
+                    # overloaded/unreachable even after in-fetch retries.
+                    # Cadastre is step 1 (no checkpoints yet); the OSM
+                    # context is built on the first non-restored tile
+                    # (restored checkpoints are kept) — defer and come back
+                    # once umfeld recovers, rather than emit a KG on an
+                    # empty road/rail/water context.
+                    _what = "v2 context upstream (umfeld OSM / INVEKOS)" if is_context_failure else "cadastre API"
+                    log.warning("KG %s: %s unavailable — deferring for retry", kg_code, _what)
+                    progress.add_log("warning",
+                                     f"KG {kg_code}: {_what} unavailable (umfeld restart?) — "
+                                     f"deferred retry",
+                                     kg_code)
+                    if is_context_failure:
+                        _publish_checkpoints_to_registry(kg_code, progress)
+                    _append_retry_queue(kg_code)
+                    _defer_n = kg.get("_defer_attempt", 0)
+                    _deferred = dict(kg)
+                    _deferred["_defer_attempt"] = _defer_n + 1
+                    _append_deferred(_deferred_retries,
+                                     (i + DEFER_GAP, _deferred, _defer_n + 1))
+                elif is_cop_batch_failure:
+                    log.warning("KG %s: Copernicus batch/server failure — deferring for retry", kg_code)
+                    progress.add_log("warning",
+                                     f"KG {kg_code}: Copernicus batch failure — deferred retry",
+                                     kg_code)
+                    _append_retry_queue(kg_code)
+                    log.info("KG %s: added to retry queue (checkpoints preserved)", kg_code)
+                    _publish_checkpoints_to_registry(kg_code, progress)
+                    # Save tile history for dashboard
+                    with progress._lock:
+                        _ckg = progress._state.get("current_kg") or {}
+                        _ts = _ckg.get("tile_statuses", [])
+                    _save_tile_history(kg_code, _ts, "postponed")
+                    # Use deferred retry — process other KGs first, then come back
+                    _defer_n = kg.get("_defer_attempt", 0)
+                    if _defer_n < 2:
+                        _deferred = dict(kg)
+                        _deferred["_defer_attempt"] = _defer_n + 1
+                        _append_deferred(_deferred_retries, 
+                            (i + DEFER_GAP, _deferred, _defer_n + 1))
+                elif is_credits_issue:
+                    log.warning("KG %s: Copernicus credits issue — will retry after credits restored", kg_code)
+                    progress.add_log("warning",
+                                     f"KG {kg_code}: credits exhausted — not marking failed",
+                                     kg_code)
+                    # Re-queue for retry after pause ends (tile checkpoints preserved)
+                    _append_retry_queue(kg_code)
+                    log.info("KG %s: added to retry queue (checkpoints preserved)", kg_code)
+                    _publish_checkpoints_to_registry(kg_code, progress)
+                else:
+                    _err = result.get("error", "unknown")
+                    _stp = result.get("step", "unknown")
+                    _defer_n = kg.get("_defer_attempt", 0)
+                    if _defer_n < 2 and _is_transient_error(_err, _stp):
+                        log.warning(
+                            "KG %s: transient error at %s — deferring "
+                            "%d KGs (attempt %d): %s",
+                            kg_code, _stp, DEFER_GAP, _defer_n + 1, _err)
+                        failure_counts[kg_code] = failure_counts.get(kg_code, 0) + 1
+                        _save_failure_counts(failure_counts)
+                        _append_retry_queue(kg_code)
+                        _deferred = dict(kg)
+                        _deferred["_defer_attempt"] = _defer_n + 1
+                        _append_deferred(_deferred_retries, 
+                            (i + DEFER_GAP, _deferred, _defer_n + 1))
+                        progress.add_log(
+                            "warning",
+                            f"KG {kg_code} error at {_stp} — "
+                            f"deferred retry in {DEFER_GAP} KGs: {_err}",
+                            kg_code)
+                    else:
+                        _record_failure(
+                            kg_code, failure_counts, failed_kgs,
+                            progress, kg_name, _err, _stp)
+                        # Record failure in manifest for retry tracking
+                        from zenodo_client import Entry
+                        manifest.set(f"{kg_code}_error", Entry(
+                            key=f"{kg_code}_error",
+                            depo_id=0, bucket_url="", filename="",
+                            size=0, checksum="",
+                            uploaded_at=datetime.now(timezone.utc).isoformat(),
+                            version=json.dumps({
+                                "error": _err,
+                                "step": _stp,
+                                "traceback": result.get("traceback", "")[:500],
+                            }),
+                        ))
+                        manifest.save()
+                    # Persist tile dots for failed KG
+                    with progress._lock:
+                        _ckg = progress._state.get("current_kg") or {}
+                        _ts = _ckg.get("tile_statuses", [])
+                    _save_tile_history(kg_code, _ts, "failed")
+
+        except Exception as e:
+            _err_str = str(e)
+            _defer_n = kg.get("_defer_attempt", 0)
+            if _defer_n < 2 and _is_transient_error(_err_str, "exception"):
+                log.warning(
+                    "KG %s: transient exception — deferring %d KGs "
+                    "(attempt %d): %s",
+                    kg_code, DEFER_GAP, _defer_n + 1, _err_str)
+                failure_counts[kg_code] = failure_counts.get(kg_code, 0) + 1
+                _save_failure_counts(failure_counts)
+                _append_retry_queue(kg_code)
+                _deferred = dict(kg)
+                _deferred["_defer_attempt"] = _defer_n + 1
+                _append_deferred(_deferred_retries, 
+                    (i + DEFER_GAP, _deferred, _defer_n + 1))
+                progress.add_log(
+                    "warning",
+                    f"KG {kg_code} exception — deferred retry in "
+                    f"{DEFER_GAP} KGs: {_err_str}",
+                    kg_code)
+            else:
+                _record_failure(
+                    kg_code, failure_counts, failed_kgs,
+                    progress, kg_name, _err_str, "exception")
+            log.error("KG %s: EXCEPTION: %s", kg_code, traceback.format_exc())
+            # Persist tile dots for exceptioned KG
+            with progress._lock:
+                _ckg = progress._state.get("current_kg") or {}
+                _ts = _ckg.get("tile_statuses", [])
+            _save_tile_history(kg_code, _ts, "failed")
+
+        # Cleanup
+        if IN_PROGRESS_FILE.exists():
+            IN_PROGRESS_FILE.unlink()
+
+        progress.update_rates(t_start)
+        progress.update_system_metrics()
+        progress.save()
+        cleanup_json_dir()
+        cleanup_ne_dir()
+
+        gc.collect()
+
+        # Explicitly free large subprocess data
+        del result
+        gc.collect()
+
+        # --- Copernicus pause: auto-probe every 15 min instead of just waiting ---
+        if COPERNICUS_PAUSE_FILE.exists():
+            log.warning("⏸ Copernicus credits exhausted — PAUSING.")
+            progress.update(state="paused_copernicus")
+            progress.add_log("warning",
+                             "Paused: Copernicus credits exhausted. "
+                             "Will auto-probe every 15 min or delete pause file to resume.", "")
+            progress.save()
+
+            # Try credential rotation first
+            try:
+                import copernicus
+                if copernicus.rotate_credentials():
+                    log.info("Rotated to next Copernicus credential set")
+            except Exception:
+                pass
+
+            probe_count = 0
+            while COPERNICUS_PAUSE_FILE.exists():
+                probe_count += 1
+                # Re-save so the time-windowed warning_rates in
+                # progress.json keep decaying while we sleep. Without
+                # this the frozen snapshot taken at pause time (e.g.
+                # copernicus 5m=1.0) is forwarded to the director
+                # forever, pinning the fleet capacity_factor at the
+                # throttle floor (~0.2) for hours after the underlying
+                # 402 storm has stopped — the brake can never self-clear.
+                progress.save()
+                time.sleep(900)  # 15 min
+                if _shutdown_requested:
+                    break
+                log.info("Credits paused — probe #%d: testing Copernicus...", probe_count)
+                if _copernicus_probe():
+                    log.info("Credits restored! Removing pause file and resuming.")
+                    try:
+                        COPERNICUS_PAUSE_FILE.unlink()
+                    except Exception:
+                        pass
+                    break
+                else:
+                    log.info("Still no credits — will retry in 15 min")
+                    # Try rotating to another credential on each probe
+                    try:
+                        import copernicus
+                        copernicus.rotate_credentials()
+                    except Exception:
+                        pass
+
+            # Reset copernicus module for fresh connections
+            try:
+                import copernicus
+                copernicus.credits_exhausted = False
+                copernicus._connection = None
+                for k in list(copernicus._connections.keys()):
+                    copernicus._connections.pop(k, None)
+            except Exception:
+                pass
+            log.info("▶ Copernicus resumed.")
+            progress.update(state="running")
+            progress.add_log("info", "Resumed after Copernicus pause", "")
+            progress.save()
+
+        # --- Zenodo pause: probe periodically, switch peers if local-only ---
+        if ZENODO_PAUSE_FILE.exists():
+            try:
+                _zinfo = json.loads(ZENODO_PAUSE_FILE.read_text())
+            except Exception:
+                _zinfo = {"reason": "network"}
+            _reason = _zinfo.get("reason", "network")
+            _is_global = bool(_zinfo.get("global")) or _zenodo_pause_is_global(_reason)
+            log.warning("⏸  Zenodo pause active (reason=%s, global=%s)",
+                        _reason, _is_global)
+            progress.update(state="paused_zenodo")
+            progress.add_log("warning",
+                             f"Paused: Zenodo {_reason}. "
+                             + ("Token-wide \u2014 all peers blocked."
+                                if _is_global else
+                                "Local network \u2014 director should switch peer."),
+                             "")
+            progress.save()
+
+            probe_count = 0
+            while ZENODO_PAUSE_FILE.exists():
+                probe_count += 1
+                # Network = peer-side issue: probe more often (2 min)
+                # so the director can switch faster.
+                # Rate-limit / auth = global: probe every 10 min.
+                # Re-save first so the time-windowed warning_rates keep
+                # decaying while we sleep (see the Copernicus pause loop
+                # above) — otherwise a frozen zenodo rate pins the fleet
+                # throttle long after the rate-limit storm has passed.
+                progress.save()
+                _wait = 600 if _is_global else 120
+                time.sleep(_wait)
+                if _shutdown_requested:
+                    break
+                ok, why = _zenodo_probe()
+                log.info("Zenodo paused \u2014 probe #%d: %s (%s)",
+                         probe_count, "OK" if ok else "failed", why)
+                if ok:
+                    log.info("▶ Zenodo recovered. Removing pause file.")
+                    try:
+                        ZENODO_PAUSE_FILE.unlink()
+                    except Exception:
+                        pass
+                    break
+                # Update reason if it changed (e.g. network → rate_limit)
+                if why and why != _reason:
+                    _reason = why
+                    _is_global = _zenodo_pause_is_global(_reason)
+                    try:
+                        _zinfo["reason"] = _reason
+                        _zinfo["global"] = _is_global
+                        _zinfo["last_probe"] = datetime.now(timezone.utc).isoformat()
+                        ZENODO_PAUSE_FILE.write_text(json.dumps(_zinfo))
+                    except Exception:
+                        pass
+            progress.update(state="running")
+            progress.add_log("info", "Resumed after Zenodo pause", "")
+            progress.save()
+
+        if (i + 1) % 10 == 0:
+            elapsed = time.time() - t_start
+            s = progress.get()
+            log.info("Progress: %d/%d done (%d success, %d fail), "
+                     "%.1f KGs/hr, ETA %.1fh",
+                     s["completed"], s["total_kgs"],
+                     s["success"], s["failed"],
+                     s["rate_kgs_per_hour"],
+                     s["eta_seconds"] / 3600 if s["eta_seconds"] else 0)
+
+        # --- Check file-based retry queue for NEW additions ---
+        # The file is no longer cleared on read; we track known codes to
+        # detect new entries added by the API while the processor runs.
+        _insert_offset = 0
+        _rq_manifest = None
+        for rq_code in _read_retry_queue():
+            if rq_code in _known_queue_codes:
+                continue  # already injected this one
+            if rq_code == kg_code:
+                _known_queue_codes.add(rq_code)
+                continue  # just processed this one
+            # --- v2 upgrade mode: completed codes arriving mid-run are
+            # upgrade units, not fresh work.  Before 2026-10-04 they were
+            # dropped by the ``_already`` guard below (completed_codes), so
+            # a director re-push never added units: the peer ran its
+            # startup slice, went COMPLETE and had to be restarted per
+            # unit — untenable at the v2.4 fast-path cadence (minutes/KG).
+            if v2_upgrade and rq_code in completed_codes and rq_code not in failed_kgs \
+                    and not any(d[1]["kg_code"] == rq_code for d in _deferred_retries) \
+                    and not any(p.get("kg_code") == rq_code for p in pending[i + 1:]):
+                try:
+                    if _rq_manifest is None:
+                        _rq_manifest = Manifest(str(MANIFEST_PATH))
+                    _units = _v2_upgrade_units([rq_code], _rq_manifest, _kg_index)
+                except Exception as _ue:  # noqa: BLE001
+                    log.debug("v2 unit injection %s: %s", rq_code, _ue)
+                    _units = []
+                if _units:
+                    _u = _units[0]
+                    _u["_defer_attempt"] = 0
+                    pending.insert(i + 1 + _insert_offset, _u)
+                    _insert_offset += 1
+                    log.info("\u21bb v2 upgrade unit %s injected mid-run at queue pos %d",
+                             rq_code, _insert_offset)
+                _known_queue_codes.add(rq_code)
+                continue
+            # Only inject if not already in deferred list or pending
+            _already = (rq_code in failed_kgs
+                        or rq_code in completed_codes
+                        or any(d[1]["kg_code"] == rq_code
+                               for d in _deferred_retries)
+                        or any(p["kg_code"] == rq_code
+                               for p in pending[i+1:i+DEFER_GAP+2+_insert_offset]))
+            if _already:
+                _known_queue_codes.add(rq_code)
+                continue
+            # Resolve the KG dict (handle both parent codes and block
+            # codes the director may push for cache-only / split-aware
+            # distribution).
+            if is_block_code(rq_code):
+                _parent = parent_kg_code(rq_code)
+                _parent_kg = next((k for k in kgs if k["kg_code"] == _parent), None)
+                if _parent_kg:
+                    _blocks = maybe_split_kg(_parent_kg)
+                    rq_kg = next((b for b in _blocks if b["kg_code"] == rq_code), None)
+                else:
+                    rq_kg = None
+            else:
+                rq_kg = next((k for k in kgs if k["kg_code"] == rq_code), None)
+                # Split-aware injection: a parent code pushed mid-run
+                # (director requeue after a stuck-kg restart, disk-low
+                # handoff, operator re-queue) bypasses the startup block
+                # expansion — so honour maybe_split_kg here too. Without
+                # this, even a parent with enough strikes to split is
+                # re-run whole when it arrives via the retry queue (the
+                # exact path oversize KGs like 91017 always take).
+                if rq_kg is not None:
+                    _rq_blocks = maybe_split_kg(rq_kg)
+                    if len(_rq_blocks) > 1:
+                        _n_ins = 0
+                        for _blk in _rq_blocks:
+                            _bc = _blk["kg_code"]
+                            if (_bc in completed_codes or _bc in failed_kgs
+                                    or any(p.get("kg_code") == _bc
+                                           for p in pending[i + 1:])):
+                                continue
+                            _blk = dict(_blk)
+                            _blk["_defer_attempt"] = 0
+                            pending.insert(i + 1 + _insert_offset, _blk)
+                            _insert_offset += 1
+                            _n_ins += 1
+                        _known_queue_codes.add(rq_code)
+                        failed_kgs.discard(rq_code)
+                        _save_failed_kgs(failed_kgs)
+                        log.info("↻ New priority: KG %s split into %d "
+                                 "blocks (%d inserted)",
+                                 rq_code, len(_rq_blocks), _n_ins)
+                        continue
+            if rq_kg:
+                rq_kg = dict(rq_kg)
+                rq_kg["_defer_attempt"] = 0
+                pending.insert(i + 1 + _insert_offset, rq_kg)
+                _insert_offset += 1
+                _known_queue_codes.add(rq_code)
+                # Also remove from failed sets so it actually runs
+                failed_kgs.discard(rq_code)
+                _save_failed_kgs(failed_kgs)
+                log.info("↻ New priority: KG %s inserted at queue pos %d",
+                         rq_code, _insert_offset)
+
+        i += 1
+
+    # Done
+    if _shutdown_requested:
+        # Let post-completion Zenodo side-effects (chkpt_delete holds a
+        # broker lease) finish before exit — a daemon thread killed
+        # mid-lease orphans the lease on the broker for ORPHAN_S.
+        _join_bg_zenodo_threads(60.0)
+        progress.update(state="stopped", current_kg=None)
+        log.info("Graceful shutdown complete.")
+    else:
+        progress.update(state="complete", current_kg=None)
+    progress.save()
+
+    elapsed = time.time() - t_start
+    s = progress.get()
+    log.info("=" * 70)
+    log.info("Processing %s: %d success, %d failed in %.1f hours",
+             "stopped" if _shutdown_requested else "complete",
+             s["success"], s["failed"], elapsed / 3600)
+    log.info("=" * 70)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1203 @@
+# Peer Director — Multi-Instance Orchestration
+
+**Read this section before touching peer_director.py, deploy.sh, or any director API endpoint.**
+
+#### Architecture: One Frontier + Many Cache-Only Peers
+
+The system uses a **single director** (the primary instance, `srtm-lidar-at`) to
+orchestrate processing across multiple exe.dev VMs. Each VM has 100 GB/month
+bandwidth.
+
+**Two roles**:
+- **Frontier** (one at a time): runs full processing including Copernicus + Hansen
+  fetches.  Touches the shared Copernicus credentials, so only one frontier
+  may run.  All credential rotation happens here.
+- **Cache-only** (many in parallel): processor started with `--cache-only` /
+  `COPERNICUS_FORBIDDEN=1`.  Refuses any Copernicus/Hansen API call — if a
+  tile isn't in the local + Zenodo cache, it raises `CacheMissError` and
+  the KG is re-queued for the frontier.  Peer is fed an explicit whitelist
+  of fully-cached KGs computed by the director.
+
+**Key invariants**:
+- exactly one frontier peer running at any time (credential safety)
+- up to `max_cache_only_peers` (default 8) cache-only peers running in parallel
+- at least `min_reserve_peers` (default 0 — was 5; with cheap unlimited
+  peers we no longer keep a reserve) enabled peers stay idle
+- all Zenodo writes (KG uploads + tile-cache flushes) serialise through a
+  single mutex broker on the primary (`/api/v1/zenodo/lock`)
+
+```
+┌─────────────────────────────────────────────────────┐
+│  PRIMARY (srtm-lidar-at)                            │
+│  ────────────────────────────────────                │
+│  • Runs the Peer Director loop (peer_director.py)    │
+│  • Has data/austria_processor/is_director flag        │
+│  • Monitors bandwidth via vnstat on all peers         │
+│  • Starts/stops processors on peers via REST API      │
+│  • Syncs priority queue to the active peer             │
+│  • Switches active peer when bandwidth < 2 GB         │
+│  • Hosts the search index + combined dashboard         │
+├─────────────────────────────────────────────────────┤
+│  PEER at2 (srtm-lidar-at2)                          │
+│  PEER at3 (srtm-lidar-at3)                          │
+│  ────────────────────────────────────                │
+│  • NO director loop (no is_director flag)             │
+│  • NO systemd autostart for austria_processor         │
+│  • Processor started/stopped ONLY by the director     │
+│  • Shares Zenodo tile-cache deposit with primary        │
+│  • Same codebase, same Copernicus credentials          │
+└─────────────────────────────────────────────────────┘
+```
+
+**Critical invariant**: Only the primary runs the director loop. Peers are
+passive workers. If a peer were to run its own director loop, it would
+start/stop processors in conflict with the primary. This is enforced by the
+`data/austria_processor/is_director` flag file (only exists on the primary).
+
+#### Cache-only peers (parallel processing)
+
+A peer started with `--cache-only` activates `tile_cache.FORBID_REMOTE`.
+All `_fetch_*_cell` methods on `CopernicusTileCache` and `HansenTileCache.get_raw`
+raise `CacheMissError` instead of calling the API.  The processor's tile loop
+catches it, sets `result['cache_incomplete']=True`, and aborts the KG.  The
+parent (`main()`) then re-queues the KG via `_append_retry_queue()` without
+marking it failed — the frontier peer will pick it up later.
+
+The director computes the cache-ready whitelist via `_compute_cache_ready_kgs()`:
+1. Read `cache_manifest.json` and intersect lat-strip availability across
+   `ndvi`, `sar`, `harmonics`, `worldcover`, `hansen` (cheap dict lookup).
+2. For each candidate KG (bbox falls inside a covered strip), call
+   `tile_cache.is_kg_fully_cached(bbox)` — walks per-cell index, no downloads.
+3. Cache result for 5 minutes; the cache extends as the frontier fetches more.
+
+When starting a cache-only peer, the director PUTs a slice of the whitelist
+as the peer's priority queue and starts the processor with `cache_only=True`.
+Different cache-only peers get different slices to reduce overlap.
+
+#### Zenodo upload mutex
+
+All Zenodo writes serialise through `/api/v1/zenodo/lock` on the primary:
+- `upload_kg_to_zenodo()` wraps the entire upload in `zenodo_upload_lock()`
+- `flush_tile_cache_to_zenodo()` wraps `ZenodoCache.upload_all()` similarly
+- Lease has TTL 120s; a daemon thread renews via `/heartbeat` every 30s
+- Stale leases (no heartbeat for >TTL) are auto-released
+- Peers point at the broker via env `ZENODO_LOCK_URL`, set from
+  `data/austria_processor/zenodo_lock_url.txt` (`deploy.sh` writes the
+  primary's URL there)
+- Primary uses `http://127.0.0.1:8000` automatically (set by app.py when
+  spawning the processor on a host with the `is_director` flag)
+- If the broker is unreachable, peers fail open (proceed without lease)
+  to avoid deadlocking the fleet on a network blip
+
+#### Per-peer config (`peers.json`)
+
+New/relevant fields:
+- `role: "frontier" | "cache_only"` — hint to the director.  If absent,
+  treated as frontier (the director may still borrow it for cache-only work
+  when the frontier is elsewhere).
+- `min_reserve_peers` (top-level) — default 5.  Director never starts a
+  cache-only peer if it would push the idle count below this.
+- `max_cache_only_peers` (top-level) — default 8.  Cap on concurrent
+  cache-only peers.
+
+#### How the Director Works
+
+`peer_director.py` (`PeerDirector` class) runs a background thread every 30s:
+
+1. **Re-reads `peers.json`** from disk (handles cross-worker/cross-process updates)
+2. **Polls bandwidth** on all peers via `GET /api/v1/bandwidth` (vnstat)
+3. **Checks active peer**:
+   - Budget exhausted (< 2 GB)? → Stop it, pick next peer with most bandwidth
+   - Scheduled (`not_before` in future)? → Skip it
+   - Stopped unexpectedly? → Restart it (if bandwidth remains)
+   - Unreachable? → Deactivate, pick another
+4. **Enforces single-active**: Stops any non-active peer found running
+5. **Syncs priority queue** to the active peer every ~2.5 min
+6. **Saves state** to `director_state.json`
+
+**File lock**: Only one gunicorn worker runs the director loop (fcntl file lock
+on `data/austria_processor/director.lock`). The other worker skips it.
+
+#### Fleet-dormant hold mode (whole fleet powered off)
+
+When **every** remote enabled peer is continuously unreachable for
+`FLEET_DORMANT_AFTER_S` (15 min) — e.g. exe.dev shut down the entire peer
+fleet — the director enters a **dormant hold** instead of churning forever
+against dead URLs:
+
+- `state['fleet_dormant'] = {active, since, remote_peers}` persisted to
+  `director_state.json`; surfaced in `/api/v1/director/status.fleet_dormant`,
+  as a `dormant:` line in `/process.txt`, and as a `FLEET-DORMANT` flag in
+  the health banner.
+- While dormant, each 30 s tick runs ONLY: primary-park enforcement + a
+  light probe sweep (`_fleet_dormant_probe`, every 5 min, 5 peers
+  round-robin, short timeouts, bypasses circuit breakers). Everything
+  else — bandwidth polls, capacity fanout, activation, shadow election,
+  stale-update retries, canary/steal/BEV checks, OIDC credential probes
+  (`_oidc_reval_loop` skips too) — is suspended. `app._sync_peer_data`
+  also reads the flag and skips its 5-min peer fanout.
+- **Wake is automatic and instant**: any peer that comes back either
+  (a) pushes its status heartbeat to the director (`_peer_status_push_loop`
+  lands in `get_pushed_status`, evaluated every tick even while dormant), or
+  (b) answers the probe sweep. `_wake_from_dormant` clears all circuit
+  breakers + bandwidth backoffs, stamps `woke_at`/`woken_by`, and normal
+  orchestration resumes on the next tick.
+- The primary keeps serving the interactive app, dashboard, search index,
+  and shares untouched throughout. With no processor running anywhere,
+  interactive `/api/v1/segment` requests may again use the live openEO
+  path on Copernicus cache misses (`_try_copernicus` gates on
+  `_is_processor_running()`, which reads local progress.json).
+- Belt-and-braces: `POST /api/v1/processing/start` on the primary returns
+  403 unless `?force_primary=1` — the processor must never launch on the
+  dashboard host even by accidental direct API call (systemd autostart is
+  already disabled; `_enforce_primary_park` pins `not_before=2027`).
+
+#### Bandwidth Management
+
+- Each exe.dev VM has 100 GB/month (resets on the 17th)
+- Budget set to 95 GB (5 GB headroom) in `peers.json`
+- When active peer drops below 2 GB remaining → director switches to the peer
+  with the most remaining bandwidth
+- When ALL peers are exhausted → director logs "no peers available" and waits
+- After bandwidth reset (17th) → vnstat reports drop, peers become eligible again
+
+#### Admin Token (cluster auth)
+
+All mutating admin/director/processing/zenodo endpoints require
+`X-Admin-Token: <token>`. Loopback (127.0.0.1, no XFF) is exempt so
+the in-process director and on-box CLI work without plumbing it.
+
+- Token lives in `data/admin_token` (gitignored, mode 0600). Auto-generated
+  on first start of the primary.
+- Peers must have the **same** token. `deploy.sh` accepts `ADMIN_TOKEN=...`
+  to install it. Without it, peer registration and director-driven
+  start/stop will 401.
+- Dashboard prompts for the token on first 401 and stores it in
+  `localStorage` (key `srtm_admin_token`). Reset with
+  `srtmResetAdminToken()` in the JS console.
+- The director re-reads `data/admin_token` on every outbound peer call
+  (`peer_director._admin_headers()`), so token rotations propagate
+  without a director restart.
+- Rotate by writing a new value to `data/admin_token` on every peer +
+  primary (e.g. via `for p in peers; do scp ...; done`); no service
+  restart required.
+
+```bash
+# Get the token (on primary)
+cat data/admin_token
+
+# Use it from CLI
+curl -H "X-Admin-Token: $(cat data/admin_token)" \
+  -X POST https://example.invalid:8000/api/v1/admin/update
+```
+
+#### Deploying a New Peer
+
+```bash
+# On the new exe.dev VM:
+#   ADMIN_TOKEN required so the peer can register with the director.
+#   Get it via `cat data/admin_token` on the primary.
+SELF_URL=https://example.invalid:8000 \
+PEER_URL=https://example.invalid:8000 \
+ADMIN_TOKEN=<paste from primary> \
+bash deploy.sh
+```
+
+`deploy.sh` does:
+1. Clones repo, installs deps, decompresses RF model
+2. Installs `srv.service` (gunicorn) and `austria_processor.service`
+3. Starts the web server (`srv`) but does **NOT** enable/start the processor
+4. Throttle mode is OFF by default (every peer uploads full + light GPKGs)
+5. Auto-registers with the director via `POST /api/v1/director/peers/add`
+6. The director will start the processor when it’s this peer’s turn
+
+**What the peer does NOT have**:
+- No `data/austria_processor/is_director` flag → no director loop
+- `austria_processor.service` is disabled → no systemd auto-restart
+- No `peers.json` with remote peers → default config only
+
+**After deploy, make the VM public** (from the exe.dev shell):
+```bash
+share set-public srtm-lidar-at4
+```
+
+#### Updating All Peers
+
+Click **⬆ Update Peers** on the dashboard, or:
+```bash
+curl -X POST http://localhost:8000/api/v1/director/update_peers
+```
+
+This calls `POST /api/v1/admin/update` on each peer, which does `git pull --ff-only`
+then `sudo systemctl restart srv`. The timeout on the restart is expected (the
+process serving the request dies). Peers come back up in ~10s.
+
+**Important**: The update restarts `srv` (gunicorn) but does NOT restart the
+processor. If the processor is running on the active peer, it keeps running —
+only the web server restarts. Code changes to `austria_processor.py` take
+effect when the processor finishes the current KG and is restarted by the
+director.
+
+To force a processor restart on the active peer:
+```bash
+curl -X POST https://<peer>/api/v1/processing/stop
+# Director will restart it automatically on next tick (~30s)
+```
+
+#### Removing a Peer
+
+Click the ✕ button on the peer card in the dashboard, or:
+```bash
+curl -X DELETE http://localhost:8000/api/v1/director/peers/<peer_id>
+```
+
+This stops the peer’s processor, removes it from `peers.json` and
+`peer_urls.txt`, and clears its bandwidth state. The peer VM continues
+running its web server but won’t receive any work.
+
+#### Throttle Propagation
+
+The 🔋 Throttle button in the dashboard toggles locally AND propagates
+to all remote peers via `POST /api/v1/director/throttle`. This ensures
+consistent throttle state across all instances.
+
+```bash
+# Set throttle on all peers
+curl -X POST http://localhost:8000/api/v1/director/throttle \
+  -H 'Content-Type: application/json' -d '{"throttle": true}'
+```
+
+#### Zenodo Cache on Peers (Shared Deposit)
+
+All peers share the same Zenodo tile-cache deposit (depo 19650075) via
+`cache_manifest.json` sync. The manifest is:
+- **Pushed to the active peer** when the director starts its processor
+  (via `PUT /api/v1/processing/cache_manifest`)
+- **Synced bidirectionally** every 5 minutes by the peer-sync thread
+  in `app.py` (`_sync_peer_data`)
+
+This means a peer processing KGs near tiles the primary already cached
+will fetch them from Zenodo (HTTP range reads, ~2-3 requests per tile)
+instead of re-downloading from Copernicus. Saves openEO credits.
+
+Concurrency safety: the director enforces single-active processing, so
+only one peer writes to the deposit at a time. Tile cache uploads
+(`flush_tile_cache_to_zenodo`) proceed regardless of the upload throttle
+(throttle only blocks big GPKG uploads).
+
+**If a peer has a stale manifest**: `rm -rf data/austria_processor/zenodo_zip_index/`
+to force re-fetch of ZIP central directories. The next sync cycle will
+push the latest manifest.
+
+#### Director API Endpoints
+
+| Method | Path | Purpose |
+|--------|------|----------|
+| GET | `/api/v1/bandwidth` | Local vnstat bandwidth for this instance |
+| GET | `/api/v1/director/status` | Full director state: mode, active peer, bandwidth per peer |
+| POST | `/api/v1/director/mode` | Set mode: `auto`, `manual`, `paused` |
+| POST | `/api/v1/director/activate` | Manually activate a specific peer |
+| POST | `/api/v1/director/stop` | Stop all peers and pause the director |
+| GET\|POST | `/api/v1/director/peers` | Get/update full peers config |
+| POST | `/api/v1/director/peers/add` | Add a new peer dynamically |
+| DELETE | `/api/v1/director/peers/<id>` | Remove a peer (stops its processor) |
+| GET\|POST | `/api/v1/director/throttle` | Get/propagate throttle state to all peers |
+| GET | `/api/v1/director/proxy/status` | Proxy active peer’s processing status |
+| GET | `/api/v1/director/proxy/log` | Proxy active peer’s processor log |
+| POST | `/api/v1/director/update_peers` | Git pull + restart srv on all remote peers |
+| POST | `/api/v1/admin/update` | Git pull + restart srv (called BY director) |
+| POST | `/api/v1/admin/restart_processor` | Restart processor via systemd (fallback) |
+| POST | `/api/v1/admin/disable_autostart` | Disable austria_processor systemd unit |
+
+#### Director Files (all instance-specific, NOT in git)
+
+| File | Purpose |
+|------|----------|
+| `data/austria_processor/is_director` | Flag file — director loop only runs if this exists |
+| `data/austria_processor/peers.json` | Peer config: IDs, URLs, enabled, not_before |
+| `data/austria_processor/director_state.json` | Runtime state: active peer, bandwidth, mode |
+| `data/austria_processor/director.lock` | fcntl lock — ensures single director loop across workers |
+| `data/austria_processor/peer_urls.txt` | Peer URLs for the data sync thread |
+
+#### Server-Friendliness Throttle
+
+When BEV (`data.bev.gv.at`), Zenodo, or Copernicus servers start emitting
+warnings (HTTP 0 range-read drops, 429 / 503, openEO 402s) the director
+automatically reduces the number of concurrent peers so we don't hammer
+them. The mechanism:
+
+1. `ProgressTracker.add_log()` (in `austria_processor.py`) classifies every
+   warning/error into `bev` / `zenodo` / `copernicus` based on substring
+   tokens, and keeps a 10-min sliding window. Per-minute rates are
+   exposed in `progress.json → warning_rates` and propagate to the
+   director via `/api/v1/processing/status`.
+2. Each director tick (~30 s) `_capacity_factor()` takes the **max**
+   per-kind 5-minute rate across all peers and maps it linearly to a
+   sub-factor: 1.0 at zero warnings, `THROTTLE_MIN_FACTOR` (0.30) at
+   `THROTTLE_SATURATION_RATE` warnings/min. The minimum sub-factor wins.
+3. An EMA (`THROTTLE_EMA_ALPHA = 0.25`, half-life ~3 ticks) smooths the
+   raw value, then a slow sinusoidal drift (±10 % over a 2-hour period,
+   phase derived from the hostname) overlays an organic wobble.
+4. `_orchestrate_parallel_frontiers()` and `_orchestrate_cache_only()`
+   multiply their caps (`max_parallel_frontiers` and
+   `max_cache_only_peers`) by the factor each tick. Frontiers always
+   keep at least one slot — the active frontier is never pre-empted by
+   the throttle. Cache-only count *can* drop to zero on sustained
+   pressure.
+5. Status payload exposes `capacity_factor` and `capacity_components`;
+   dashboard shows a 🌿 pill (green/yellow/red) with the rates as
+   tooltip.
+
+Saturation thresholds (warnings per minute) live in
+`peer_director.py → THROTTLE_SATURATION_RATE` (re-tuned 2026-04-23 for
+the ~50-peer fleet — the previous values were too tight at this scale
+and were causing the throttle to bite on ambient noise):
+- bev: 5.0  (a few range-read retries are normal noise)
+- zenodo: 1.5  (Zenodo rate-limits aggressively)
+- copernicus: 0.4  (402s should be near zero in steady state)
+
+A dead-zone (`THROTTLE_DEAD_ZONE_FRAC = 0.10`, i.e. 10 % of saturation)
+is applied before the linear ramp — fleet-max rates below the dead-zone
+read as zero so a single chatty peer can't drag capacity off 100 %.
+Drift amplitude reduced from ±10 % to ±4 % (cosmetic-only, was loud
+enough to flip dashboard colors on its own).
+
+The fleet aggregator also filters out peers whose state is `stopped`
+(clean exit — their warning window is stale immediately) and peers
+that have been `unreachable` for more than 30 minutes. A peer that
+just became unreachable is still trusted: it may be doing a long
+GPKG upload and briefly not responding to `/processing/status`.
+Last-seen-live timestamps live in `director_state.json` under
+`peer_last_live_ts`.
+
+Backoff timings are also more tender:
+- `BANDWIDTH_BACKOFF_SECONDS = 900` (15 min after 3 failed bandwidth polls)
+- `ZENODO_NETWORK_COOLDOWN_MIN = 60` (was 30)
+- `HOLD_TENDENCY_WINDOW_HOURS = 6` (was 3) — longer memory for repeat offenders
+- `HOLD_TENDENCY_MAX_MIN = 24 * 60` (was 12 h) — a bad peer can sit out a full day
+- `THROTTLE_EMA_ALPHA = 0.15` (was 0.25) — slower recovery, kinder to upstreams
+- `THROTTLE_MIN_FACTOR = 0.20` (was 0.30) — deeper cuts under heavy pressure
+
+Tuning knobs: `THROTTLE_MIN_FACTOR`, `THROTTLE_EMA_ALPHA`,
+`THROTTLE_DRIFT_PERIOD_S`, `THROTTLE_DRIFT_AMPLITUDE` at the top of
+`peer_director.py`.
+
+**Per-kind sub-factor EMAs**: `capacity_components.sub_factor_emas`
+holds smoothed `bev` / `zenodo` / `copernicus` sub-factors (same
+α = THROTTLE_EMA_ALPHA, persisted across worker swaps). Used by
+`_effective_creds_per_frontier` with hysteresis (per=1 above 0.92,
+per=floor below 0.78, sticky band) so the per=1↔per=2 decision
+doesn't flap on a single 402 inside the 5-min window. The flap was
+causing ~8 frontier restarts/hour because each flip re-derived
+`max_parallel_frontiers` and the cred-slice plan.
+
+**Frontier restart cooldown** (`FRONTIER_RESTART_COOLDOWN_S = 180`):
+each KG ends with a clean subprocess exit, so the active frontier
+reports `state in ('idle','stopped')` between KGs. The director
+used to fire a fresh start on every 30 s tick. Now it only restarts
+when the cred slice, lat strips, or excluded-KG set actually
+changed; otherwise it waits at least 180 s. Last decisions are
+tracked in `_frontier_restart_log[peer_id] = {ts, fp}`.
+
+**Constrained starts skip systemd fallback**: when
+`start_peer_processor` carries `cache_only` / `cred_indices` /
+`lat_strips` / `queue_whitelist`, an API 500 is retried once after
+1.5 s. If still failing, we return
+`{method: 'no_fallback_constrained'}` instead of calling
+`/api/v1/admin/restart_processor` (which restarts
+`austria_processor.service` and ignores the per-peer contract).
+Without this guard, a cache-only start was turning into a frontier
+start, the director then killed it as 'non-active running
+frontier', and the loop repeated forever.
+
+**Silent-peer surfacing**: `capacity_components.peers_silent_ids`
+lists peers in the fleet that didn't contribute warning signal in
+the latest tick (scheduled, stopped, or unreachable past the 30-min
+grace). Useful when capacity_factor looks low but you can't tell
+which peer is the source.
+
+#### BEV outage handling (multi-pool parks)
+
+When `data.bev.gv.at` becomes unreachable for some egress pools but
+not others (the common failure mode — AWS NAT routes flap independently),
+the director uses `_check_bev_outage` + `_classify_outage_multi_pool`
+to park *the affected /24 pools only*, never the whole fleet on first
+trigger.
+
+Trigger conditions (all three):
+* Fleet BEV warns/min ≥ `BEV_OUTAGE_TRIGGER_WPM` (12.0)
+* over ≥ `BEV_OUTAGE_MIN_PEERS` (4) distinct peers
+* sustained for ≥ `BEV_OUTAGE_TRIGGER_PERSIST_S` (180 s)
+
+Classification:
+* `≥ OUTAGE_POOL_KNOWN_FRAC` (0.60) of warns must come from peers
+  with a known `outbound_24` (else most pressure is in `'?'` and we
+  can't attribute — fall through to fleet scope).
+* Sort known pools by 1m sum descending. Take the smallest prefix
+  whose cumulative share ≥ `OUTAGE_POOL_DOMINANCE` (0.70).
+* If `len(prefix) > OUTAGE_POOL_MAX_SET` (3): fleet scope.
+* Otherwise: pool scope, park every peer in each prefix pool.
+
+What "pool scope" does (per `_check_bev_outage`, the `scope == 'pools'`
+branch):
+* Sets `not_before` on every peer in the affected /24s with a
+  `bev_pool_park` canary_note (event, level, cooldown_until).
+* Gracefully stops any running peer in those pools.
+* Appends a per-pool entry to `bev_pause_history` (scope='pool',
+  ended=None until cooldown / manual clear).
+* Bumps `bev_pool_escalation[pool]` so the per-pool escalation
+  ladder ticks independently of fleet level.
+* **Does NOT set `bev_pause.active=True`** — the fleet-wide pause
+  flag is reserved for the fallback fleet-scope path. Peers in
+  healthy pools keep working.
+
+**Canary unpark probes** (since 2026-05-28): once a pool is parked,
+the director polls one peer in that /24 every
+`BEV_POOL_PROBE_INTERVAL_S` (5 min) via
+`GET /api/v1/bev_probe` on the peer. The peer issues a single
+range request to `bev_proxy._BEV_TEST_URL` direct (no proxy) and
+checks 206 + TIFF magic on the body. On success the director
+immediately clears `not_before` on every peer in that /24 (only
+those whose latest `canary_notes` entry is `bev_pool_park` so we
+never release a primary / steal / role / auto / manual park), drops
+`bev_pool_escalation[pool]` so the next legit trigger restarts at
+L1, appends a `bev_pool_unpark` event (`end_reason='canary_probe'`)
+to `bev_pause_history`, and emits a director event. State lives
+under `state['bev_pool_probes']` (`{pool: {last_ts, ok, http_code,
+magic_ok, latency_s, peer_id, error}}`) and is persisted via the
+standard snapshot path. The probe runs from the *parked peer's*
+egress, not the primary's — the whole point is to test whether the
+/24 specifically can reach BEV again.
+
+Escalation: 1h → 4h → 12h → 24h cooldowns (`BEV_OUTAGE_LEVELS_S`).
+A pool that re-triggers within `BEV_OUTAGE_RESET_S` (48 h) of its
+last unpause moves up one level. Across the prefix the director
+uses the max prev_level so a fresh-co-affected pool inherits the
+repeat-offender's escalation for this round.
+
+Manual clear: `POST /api/v1/director/bev_pause/clear` (admin-token
+in header). Body `{reason: str}` optional. Records an event with
+`end_reason='manual'` in `bev_pause_history`, drops the pool
+escalation entry (so next legit trigger starts at L1), busts the
+status cache. The dashboard's `BEV PAUSED` chip in the Service
+card is wired to the same endpoint (click → confirm → POST).
+
+**Cross-worker visibility gotcha** (fixed 8ce44cd): the director
+tick loop must reload `bev_pause` + `bev_pool_escalation` from
+disk on every tick. The clear endpoint runs in whichever gunicorn
+worker the request lands on; without the disk-merge, the
+director-loop worker keeps its stale in-mem `active=True` forever
+and the clear has no effect on actual scheduling. Both keys live
+in the same disk-merge block as `active_peer`/`mode`/`last_switch`
+at the top of `_loop()`.
+
+Warning-classification subtlety (`austria_processor._classify_warning`):
+intermediate `bev_retry: ... attempt N/M ... retrying in Ns...`
+warnings are filtered out of the `bev` bucket (proxy-lane noise,
+not a BEV-outage signal). Only the final `all N attempts exhausted`
+line counts. Without this filter every direct-first timeout on a
+broken pool emits a wpm of fleet-side `bev` warns, which by itself
+is enough to clear the 12 wpm trigger even when the wrapper is
+successfully falling back to proxy.
+
+Why egress-pool parking (not per-peer): every VM in an outbound
+/24 shares the same NAT gateway and same route to BEV. If TCP
+times out for one peer in `109.94.96.0/24`, it'll time out for
+every other peer in that /24 too. Per-peer parking would whack-
+a-mole — the director would activate an idle peer in the broken
+pool, watch it warn for 5 min, park it, activate the next, repeat
+— burning Copernicus minutes during each trigger streak. Pool
+parking parks the whole /24 in one shot, all `not_before`
+expiring together so the pool gets one clean retry per cooldown
+level.
+
+#### Stuck-KG watchdog (`_check_stuck_kg`)
+
+A peer's processor can wedge *inside* a KG — a BEV re-read that never
+gives up (`bev_retry` exhausted its pool), a hung SSL upload, an
+infinite divide-warning loop. The peer keeps reporting `state=running`
+but makes zero progress, holding a running slot indefinitely. We
+observed peers frozen on the same KG+step for **72 h** (at21/at92/at94,
+Jun 2026) before this watchdog existed.
+
+Every director tick `_check_stuck_kg(_statuses)` computes a **progress
+fingerprint** per peer from the pushed status:
+`current_kg.code | step | current_tile | n_tiles | step_detail_ts | completed`.
+Any healthy work advances at least one component — crucially the
+legitimately-multi-hour steps (frontier `copernicus` openEO fetches up
+to ~5.7 h, big `upload_full_gpkg`) move `step_detail_ts` every few
+minutes (`harmonics N/12`, `upload N%`). A truly hung peer freezes
+*every* component at once.
+
+When the fingerprint stays unchanged for **`STUCK_KG_FROZEN_S` (12 h)**
+the peer gets a **hard** stop (mid-KG SIGTERM→SIGKILL — graceful
+"exit-after-KG" would never fire on a frozen loop). 12 h is ~2.4× the
+worst legit *opaque* window (a single step emitting no director-visible
+progress field; measured ~5 h over 7 days of fleet logs), so a slow but
+progressing KG is never killed. Tile checkpoints + the cross-peer chkpt
+registry make the restart nearly free — the next peer to pick up the KG
+resumes the finished tiles.
+
+**Jul 2026 fix — gpkg_full was a silent step.** The GPKG builders
+(`build_full_gpkg_tiled` / `gpkg_streamed`) historically emitted zero
+within-step detail, so on big KGs (91017, 01651, 50017, 90014, …) a
+*healthy* multi-hour raster stitch froze the fingerprint and got killed
+at exactly 12.0 h, looping the KG across peers indefinitely (~40 kills
+in 14 days). Fixed processor-side, NOT by raising the 12 h timeout:
+`austria_processor._gpkg_heartbeat()` (registered per-KG via
+`_STEP_REPORT_HOOK`, throttled to 1/min) now moves `step_detail_ts`
+from every tile/strip/layer loop in both builders. A companion
+`_gpkg_reuse_ok()` gate stops the retry path from reusing (and
+uploading) a GPKG left structurally incomplete by a prior mid-build
+SIGKILL — it requires no hot -wal/-journal, the GPKG application_id,
+a populated `layer_styles` table (written at the very end of both
+builders), and a passing `PRAGMA quick_check`.
+
+**Oct 2026 finding — most 12 h kills were *dead* workers, not slow
+ones.** ~10 firings/day (`gpkg_light` on 80110-* blocks, `gpkg_full` on
+30+ Mpx KGs). `admin/proc_env` (now lists the processor's spawn workers
++ the `austria-processor-*` scope's `memory.events`) showed the real
+picture on at11: `oom_kill=2`, `peak 6956 MB`, and the only live worker
+a fresh 172 MB idle replacement. `multiprocessing.Pool` respawns a
+SIGKILLed worker but the lost task's `AsyncResult` never completes, so
+the parent polled `get(timeout=5)` until `KG_TIMEOUT_SECONDS` (16 h) —
+the 12 h watchdog was merely the first thing to notice, and the OOM was
+never recorded (the KG re-dispatched and OOM-ed the next peer). Fixed
+in `c8a3952`: (a) the parent snapshots the worker `Process` objects and
+raises `PoolWorkerDied` (with cgroup oom evidence) within one 5 s poll
+slice; (b) `ne_h3.build_observed` clips the parent's declared cell set
+to the block's raster bbox (1.5 M → ~60 k cells for a Sölden block,
+~8 GB → 1.6 GB) and heartbeats per strip; (c) `_merge_boundary_segments`
+no longer does three full-raster passes per merge group and heartbeats.
+If `stuck-kg` fires again, read `proc_env` on the peer *before* it is
+restarted: `tree[].rss_mb/hwm_mb` + `cgroup.events.oom_kill` separate
+"dead" from "alive but opaque" in one call. For the parent's actual
+stack use `GET /api/v1/admin/pystack` (py-spy dump of the processor
+tree, read-only `--nonblocking`; `?pid=N` for one process).
+
+**Second Oct 2026 finding (after c8a3952) — `Pool.terminate()`
+deadlock.** The detection worked (`worker killed (OOM?) … pool worker
+pid=… rc=-9` within seconds), but the *recovery* hung: py-spy on
+at227/23020-north and at208/56221-east showed MainThread in
+`_drain_pool → Pool.terminate → _terminate_pool → _help_stuff_finish`
+blocked on `inqueue._rlock.acquire()`, one zombie child, and no
+`_handle_workers`/`_handle_tasks` threads. Mechanism: after the OOM
+kill, `Pool`'s handler thread respawns an idle worker; that worker runs
+`_pool_worker_init` → `PR_SET_PDEATHSIG`, which Linux ties to the
+*creating thread* (the handler thread, not the process). `terminate()`
+stops the handler thread first → the kernel SIGKILLs the replacement
+while it sits in `SimpleQueue.get()` holding `inqueue._rlock` (a POSIX
+semaphore a dead process can't release) → `_help_stuff_finish` waits
+forever → the parent is frozen on the KG until this watchdog kills it
+12 h later. Reproducible in 20 lines (spawn + PDEATHSIG initializer +
+kill worker + `terminate()`). Fix: `austria_processor._OneShotPool`
+replaces `multiprocessing.Pool(1)` for the KG task — one `Process`
+started from the main thread + one `Pipe`; no respawn, no shared
+semaphores, a dead child is an EOF on the pipe (`PoolWorkerDied` in the
+same 5 s slice). `_drain_pool` additionally runs `terminate()` inside
+its deadline thread so a real `Pool` could never block the parent again.
+Expect the `stuck-kg` rate to drop to ~0 for gpkg_full/gpkg_light; the
+remaining `worker killed (OOM?)` failures are the real signal (big
+parents → strikes → adaptive split).
+
+False-positive guards:
+- **Fresh status only.** Stale/cached fallback (`_stale`) or
+  `unreachable` ticks are skipped — a flaky network must never look
+  like a frozen fingerprint. The timer is held, not advanced.
+- **Timer resets** the instant the fingerprint changes.
+- **Skips scheduled-off peers** (`_peer_is_scheduled`) so it won't
+  stomp a park cooldown.
+- No explicit park after the stop: the scheduler re-admits the peer on
+  a later tick and the KG flows back through the normal
+  in-progress/requeue path.
+
+Emits a `stuck-kg <pid>: KG <code> frozen on step "<step>" for Xh …`
+warning into the merged log (grep `?q=stuck-kg`). Tracker state lives in
+`state['stuck_kg_track']` (in-memory; rebuilt within 12 h after an HA
+handover — the timer simply restarts, which is safe).
+
+#### Duplicate-KG reconciler (`_check_duplicate_kgs`)
+
+**Oct 2026 loop (90013-southwest-1, at123 vs at100, 6 firings in
+70 min):** the hard-stopped loser was re-admitted onto the same cell and
+re-picked the same block every ~10 min because the *processor's* peer
+claim filter was set-based: at100 ran `90013-southwest` (5-block split),
+at123 — with more strikes synced — split the parent into 10 "doubled"
+blocks and `90013-southwest-1` was not literally in any claim set.
+`austria_processor._code_claimed_by_peer` now applies the same prefix
+overlap rule as `_collides` here (sub-block of a live block claim, or
+any block of a live unsplit parent claim ⇒ "claimed by peer"), so the
+loser skips the colliding blocks and moves on. The winner in that
+episode (at100 at "95 %") was itself frozen in the `Pool.terminate()`
+deadlock above — progress fraction, not liveness, decides the winner.
+
+The dispatch-side guards — the cross-peer **claim registry**
+(`_claim_dispatch`, `_RECENT_DISPATCH_TTL=150s`), the `_in_progress_kgs`
+status filter, and the block-level whitelist guard (commits `0afd538` →
+`ac74cf2`) — stop two peers being *handed* the same KG **within a
+director tick**. They structurally cannot undo a duplicate that arose
+*outside* that 150 s window:
+
+- two peers self-picked the same parent code from their **own**
+  `retry_queue.json` minutes or hours apart (well past the claim TTL);
+- a peer started a KG before another peer finished *uploading* it, so
+  neither saw the other in `_in_progress_kgs` at start time.
+
+Those run side-by-side to completion, burning a second peer's CPU +
+bandwidth on identical work. Observed Jun 2026: `92111` on at26+at112
+(37 min apart), `49008` on at109+at115 (~2.4 h apart), `01803` on
+at27+at114.
+
+Every tick `_check_duplicate_kgs(_statuses)` groups running peers by
+**parent** KG code (so block `92117-west` collides with parent `92117`
+and sibling `92117-east`), and for any parent with ≥2 distinct peers it
+keeps the **furthest-along** peer and **hard-stops** the rest. Progress
+is ranked by `_kg_progress_frac`, which mirrors `_peerKgFrac` in
+`static/process.html` *exactly* (tile fraction `(current_tile-1)/n_tiles`
+dominates; else canonical pipeline step index) so the director's
+"winner" matches the % the dashboard shows. Tiebreak: longest-running,
+then lowest id — fully deterministic, so both gunicorn workers and a
+post-handover director would pick the same winner from the same
+snapshot. Hard stop (not graceful) because a graceful "exit-after-KG"
+would let the loser finish the very work we're deduping; tile
+checkpoints + the cross-peer chkpt registry preserve the loser's
+finished tiles for resume.
+
+Anti-herd guards (mirror the stuck-KG watchdog so the director is never
+overwhelmed and the fleet never thundering-herds):
+- **Reuses the existing `_statuses` snapshot** gathered once per tick for
+  capacity/throttle — **zero extra peer fanout**.
+- **Fresh status only** — `_stale`/`unreachable` ticks skipped.
+- **`DUP_KG_MIN_AGE_S` (5 min)**: every collide-member must be ≥5 min
+  into the KG, so a just-started peer (whose `current_kg` may not yet be
+  claim-visible) is never treated as a duplicate.
+- **`DUP_KG_PERSIST_S` (120 s)**: the exact dup member-set must hold for
+  two ticks before any stop — we never fight a fresh dispatch the claim
+  registry is still resolving.
+- **Skips scheduled-off peers** (`_peer_is_scheduled`) — won't stomp a
+  park/steal/canary cooldown.
+- **`DUP_KG_STOPS_PER_TICK` (2)** caps loser stops per tick.
+- **Active-director only**: the whole loop self-stops unless this
+  process holds `is_director` (single fcntl lock holder across both
+  gunicorn workers; the HA shadow never has the flag), so it runs once,
+  on one worker, on the live director.
+
+Emits `dup-kg <loser>: KG <code> also running on <winner> (winner X% vs
+Y%) — hard stop loser` into the merged log (grep `?q=dup-kg`). Tracker
+lives in `state['dup_kg_track']` (in-memory, self-pruning; after an HA
+handover the fresh director simply re-observes the dup and waits
+`DUP_KG_PERSIST_S` again — the conservative direction).
+
+#### Director Modes
+
+| Mode | Behaviour |
+|------|----------|
+| `auto` | Director picks peer with most bandwidth, starts/stops automatically |
+| `manual` | Director keeps the manually-activated peer running, no auto-switch |
+| `paused` | Director does nothing — all peers stay in current state |
+
+#### Credential revalidation — director-only
+
+`_valid_credentials()` is a **pure cache read**. It never triggers an
+OIDC probe. The dashboard hot path (`get_status` running in any
+gunicorn worker) and every other reader sees the cached `last_status`
+values from `copernicus.list_credentials()` (refreshed on disk via
+`_save_credentials_to_disk()`).
+
+The *only* call site permitted to refresh credential health is
+`_refresh_credentials_if_due()` invoked from the director loop (once
+per tick, gated to `_REVALIDATE_INTERVAL_S = 600s`). It uses a
+process-wide `_REVALIDATE_LOCK` for single-flight semantics, so even if
+a future caller wires a second invocation in, only one OIDC probe per
+process runs at a time.
+
+Why this is strict: in 2026-05-06 we wedged the primary's worker pool
+with ~50 OIDC requests/s after a srv restart. The bug was that
+`_valid_credentials` had a per-call `if now-last > 600` guard reading
+an in-memory timestamp — which non-director workers never updated
+from disk, and which 4 racing dashboard threads all passed
+simultaneously. Each cache miss fanned out into 8 OIDC token requests
+(one per credential), the listen backlog overflowed, and process.html
+became unreachable. The architectural fix (this section) is that the
+request path *cannot* probe — only the director loop can. To force a
+fresh probe (e.g. after credential renewals), call
+`POST /api/v1/credentials/validate` (no body).
+
+#### Director link on peer dashboards
+
+`/api/v1/director/status` returns `self_url`, `director_url`, and
+`is_director_local`. When the dashboard is open against a non-director
+VM, the Peer Director header renders a `⇗ director: <id>` pill linking
+to the current director's `process.html`. This works even when the
+local `self.json` hasn't been updated by the latest announce: the JS
+resolves the id by matching `director_url` against peer URLs in
+`d.peers`. On the director itself the pill is hidden (the existing
+`★ director` peer-card badge already marks who is in charge).
+
+#### Director High-Availability (`director_ha.py`)
+
+Failover is automatic. Every VM (primary + peers) runs a watchdog
+thread that pings the director's `GET /api/v1/director/heartbeat`
+every 30 s. The director elects a *shadow* each tick — the most-reliable
+peer that is **enabled, reachable, on the same git commit, has ≥ 5 GB
+free disk and ≥ 10 GB remaining bandwidth**. Sticky: keeps the current
+shadow unless the noise-score gap to the best alternative exceeds 0.3.
+The director PUTs a full state snapshot to the shadow every 30 s.
+
+**Small-fleet shadow (2026-08-22)**: `_enforce_director_self_park` only
+role-parks the shadow when the fleet has ≥ `SHADOW_PARK_MIN_FLEET` (12)
+enabled non-primary workers. Below that, dedicating a whole worker to a
+pure-standby role costs ~1/N of fleet throughput, so the shadow keeps
+processing (frontier or cache-only). On promotion it aborts its
+in-flight KG — tile checkpoints + the cross-peer chkpt registry make
+that loss cheap. The active director still self-parks at any scale
+(fanout BW cost is real). Above the threshold, behaviour reverts to
+parking both director and shadow.
+
+**Cache-mix reservation (2026-08-22)**: when `cache_ready_kgs ≥
+CACHE_MIX_MIN_READY` (20), `_orchestrate_parallel_frontiers` caps
+frontier count at `total_enabled − min_reserve − reserve` where
+`reserve = min(CACHE_MIX_MAX_RESERVE=8, round(total_enabled ×
+CACHE_MIX_FRAC=0.25))`, so accumulated cache-only work drains in
+parallel instead of every peer being absorbed by the frontier. Only
+binds in the small-fleet regime where peer count (not credential
+capacity) is the frontier ceiling — at scale creds bind first and the
+reservation is a no-op. Over-cap fleets converge via a gentle drain:
+at most ONE excess parallel frontier per tick gets a graceful stop
+(noisiest first, 10 min re-send guard); it finishes its current KG and
+the cache-only orchestrator picks it up on a later tick.
+
+**Snapshot contents** (small JSON, ~200 KB total): `director_state.json`,
+`kg_strikes.json`, `failure_counts.json`, `cache_miss_kgs.json`,
+`deferred_kgs.json`, `retry_queue.json`, `failed_kgs.json`,
+`manifest_tombstones.json`, `copernicus_credentials.json`,
+`peers.json`, `cache_manifest.json`, `peer_urls.txt`. Staged under
+`data/austria_processor/shadow/`.
+
+**Auto-failover**: shadow misses 6 consecutive heartbeats (3 min) →
+promotes itself: installs staged snapshot, writes `is_director`,
+restarts director loop in-process (singleton replaced so EMA /
+capacity_history reload), broadcasts `POST /api/v1/director/announce`
+to every peer. The threshold was previously 3 misses (90 s) but that
+triggered spurious takeovers during code pushes, long uploads, and
+any tick where the director worker briefly stalled. 3 min still
+fails over a genuinely-dead director quickly while tolerating
+transient saturation. Peers flip `data/austria_processor/zenodo_lock_url.txt`
+and `self.json:director_url`. Old director, if it ever comes back,
+finds `stepped_down` flag and refuses to start its director loop —
+lives on as a regular peer until manually re-promoted.
+
+**Manual handover**: dashboard `⇋ Hand Over` button (next to `+ Add
+Peer`) → `POST /api/v1/director/handover?to=<peer_id>` on the current
+director. Director ships fresh snapshot inline to target via
+`/api/v1/director/takeover`, target promotes itself, broadcasts
+announce. Old director steps down proactively. Reload the dashboard
+against the new director's URL afterwards.
+
+**Identity** (`data/austria_processor/self.json`): `{id, url,
+director_url}`. On the primary, `director_url=null` (it *is* the
+director). Peers learn their identity at registration time (deploy.sh
+or `+ Add Peer`); the director also broadcasts identity to all peers
+at startup, and self-heals one peer per tick.
+
+**HA endpoints** (all admin-token protected except heartbeat):
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/v1/director/heartbeat` | Liveness probe (public). 200 if director, 410 otherwise. |
+| GET\|PUT | `/api/v1/director/snapshot` | Director GETs snapshot, shadow accepts staged PUT. |
+| POST | `/api/v1/director/announce` | New director claims authority — peers flip pointer / step down. |
+| POST | `/api/v1/director/step_down` | Voluntarily relinquish director role. |
+| POST | `/api/v1/director/takeover` | Inbound takeover (manual handover or watchdog promotion). |
+| POST | `/api/v1/director/handover?to=<id>` | Initiated by current director; ships state + steps down. |
+| GET\|POST | `/api/v1/director/identity` | Read/set self.json. |
+
+**Files**: `is_director` (this VM is director), `stepped_down`
+(refused promotion, written by step-down), `self.json` (identity),
+`zenodo_lock_url.txt` (peer's pointer to current director),
+`shadow/` (staged snapshot), `shadow/meta.json` (origin + shadow_id
+stamp — watchdog only takes over if `meta.shadow_id == self_id`).
+
+**Auto-handback to primary**: every director tick, if `self_id != 'primary'`
+and the primary is reachable, on the same git commit, enabled and not
+scheduled, the director hands the role back via `do_handover('primary',
+primary_url)`. The throttle has two scales:
+* `HANDBACK_RETRY_S = 60` after a transient failure (primary unreachable,
+  stepped_down clear in flight, etc.) so handback fires within ~1–2 min
+  of conditions becoming favourable.
+* `HANDBACK_BACKOFF_S = 300` after a hard failure (primary commit behind,
+  commits unrelated) which needs operator intervention.
+
+`_handback_last_attempt` is advanced on **every** entry past the basic
+gates — not just on success. The 2026-05-07 wedge happened because a
+prior bug returned early without setting the timestamp on the
+`stepped_down: true` path, so the function silently re-fired every
+30 s tick for hours, hammering primary's `clear_stepped_down`
+endpoint without ever reaching the actual handover. `_handback_last_reason`
+in `director_state.json` records why the most recent attempt didn't
+hand over.
+
+**Index build deferral on freshly-promoted peers** (`app.py:
+_index_build_deferred`): when a non-primary peer becomes director or
+shadow it stamps `data/austria_processor/role_promoted_at`. For
+`ROLE_INDEX_BUILD_DELAY_S = 1800` (30 min) after promotion the peer
+* skips the initial `SearchIndex.build()` (which loads ~8000 KG JSONs
+  into memory), and
+* skips the JSON download phase of `_sync_peer_data` (manifest merge
+  still runs — cheap).
+
+This prevents the index build's CPU+memory spike from landing on top
+of director-takeover load. On 2026-05-07 we observed a 3.4 GB worker
+on at40 + load avg 6.87 + every non-heartbeat request timing out for
+~30 min after promotion. Primary is unaffected (always keeps the
+index). If a peer is demoted again the stamp is cleared.
+
+**Identity hardening** (after the 2026-05-03 split-brain incident where
+at2/at37/at39/at49 all believed themselves director and self.json files
+were cross-corrupted):
+
+* `POST /api/v1/director/identity` refuses to override `id`/`url` from a
+  remote address. Only loopback may. Receivers derive identity from
+  hostname — the broadcaster cannot lie. Bad inputs are logged at
+  WARN with `_rejected={...}` in the response.
+* `app.py` startup heals `self.json` from the hostname on every srv
+  restart (id and url). The hostname is authoritative.
+* `_normalise_local_identity_in_peers` (called during takeover) only
+  rewires the *single* entry whose id == snapshot origin (read from
+  `shadow/meta.json`). Other peers' URLs are never touched. Earlier
+  versions stamped `prev_director_url` onto every `url=None` entry,
+  which is how the cluster ended up with multiple peers pointing at
+  the same URL after a few cascading handovers.
+
+**Recovery from split-brain**: if multiple peers claim director, write
+`is_director` on the primary, restart srv, then broadcast a manual
+announce from the primary to every peer:
+```python
+payload = {'new_director_id': 'primary',
+           'new_director_url': 'https://example.invalid:8000',
+           'reason': 'manual_consolidation'}
+# POST to /api/v1/director/announce on every peer’s URL
+```
+`accept_announce` will step down any competing director and update
+pointers on the rest. Survey afterwards via `/api/v1/director/identity`.
+
+**Disaster recovery**: press `⇋ Hand Over` and pick a peer. Or stop
+the primary and wait 90 s; the shadow takes over automatically. After
+recovery, auto-handback returns the role to primary as soon as primary
+is healthy and on the same commit.
+
+#### Role-data eviction (free disk on demoted peers)
+
+The per-KG JSON corpus (`data/austria_processor/json/*.json`, ~1 GB on a
+fully-built fleet) and `data/search_index.db` (~120 MB) are only useful
+to:
+* the **primary** (canonical home for search index + dashboard) — always keep
+* the **current director** (peer_director consults the index for cache-ready
+  KGs, KG-split lookups)
+
+**NOT the shadow** (Jul 2026, commit 84a123c): the shadow only stages the
+small snapshot state (`director_ha.SNAPSHOT_FILES`); replicating the
+~5–7 GB corpus filled its 24.5 GB disk to 0 and caused the
+shadow-election ↔ disk-eviction death loop (Jul 1–3 2026 fleet stall).
+A designated shadow is therefore *non-keep-role*: it stamps
+`role_demoted_at` like any other peer and its stale corpus (if it was
+ever director) is purged after the 1 h grace. On real promotion the
+ex-shadow becomes director → keep-role → corpus replenishes via
+`_sync_peer_data` + deferred index build.
+
+A peer that *was* director (e.g. after handback to primary) accumulates
+the full corpus. Without eviction, that data crowds out expensive
+Copernicus tile caches and trips the disk-pressure threshold (1.6 GB
+free on at17 was the trigger for adding this).
+
+**Loop** (`app.py:_role_data_eviction_loop`, 10 min tick):
+1. Classify role via `_is_keep_role_data()` — reads `is_director` and
+   `self.json:id` (shadow meta is no longer consulted).
+2. If demoted, stamp `data/austria_processor/role_demoted_at`.
+3. After `ROLE_EVICT_GRACE_SECONDS` (1 h) of continuous demotion,
+   delete `json/*.json` + `search_index.db{,-wal,-shm,-journal}`.
+4. Promotion (becoming director) clears the marker.
+5. `_sync_peer_data` and `_init_search_index` short-circuit on demoted
+   peers so we don't immediately re-fetch what we just freed.
+
+**Primary special-case**: `id == 'primary'` is always keep-role, even
+when not director, so the search index has a stable canonical home that
+survives any failover.
+
+**Endpoints**:
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/v1/admin/diskstat` | Per-VM disk + role status (sizes_mb, role.demoted_at, role.grace_remaining_s) |
+| POST | `/api/v1/admin/role_evict` | Force-run a tick. `{"force": true}` purges regardless of role (decommission). |
+
+**Tuning** (top of `app.py`):
+* `ROLE_EVICT_GRACE_SECONDS = 3600`
+* `ROLE_EVICT_TICK_SECONDS = 600`
+
+**When NOT to enable**: never delete on uncertainty — if the
+keep-role check raises, `_is_keep_role_data()` returns True (fail-safe).
+
+#### Processor uid (must be exedev, never root)
+
+**Background**: the processor is launched via
+`sudo systemd-run --scope -p User=exedev ...`. **`-p User=` is silently
+ignored on `--scope` units** (only `--service` units honour it). For
+months the processor ran as uid=0, with two consequences:
+1. `/proc/<pid>/environ` was unreadable from gunicorn (uid=exedev) —
+   the dashboard couldn't display per-process credential indices,
+   masking director-assigned `COPERNICUS_CRED_INDICES` /
+   `KG_LAT_STRIP_FILTER`.
+2. `pkill` from gunicorn couldn't kill a root-owned processor; only the
+   sudo escalation chain (`sudo systemctl kill --signal=SIGKILL` →
+   `sudo pkill -9`) succeeded.
+
+**Fix** (`app.py:start_peer_processor`): keep the scope + `-E env`
+forwarding, but drop privileges *inside* the scope via
+`setpriv --reuid=exedev --regid=exedev --init-groups --`. Result:
+sudo = uid 0, python3 = uid 1000 (setpriv execs in place, so it is not
+a resident parent).
+
+**Why `setpriv` and not `runuser`/`su` (2026-09-21 post-mortem).** From
+2026-05-03 (37cea2a) the shim was `runuser --preserve-environment`.
+`runuser`/`su` stay resident as the python's parent and, on SIGTERM,
+forward it to the child, wait **2 s**, then **SIGKILL** it ("Session
+terminated, killing shell... ...killed."). Both graceful paths —
+`/processing/stop?graceful=1` (`os.killpg`) and `/admin/update?graceful=1`
+(`pkill -TERM -f austria_processor.py`) — also hit the wrapper, so every
+"finish the current KG then exit" was a hard mid-KG kill ~2 s later. Each
+kill re-ran the KG from tile checkpoints **and counted a strike**
+(`kg_strikes.json` → adaptive split at 2). Fleet-wide this silently
+split dozens of small KGs into 2–10 blocks; on a day with six rolling
+commits it drove 63330 to 9 strikes / 10 blocks and its blocks then
+bounced between cache-only peers on cache misses for a day. Fixes:
+`setpriv` (no resident wrapper) **and** graceful signalling now targets
+only the python PID (`_processor_python_pids()` /
+`_signal_processor_graceful()`), which also protects peers still running
+the legacy runuser chain until they restart. Strikes inflated by this
+can be reset with `PUT /api/v1/processing/kg_strikes {"<code>": -1}`
+(drops the code + its block children; must reach every peer, since the
+merge is max()). `scripts/reset_kg_strikes_v2pending.py --apply` does
+this fleet-wide for every parent that is v1-complete but not yet
+v2-complete (the v2 upgrade / v2_regen / v2.2 re-run universe — small
+KGs, cheap to re-run whole). Done 2026-09-21 for 466 parents; peers
+still on pre-3b1b9bd code ignore negatives, so re-run it once
+`versions:` shows the whole fleet on the target.
+
+Verify with `GET /api/v1/admin/proc_env`. Look for the python3 row —
+`uid` should start with `1000`, and `env` should include
+`COPERNICUS_CRED_INDICES`, `KG_LAT_STRIP_FILTER`, `ZENODO_LOCK_URL`,
+`HOME=/home/exedev`, `USER=exedev`. The sudo row shows
+`env_err: Permission denied` (expected — they're still uid 0 / sudo).
+
+#### Cross-Cutting Concerns (director changes)
+
+**Adding a peer**: Use the dashboard "+ Add Peer" button or API. This updates
+`peers.json` on the primary only. The director re-reads it each tick.
+
+**Removing a peer**: Use the ✕ button or DELETE API. Stops the processor,
+removes from config and peer_urls.txt.
+
+**Changing bandwidth budget**: Edit `peers.json` directly:
+```bash
+python3 -c "
+import json
+cfg = json.load(open('data/austria_processor/peers.json'))
+cfg['budget_gb'] = 90  # more conservative
+json.dump(cfg, open('data/austria_processor/peers.json', 'w'), indent=2)
+"
+```
+Director picks it up on next tick (re-reads from disk).
+
+**Scheduling a peer** (e.g. don’t use primary until next billing cycle):
+```bash
+python3 -c "
+import json
+cfg = json.load(open('data/austria_processor/peers.json'))
+for p in cfg['peers']:
+    if p['id'] == 'primary':
+        p['not_before'] = '2026-05-17'  # skip until bandwidth resets
+json.dump(cfg, open('data/austria_processor/peers.json', 'w'), indent=2)
+"
+```
+
+**Disaster recovery**: If the primary goes down, peers stop receiving work but
+don’t crash. To make a peer the new director:
+1. Create `data/austria_processor/is_director` on the peer
+2. Copy/create `peers.json` with all peer URLs
+3. Restart `srv` on the peer
+
+---
+
+
+---
+
+*See `AGENTS.md` for the project map.*
+
+
+## Start-path gates vs. rollout (Sep 2026)
+
+Every processor *start* path (cache-only, parallel frontier) refuses peers for which
+`_peer_is_stale_idle(pid, status)` is true — reachable, idle (`stopped/idle/complete/paused`)
+and on a commit behind `_LOCAL_GIT_COMMIT` (not ahead). Such a peer gets a hard update from
+`_orchestrate_stale_peer_updates` after `STALE_UPDATE_GRACE_S` (90 s, was 600). Before this
+gate the director re-started idle peers on the old commit during the grace window, converting a
+60 s hard restart into a graceful restart at the next KG boundary — a fleet rollout took hours
+instead of ~5 min. Log lines: `cache-only: skipping N idle stale peer(s)` /
+`Parallel frontier: skipping <id> — idle on a stale commit`.
+
+Related fixes from the same incident:
+* The active-frontier continuation gate now includes `'complete'` (processor exhausted its
+  pending list or exited via disk-pressure pause). at123 held the active slot + 2 creds idle for
+  5 days because only `idle`/`stopped` triggered a restart.
+* `_maintain_shadow` adds +5 to the score of peers that are running, the active frontier, a
+  parallel frontier, or hold a `frontier_cred_plan` entry — the shadow is role-parked for 2 h, so
+  electing a busy peer discards its work (at202 was started as frontier and elected shadow 30 s
+  later).
+* Director identity push carries `peer_urls` (enabled fleet minus the receiver); peers rewrite
+  `peer_urls.txt` on drift. Stale lists cost a 10 s timeout per dead URL on every claim poll.
+* Peer push refreshes `system.disk_free_gb` live via statvfs; progress.json only carries it
+  while the processor runs, so idle peers pushed a frozen value (bogus "disk pressure" rows).
+
+## Cluster bandwidth accounting & budget (Sep 2026)
+
+The primary's egress/ingress is metered by exe.dev (200 GB/mo included
+across the account; the primary alone was burning ~20 GB/day ≈ 1 GB/h
+before this pass). Target after the pass: **< 50 MB/h steady state**
+on the primary, without losing any orchestration / dashboard / HA
+functionality. Everything below is measurable live:
+
+```bash
+curl -s 'http://localhost:8000/api/v1/net_stats?fmt=txt&top=40'   # per-endpoint MB/h
+vnstat -h            # ground truth per hour (rx | tx)
+vnstat -d            # per day
+```
+
+`net_meter.py` wraps `requests.Session.send` (outbound, keyed by
+`METHOD host/path`, peer hostnames collapsed to `<peer>`, numeric path
+segments to `<n>`) and adds a Flask `after_request` (inbound, keyed by
+`METHOD /path [ext|lo]`; `ext` = came through the exe.dev proxy =
+metered; `lo` = loopback, free). Counters are per gunicorn worker,
+flushed to `/tmp/net_meter/<pid>.json` every 20 s and merged by
+`/api/v1/net_stats` (admin-token / loopback). HEAD responses count 0
+body bytes. TLS handshakes (~6 KB/connection) are **not** counted —
+that is why request *counts* matter as much as bytes; `http_pool.py`
+puts a keep-alive `Session` behind module-level `requests.get/post/…`
+in both `srv` and the processor.
+
+### What was eating the budget (measured 2026-09-21, before → after)
+
+| Item | Before | Mechanism | After |
+|---|---|---|---|
+| `_sync_peer_data` pulling every peer's full manifest (`GET /processing/peers`, ~0.9 MB gz × 29 peers × 2 gunicorn workers / 5 min) | ~700 MB/h | single-flight fcntl lock; `?since=<watermark−1h>` incremental (peer filters by `uploaded_at`); full reconcile every 12 h; legacy peers (no `manifest_since` in reply) backed off to 30 min | ~5 MB/h |
+| `cache_manifest` GET+PUT to every peer every 5 min (both workers) | ~350 MB/h | `GET ?since=` deltas + ETag on the 12-h full; PUT only files newer than the per-peer pushed watermark (handler merges by `updated_at`), gzipped | ~3 MB/h |
+| Shadow snapshot every 30 s (`director_state.json` 4 MB pretty-printed + peers.json + cache_manifest, plain JSON) | ~360 MB/h | light snapshot every 120 s (telemetry rings `SNAPSHOT_HEAVY_STATE_KEYS` stripped, byte-identical files omitted), full every 30 min / on shadow change, gzipped; shadow re-attaches stripped keys from its staged copy | ~3 MB/h |
+| Log-archive full sweep on every shadow change (16 MB) + shadow flapping during rollouts | bursty | `GET /director/log_archive` inventory primes the sha cache; 10-min grace before dropping a transiently ineligible shadow | ≈0 |
+| `/director/proxy/all_status` probing every running peer per dashboard poll | ~30 GET/min per tab | serves the pushed status (`get_pushed_status`) — identical payload | 0 |
+| `_PEER_PUSH` per-worker → loop worker saw half the pushes, judged them stale, polled `/processing/status` | ~30 GET/min | pushes mirrored to `/tmp/srtm_peer_push/<id>.json`, mtime-gated read | 0 |
+| `/api/v1/credentials` fanout on every status recompute | ~7k req/h | per-peer cache: 10 min running / 30 min idle | ~100 req/h |
+| Peer side: both workers pushed `peer_status` + both ran the HA watchdog heartbeat | 2× | fcntl single-flight per VM; watchdog 60 s × 6 misses (same 6-min failover) | 1× |
+| Processor `_fetch_peer_state` pulling the manifest it never reads | 0.9 MB/KG-boundary | `?manifest=0` | ~20 KB |
+| Dashboard tab: 5 s status + all_status + combined_log, 60 s kg_outlines (114 KB) | ~30 MB/h/tab | 10 s poll, 20 s director, 20 s combined_log, 5 min outlines, 60 s cadence when `document.hidden`, `Cache-Control: no-cache` so 304s fire | ~8 MB/h/tab, ~1 MB/h hidden |
+| 404'd KG JSON re-downloaded per peer per cycle | noise | 6 h negative cache | 0 |
+
+### Second pass (2026-10-22) — restart spikes + per-cycle fixed costs
+
+| Item | Before | Mechanism | After |
+|---|---|---|---|
+| Log-archive hourly push re-sent the *growing* day whole (1–1.5 MB, base64 = incompressible) + every shadow (re-)election | ~30–40 MB/day + restart spikes | files are gzip-appended → `director_ha._push_one_archive_day` PUTs only the tail (`base_size`/`base_sha256`); shadow verifies prefix, 409 → full push; inventory priming seeds `last_size` | ~50 KB/h |
+| `cache_manifest` 5-min delta carried the union-only `shards` registry (35 KB raw / 8 KB gz) both ways | ~10 MB/h | GET `?since=&shards_n=<ours>` → peer omits shards when ours ≥; PUT ships the top block only when its hash changed for that peer / on the 6-h full | ~1 MB/h |
+| `/processing/peers?since=` replies carried full `tombstones` + `tombstone_drops` (~16 KB raw) | ~5 MB/h | filtered to entries stamped ≥ since (timestamped unions; 6-h full reconcile unchanged) | ~1 MB/h |
+| OIDC revalidation = 4 requests × 107 creds / 30 min via `openeo.connect` | ~3 MB/h | `copernicus.validate_credential` POSTs the CDSE token endpoint directly; non-200/401 falls through to the openeo path | ~0.7 MB/h |
+| `net_meter` inbound counted *inflated* gzip bodies (peer_status read 63 MB/h, really ~16) | telemetry | `srtm.wire_content_length` set by `_inflate_gzip_request_body` | correct |
+
+Restart cost that remains by design: the fleet's `peer_status` full
+ring once per peer (~8 KB gz × 50) and the shadow re-election full
+snapshot (~0.5 MB) — each srv restart is still ~a few MB, not ~100.
+
+### Invariants to keep
+
+* **Single-flight background loops.** `_sync_peer_data`,
+  `_peer_status_push_loop`, `director_ha._watchdog_loop` hold fcntl
+  locks (`peer_sync.lock`, `peer_status_push.lock`, `watchdog.lock` in
+  `data/austria_processor/`). Any new periodic fanout must do the same —
+  gunicorn runs two workers and every un-guarded loop doubles traffic.
+* **Deltas, not snapshots.** The merge rules are "strictly newer
+  `uploaded_at`/`updated_at` wins", so partial payloads are always
+  safe. Never reintroduce a full-table push on a short timer.
+* **Partial shadow snapshots require a commit-matched shadow** (election
+  already rejects `commit_mismatch`; an old-code shadow would unlink
+  omitted files). Full snapshot on every shadow change covers it.
+* **`SHADOW_META_FRESH_S` must exceed the miss window.** Pre-Sep-2026 it
+  was `3 × 30 s`, which could refuse a legitimate takeover after the
+  6-min miss threshold; it is now derived from
+  `WATCHDOG_MISS_THRESHOLD × WATCHDOG_INTERVAL + 2 × SHADOW_SYNC_INTERVAL`.
+* **Compressed request bodies.** `app._inflate_gzip_request_body`
+  transparently inflates `Content-Encoding: gzip` on PUT/POST. Cluster
+  pushes use `_gzip_put_json` / `peer_director._put_json_gz` /
+  `director_ha.push_snapshot_to_shadow` which retry plain once on
+  400/415/500 for pre-rollout peers.
+* **Measure before adding a poll**: `curl -s -H 'Accept-Encoding: gzip'
+  -o /dev/null -w '%{size_download}' localhost:8000/<ep>` and check
+  `/api/v1/net_stats` an hour later.
+
+## Frontier planning cells (Sep 2026)
+
+Frontiers are pinned to disjoint **planning cells** (KG centroid → cell,
+`KG_CELL_FILTER` on the processor, `_frontier_cells` / `frontier_strip_plan`
+on the director). Until 2026-09-23 the planning grid *was* the v1 Zenodo
+ZIP grid (1°×2°, `zenodo_cache.STRIP_HEIGHT × STRIP_WIDTH`) because two
+frontiers rebuilding the same cell ZIP lost each other's tiles. That made
+`_max_parallel_frontiers` bind on `cap_cells` — 9 work cells → 6–9
+frontiers while 98 credentials and ~17 starved cache-only peers
+(`cache_pipeline: ready_kgs=0`) sat idle.
+
+With tile store v2 (`docs/zenodo-cache.md → Tile store v2`) Copernicus
+writes are idempotent per-tile PUTs and Hansen ZIP writes are serialised by
+the per-ZIP fleet lock, so the coupling is gone. The planning grid is now
+`FRONTIER_CELL_LAT × FRONTIER_CELL_LON` (env, default **0.5°×1°** = the
+tile-store shard; ~35 non-empty / ~34 work cells) via
+`PeerDirector._planning_grid()`. v1 ZIP coverage is translated into
+planning cells with `_planning_cells_within` (`_cached_cells`) and by
+containment in `_cell_fingerprint`. The frontier count is now bounded by
+`min(cap_creds, cap_cells, FRONTIER_MAX_PARALLEL=20)` × capacity factor,
+ramped by `RAMP_*_STARTS_PER_TICK`. Raise `FRONTIER_MAX_PARALLEL` once
+openEO warns/min (`throttle: … C=`) and credit burn look stable at 20.
+Revert with `FRONTIER_CELL_LAT=1.0 FRONTIER_CELL_LON=2.0`.
+
+Rollout note: persisted `frontier_strip_plan` entries in the old grid are
+not in the new `strip_set`, so every running frontier is re-planned once
+(graceful, KG boundary) — expected on the first director tick after the
+restart.
+
+#### Incident 2026-09-30 — primary proxy blackout + director flapping
+
+Timeline (all UTC, primary VM alive and logging the whole time until 13:28):
+
+* 05:52–12:14: shadow at240 promoted itself **7 times** (05:58, 06:25,
+  07:11, 08:03, 09:31, 11:34→at231, 12:14) because it missed 6 heartbeats of
+  the primary **through the exe.dev proxy**; primary's local `srv-watchdog`
+  saw only ONE genuine gunicorn wedge (06:09–06:11, all 8 threads blocked,
+  auto-restart). Auto-handback returned the role each time (~15–40 min).
+* 08:30: exe.dev dashboard metrics for `srtm-lidar-at` flat-line at zero
+  while the VM kept running → host-side telemetry/proxy lost the VM.
+* 12:39: at240 (director) died — **disk full** (24.5 GB disk, 12 GB of
+  JSON corpus pulled in as director; the 1 h role-eviction grace was reset
+  on every re-promotion, so it never purged). at204 took over.
+* 13:00–13:28: peers get `503` from `https://example.invalid:8000`
+  (edge proxy → VM unreachable) while the VM journal shows normal activity.
+* 13:28 / 13:29 / 14:22: three cold resets (operator restarts; no shutdown
+  in journal). Operator could not reach the VM even after reboot.
+* 14:37: primary took over from at204 (stale director pointer → 6 misses
+  → legitimate-looking takeover; harmless because primary is the home).
+
+Verdict: hosting-level reachability of the primary (exe.dev proxy/host),
+compounded by two of our own weaknesses: (1) the HA watchdog treats
+"unreachable via proxy" as "dead"; (2) an interim director on a 24.5 GB
+peer fills its disk with the JSON corpus if it holds the role >1 h in
+aggregate.
+
+Recovery tooling: `scripts/recover_combined_log.py` backfills the merged
+24 h log from interim directors' rings + every peer's raw processor.log
+(warnings/errors + uploads, tagged `recovered:true`). Manifest / v2 store
+re-converge on their own via `_sync_peer_data` + ingest (verified: 0
+missing products after this incident).

@@ -1,0 +1,1422 @@
+# Austrian Landscape Analysis API — v5.4
+# Base: https://example.invalid:8000
+# Geometry: WGS84 (lon/lat). Processing: EPSG:3035. Max area: 25 km². Austria only.
+
+## Overview
+
+Watershed segmentation + Random Forest classifier over 6 remote sensing layers.
+Classifies landscape into 25 object types + 11 group types.
+Focused on distinguishing man-made vs natural and detecting terrain modification.
+
+## Data Sources (8)
+
+| # | Source | Resolution | Access | Role |
+|---|--------|-----------|--------|------|
+| 1 | BEV ALS DTM+DSM | 1m | HTTP range /vsicurl/ | Height model, terrain, temporal change (3 dates: 2022/2023/2024) |
+| 2 | BEV DOP RGBI Orthophoto | 0.2m | HTTP range /vsicurl/ | NDVI, spectral bands, GLCM texture (47 operates + DOP fallback) |
+| 3 | Sentinel-2 NDVI | 10m | openEO (openeo.dataspace.copernicus.eu) | Growing-season NDVI composite + monthly time series → phenology |
+| 4 | ESA WorldCover v200 | 10m | AWS COG (esa-worldcover.s3.eu-central-1.amazonaws.com) | Land cover prior (built/tree/crop/grass/water fractions) |
+| 5 | Sentinel-1 SAR | 10m | openEO | VV+VH backscatter (cloud-proof ground classification) |
+| 6 | Hansen GFC-2024-v1.12 | 30m | HTTP range (storage.googleapis.com) | Forest cover 2000, annual loss/gain 2001–2024 |
+| 7 | Austrian Cadastre | mm | umfeld-at `/k` REST API | Run-time model context only (footprint/land-use priors); never written to a product since 2.4 |
+| 8 | OpenStreetMap | varies | Overpass API | Roads, paths, waterways, landcover (supplementary ground truth) |
+
+BEV LiDAR URLs: data.bev.gv.at/download/ALS/{DTM,DSM}/{20220915,20230915,20240915}/
+BEV Ortho URLs: data.bev.gv.at/download/DOP/{20220128,20221027,20240625,20250415}/
+Hansen URL: storage.googleapis.com/earthenginepartners-hansen/GFC-2024-v1.12/
+All raster data accessed via GDAL /vsicurl/ (HTTP range requests) — no bulk downloads.
+
+## Licence & Attribution (READ before redistributing any output)
+
+Machine-readable: GET /api/v1/attribution (JSON) or ?format=text. Also
+embedded in every KG JSON (`attribution` key), every GPKG (`gpkg_metadata`
+table, dataset scope + per-layer ODbL flag) and every Zenodo deposit
+description/notes. Single source of truth: attributions.py.
+
+Our derivatives (API responses, Zenodo dumps, GPKG/GeoJSON exports) are
+**CC BY 4.0** (https://creativecommons.org/licenses/by/4.0/). When you
+re-use them you must carry forward these credits:
+
+| Source | Licence | Required credit |
+|---|---|---|
+| BEV ALS DTM/DSM, DOP orthophoto, Kataster | CC BY 4.0 (Open Government Data) | "Datenquelle: BEV – Bundesamt für Eich- und Vermessungswesen, <product>, Stichtag <date>, CC BY 4.0, bearbeitet" |
+| Copernicus Sentinel-1 / Sentinel-2 | Free, full & open (EU Reg. 377/2014; Del. Reg. 1159/2013) | "Contains modified Copernicus Sentinel data <year>" |
+| ESA WorldCover 2021 v200 | CC BY 4.0 | "© ESA WorldCover project 2021" + Zanaga et al. 2022, doi:10.5281/zenodo.7254221 |
+| Hansen GFC-2024-v1.12 | CC BY 4.0 | "Hansen/UMD/Google/USGS/NASA" + Hansen et al. 2013, Science 342:850–853 |
+| OpenStreetMap (roads/paths/water/landcover, power polygons) | **ODbL 1.0** (share-alike) | "© OpenStreetMap contributors" |
+| austria-power API (Austro Control, IG Windkraft, OSM) | mixed; per-feature `source` | "Austro Control, IG Windkraft, © OpenStreetMap contributors" |
+
+Obligations (CC BY 4.0): attribute, link the licence, indicate that the
+data was modified ("bearbeitet": re-projected to EPSG:3035, tiled,
+segmented, classified, enriched), and do not imply BEV/ESA/EU endorsement.
+Stichtag: ALS epochs 20220915/20230915/20240915 are mosaic snapshot dates —
+real flight years per block in meta.acquisition. DOP series
+20220128/20221027/20240625/20250415.
+
+OSM caveat: the `infrastructure` layer / JSON key contains OSM-derived
+(ODbL) data and is kept separate. Merging it into a redistributed database
+triggers ODbL share-alike for that database. Everything else is CC BY 4.0.
+No personal data: cadastre owner data is not in the open datasets nor in
+this API; EZ numbers are public cadastre attributes.
+
+## Methods — Segmentation Pipeline
+
+Pipeline: fused gradient → Felzenszwalb over-segmentation → RAG merge → feature extraction → classification → grouping.
+
+### Step 1: Fused Multi-Layer Gradient
+Sobel edge detection on each data layer, weighted sum:
+- CHM (nDSM=DSM−DTM): 0.25 — canopy/building edges
+- DTM: 0.20 — terrain breaks (roads, embankments)
+- DSM: 0.10 — surface breaks
+- NDVI: 0.20 — vegetation boundaries
+- NIR: 0.15 — material transitions
+- Green/Red/Blue: 0.05/0.03/0.02 — fine spectral detail
+Each layer smoothed (Gaussian σ=0.8), Sobel-filtered, normalised to [0,1].
+
+### Step 2: Two-Layer Felzenszwalb + RAG
+Ground (nDSM<0.3m) and elevated (≥0.3m) segmented separately to prevent tree/ground merging.
+- Felzenszwalb: scale=150 (elevated) / 180 (ground), sigma=0.5, min_size=30px / 60px
+- RAG merge: threshold=0.12 — adjacent segments with similar gradient are merged
+
+### Step 3: Feature Extraction (57 features per segment)
+- Height & terrain (8): h_mean, h_max, h_std, h_p90, slope_mean, slope_std, dsm_roughness, dtm_roughness
+- Shape (5): compactness, elongation, solidity, extent, area
+- DSM edges (1): dsm_edge_strength
+- Spectral/BEV (11): ndvi_mean, ndvi_std, brightness_mean, nir_mean, red/green/blue_mean, green_ratio, rg_index, nir_brightness_ratio, nir_red_ratio
+- Copernicus (3): cop_ndvi_mean, fused_ndvi_mean, fused_ndvi_std
+- ESA WorldCover (5): esa_built_frac, esa_tree_frac, esa_crop_frac, esa_grass_frac, esa_water_frac
+- Temporal (8): h_change, dtm_change, dtm_change_abs, temporal_h_std, stability, volume_change_m3, volume_change_abs_m3, dtm_change_max, dtm_change_frac_03m
+- GLCM texture (6): glcm_contrast, glcm_homogeneity, glcm_entropy, glcm_dissimilarity, glcm_energy, texture_complexity
+- SAR (3): sar_vv, sar_vh, sar_ratio
+- NDVI harmonics (4): harm_mean, harm_amplitude, harm_phase, harm_rmse
+- Hansen (6): hansen_treecover2000, hansen_loss_frac, hansen_recent_loss_frac, hansen_loss_3yr_frac, hansen_gain_frac, hansen_current_forest_frac
+- Additional (5): ndvi_max, slope_max, h_p10, perimeter, esa_dominant_lc
+
+## Methods — Classification
+
+Two-tier: Random Forest (primary) with rule-based decision tree (fallback).
+
+### Random Forest Classifier
+- scikit-learn RandomForestClassifier: n_estimators=200, max_depth=20, min_samples_leaf=5, class_weight="balanced", oob_score=True
+- 16 learnable classes: tree, shrub, grass, crop, road, path, parking, roof, water, bare_soil, rock, earthwork, garden, orchard, vineyard, tree_loss
+- 3 excluded (rule-based only): wind_turbine, substation, solar_panel (need spatial context)
+- excavation + fill merged → earthwork for training; split back at inference by DTM change sign
+- If RF confidence < threshold → falls back to rule-based classifier
+
+### Rule-Based Fallback (decision tree, ordered by priority)
+0. Infrastructure spatial match: known solar/wind/substation locations from austria-power API → early exit
+1. Temporal disturbance: DTM change >0.8m → excavation/fill; nDSM drop >2m → tree_loss/construction; nDSM grow >2m → construction. NDVI>0.5 vetoes disturbance.
+2. Water: ESA water >50% + NDVI <0.1 + flat; or very low NIR + negative NDVI
+3. Elevated (nDSM>0.5m): building score from DSM roughness + height variance + compactness + NDVI + texture + SAR. High score → roof/greenhouse/solar_panel. Low score → tree/shrub/hedge.
+4. Ground (nDSM≤0.5m): NDVI harmonics primary (high amplitude→crop, low mean→road, moderate→grass). SAR fallback. Shape (elongated→road). ESA priors. Terrain (steep+rough→rock).
+
+NDVI selection hierarchy: fused NDVI (1m+seasonal) > BEV ortho NDVI (1m) > Copernicus 10m NDVI.
+Coarse 10m NDVI triggers extra caution (vegetation bleed into roads at boundaries).
+
+### Hierarchical Grouping
+Adjacent compatible segments merge into 11 group types:
+- forest (tree+shrub+hedge), woodland (shrub+hedge), hedgerow (hedge)
+- waterbody (water)
+- building (roof+wall+solar_panel+greenhouse+substation)
+- road_network (road+path+parking)
+- cropland (crop+grass), pasture (grass+garden), orchard_grove (orchard+vineyard)
+- quarry (excavation+fill), construction_site (construction+excavation+fill+tree_loss)
+
+## Methods — RF Training Pipeline
+
+### Ground Truth Sources
+1. Cadastre land-use codes (Benützungsart): 50-entry BA→type mapping (42→roof, 51→crop, 56→tree, 48→road, etc.)
+2. OSM: roads/paths buffered to width → road/path labels; landuse/natural polygons → forest/farmland/water/quarry labels
+3. Hansen tree_loss: synthetically labelled where hansen_recent_loss_frac≥0.15 + treecover2000≥20% + (height<5m or h_change<-2m)
+   - Label circularity fix: hansen_recent_loss_frac and hansen_treecover2000 features zeroed for tree_loss samples
+
+### Training Process
+Runs as systemd service (rf_train.service). Iterates ~300 random KGs (seed 42, >5 buildings each) + infrastructure KGs:
+1. For each KG: fetch cadastre + OSM ground truth, read all raster data, segment, extract 57 features, match to labels
+2. Each KG checkpointed to rf_training_data/checkpoints/kg_XXXXX.npz (skipped on restart)
+3. Every 10 KGs: retrain RF on all accumulated samples, save to /tmp/learned_classifier/
+4. Dominant classes downsampled to 5× median class count to reduce imbalance
+
+### Model Selection
+- evaluate_checkpoints.py trains RF at every 5-KG increment, multiple seeds
+- Composite score: 0.4×OOB + 0.35×mean_per_class_accuracy + 0.25×worst_class_accuracy
+- Best checkpoint+seed saved to data/best_model/ — API prefers this over live model
+- Training Monitor dashboard: /training.html (live OOB curve, per-class accuracy, convergence)
+
+### Deployed Model (data/best_model/)
+Selected at peak composite score from learning curve:
+- Training: 55 KGs, seed 2, 87,496 samples, 16 classes
+- Hyperparams: n_estimators=200, max_depth=20, min_samples_leaf=5, class_weight="balanced"
+- OOB accuracy: 69.9%, composite: 59.0%, mean per-class: 65.0%, worst class: 33.0% (earthwork)
+
+Per-class OOB accuracy:
+  Vegetation: tree 86%, crop 83%, garden 80%, shrub 63%, grass 59%, vineyard 54%, orchard 44%
+  Water: water 52%
+  Buildings: parking 77%, roof 68%
+  Transport: road 72%, path 35%
+  Terrain: bare_soil 78%, rock 56%, earthwork 33%
+  Change: tree_loss 100%
+
+Top 10 feature importances:
+  hansen_loss_frac 3.5%, hansen_treecover2000 3.5%, dtm_roughness 3.2%,
+  fused_ndvi_mean 3.2%, slope_mean 3.2%, h_mean 2.7%, dtm_change_abs 2.6%,
+  temporal_h_std 2.3%, h_p90 2.3%, h_p10 2.2%
+
+Learning curve: composite peaks at 55 KGs then declines (additional data introduces label noise
+from cadastre/OSM misalignment faster than new signal). OOB and composite both trend down after 60 KGs.
+
+## Austria-Wide Processing (Austria Processor)
+
+Background processor (austria_processor.py, ~5100 lines) applies the full pipeline to all ~8,440 Austrian Katastralgemeinden (KGs), uploading results to Zenodo as open-access datasets.
+
+### Architecture
+- Runs as systemd service (austria_processor.service, MemoryMax=4G)
+- Each KG processed in isolated subprocess (multiprocessing.Pool(1)) — full memory reclaim between KGs
+- Large KGs tiled into 1.5km overlapping strips (100m overlap), centroid-ownership deduplication
+- Tile checkpoints: completed tiles pickled to disk; on crash only interrupted tile re-processed
+- Grid-snapped caches: Copernicus (0.1°) and Hansen (0.5°) tiles shared by adjacent KGs
+- Zenodo cache: Copernicus/Hansen tiles persisted as ZIP archives, restored via HTTP range reads on local miss
+
+### Per-KG Outputs (uploaded to Zenodo)
+- {kg}_full.gpkg (~400MB): all raster layers (DTM/DSM/nDSM/ortho/segment_type) + vector segment polygons
+- {kg}_light_v2.gpkg (~100-400MB): segment raster+vector, new buildings, infrastructure, tree apices/crowns, terrain_coarse (no cadastre layers since 2.4)
+- {kg}.json / {kg}_v2.json.gz / {kg}_ne.h3b: cadastre-stripped summary (completion marker), kgjson/2 blob, NE H3 cells — area statistics, height distributions, landscape characterisation, top objects, terrain, NDVI, Hansen loss, new buildings, infrastructure, data quality score
+
+#### GPKG segments layer — full per-object attribute schema (55 props)
+Present in {kg}_full.gpkg and {kg}_light.gpkg (layer 'segments',
+MultiPolygon EPSG:3035) and in app GPKG exports (onestop, /export/geopackage,
+share download). A companion 'segment_points' layer (Point EPSG:4326, 54
+props) carries the same attributes on object centroids.
+  Identity:       id, type, type_code, group_type, height_class
+  Shape:          area_sqm, perimeter_m, compactness, elongation, solidity, extent
+  Height:         height_max_m, height_mean_m, height_p90_m, height_std_m
+  Terrain:        slope_mean_deg, aspect_mean_deg, aspect_dominant, roughness,
+                  dsm_edge_strength, elevation_mean_m, elevation_min_m,
+                  elevation_max_m, tri_mean, tpi_mean, curvature_mean, terrain_class
+  Spectral:       ndvi_mean, ndvi_std, ndvi_fused, brightness_mean, nir_mean
+  Temporal:       height_change_m, dtm_change_m, temporal_stability,
+                  volume_change_m3, volume_change_abs_m3, dtm_change_max_m
+  Texture (GLCM): glcm_entropy, glcm_homogeneity, texture_complexity
+  SAR:            sar_vv, sar_vh
+  Phenology:      harm_amplitude, harm_phase, phenology_class
+  Classification: confidence, is_manmade, classifier (rf|rules|infra),
+                  rf_model (model hash), rf_type, rf_confidence
+  Rendering:      color (by type), color_height (viridis height ramp)
+  Observation:    obs_year
+A QGIS layer_styles table auto-renders both layers (colour by type).
+
+#### Retired layers (product 2.4, Oct 2026)
+`parcels` / `buildings` layers are no longer written (cadastre-free products;
+the Austrian cadastre is run-time model context only). The light GPKG is
+`{kg}_light_v2.gpkg` (segments, segment_points, new_buildings, infrastructure,
+segment_type, segment_height, tree_apices, tree_crowns, terrain_coarse);
+per-cell observed data lives in `{kg}_ne.h3b` (public /api/v1/cells).
+
+### Zenodo Integration
+Each KG gets its own Zenodo deposit with DOI. Search index stores download URLs:
+- zenodo_json_url, zenodo_light_gpkg_url, zenodo_full_gpkg_url
+- /api/v1/kg/<code> includes these URLs when available
+
+### Fault Tolerance
+- Tile checkpoints survive crashes/restarts
+- Automatic retry on timeout (90min), deferred retry 5 KGs later for transient failures
+- OOM: systemd kills + auto-restarts, checkpoints preserved
+- Disk management: LRU eviction, auto-pause below 3GB free
+- Copernicus circuit breaker: skip openEO on 503s for cooldown period
+- failed_kgs.json: permanently failed KGs skipped on restart
+
+### Processor Dashboard & API
+- Dashboard: /process.html (live progress, map, tile status, log, Zenodo manifest)
+- GET /api/v1/processing/status — current state, KG, step, tile progress, rates
+- POST /api/v1/processing/start — start (optional: state=, kg=)
+- POST /api/v1/processing/pause|resume|stop — control
+- POST /api/v1/processing/single?kg=X — process single KG
+- GET /api/v1/processing/log — recent log lines
+- GET /api/v1/processing/manifest — Zenodo manifest entries
+- GET /api/v1/processing/queue — read priority queue (items, names, failure counts, permanently failed)
+- POST /api/v1/processing/queue — add KGs at position (body: {kgs, position, skip_processed})
+- PUT /api/v1/processing/queue — replace entire queue (body: {queue: [...]})
+- DELETE /api/v1/processing/queue?kg=X — remove KG from queue
+
+Queue management: The processor reads retry_queue.json before its normal
+nearest-neighbor traversal. POST inserts KGs at a 0-based position (default -1 = append).
+Already-processed KGs are skipped by default. Duplicates in the queue are moved to
+the new position. Response includes resolved KG names, gemeinde, and final positions.
+
+Examples:
+  # Read the queue
+  curl https://example.invalid:8000/api/v1/processing/queue
+  # → {"queue": [{"code":"12105","name":"Dürnstein",...}, ...], "count": 28, "permanently_failed": [...]}
+
+  # Add Gesäuse + Kalkalpen national park KGs starting at position 2 (3rd place)
+  curl -X POST https://example.invalid:8000/api/v1/processing/queue \
+    -H 'Content-Type: application/json' \
+    -d '{"kgs":["49006","49013","49106","49311","49313","49321","49405","49406","49407","49409","49412","60102","60106","60107","67106","67107","67109","67111","67404","67405","67412","67501"],"position":2}'
+  # → {"status":"added","added_count":22,"queue_length":50,"added":[{"code":"49006","name":"Innerbreitenau","position":2},...]}
+
+  # Move a KG to the front of the queue
+  curl -X POST https://example.invalid:8000/api/v1/processing/queue \
+    -H 'Content-Type: application/json' \
+    -d '{"kgs":["91109"],"position":0}'
+
+  # Replace entire queue
+  curl -X PUT https://example.invalid:8000/api/v1/processing/queue \
+    -H 'Content-Type: application/json' \
+    -d '{"queue":["49006","49013","60102"]}'
+
+  # Remove a KG from the queue
+  curl -X DELETE 'https://example.invalid:8000/api/v1/processing/queue?kg=49006'
+
+## Geometry Input (all POST endpoints)
+
+Body accepts: GeoJSON, `{"geometry": <GeoJSON>, ...params}`, KML string,
+coordinate string (`lon,lat` or `lon,lat;lon,lat;...`), or multipart file upload
+(KML, GeoJSON, Shapefile ZIP, GPX, WKT, GeoPackage).
+Multi-feature inputs are unioned. Points are buffered to 100m radius.
+
+---
+
+## Endpoints
+
+### Analysis
+
+#### POST /api/v1/segment ← PRIMARY
+Watershed segmentation → 25 object types + 11 group types.
+
+Query/body params:
+  dataset            ALS date (default: 20240915)
+  min_object_size    Min segment area in m² (default: 30)
+  felz_scale         Felzenszwalb scale (default: 150)
+  rag_threshold      RAG merge threshold (default: 0.12)
+  include_ortho      true → BEV RGBI (NDVI, NIR, brightness, GLCM texture)
+  include_temporal   true → 3-date DTM comparison (2022/2023/2024)
+  include_copernicus true → Sentinel-2 NDVI + ESA WorldCover + SAR + NDVI harmonics
+  include_cadastre   true → cadastre building footprint ground truth
+  include_hansen     true → Hansen Global Forest Change calibration
+  types              Comma-separated type filter (e.g. "roof,tree,road")
+  groups             Comma-separated group filter (e.g. "building,forest")
+  async              true → returns 202 with {task_id}, poll for progress
+  task_id            Client-provided UUID for tracking
+
+Async flow:
+  1. POST /api/v1/segment?async=true → 202 {task_id, status: "running"}
+  2. GET  /api/v1/segment/progress?task_id=X → {active, step, detail, elapsed, done, error, auto_share_id,
+          progress?, fetch?, updated_ago}
+       progress = 0..1 fraction of the CURRENT step when known (e.g. a Zenodo download).
+       fetch    = live Zenodo download state while step=="download": {status
+          (queued|connecting|downloading|verifying|done|error), label, bytes_done,
+          bytes_total, pct, rate_mbps, eta_s, elapsed_s, attempt, files_done,
+          files_total, files_failed, active:[labels]}. All product-backed
+          endpoints (v3 tree service, GPKG layer reads) report through this, so a
+          slow Zenodo shows as a moving byte counter + ETA, never a silent spinner.
+          Host-wide view: GET /api/v1/zenodo/fetches.
+  3. GET  /api/v1/segment/result?task_id=X → full result
+  4. POST /api/v1/segment/abort?task_id=X → cancel
+
+Result: FeatureCollection. Per-feature properties:
+  type, type_code, group_id, group_type, is_manmade, confidence,
+  classifier_source ("rf"|"rules"|"infra"), rf_type (original RF prediction), rf_confidence,
+  height_max_m, height_mean_m, height_p90_m, area_sqm,
+  compactness, elongation, solidity, extent, dsm_edge_strength,
+  slope_mean, roughness, ndvi_mean, ndvi_fused, nir_mean,
+  brightness_mean, height_change, dtm_change, temporal_stability,
+  glcm_entropy, glcm_homogeneity, texture_complexity,
+  sar_vv, sar_vh, harm_amplitude, harm_phase, phenology_class
+
+  Terrain enrichment (per-segment, also in GPKG segments layer):
+  aspect_mean_deg          float, 0-360 degrees (-1 = flat terrain)
+  aspect_dominant           str, compass octant: N/NE/E/SE/S/SW/W/NW/flat
+  elevation_mean_m          float, mean DTM elevation in metres
+  elevation_min_m           float, minimum DTM elevation
+  elevation_max_m           float, maximum DTM elevation
+  tri_mean                  float, Terrain Ruggedness Index (mean within segment)
+  tpi_mean                  float, Topographic Position Index (mean; +ve=ridge, -ve=valley)
+  curvature_mean            float, profile curvature (mean; +ve=convex, -ve=concave)
+  terrain_class             str, Riley et al. classification: level / nearly_level /
+                            slightly_rugged / intermediately_rugged / moderately_rugged /
+                            highly_rugged / extremely_rugged
+
+Completed async tasks are auto-saved as shares (auto-<task_id[:8]>).
+
+#### POST /api/v1/elevation
+Enrich features with DSM/DTM elevation.
+
+#### POST /api/v1/terrain
+Terrain characterisation: slope, aspect, TRI, TPI, curvature.
+Invalid input polygons (self-intersections, ring sets where a hole is emitted
+as the exterior — common with raw cadastre geometry) are repaired server-side
+with make_valid() before rasterising. When that happens the response carries
+meta.geometry_repaired=true and meta.warnings[]. Applies to all
+geometry-driven endpoints (/terrain, /elevation, /segment, /changes*).
+
+#### POST /api/v1/changes
+Temporal change detection between two ALS dates.
+Params: date_a (default: 20220915), date_b (default: 20240915), min_change (m, default: 1.0)
+20 event types: tree_growth, tree_felling, new_tree, forest_clearcut,
+vegetation_growth/loss, new_building, demolition, construction,
+earthwork_fill/cut/grading/dam/trench/pond,
+road_new/resurfaced/widened, surface_change, unclassified_change.
+
+#### POST /api/v1/changes/trees
+Per-tree growth/felling analysis between dates (matches trees across epochs by
+centroid proximity; statuses: grown, stable, felled, new).
+Params:
+  date_a, date_b     ALS dates (default: 20220915, 20240915)
+  min_tree_height    Min nDSM peak to count as a tree in metres (default: 3.0)
+  crown_geometry     point (default) | polygon — return crown outlines
+                     (after-date crown preferred, before-date for felled trees)
+  async              true → 202 {task_id, poll, result}; poll
+                     /api/v1/segment/progress, fetch /api/v1/segment/result.
+                     Recommended for areas > ~50 ha.
+Per-tree properties: tree_id, status, height_before_m, height_after_m,
+height_change_m, crown_area_before_sqm, crown_area_after_sqm.
+Summary: total_trees, by_status{count, height_change_mean_m}.
+v2.3: NON-FOREST SUPPRESSION also runs here (params reject_nonforest /
+include_cadastre / min_tree_likelihood, defaults as in /api/v1/trees).
+Load-bearing for change detection: without it a demolished barn is
+reported as 'felled' timber and a new shed as a 'new' tree. Objects are
+judged on the epoch where they exist (after-date crown if present, else
+before-date). Measured on a farmyard AOI: 95 → 51 changes, 44 rejected
+(29 building, 13 crop, 2 flat_structure). meta carries
+rejected_by_surface / rejected_by_surface_class / building_mask.
+
+#### POST /api/v1/trees
+Single-date per-tree inventory (crown detection on nDSM watershed + crown-shape
+analysis, optional orthophoto spectral support). Forestry-oriented.
+Params:
+  dataset            ALS date (default: 20240915)
+  min_tree_height    Min nDSM peak in metres (default: 3.0)
+  crown_min_area     Min crown footprint in pixels/m² (default: 4)
+  crown_geometry     point (default) | polygon — crown outline polygons (WGS84)
+  include_ortho      true (default) | false — use BEV ortho for NDVI/leaf type
+  reject_nonforest   true (default) | false — v2.3 NON-FOREST SUPPRESSION,
+                     the SAME engine as /api/v2/trees (see there for the
+                     full evidence chain). v1's own building pixel class is
+                     geometry+spectral only and leaks badly: on a Waldviertel
+                     farmyard AOI it reported 175 trees, 85 of them standing
+                     on cadastre building footprints. With suppression on:
+                     69 trees, 2 on footprints (both genuine crowns
+                     overhanging a roof).
+  include_cadastre   true (default) | false — fetch BEV building footprints
+                     as authoritative non-tree evidence
+  min_tree_likelihood 0..1 (default 0.35) — reporting threshold
+  async              true → 202 {task_id, poll, result} (same task framework
+                     as /segment). Recommended for areas > ~50 ha.
+Per-tree properties: tree_id, height_max_m, height_mean_m, height_p90_m,
+crown_area_sqm, crown_shape (conical|rounded|columnar|irregular),
+leaf_type (coniferous|broadleaf|dead|unknown — heuristic from crown shape +
+spectra; treat as a hint, not species truth), compactness, elongation,
+ndvi_mean (when ortho available), surface_class + tree_likelihood (v2.3).
+Summary: total_trees, stems_per_ha, by_leaf_type, height_mean_m, height_max_m,
+top_height_m (h_dom — mean of the 100 tallest stems per ha), crown_area_total_sqm,
+crown_cover_pct.
+meta also carries rejected_by_surface / rejected_by_surface_class /
+building_mask / nonforest_rejection.
+
+NOTE: for forestry-grade stem density / height distributions prefer the
+/api/v2 tree service below — v1 watershed under-segments closed conifer
+canopy ~2x and its summary uses the whole-AOI denominator. Non-forest
+suppression quality is now IDENTICAL in both (shared engine), so the
+choice is purely about detection: v2 for inventory work, v1 only if you
+need its crown_shape / segment-based object semantics.
+
+### v2 tree service (apex-based, forestry-grade)
+
+#### POST /api/v2/trees
+Apex-based single-tree inventory, v2.3 (ortho-fused detection +
+NON-FOREST SUPPRESSION).
+
+NON-FOREST SUPPRESSION (v2.3, on by default). An nDSM local maximum is
+only reported as a stem when the surface under it behaves like a crown.
+Roof ridges, silos, containers, hay stacks, maize/rape plateaus, rock
+and road furniture all raise the DSM above terrain and used to be
+reported as trees with full DBH/volume (bogus crowns over farmyards and
+fields). Every crown is now judged on evidence, in order of authority:
+  1. CADASTRE — crown apex on, or >=50% of crown inside, a BEV building
+     footprint (dilated 1 m: outlines are wall lines, the DSM sees eaves)
+     => surface_class='building'.
+  2. NDVI (0.2 m BEV RGBI) — mean crown NDVI <= 0.10 means no live
+     foliage => 'hard_surface'. The one legitimate NDVI-poor tree, a
+     dead standing stem (small AND geometrically rough crown), is kept
+     as 'dead_tree_candidate' rather than silently dropped.
+  3. SURFACE GEOMETRY — plane-fit RMS residual, median |Laplacian|
+     roughness and apex-minus-crown-p10 relief, all measured on the
+     crown CORE (crown eroded 1 px, so the height cliff at the object
+     edge does not fake roughness). Planar + smooth + flat-topped =>
+     'crop' (<=6 m, i.e. field crops) or 'flat_structure' (taller);
+     borderline cases => 'uncertain'.
+Strong vegetation evidence (crown NDVI >= 0.30) overrides the
+geometry-only verdicts, so a broad flat-crowned solitary oak on a lawn
+stays a tree — but it does NOT override 'crop', because maize is the
+greenest thing in the scene; the 6 m height ceiling is what protects
+real trees there.
+Rejected crowns are removed from the label raster AND from the canopy
+mask, so stems_per_ha / crown_cover_pct denominators no longer count a
+farmyard or a maize field as stocked area.
+Every reported tree carries surface_class + tree_likelihood (0..1) +
+surface_building_frac / surface_roughness_m / surface_planarity_m /
+surface_relief_m, so a client can re-threshold or audit the verdict.
+Set reject_nonforest=false to receive ALL apices, classified but
+unfiltered (useful to see what was removed and why).
+Measured on a Waldviertel farmyard AOI (0.008° x 0.005°, 47 cadastre
+buildings, 5.8% of grid): 650 → 206 stems, apices on building
+footprints 317 → 4. On a forest-dominated hamlet AOI the filter is
+nearly a no-op (4829 → 4734, 95 rejected), i.e. it costs almost no
+recall where there is nothing to reject. Cost is ~0.1 s + one cached
+cadastre call.
+
+Seeding is two-source: (1) variable-window local maxima on nDSM
+(smoothed sigma=smooth_sigma), window radius r(h) = crown_radius_a +
+crown_radius_b*h; (2) native-resolution (0.2–0.5 m) RGBI ortho apex
+candidates — DoG band-pass crown-cap maxima (NIR preferred, RGB
+luminance fallback), height-gated on the nDSM (no stems below canopy)
+and restricted to locally CLOSED canopy (>=70% closure in 15 m) where
+the 1 m first-return gridding merges neighbouring tops. Both seed sets
+fuse into one marker-controlled watershed; crown radius capped at
+r(h)*crown_cap_factor and max_crown_area.
+Params:
+  dataset            ALS date (default: 20240915)
+  min_tree_height    m (default 3.0)
+  reject_nonforest   true (default) | false — drop buildings/crops/hard
+                     surfaces (see NON-FOREST SUPPRESSION above)
+  include_cadastre   true (default) | false — fetch BEV building
+                     footprints as authoritative non-tree evidence.
+                     false skips the cadastre round-trip (faster, and
+                     the only option outside cadastre coverage); the
+                     NDVI + geometry gates still run. meta.building_mask
+                     reports what was actually used.
+  min_tree_likelihood 0..1 (default 0.35) — reporting threshold on the
+                     surface score. Raise to be stricter (0.6 keeps only
+                     crowns with no non-tree evidence at all), lower to
+                     recover borderline field trees.
+  crown_radius_a     m, local-max window base (default 1.2)
+  crown_radius_b     m per m height (default 0.08)
+  smooth_sigma       Gaussian sigma in px/m (default 0.5)
+  crown_cap_factor   crown radius cap multiplier (default 1.5)
+  max_crown_area     m² hard cap per crown (default 250)
+  crown_geometry     polygon (default) | point
+  include_ortho      true (default) — 0.2 m RGBI spectra when covered
+  detection_mode     fused (default) | ndsm_only — fused adds the
+                     native-res ortho seeding; falls back to ndsm_only
+                     automatically when no ortho covers the AOI (see
+                     meta.detection_mode + detection_fallback_reason)
+  ortho_seed_res_m   target seeding resolution (default 0.4; snapped to
+                     an integer divisor of 1 m, coarsened for huge AOIs)
+  min_apex_prominence_m  m (default 0 = off) — filter apices by h-maxima
+                     prominence; suppresses branch-level false apices
+  leaf_type_min_conf 0..1 (default 0.5) — below this leaf_type='unknown'
+  h_dom_basis        canopy (default) | total — area basis for h_dom
+  async              recommended for areas > ~50 ha
+Per-tree properties: tree_id (STABLE, location-derived: t_<E_dm>_<N_dm>,
+EPSG:3035 apex rounded to 1 dm — deterministic across re-runs and epochs),
+seq, apex_lon/apex_lat (the local maximum, for field navigation), height_m
+(raw nDSM at apex), crown_area_sqm, crown_radius_mean_m/max_m, is_edge
+(crown touches AOI boundary — exclude from density), dbh_est_cm +
+dbh_method (heuristic), volume_m3_est, leaf_type + leaf_type_conf +
+leaf_type_prob_conifer (raw probability — re-threshold client-side),
+species_hint (spruce|larch|pine|conifer_unspecified|
+broadleaf_unspecified|unknown) + species_conf (capped 0.6 —
+ASSUMPTION-grade: relative within-AOI RGBI spectral position of the
+conifer population; spruce=dark crowns, larch=bright fresh-green
+deciduous conifer, pine=intermediate; needs >=10 conifers in AOI and
+leaf-on imagery — keep out of hard economic gates),
+vitality (vital|stressed|dead|unknown) + vitality_conf,
+detection_source (ndsm | ortho | fused) + detection_conf (0..1):
+'ndsm' = LiDAR local maximum (conf 0.75), 'fused' = nDSM apex
+independently confirmed by an ortho crown cap (conf 0.9), 'ortho' =
+recovered ONLY by native-res ortho seeding (conf 0.30–0.75 by seed
+strength — render differently, keep out of hard economic gates).
+Vitality is RELATIVE: 'stressed' = NDVI <= p10 within the AOI's
+same-leaf-type population (per-tree spectral.ndvi_percentile_in_aoi lets
+you re-cut); 'dead' stays absolute (ndvi_mean<0.15 & ndvi_p10<0.10 &
+h>=5). Only trustworthy when meta.nir_used=true. Also
+ndvi_mean/ndvi_p10/nir_mean/brightness_mean (when spectra available).
+Summary (explicit denominators): n_trees, n_trees_edge, area_ha_total,
+area_ha_canopy (nDSM >= min_tree_height), stems_per_ha_canopy,
+stems_per_ha_total (both non-edge only), h_mean_m, h_p50/p90/p95/p99/max_m,
+h_dom_m (mean of 100 tallest per ha over CANOPY area by default — see
+h_dom_basis/h_dom_note), h_top100_m (tallest stem per 100 m grid cell,
+robust moving-hectare Oberhöhe), crown_area_total_sqm,
+crown_cover_pct_canopy, crown_cover_pct_total, height_histogram_2m (2 m
+bins, STEMS — detection-biased below ~10 m under closed canopy),
+layer_profile_2m (nDSM PIXEL heights in 2 m bins — use for structure/
+plenter tests), canopy_gap_fraction (share of AOI pixels 2–10 m — where
+low stems are actually visible to first-return DSM), understory_detectable
+(always false: suppressed stems below dominant layer are invisible to a
+1 m first-return DSM — see detection_floor_note), by_leaf_type,
+by_vitality, by_species_hint, by_detection_source,
+by_surface_class (+ surface_class_note) — surface verdict of the
+REPORTED stems; with reject_nonforest=false the non-tree classes
+(building / hard_surface / crop / flat_structure / uncertain) show how
+many apices are not trees,
+recall_model {canopy_area_ha, crown_area_ha, unassigned_canopy_frac —
+self-reported residual under-detection: the share of canopy >= min
+height that belongs to no detected crown},
+volume_m3_est_total, volume_method (full allometry formula +
+known bias; generic spruce heuristic, NOT Pollanschütz — calibration
+against plot data available on request).
+meta: tree_algo_version, params_hash (deterministic over effective params
+— same params → same result; invalidate caches when tree_algo_version
+changes), detection_mode (fused | ndsm_only — what actually ran) +
+detection_fallback_reason when degraded, seed_band (nir | luminance),
+n_seeds_ndsm / n_seeds_ortho_candidates / n_seeds_ortho_added /
+n_seeds_ortho_pruned (added seeds whose final crown < 4 m² are treated
+as intra-crown branch texture, dropped, and the watershed re-run — no
+confetti crowns), detection_mode_requested (the param echo; meta.
+detection_mode is what actually ran),
+rejected_by_surface (count of apices dropped as non-forest) +
+rejected_by_surface_class ({building: N, crop: N, hard_surface: N, …}) +
+nonforest_rejection (bool, whether suppression was active) +
+building_mask (cadastre | unavailable | skipped… | error: …) +
+building_mask_px (footprint pixels on the AOI grid),
+nir_used_for (list: classification / detection / detection_luminance —
+replaces the ambiguous nir_used flag, which is kept for compatibility),
+acquisition (REAL flight years per BEV flight-block overlay:
+blocks[{flugjahr, year_from/to, gebiet, coverage_frac}], effective_date —
+the folder date 20220915 etc. is a mosaic snapshot, NOT the flight date;
+e.g. Steiermark '20220915' was flown 2010), ortho_operates/ortho_epoch
+(which RGBI operate fed the spectra), all effective parameters echoed.
+
+#### POST /api/v2/changes/trees
+Apex-matched change detection that survives re-segmentation.
+Matching pass 1: greedy nearest-neighbour on APEX points, radius
+max(match_radius_m, 0.75*r(h)). Pass 2: apex-unmatched trees whose crown
+masks overlap >= 30% of the smaller crown across epochs are the same tree
+(apex jumped to another branch) — match_method=apex|crown|none, crown
+matches carry crown_overlap_frac. Raster veto: 'felled' requires max nDSM
+in 3 m radius at date_b to have dropped >= felling_min_drop_m AND be < 40%
+of date_a height. Veto failures are SUB-CLASSIFIED, not lumped:
+  unmatched_a_canopy_intact       date_b canopy >= 70% of date_a height —
+                                  matching failure, NOT a loss
+  unmatched_a_partial_drop        30–70% height remains — crown break /
+                                  snow / wind damage
+  unmatched_a_ambiguous           the rest
+'new' requires date_a nDSM < max(3 m, 30% of date_b height), else
+unmatched_b_canopy_preexisting (apex churn, not a new tree).
+Statuses: stable | grown | shrunk | felled | new | unmatched_a_* |
+unmatched_b_canopy_preexisting.
+unmatched_a_canopy_intact and unmatched_b_canopy_preexisting records also
+carry match_status='unmatched_recall' — the counterpart epoch had no
+detection but the canopy is intact, i.e. a detector-recall artefact, NOT
+a physical change. Filter these out of loss/gain accounting.
+Detection here is FORCED symmetric ndsm_only for BOTH epochs (fused
+seeding disabled), so a recall difference between detector generations
+can never masquerade as new/felled records; ortho still feeds epoch-b
+vitality/leaf-type when include_ortho=true.
+Params: date_a, date_b, match_radius_m (default 3.0), felling_min_drop_m
+(default 5.0), growth_eps_m (default 0.3), min_patch_sqm (default 25),
+crown_geometry=point (default)|polygon, + all /api/v2/trees params.
+Per-record: tree_id (epoch-a id; tree_id_b when matched), status,
+match_method, height_a_m, height_b_m, height_change_m (null when not
+matched — never reused as a height), growth_cm_yr, volume_m3_est (felled
+records: allometric volume of the lost tree), crown_area_a/b_sqm,
+ndsm_max_a/b_m (the raster evidence at the apex, for audit without
+re-downloading rasters), match_distance_m, match_confidence,
+apex_a_lon/lat, apex_b_lon/lat.
+growth_cm_yr normalisation (IMPORTANT): the ALS folder dates are mosaic
+snapshots, not flight dates. When the BEV flight-block overlay knows the
+real Flugjahr for the AOI, growth is normalised by days_effective
+(mid-year assumption) — e.g. Steiermark 20220915→20240915 is really
+2010→2022 = 4383 days, not 731. summary.growth_cm_yr_is_nominal=true
+flags AOIs where real dates are unknown. If both epochs were flown the
+same year (same_flight_epoch=true) the rasters are likely the same
+acquisition republished — treat height changes as noise.
+Response also carries:
+  felling_patches    FeatureCollection of contiguous raw-nDSM-drop polygons
+                     (>= min_patch_sqm, despeckled) with area_sqm,
+                     drop_mean_m, drop_max_m, height_before_mean_m — the
+                     segmentation-independent disturbance product.
+  epoch_dates        {a, b, days, days_nominal, days_effective,
+                     same_flight_epoch}
+  summary            by_status, n_trees_a/b, felled_area_sqm,
+                     felled_volume_m3_est (SUM of per-tree allometric
+                     volumes over status=felled — same allometry as
+                     /v2/trees), felled_volume_m3_patch (independent
+                     patch-based proxy: area_ha × height_before × 16 m³/ha
+                     per metre; formula in the *_note fields),
+                     growth_cm_yr_percentiles (p10/p25/p50/p75/p90).
+  meta.acquisition   {a, b} real flight-year blocks per epoch.
+
+#### POST /api/v2/trees/by-polygons
+Per-stand batch inventory. Body: GeoJSON FeatureCollection of stand
+polygons (WGS84; reproject client-side from EPSG:32633 etc.). Computed
+ONCE on the union raster; trees assigned by apex containment (no double
+counting at stand boundaries — but if the stand polygons themselves
+overlap, trees in the overlap are counted in every containing stand;
+see n_overlapping_pairs / overlap_area_ha in the response summary).
+Params: key_property (stand id property name, default 'name'),
+merge_by_key=true to union same-key features into one multipart stand
+(entry carries n_parts), include_trees=true to embed per-tree Features
+per stand, + all /api/v2/trees params. async strongly recommended.
+Null/missing keys → key: null + a warning (never silently renamed);
+duplicate keys without merge_by_key are flagged key_is_duplicate.
+Response: {stands: [{key, feature_index, summary, n_parts?,
+key_is_duplicate?, trees?}], summary: {n_stands, n_trees_total,
+n_trees_assigned, union_area_ha, sum_area_ha, n_overlapping_pairs,
+overlap_area_ha}, warnings, meta}.
+
+#### POST /api/v2/changes/trees/by-polygons
+Per-stand growth + mortality in ONE call. Body: FeatureCollection of
+stand polygons. Runs the full two-epoch change analysis once on the
+union raster, then buckets records into stands by apex containment
+(apex_b preferred, apex_a fallback for felled).
+Params: all /api/v2/changes/trees params + key_property, merge_by_key,
+include_records=true to embed the per-tree change records per stand.
+async strongly recommended.
+Response: {stands: [{key, feature_index, summary: {n_records, by_status,
+area_ha_total, growth_cm_yr_percentiles (p10/p50/p90),
+felled_volume_m3_est, mortality_pct}}], summary (whole-union, incl.
+overlap diagnostics), warnings, epoch_dates, felling_patches (union-wide),
+meta}.
+
+### v3 tree service (product-backed — tree_apices + tree_crowns + landcover.grid25)
+
+v3 answers from the FROZEN products instead of re-running the detector:
+every `_light_v2.gpkg` (product_version ≥ 2.1) carries a `tree_apices`
+point layer (EPSG:3035, R-tree) — the v2 ndsm_only apex inventory run
+once on the stitched 1 m nDSM with the cadastre building mask — and the
+JSON carries a 25 m `landcover.grid25` index. Product 2.2 (2026-09-20,
+tree_algo_version 3.1.0) adds per-crown BEV ortho RGBI spectra +
+vitality + species_hint on every apex, a `tree_crowns` polygon layer,
+area-weighted canopy fractions, and anchors the raster grid to the BEV
+grid so tree_id is identical between product and live calls. 2.1
+products stay readable (meta.product_versions per code tells you which
+fields you get); the fleet re-upgrades them in the background.
+
+GRID ANCHOR / tree_id (meta.grid_anchor, meta.tree_id_note):
+  * All 1 m grids (product AND live, v2 AND v3) are the integer-metre
+    EPSG:3035 BEV ALS grid; an apex is the pixel centre (x.5). tree_id =
+    `t_<E_dm>_<N_dm>` of that centre — AOI-independent, epoch-stable
+    while the tree keeps its apex pixel. Before 2026-09-20 the live grid
+    origin was the fractional AOI corner, so v2 ids were shifted per AOI
+    and never equalled product ids.
+  * 2.1 products are re-anchored on read (constant per-product δ); the
+    id stored in the 2.1 file is returned as `tree_id_product` when it
+    differs — use it to migrate ids captured from v3.0.
+  * `legacy_ids=1` adds `tree_id_v2` per feature (v2 AND v3): the id a
+    pre-2026-09-20 /api/v2/trees call over THIS SAME AOI reported. Submit
+    the AOI you used then, join on tree_id_v2, store tree_id.
+  * Products built by the v2-upgrade path (from v1 full GPKGs) can carry
+    ≤1 px tile misregistration; fresh products are exact.
+
+Client notes:
+  * POST only. GET returns 405 with a hint. Send a JSON body with
+    `geometry` (any format in "Geometry Input") or a bare GeoJSON.
+  * Cold start per KG: the first request touching a KG downloads its
+    `_light_v2.gpkg` from Zenodo into the server-side GPKG cache
+    (1 GB LRU). Light v2 GPKGs are 30-800 MB (63330: 743 MB → 223 s
+    cold, then <2 s). Use `async=true` (poll /api/v1/segment/progress/
+    <task_id> → /result) or a client timeout ≥ 300 s for the first hit.
+  * To check coverage before calling: GET /api/v1/kg/<code> and look
+    for `_links.zenodo_light_gpkg_v2`, or query the search index with
+    `product_version=v2`. Uncovered AOI parts fall back to the live v2
+    detector (fallback_live=true) — meta.coverage tells you which.
+  * Product apices are frozen at the KG's als_year (2022–2024);
+    meta.acquisition lists the flight blocks per product
+    (als_year_min/max, years_gap_median, flight_dates) plus the live
+    dataset's block lookup. meta.dataset is only the mosaic release.
+
+Coverage rules (meta.coverage / meta.source_mix):
+  * AOI → parent KGs (R-tree) → product codes with a ≥2.1 light GPKG.
+  * A product's footprint = its classified grid25 cells (≈ the KG
+    polygon; bbox for monster KGs without grid25). Apices are read only
+    inside footprint ∩ AOI; duplicates across overlapping products are
+    collapsed by tree_id.
+  * live part = AOI minus all footprints. With fallback_live=true
+    (default) the live v2 detector (ndsm_only, cadastre mask) runs ONCE
+    on that part; live trees within 1.5 m of a product apex are dropped
+    (meta.coverage.live_deduped). fallback_live=false → product only.
+  * meta.product_codes_failed / _reasons: products whose GPKG could not
+    be read (they fall back to live).
+
+#### POST /api/v3/trees
+Params: min_tree_height (default 3), min_tree_likelihood (default 0;
+raise to e.g. 0.6 to drop 'uncertain' surfaces), stand_context=tree,
+orchard,… (filter on the v2 segment class under the apex),
+include_trees (default true), include_edge (default true; false drops
+is_edge trees from features too), crown_geometry=point|polygon
+(polygon = 2.2 `tree_crowns` watershed outline, simplified 0.5 m; 2.1
+products / live rows fall back to the apex point; meta.crown_polygons
+counts), legacy_ids, detection_mode=ndsm_only|fused (see below),
+fallback_live, dataset (live part), async.
+Cold products are pulled from Zenodo IN PARALLEL (all covering light
+GPKGs at once) and the task progress reports the aggregate download —
+step "download", detail "Downloading 3 light GPKG(s) from Zenodo: 1/3
+files, 120.6/250.6 MB · 4.5 MB/s · ETA 29s", plus structured
+progress/fetch fields (see /api/v1/segment/progress). Use async=true for
+AOIs touching uncached KGs; a sync call blocks for the download.
+detection_mode=fused: runs the live v2.3 fused detector (0.4 m ortho
+seeds + nDSM, ortho spectra) over the WHOLE AOI at /api/v2/trees cost,
+then joins product rows by tree_id and carries stand_context,
+segment_type, dh_per_year_m, als_year, product_code onto the matched
+trees (source=fused_product); ortho-only stems come back as
+source=live_fused; product apices the fused run did not reproduce
+within 1.5 m are kept (source=product). Canopy is then the live 1 m
+mask. Use when density/structure needs the ortho-only fifth; the
+harvest gate does not.
+Per-tree properties (Feature = apex Point WGS84, or crown Polygon):
+tree_id (+tree_id_product, +tree_id_v2), height_m, crown_area_sqm,
+crown_radius_mean_m, is_edge (crown disc crosses the SUBMITTED AOI
+boundary — product and live alike), dbh_est_cm, volume_m3_est,
+leaf_type (+_conf), detection_source/_conf, surface_class,
+tree_likelihood, stand_context (tree|orchard|vineyard|hedge|garden|
+shrub|other|none; 'unknown' for live trees), segment_type (+_conf),
+dh_per_year_m, als_year, source, product_code, product_version, and
+(2.2 / live-with-ortho) vitality (vital|stressed|dead|unknown, +_conf),
+species_hint (spruce|larch|pine|conifer_unspecified|
+broadleaf_unspecified|unknown, +_conf), ndvi_mean, ndvi_p10, nir_mean,
+brightness_mean, green_ratio_mean — per-crown means over the 1 m BEV
+ortho RGBI (not Sentinel-2) — and ndvi_percentile_in_aoi, re-ranked
+over the SUBMITTED AOI per leaf class on every call (stressed = bottom
+decile AND below the AOI median; dead = absolute NDVI < 0.15 & p10 <
+0.10 & h ≥ 5 m, ranked KG-wide in the product). null on 2.1 products.
+summary: n_trees (+_product/_live/_edge), area_ha_total,
+area_ha_canopy, area_ha_canopy_cover_weighted, area_ha_stand,
+area_ha_forest, area_ha_live_part, canopy_method +
+canopy_denominator_note, stems_per_ha_total / _canopy / _forest
+(non-edge stems), h_mean/p50/p90/p95/p99/max, h_dom_m, h_top100_m,
+height_histogram_2m, by_leaf_type, by_stand_context, by_surface_class,
+by_detection, by_vitality, by_species_hint, by_source,
+volume_m3_est_total (+_per_ha_canopy), dh_per_year_m_median,
+n_with_dh, grid25_cells_in_aoi.
+Canopy denominators (2.2): area-weighted — Σ (25 m cell ∩ AOI area) ×
+`canopy_frac` (fraction of 1 m px in the apex-inventory canopy: nDSM ≥
+min_tree_height inside a v2 segment, roofs/crop rejected) for
+area_ha_canopy, × `tree_frac` for area_ha_forest, × `woody_frac` for
+area_ha_stand. No centre rule, no dominance rule, no rim loss. 2.1
+products fall back to the centre + dominant-class rule
+(canopy_method says which).
+meta: tree_algo_version 3.1.0, product_algo_version, product_version,
+product_versions (per code), detection_mode, grid_anchor, tree_id_note,
+acquisition, source_mix, coverage, product_codes_failed (+_reasons),
+grid25_codes, live (detector provenance), n_edge, params_hash.
+
+#### POST /api/v3/trees/by-polygons
+FeatureCollection of stand polygons in → per-stand summaries out, from
+the products (union collected once; apex containment; is_edge judged
+against EACH stand's boundary; area-weighted grid25 canopy per stand;
+live canopy pro-rated by live area). Params: key_property,
+merge_by_key, include_trees (default false), + /api/v3/trees params.
+Response shape = /api/v2/trees/by-polygons.
+
+#### POST /api/v3/changes/trees
+Epoch a = the product apices (frozen at the product's als_year), epoch
+b = live nDSM at `date_b` (default 20240915) detected ndsm_only. Same
+apex matching + raster veto as /api/v2/changes/trees. The product has
+no epoch-a 1 m raster (disk rule), so epoch a is a CROWN PROXY: the 2.2
+`tree_crowns` outlines (mean-radius discs for 2.1 products) painted
+with h_m. On that proxy both matching passes run (apex, then crown-
+overlap on the proxy labels) and `felling_patches` are derived: drop =
+crown h_m − live nDSM ≥ felling_min_drop_m, patches ≥ min_patch_sqm
+(default 25), each with area_sqm, drop_mean_m, drop_max_m,
+height_a_mean_m (= height_before_mean_m, the crown apex height) — so
+the fresh/old split via height_before_mean_m − drop_mean_m works;
+patch edges are crown-outline-true at best. felling_patches_note and
+summary.epoch_a_note state the proxy composition (n polygon vs disc
+crowns). growth_cm_yr is only emitted when date_b's flight year is
+> 0.5 a later than the product als_year; epoch_dates.same_flight_epoch
+flags republished acquisitions. Requires ≥1 covering product (400
+otherwise).
+
+#### POST /api/v1/changes/summary
+Multi-epoch change summary (2022→2023→2024).
+
+### Overlays (POST, return PNG with X-Bounds header: south,west,north,east)
+
+  /api/v1/segment/overlay  Segment classification raster. Params: types, color_mode (type|height)
+  /api/v1/dtm/overlay      DTM hillshade. Params: dataset
+  /api/v1/lidar/overlay    nDSM height (viridis). Params: dataset
+  /api/v1/ortho/overlay    RGB orthophoto. Params: dataset, ortho_year
+  /api/v1/cir/overlay      CIR false-colour (NIR→R, R→G, G→B). Params: dataset, ortho_year
+  /api/v1/hansen/overlay    Hansen forest change. Params: dataset
+
+### Exports
+
+#### POST /api/v1/export/geopackage
+All layers in one GPKG. Supports async (async=true → poll → download).
+Params:
+  layers       all (default) | comma-separated layer IDs:
+                 dtm        → DTM + DSM + nDSM (raw 1m float32)
+                 segments   → Segment type + height rasters
+                 ortho-YYYY → Orthophoto RGBI for that year
+                 cir-YYYY   → CIR false-colour for that year
+                 raster     → Coloured segment overlay (RGBA)
+                 hansen     → Hansen forest change overlay (RGBA)
+                 dtm-YYYY   → DTM hillshade overlay (RGBA)
+                 dsm-YYYY   → nDSM height overlay (RGBA)
+  types        Segment type filter (e.g. tree,road)
+  height_min   Height filter: keep segments >= X metres
+  height_max   Height filter: keep segments <= X metres
+  height_op    gt | lt | between (inferred from min/max if omitted)
+  color_mode   type | height (segment colouring)
+  include_segments_vector  true → add vector 'segments' (MultiPolygon,
+               EPSG:3035) + 'segment_points' (Point, EPSG:4326) layers with
+               the full 55-attribute schema (see "GPKG segments layer" above)
+  async        true → 202 with {task_id}
+Async download: GET /api/v1/export/geopackage/download/<task_id>
+
+Share shortcut: GET /api/v1/share/<id>/download.gpkg
+  layers=all (default) | active (from share's UI state) | comma-separated IDs
+  types, height_min, height_max, height_op → filter segments
+
+#### POST /api/v1/export/kml
+Export segment features as KML with type/height_class folders.
+Params:
+  types                    Segment type filter (e.g. tree,grass)
+  group_by                 type (default) | height_class — folder grouping
+  segment_geometry         point (default) | polygon — vectorise segments to polygons
+  segment_geometry_style   type (default) | height — colour by object type or viridis height ramp
+  height_min               Height filter: keep segments >= X metres
+  height_max               Height filter: keep segments <= X metres
+  height_op                gt | lt | between (inferred from min/max if omitted)
+
+#### POST /api/v1/export/mbtiles
+Single raster layer as MBTiles for offline use.
+Params: layer (required, e.g. dtm-2024, ortho-2024, raster), min_zoom, max_zoom, async
+Async download: GET /api/v1/export/mbtiles/download/<task_id>
+
+### Raw GeoTIFF Downloads (POST)
+
+  /api/v1/lidar/geotiff    DTM/DSM/nDSM float32 GeoTIFF. Params: dataset,
+                           band=dtm|dsm|ndsm|all (default all → 3-band stack
+                           b1=DTM b2=DSM b3=nDSM). Single-band requests
+                           return a 1-band file. NoData=-9999 set; band
+                           descriptions set.
+  /api/v1/ortho/geotiff    Orthophoto GeoTIFF, RGB + NIR (band 4) when an
+                           RGBI operate covers the AOI/year. Params: dataset,
+                           ortho_year (e.g. 2024), resolution (m/px, default
+                           1.0, min 0.2 = native; capped at 100 Mpx), or
+                           res=native|1m alias (native → 0.2 m). GeoTIFF
+                           tags: ORTHO_RES_M, ORTHO_EPOCH, ORTHO_OPERATE_ID.
+
+### BEV source-data access (for local validation / offline work)
+
+ALS DTM/DSM (1 m, EPSG:3035, 50 km tiles, BigTIFF ~12 GB, HTTP
+range-requests supported — use GDAL /vsicurl/, no directory listing):
+  https://data.bev.gv.at/download/ALS/{DTM|DSM}/{epoch}/ALS_{DTM|DSM}_CRS3035RES50000mN{N}E{E}.tif
+  epochs: 20220915, 20230915, 20240915. Tile origin = lower-left corner in
+  EPSG:3035 metres, aligned to the 50 000 m grid, no zero-padding beyond the
+  natural 7 digits (e.g. N2650000E4700000). 55 tiles cover Austria; the
+  authoritative tile list is tile_index.py:TILE_COORDS in
+  https://github.com/ (this repo) — or derive: floor(coord/50000)*50000.
+  Example (covers the Kohlschwarz/WILHELM AOI at E4708478 N2682287):
+  https://data.bev.gv.at/download/ALS/DSM/20240915/ALS_DSM_CRS3035RES50000mN2650000E4700000.tif
+  nDSM is NOT published — compute DSM - DTM (clamp negatives to 0).
+
+ALS flight dates (IMPORTANT): the epoch folder names (20220915 etc.) are
+national mosaic snapshot dates, NOT acquisition dates. Real per-block
+flight years come from the BEV "Aktualitaet DGM - ALS" overlay
+(Metadatenuebersicht shapefiles on www.bev.gv.at, ALS-Hoehenraster page;
+vendored in this repo at data/als_acquisition/*.geojson, queried by
+als_acquisition.py and surfaced as meta.acquisition on the v2 tree
+endpoints). Blocks can be over a decade apart between epochs — e.g. the
+Steiermark block in the '20220915' mosaic was flown 2010, while
+'20230915'/'20240915' carry a 2022 flight. Always use
+epoch_dates.days_effective (not the nominal folder-date span) for growth
+rates. Only Flugjahr (year, sometimes a range) is published — no
+month/day.
+
+Raw LiDAR point clouds (LAZ): BEV publishes ONLY the derived 1 m DTM/DSM
+rasters nationally — no national point-cloud download. Point clouds are
+held by the federal states (Laender): several offer open LAZ downloads
+(e.g. data.gv.at portals for Ober-/Niederoesterreich, Tirol, Kaernten,
+Stmk GIS), others on request. This service is raster-only.
+
+DOP orthophoto RGB (0.2 m, EPSG:3035, same 50 km grid):
+  https://data.bev.gv.at/download/DOP/20220128/DOP_CRS3035RES50000mN{N}E{E}_20220128.tif
+RGBI operates (0.2 m RGB + separate NIR file, native Austrian GK CRS
+31254/31255/31256, per-operate footprints): series folders
+  https://data.bev.gv.at/download/DOP/{20221027|20240625|20250415}/
+Operate ids, bboxes and CRS per operate: see ortho_io.py:RGBI_OPERATES.
+No public directory listing or STAC; range requests work; no special
+headers required. Per-AOI epoch availability oracle:
+GET /api/v1/layers?bbox=w,s,e,n (authoritative; /api/v1/info now lists the
+same epochs statically).
+
+### Shares
+
+#### GET /api/v1/shares?limit=20
+List saved shares, most recent first.
+Response: [{id, name, description, has_result, has_geometry, endpoint, updated, size_kb}, ...]
+
+#### POST /api/v1/share
+Save analysis state + result for sharing. Content-hash dedup.
+Body: {state, result?, overlays?, name?, reuse_id?}
+Response: {id, url, reused}
+
+#### GET /api/v1/share/<id>
+Load a share. Follows rename redirects (old links keep working).
+Response header X-Share-Id contains the resolved ID.
+Response: {state, result, overlays?, name?, aliases?}
+
+#### POST /api/v1/share/<old_id>/rename
+Rename a share. Old ID becomes a redirect stub so old links still work.
+Body: {new_id: "MySlug"}
+Response: {id, old_id}
+
+#### GET /api/v1/share/<id>/download.gpkg
+Direct GeoPackage download from a share (usable as QGIS data source URL).
+Params: layers (all|active|comma-separated IDs), types, color_mode
+
+### Utilities
+
+#### GET /api/v1/layers?bbox=lon_min,lat_min,lon_max,lat_max
+Data layer availability for a bounding box.
+Response: {ortho: {"2024": bool, ...}, cir: {...}, dtm: {...}, dsm: {...}, hansen: bool}
+
+#### GET /api/v1/info
+Server info: data sources, datasets, object types, endpoints, licence + attribution block.
+
+#### GET /api/v1/attribution
+Licence + attribution for all upstream sources (see "Licence & Attribution" above).
+Params: format=text → plain-text block. Default JSON: {license, license_url,
+modification_note, osm_derived_layers, sources{id:{name,provider,license,
+license_url,attribution,citation?,share_alike?,url}}, short, text}.
+
+#### POST /api/v1/parse-geometry
+Parse uploaded geometry file (Shapefile ZIP, GeoPackage, GeoJSON, KML, GPX, WKT).
+Multipart upload with field "file". Returns GeoJSON FeatureCollection.
+
+#### POST /api/v1/classifier/train
+Train RF classifier on cadastre ground truth for a bbox.
+Params: bbox (lon_min,lat_min,lon_max,lat_max), n_estimators, max_depth
+
+#### GET /api/v1/classifier/status
+RF model status: trained, n_samples, oob_score, feature_importances.
+
+#### GET /api/v1/training/status
+Background RF training job progress (4000-KG run).
+
+### Quality Flags & Feedback
+
+Every KG JSON is scanned post-build. Rules in `quality_flags.py` flag
+implausible heights, mismatched NDVI, edge artefacts, low-confidence
+classifications, and tree-vs-mast/hedge-vs-tree mistakes. Flags carry a
+`severity` (low|medium|high|critical) and a numeric `weight` so multiple
+rules firing on the same object accumulate ("agreement").
+
+Empirical thresholds (re-tuned Apr-2026 against ~36k indexed parcels with
+top_objs/top_trees data):
+  tree height        warn 50m  high 60m  critical 80m   (real Austria max ~57m)
+  shrub height       warn  8m  high 12m  critical 20m   (was 4/6/15 — too noisy)
+  hedge height       warn  8m  high 15m  critical 25m
+  + new rule: hedge ≥10m AND rf_conf 0.45–0.6 → likely_tree_row (medium)
+
+#### GET /api/v1/flags
+List flags. Filterable + paginated.
+Params: kg, severity, code, type, kind, obj_ref, bbox, min_value,
+        order=severity|value|recent, limit, offset.
+Returns: {count, flags: [{obj_ref, kg_code, kind, obj_type, flag_code,
+          severity, weight, message, attrs, aggregate}, ...]}.
+
+#### GET /api/v1/flags/object/<obj_ref>
+All flags + aggregates for one object. obj_ref examples:
+  KGCODE:top_tree:N           top_10_trees rank N
+  KGCODE:top_obj:N            top_10_objects rank N
+  KGCODE:top_manmade:N        top_manmade_objects rank N (product 2.3+)
+  KGCODE:top_by_type:tree:0   per-type top entry
+  KGCODE:building:<id>        cadastre-matched building
+  KGCODE:new_building:N       vectorised unmatched roof
+  KGCODE:infra:road:N         vectorised infrastructure feature
+
+#### GET|POST /api/v1/flags/match
+Match free text + optional coords to a known object so users can flag
+without knowing the obj_ref. Used by static/flag.js.
+Params: text="102.2m tree", kg=, lon=, lat=, radius_m=200.
+Returns: {obj_ref, candidates: [{obj_ref, distance_m, score, agg, ...}],
+          flags: [...], action_predictions: {confirm, reject, correct_type}}.
+
+#### GET /api/v1/flags/stats
+Totals by code/severity/type. Useful for QA dashboards.
+
+#### POST /api/v1/feedback
+User confirms/rejects/corrects an object. Body:
+  {obj_ref, kind: confirm|reject|correct_type|report_missing,
+   value|corrected_type: <new_type>?, notes|note?, user?}.
+Both spellings are accepted (`notes`/`note`, `value`/`corrected_type`).
+Resolves matching flags atomically.
+Returns {ok, id, resolved_obj_ref, resolution_status, notes_stored,
+         warnings?}. `warnings` lists silently-ignored fields (unknown keys,
+correct_type without a value, reject/report_missing with no note) — check it
+rather than trusting a bare ok:true.
+`user_role` is server-assigned ('student'); it is not settable by clients.
+
+#### GET /api/v1/feedback/events
+Recent feedback actions (live activity feed).
+
+### Search Index (fast pre-built SQLite FTS5 + R-tree over all 8440 Austrian KGs)
+
+#### GET /api/v1/index/status
+Index statistics: kg_count, processed_count, total_area_km2, zenodo_kgs, etc.
+
+#### POST /api/v1/index/rebuild
+Rebuild search index from scratch (~0.3s).
+
+### Search Index Schema
+
+kg table columns (all indexed): kg_code, kg_name, gemeinde_code, gemeinde_name,
+  district_code, district_name, state_code, state_name, bbox, centroid,
+  building_count, total_area_sqm, processed, primary_year,
+  dominant_type, vegetated_fraction, shannon_diversity, n_segments,
+  elevation_min_m, elevation_max_m, elevation_mean_m, slope_mean_deg,
+  aspect_dominant, roughness_mean, steepness_max_deg, elevation_range_m,
+  tri_mean, terrain_class, ndvi_mean,
+  tree_count, tree_canopy_sqm, tree_mean_height_m, tree_stem_volume_m3,
+  net_volume_change_m3, temporal_stability,
+  new_building_count, infrastructure_count,
+  building_mean_height_m, building_max_height_m,
+  building_stories_mean, building_stories_max, building_pitched_pct,
+  new_building_mean_height_m, new_building_stories_mean,
+  sar_vv_mean_db, sar_vh_mean_db,
+  ndvi_harm_mean, ndvi_harm_amplitude, ndvi_harm_phase,
+  dtm_change_mean_m, n_changed_segments, total_disturbed_volume_m3,
+  phenology_dominant, n_tiles, building_height_coverage_pct,
+  mean_confidence, rf_classified_pct, rf_mean_confidence,
+  rf_diverged_count, rf_diverged_pct, quality_score, quality_grade,
+  zenodo_json_url, zenodo_light_gpkg_url, zenodo_full_gpkg_url
+
+kg_buildings table (per-building records, joined via kg_code):
+  roof_type_hint (flat/pitched), max_height_m, mean_height_m,
+  stories_est, centroid_lon, centroid_lat, centroid_dtm_m
+
+Async flow:
+  1. POST {"min_elevation": 1500, "async": true} → 202 {task_id, status, poll}
+  2. POST {"task_id": "..."} → 202 while running, 200 with result when done
+
+Example: tree conf>0.8 area>800 + grass conf>0.8 area>1300 + no buildings + SW aspect + rugged:
+  POST {"type_filters":[{"type":"tree","min_confidence":0.8,"min_area_sqm":800},
+    {"type":"grass","min_confidence":0.8,"min_area_sqm":1300}],
+    "max_buildings":0, "aspect":["S","SW","W"], "min_roughness":2.0}
+
+#### GET /api/v1/kg/<kg_code>
+Full KG JSON summary if processed locally, else index data with Zenodo links.
+Add ?index_only=true to always use index (faster, no file I/O).
+
+#### GPKG-backed KG endpoints & Zenodo download progress (segments, layers)
+These read the KG's light GPKG. First access lazy-loads it from Zenodo
+(10–900 MB, cached 1 GB LRU; v2 light GPKG preferred, shared with the v3
+tree service). Downloads are resumable, retried, single-flight (one
+download per file across all workers/clients) and PROGRESS-AWARE:
+  wait=S   seconds to block on a cold download (default 25, max 120, 0 = never).
+  → 200 JSON once the GPKG is local (cached KGs: always immediate).
+  → 202 Accepted + Retry-After while still downloading, body:
+      {status:"fetching", kg_code, resource, message,
+       fetch:{status, bytes_done, bytes_total, pct, rate_mbps, eta_s, elapsed_s, attempt, error},
+       retry_after_s, poll (this URL), zenodo:{inflight, recent_1h_median_mbps, slow, …}, hint}
+    The download continues server-side; re-GET the same URL (wait=0 for a
+    pure poll) until 200. X-Fetch-Progress header carries the percentage.
+  → 404 when no GPKG exists for the KG; 500 only on a terminal download error.
+GET /api/v1/zenodo/fetches → {inflight:[…], recent:[…], stats:{inflight,
+  inflight_rate_mbps, recent_1h, recent_1h_failed, recent_1h_median_mbps,
+  slow (median < 1 MB/s), max_parallel}, text} — every Zenodo product
+  download on this host with bytes/rate/ETA/attempt (also the
+  `zenodo_fetch:` line of /process.txt, flag ZENODO-SLOW).
+
+#### GET /api/v1/kg/<kg_code>/heightfield ← FAST (<100 ms) 2.5D terrain for games / viz
+Index-only gridded DTM estimate for a whole KG — no raster read, no GPKG.
+IDW (k nearest, 3 km cutoff) over the pre-indexed building centroids
+(`kg_buildings.centroid_dtm_m`, dense in settlements). Coarse
+accuracy — fine for isometric relief / hillshade / extrusion offsets,
+accuracy — fine for isometric relief / hillshade / extrusion offsets,
+NOT for survey use (use POST /api/v1/lidar/geotiff for real 1 m DTM).
+Params: cell=N   grid spacing in metres (default 50, min 20, max 500)
+        k=N      IDW neighbours (default 8; IDW path only)
+        landcover=1  also return landcover:[[type_code]] + landcover_legend
+                 (product 2.1 KGs only; 0 = no segment)
+Returns: {kg_code, bbox:[w,s,e,n], cell_m, cols, rows, origin:'nw',
+          rows_major_north_to_south:true, z:[[…]] (row 0 = north edge,
+          null = no sample within 3 km), elev_min, elev_max,
+          kg_elev_min, kg_elev_max (true DTM extremes from the KG index),
+          samples, source, source_detail}
+source = "dtm_grid25_v2.1"  → product-2.1 fast path: bilinear resample of
+          true 25 m DTM block means (terrain.grid25 in the v2.1 KG JSON,
+          read from the primary store). No nulls inside the KG, forest and
+          alpine cells included; cell is floored at 25. product_codes lists
+          the blocks used for split KGs.
+source = "idw_index"        → legacy IDW estimate (KG not yet on product 2.1).
+
+#### GET /api/v1/kg/<kg_code>/landcover  (product 2.1)
+Dominant v2 segment class per 25 m cell, native EPSG:3035 grid, one block
+per product code: {kg_code, product_version:"2.1", grids:[{code, x0, y0,
+cell_m:25, cols, rows, origin:'nw', crs:'EPSG:3035', legend:{code:type},
+cls:[[int]], cover_frac:[[0..1]]}]}. Cell (r,c) centre = (x0 + (c+0.5)*25,
+y0 - (r+0.5)*25). 404 until the KG has a 2.1 product; use
+/heightfield?landcover=1 for a lon/lat grid instead.
+
+Product 2.1 (docs/v2.1-product-spec.md) also puts a `tree_apices` point
+layer (EPSG:3035, R-tree; tree_id, h_m, crown_r_m, crown_area_m2,
+detection_source/conf, surface_class, tree_likelihood, stand_context,
+segment_type(_conf), dh_per_year_m, als_year, ndvi, leaf_type_hint) and
+`terrain_coarse_{dtm,dsm,ndsm,slope,aspect}` 5 m float32 rasters into
+<code>_light_v2.gpkg on Zenodo, plus `acquisition.tiles` (flight years)
+and `tree_stats.{n_apices,det_mode,algo_version}` in the JSON.
+Grid cell (r,c) → lon = w + c*cell/(111320*cos(lat)), lat = n - r*cell/110540.
+~90 KB at cell=50 for a typical KG; cached 1 h server-side.
+404 with processed:false for KGs not yet processed.
+
+Recipe — everything a 2.5D renderer needs for one KG, all <100 ms each:
+  /api/v1/kg/<kg>/heightfield?cell=50                    terrain grid
+  /api/v1/kg/<kg>/heightfield?cell=50&landcover=1        + dominant land-cover class per cell (2.1+)
+  /api/v1/trees/bbox?west&south&east&north&min_height=20 sampled tallest trees (index, <10 ms)
+AVOID for interactive use: /kg/<kg>/segments (GPKG fetch) and every POST
+raster endpoint (10–60 s).
+
+#### Sibling-service contract (siedler / kohlschwarz)
+  POST /api/v1/prewarm?kgs=   warm-up hint (200 all warm / 202 pending)
+  GET /api/v1/trees/bbox      sampled tree apices in a bbox (index, <10 ms)
+  GET /tiles/{hillshade|slope}/{z}/{x}/{y}.png   z10-17 WebMercator, from the 25 m grid25 DTM; 204 = no data
+  All CORS *, ETag, gzip, index-backed (never a KG JSON / GPKG read).
+  (The per-KG dossiers /llm/kg/<kg>, /llm/kgs, /llm/manifest.json and the
+  parcel / buildings query endpoints were retired 2026-10-13 — Kataster purge.)
+
+#### GET /api/v1/kg/<kg_code>/segments
+Segment polygons with classification (from light GPKG).
+Properties: id, type, type_code, group_type, height_class, area_sqm,
+  aspect_mean_deg, aspect_dominant, elevation_mean_m, elevation_min_m, elevation_max_m,
+  tri_mean, tpi_mean, curvature_mean, terrain_class, etc.
+Params: bbox=w,s,e,n  type=tree,roof,...  limit=N  offset=N
+
+#### GET /api/v1/kg/<kg_code>/layers
+List available vector layers in the KG's GPKG.
+Params: variant=light|full (default: light)
+
+---
+
+## 25 Object Types
+
+| Code | Type | Detection |
+|------|------|-----------|
+| 1 | tree | nDSM>4m, rough DSM, high NDVI |
+| 2 | shrub | nDSM 0.5–4m, high NDVI |
+| 3 | grass | Ground level, moderate+ NDVI, smooth DTM |
+| 4 | hedge | Elongated shrub (length/width>4) |
+| 5 | water | ESA water class, very low NDVI+NIR, flat |
+| 10 | roof | Compact elevated, smooth DSM, low NDVI |
+| 11 | greenhouse | Roof-like, high NIR transmittance |
+| 12 | solar_panel | Very smooth, bright, low NDVI on roof |
+| 15 | fence | Low (0.5–2m), thin, elongated |
+| 16 | wall | Narrow elevated, adjacent to roof |
+| 17 | mast | Tiny footprint (<10m²), very tall (>15m) |
+| 20 | road | Smooth DTM (<0.04m roughness), elongated, low NDVI |
+| 21 | path | Narrower road (<3m width) |
+| 22 | parking | Smooth, large, compact, low NDVI |
+| 23 | bridge | Elevated road/path over gap |
+| 30 | crop | Flat, seasonal NDVI, ESA cropland |
+| 31 | orchard | Regular tree spacing, <10m height |
+| 32 | vineyard | Low rows, <3m, row pattern |
+| 33 | garden | Mixed vegetation near buildings |
+| 40 | bare_soil | Low NDVI, flat-to-moderate slope |
+| 41 | rock | Steep + very rough DTM + low NDVI |
+| 50 | excavation | DTM lowered >0.20m between dates (≥25m²) |
+| 51 | fill | DTM raised >0.20m between dates (≥25m²) |
+| 52 | tree_loss | nDSM dropped >2m, terrain intact (≥8m²) |
+| 53 | construction | New structure or site clearing |
+
+## 11 Group Types
+
+| Code | Group | Members |
+|------|-------|---------|
+| 101 | forest | tree + shrub + hedge |
+| 102 | woodland | shrub + hedge (sparse) |
+| 103 | hedgerow | hedge + hedge |
+| 106 | waterbody | water + water |
+| 110 | building | roof + wall + solar_panel + greenhouse |
+| 115 | road_network | road + path + parking |
+| 120 | cropland | crop + grass |
+| 121 | pasture | grass + garden |
+| 122 | orchard_grove | orchard + vineyard |
+| 130 | quarry | excavation + fill |
+| 131 | construction_site | construction + excavation + fill |
+
+---
+
+## One-Stop URL (# url)
+
+GET /api/v1/onestop — Trigger segmentation + download from a single bookmarkable URL.
+Designed for users on limited/mobile connections. No POST body needed.
+
+Query params:
+  bbox=lon_min,lat_min,lon_max,lat_max  Bounding box (required)
+  name=MySave              Save name / share ID (slug, 1-80 chars, [A-Za-z0-9_-])
+  min_object_size=10       Min segment area in m² (default: 10)
+  include_ortho=true       Orthophoto features (default: true)
+  include_temporal=false    Multi-date comparison
+  include_copernicus=false  Sentinel-2/SAR
+  include_cadastre=false    Cadastre ground truth
+  include_hansen=false      Hansen forest change
+  types=tree,road           Object type filter
+  height_min=X              Height filter: >= X metres
+  height_max=X              Height filter: <= X metres
+  height_op=gt|lt|between   Height operator (inferred if omitted)
+  format=json|gpkg|kml      Output format (default: json)
+  layers=segments           GPKG layers (default: segments with vector)
+  include_segments_vector=true  Include vector polygon layer in GPKG
+  segment_geometry=point|polygon  Feature geometry (default: point for KML, polygon for GPKG)
+  segment_geometry_style=type|height  Colour scheme: by object type or viridis height ramp
+  group_by=type|height_class    KML folder grouping
+
+Flow:
+  1. GET /api/v1/onestop?bbox=...&format=gpkg  → 202 {task_id, poll_url, estimated_seconds}
+  2. Poll the poll_url (same endpoint + task_id) until status=done
+  3. Final poll returns the file download (GPKG/KML) or JSON result
+  Result is auto-saved as a share for later access (auto_share_id in response).
+
+GPKG contents (format=gpkg, defaults):
+  Raster tables: segment_type, segment_height (float32, EPSG:3035);
+    add include_dtm=true for DTM/DSM/nDSM; layers=... for ortho/overlays.
+  Vector layer 'segments' (MultiPolygon, EPSG:3035) — the FULL 55-attribute
+    schema, identical to the Zenodo {kg}_full/_light GPKGs (see
+    "GPKG segments layer" under Austria Processor above): identity
+    (type, type_code, group_type, height_class), shape (area_sqm,
+    perimeter_m, compactness, elongation, solidity, extent), height
+    (max/mean/p90/std), terrain (slope, aspect, roughness,
+    dsm_edge_strength, elevation min/mean/max, tri, tpi, curvature,
+    terrain_class), spectral (ndvi_mean/std/fused, brightness, nir),
+    temporal (height_change_m, dtm_change_m, temporal_stability,
+    volume_change_m3, volume_change_abs_m3, dtm_change_max_m), texture
+    (glcm_entropy, glcm_homogeneity, texture_complexity), SAR (sar_vv,
+    sar_vh), phenology (harm_amplitude, harm_phase, phenology_class),
+    classification provenance (confidence, is_manmade, classifier,
+    rf_model, rf_type, rf_confidence), rendering (color, color_height),
+    obs_year. Note: temporal/SAR/phenology fields are 0 unless
+    include_temporal / include_copernicus were set on the analysis.
+  Vector layer 'segment_points' (Point, EPSG:4326) — centroid per object,
+    same attributes (54 props, no height_std duplicate), mirrors the API
+    GeoJSON point features.
+  layer_styles table — QGIS auto-render styles for both vector layers.
+
+Already-processed KGs: if your bbox lies inside a processed KG, prefer the
+prebuilt Zenodo products — zenodo_light_gpkg_url / zenodo_full_gpkg_url from
+GET /api/v1/kg/<code> — over re-running onestop.
+
+Processing queue: max 2 concurrent tasks, 4 in queue. Returns 503 if full.
+
+### Timing Estimates (bounding box < 1 km²)
+
+| Configuration              | Est. time  | Notes                            |
+|---------------------------|-----------|----------------------------------|
+| ortho only (default)       | ~30-60s   | DTM+DSM+ortho, fast              |
+| ortho + temporal           | ~60-90s   | +3-date comparison               |
+| ortho + temporal + all     | ~90-120s  | +Copernicus+cadastre+Hansen      |
+| GPKG/KML export            | +5-10s    | Added on top of analysis time    |
+| Auto-save (always happens) | +1-2s     | Gzip-compressed share saved      |
+
+For 0.5 km² with ortho, expect ~40s total. For 0.1 km², ~25s.
+On mobile connections, GPKG download (1-5 MB) may add 5-30s depending on speed.
+
+### Example One-Stop URLs (< 1 km²)
+
+```bash
+# 1. Trees >30m in a forest area near Graz (~0.3 km², ~35s, JSON)
+curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&height_min=30&format=json'
+# → {"task_id":"...","status":"running","poll_url":"...","estimated_seconds":35}
+
+# 2. Same area, download as GeoPackage with vector polygons (~40s + 5s export)
+curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&height_min=30&format=gpkg'
+# Poll the poll_url until done, then the final request returns the .gpkg file
+
+# 3. All objects in a small village (~0.2 km², ortho+temporal, KML, ~50s)
+curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.35,47.15,15.355,47.154&include_temporal=true&format=kml'
+
+# 4. Buildings only, height 5-15m, as GPKG (~30s)
+curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=roof&height_min=5&height_max=15&format=gpkg'
+
+# 5. Poll a running task (same URL with task_id)
+curl 'https://example.invalid:8000/api/v1/onestop?task_id=<TASK_ID>&format=gpkg'
+# → 202 while running, then file download when done
+
+# 6. Full pipeline in a shell script:
+TASK=$(curl -s 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&height_min=30&format=gpkg' | jq -r .task_id)
+while true; do
+  RESP=$(curl -s -w '%{http_code}' -o /tmp/result.gpkg "https://example.invalid:8000/api/v1/onestop?task_id=$TASK&format=gpkg")
+  [ "$RESP" = "200" ] && echo "Downloaded!" && break
+  sleep 5
+done
+```
+
+### Segment Geometry Examples (polygon vs point, style modes)
+
+```bash
+# KML with polygon outlines coloured by height (viridis ramp)
+curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&format=kml&segment_geometry=polygon&segment_geometry_style=height&group_by=height_class'
+
+# KML with polygons coloured by object type (default style)
+curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&format=kml&segment_geometry=polygon'
+
+# KML with point centroids only (default, fast — no vectorisation)
+curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&format=kml'
+
+# GPKG with height-coloured polygons (segment_geometry defaults to polygon for GPKG)
+curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&format=gpkg&segment_geometry_style=height'
+
+# GPKG with points only (skip vectorisation, smaller file)
+curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&format=gpkg&segment_geometry=point'
+```
+
+### Height Filter Examples (work on GPKG, KML, and one-stop)
+
+```bash
+# Trees taller than 30m (height_min=30, operator inferred as >=)
+curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&height_min=30&format=gpkg'
+
+# Objects shorter than 5m
+curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&height_max=5&format=kml'
+
+# Objects between 10m and 25m
+curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&height_min=10&height_max=25&format=gpkg'
+
+# Height filter on share GPKG download
+curl -o filtered.gpkg 'https://example.invalid:8000/api/v1/share/Kohlschwarz80/download.gpkg?types=tree&height_min=20'
+```
+
+---
+
+## Examples
+
+```bash
+# Async segmentation with all sources
+curl -X POST 'https://example.invalid:8000/api/v1/segment?async=true&include_ortho=true&include_temporal=true&include_copernicus=true&include_cadastre=true' \
+  -H 'Content-Type: application/json' \
+  -d '{"geometry":{"type":"Polygon","coordinates":[[[15.4,47.07],[15.403,47.07],[15.403,47.073],[15.4,47.073],[15.4,47.07]]]}}'
+# → {"task_id":"...","status":"running"}
+
+# Poll progress
+curl 'https://example.invalid:8000/api/v1/segment/progress?task_id=...'
+
+# Get result
+curl 'https://example.invalid:8000/api/v1/segment/result?task_id=...'
+
+# Layer availability
+curl 'https://example.invalid:8000/api/v1/layers?bbox=15.1,47.1,15.2,47.2'
+
+# Change detection
+curl -X POST 'https://example.invalid:8000/api/v1/changes' \
+  -H 'Content-Type: application/json' \
+  -d '{"date_a":"20220915","date_b":"20240915","geometry":{"type":"Polygon","coordinates":[[[15.4,47.07],[15.41,47.07],[15.41,47.08],[15.4,47.08],[15.4,47.07]]]}}'
+
+# List shares
+curl 'https://example.invalid:8000/api/v1/shares?limit=10'
+
+# Load share (follows rename redirects)
+curl 'https://example.invalid:8000/api/v1/share/Kohlschwarz80'
+
+# Direct GPKG download from share
+curl -o analysis.gpkg 'https://example.invalid:8000/api/v1/share/Kohlschwarz80/download.gpkg'
+
+# --- Search Index (index status / KG detail / rebuild) ---
+# Index status
+curl 'https://example.invalid:8000/api/v1/index/status'
+
+# Specific KG detail (landcover + hansen + zenodo download links)
+curl 'https://example.invalid:8000/api/v1/kg/91109'
+curl 'https://example.invalid:8000/api/v1/kg/91109?index_only=true'
+# → includes zenodo_json_url, zenodo_light_gpkg_url, zenodo_full_gpkg_url
+#   and _links.zenodo_json, _links.zenodo_light_gpkg, _links.zenodo_full_gpkg
+#   (direct Zenodo download URLs when available)
+
+# Rebuild index (picks up new processor results + Zenodo manifest)
+curl -X POST 'https://example.invalid:8000/api/v1/index/rebuild'
+
+# Sampled tallest trees in a bbox (index, <10 ms)
+curl 'https://example.invalid:8000/api/v1/trees/bbox?west=15.4&south=47.0&east=15.5&north=47.1&min_height=25'
+```
