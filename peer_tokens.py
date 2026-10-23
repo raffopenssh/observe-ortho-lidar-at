@@ -160,9 +160,14 @@ def mesh_token() -> str:
     return _cache['mesh']
 
 
+IS_DIRECTOR_FLAG = Path('data/austria_processor/is_director')
+
+
 def is_primary_role() -> bool:
-    """The primary is the only VM holding a peer-token map."""
-    return PEER_TOKENS_PATH.exists()
+    """The primary = the VM holding the peer-token map (or the director
+    flag). Decides owner-channel enforcement for the master and the
+    outbound rewrite direction."""
+    return PEER_TOKENS_PATH.exists() or IS_DIRECTOR_FLAG.exists()
 
 
 def generate() -> str:
