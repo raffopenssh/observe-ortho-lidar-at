@@ -21903,13 +21903,14 @@ def process_txt():
     # whose reported token sha matches the primary's store runs on the
     # leased value; a mismatch means a stale legacy disk copy / old code.
     try:
-        if _pt.is_primary_role() and _fs.store_rev():
+        import fleet_secrets as _fsec
+        if _pt.is_primary_role() and _fsec.store_rev():
             import hashlib as _hl
-            _sv = _fs._load_store()
+            _sv = _fsec._load_store()
             _want = {k: _hl.sha256(_sv[k].encode()).hexdigest()[:16]
                      for k in ('github', 'umfeld') if _sv.get(k)}
-            _ls = _fs.leases()
-            _rev = _fs.store_rev()
+            _ls = _fsec.leases()
+            _rev = _fsec.store_rev()
             _at_rev = sum(1 for v in _ls.values() if int((v or {}).get('rev') or 0) == _rev)
             _ok = {k: 0 for k in _want}
             _bad: dict = {}
@@ -21928,14 +21929,14 @@ def process_txt():
                         _ok[k] += 1
                     elif _key in _st:
                         _bad.setdefault(k, []).append(_pid)
-            _deny = sorted(_fs.denied())
+            _deny = sorted(_fsec.denied())
             _bad_s = ''.join(f' {k}_stale={",".join(sorted(v)[:8])}{"…" if len(v) > 8 else ""}'
                              for k, v in _bad.items())
             out.append(
                 f'secrets:  rev={_rev} leases_at_rev={_at_rev}/{len(_ls)}'
                 + ''.join(f' {k}_sha_ok={_ok[k]}/{_n}' for k in _ok)
                 + f' denied={len(_deny)}{_bad_s}'
-                + f' legacy_file={"yes" if (_fs.LEGACY_FILES["github"].exists() or _fs.LEGACY_FILES["umfeld"].exists()) else "no"}'
+                + f' legacy_file={"yes" if (_fsec.LEGACY_FILES["github"].exists() or _fsec.LEGACY_FILES["umfeld"].exists()) else "no"}'
             )
     except Exception:
         log.exception('process.txt secrets line failed')
