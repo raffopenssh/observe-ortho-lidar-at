@@ -27,6 +27,12 @@ HOST = 'example.invalid'
 PRIVATE_PREFIX = '/k'
 ROOT = f'https://{HOST}{PRIVATE_PREFIX}'
 CADASTRE_BASE = f'{ROOT}/api/v1'
+# Public (tokenless) tier of the same host.  OSM geometry lives here since
+# 2026-10-23: ``/k/api/v1/osm/geometry`` is gone (404) — the only /k-specific
+# extra was ``?kg=<code>``; the public tier is bbox-keyed (``bbox=`` required,
+# ``parcel=`` / ``cat=water_parcels`` removed on every tier).
+PUBLIC_BASE = f'https://{HOST}/api/v1'
+OSM_GEOMETRY_URL = f'{PUBLIC_BASE}/osm/geometry'
 DOCS_URL = f'{CADASTRE_BASE}/docs/llm.txt'
 
 # Anchored to the repo dir, not cwd (segv2/ tools run with cwd=segv2/).

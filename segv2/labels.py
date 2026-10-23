@@ -49,9 +49,11 @@ try:
         _sys.path.insert(0, str(ROOT))
     import umfeld as _umfeld
     CADASTRE_BASE = _umfeld.CADASTRE_BASE
+    OSM_GEOMETRY_URL = _umfeld.OSM_GEOMETRY_URL
 except Exception:  # noqa: BLE001  (standalone checkout without umfeld.py)
     _umfeld = None
     CADASTRE_BASE = "https://example.invalid/k/api/v1"
+    OSM_GEOMETRY_URL = "https://example.invalid/api/v1/osm/geometry"
 INVEKOS_GPKG = ROOT / "data/invekos/INSPIRE_SCHLAEGE_2024-1_POLYGON.gpkg"
 # INVEKOS Schläge API (farm-subsidies-austria VM; years 2022-2026, stored EPSG:3035,
 # `nearest_to=<flight year>` picks the release closest to the LiDAR flight).
@@ -294,7 +296,9 @@ def fetch_osm(bbox_wgs: tuple[float, float, float, float], strict: bool = False)
     :class:`UpstreamUnavailable` instead of returning an empty context."""
     w, s, e, n = bbox_wgs
     out = {"road": [], "rail": [], "water_line": [], "water_area": []}
-    d = _get_json(f"{CADASTRE_BASE}/osm/geometry",
+    # Public tier (no /k, no token): bbox-keyed only; ``cat=water_area`` gives
+    # fillable (Multi)Polygons, ``cat=water`` the centreline/outline chunks.
+    d = _get_json(OSM_GEOMETRY_URL,
                   {"bbox": f"{w},{s},{e},{n}", "cat": "road,rail,water,water_area",
                    "limit": 100000},
                   retries=len(STRICT_BACKOFF_S) + 1 if strict else 3,
