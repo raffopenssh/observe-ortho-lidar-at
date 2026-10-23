@@ -905,7 +905,30 @@ def _ensure_bevdirect_server() -> None:
     raise NEError("bevdirect-serve did not come up")
 
 
-BEV_SOURCES_OK = frozenset({"bevdirect@v0.2.0", "bevdirect@v0.2.1", "bevdirect@v0.3.0", "bevdirect@v0.3.1", "bevdirect@v0.3.2", "bevdirect@v0.3.3", "bevdirect@v0.3.4"})
+# Static floor of bev-equivalent tags (mirrors umfeld ``frozen.bev_equivalent_tags``
+# as of 2026-10-23).  ``bev_sources_ok()`` extends it with the current binary pin
+# and whatever the cached umfeld manifest lists, so a ``BEVDIRECT_TAG`` bump can
+# never again reject every local build fleet-wide (v0.3.5 incident, 2026-10-23).
+BEV_SOURCES_OK = frozenset({"bevdirect@v0.2.0", "bevdirect@v0.2.1", "bevdirect@v0.3.0", "bevdirect@v0.3.1",
+                            "bevdirect@v0.3.2", "bevdirect@v0.3.3", "bevdirect@v0.3.4", "bevdirect@v0.3.5"})
+
+
+def bev_sources_ok() -> frozenset:
+    """Accepted NEC1 ``source`` tags: static floor ∪ ``bevdirect@<pin>`` ∪
+    umfeld's ``frozen.bev_equivalent_tags`` from the on-disk manifest cache
+    (``ne_rollout.NE_MANIFEST_CACHE``; no network call)."""
+    tags = set(BEV_SOURCES_OK)
+    tags.add(f"bevdirect@{BEVDIRECT_TAG}")
+    try:
+        import ne_rollout
+        if ne_rollout.NE_MANIFEST_CACHE.exists():
+            mf = (json.loads(ne_rollout.NE_MANIFEST_CACHE.read_text()) or {}).get("manifest") or {}
+            for t in ((mf.get("frozen") or {}).get("bev_equivalent_tags") or []):
+                if str(t).startswith("bevdirect@"):
+                    tags.add(str(t))
+    except Exception:  # noqa: BLE001 — cache absent/corrupt → static floor
+        pass
+    return frozenset(tags)
 
 
 def is_bev_declared(h) -> bool:
@@ -936,8 +959,9 @@ def build_declared_bevdirect(kg: str, bbox_wgs: tuple, is_block: bool = False) -
     sec = secs[0]
     _check_declared_header(sec, kg)
     src = str(sec.header.get("source") or "")
-    if src not in BEV_SOURCES_OK:
-        raise NEError(f"NEC1 source {src!r} is not a bev-equivalent tag umfeld accepts ({sorted(BEV_SOURCES_OK)})")
+    ok = bev_sources_ok()
+    if src not in ok:
+        raise NEError(f"NEC1 source {src!r} is not a bev-equivalent tag umfeld accepts ({sorted(ok)})")
     if src != f"bevdirect@{BEVDIRECT_TAG}":
         log.warning("ne_h3: declared layer %s built with %s (binary pin is %s)", kg, src, BEVDIRECT_TAG)
     if sec.header.get("algo") != "ne-cells-2":
