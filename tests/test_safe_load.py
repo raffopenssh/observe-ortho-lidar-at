@@ -30,6 +30,13 @@ def main():
     with tempfile.TemporaryDirectory() as d:
         good = os.path.join(d, 'g.npz'); np.savez(good, data=np.array({'map': np.zeros((2, 2))}, dtype=object))
         assert np.load(good, allow_pickle=True)['data'].item()['map'].shape == (2, 2)
+        # WorldCover tiles embed a rasterio CRS (pickled as WKT via __setstate__) —
+        # must stay loadable or every tile-store hit turns into an openEO refetch.
+        import rasterio.crs
+        wc = os.path.join(d, 'wc.npz')
+        np.savez(wc, data=np.array({'map': np.ones((2, 2), dtype=np.uint8),
+                                    'crs': rasterio.crs.CRS.from_epsg(4326)}, dtype=object))
+        assert np.load(wc, allow_pickle=True)['data'].item()['crs'].to_epsg() == 4326
         badp = os.path.join(d, 'b.npz'); np.savez(badp, data=np.array(Evil(), dtype=object))
         try:
             np.load(badp, allow_pickle=True)['data']; raise SystemExit('FAIL: evil npz loaded')

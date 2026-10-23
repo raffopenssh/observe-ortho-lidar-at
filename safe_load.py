@@ -41,6 +41,9 @@ ALLOWED: frozenset = frozenset({
     ('numpy', 'float64'), ('numpy', 'float32'), ('numpy', 'int64'), ('numpy', 'int32'),
     ('numpy', 'bool_'), ('numpy', 'uint8'), ('numpy', 'uint16'), ('numpy', 'int16'),
     ('affine', 'Affine'),
+    # rasterio CRS pickles as copyreg._reconstructor + __setstate__(wkt str):
+    # pure WKT parsing, no callable payload. Every WorldCover tile stores one.
+    ('rasterio.crs', 'CRS'),
     ('object_segmentation', 'SegmentedObject'),
     ('collections', 'OrderedDict'), ('collections', 'defaultdict'), ('collections', 'Counter'),
     ('builtins', 'set'), ('builtins', 'frozenset'), ('builtins', 'slice'),
