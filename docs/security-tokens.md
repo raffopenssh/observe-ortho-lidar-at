@@ -118,15 +118,44 @@ healthy — the only symptom was `EDGE-INBOUND-UNREACHABLE` in the banner.
 `data/owner_emails` (primary; one exe.dev login per line),
 `data/ha_enabled` (primary; absent = HA off).
 
+## Provider secrets (`fleet_secrets.py`, since 2026-10-23)
+
+Zenodo / umfeld / GitHub tokens live **only** in the primary's
+`data/secrets.json` (0600, gitignored, `{rev, zenodo, umfeld, github}`).
+Peers lease the bundle with their own peer token from
+`GET /api/v1/secrets/lease`, hold it in process memory, and scrub any
+legacy `data/umfeld_token` / `data/github_token` after the first lease.
+Re-lease is triggered by the `secrets_rev` field in the status-push ack
+(no polling) or by one provider 401 (rate-limited).
+
+* Rotate: rotate at the provider → `python3 fleet_secrets.py --set zenodo`
+  (value on stdin) → fleet converges within one push interval (~30 s).
+* Audit: `python3 fleet_secrets.py --leases` (peer → rev, ts, ip),
+  `--deny <peer>` / `--allow <peer>` (`data/secrets_deny`),
+  `/process.txt?q=secret-lease` for events (`secret-lease-refused` = denied
+  or unknown peer).
+* `/process.txt` `secrets:` line: `rev=N leases_at_rev=a/b
+  github_sha_ok=x/n umfeld_sha_ok=y/n denied=d legacy_file=no`. The
+  `*_sha_ok` counts compare the sha each peer reports in its status push
+  with the store value — equal ⇒ the peer runs on the leased value, not a
+  stale disk copy; `github_stale=…` / `umfeld_stale=…` list offenders.
+  `legacy_file=yes` means the primary still has a bootstrap
+  `data/github_token` (only needed while peers run pre-lease code —
+  delete it once `leases_at_rev` is full).
+* Convergence verified 2026-10-23 21:00 UTC: 51/51 leases at rev 4, 0
+  refusals, interim bootstrap PAT removed from the primary.
+
 ## Remaining trust anchors (out of scope here)
 
 * Code: peers `git reset --hard origin/main` on update — GitHub repo
-  access = fleet code execution. Keep the repo private, rotate the
-  deploy token if a peer is suspected compromised.
+  access = fleet code execution. Keep the repo private; the read-only
+  PAT is leased (above) and rotated with `--set github`.
 * Zenodo token / Copernicus credentials / umfeld token are still
   fleet-shared (peers need them to work). A compromised peer can spend
   Copernicus credits and PUT garbage into Zenodo buckets; rotate those
-  at the provider if a peer is confirmed compromised.
+  at the provider (+ `--set`) if a peer is confirmed compromised. Zenodo
+  has no scoped tokens — `safe_load.py` is the blast-radius limit for
+  poisoned artefacts.
 * Peer `:8000` ports are public (other exe.dev account) — only the
   per-peer token guards them; blast radius of a leaked peer token = that
   VM.

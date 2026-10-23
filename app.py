@@ -8398,6 +8398,11 @@ def director_peer_status():
         # line can count peers able to POST obs/reports to umfeld
         status = dict(status)
         status['umfeld_token_sha'] = body.get('umfeld_token_sha')
+    if 'git_token_sha' in body and isinstance(status, dict):
+        # kept so the `secrets:` line in /process.txt can prove peers run on
+        # the leased GitHub PAT (not a stale on-disk copy)
+        status = dict(status)
+        status['git_token_sha'] = body.get('git_token_sha')
     pd.record_peer_push(peer_id, status, bandwidth=bw)
     # Fleet distribution of the umfeld (cadastre upstream) token: a peer
     # whose reported sha differs from ours gets ours pushed (throttled).
@@ -21893,6 +21898,47 @@ def process_txt():
             )
     except Exception:
         log.exception('process.txt fleet_proxy line failed')
+
+    # secrets: provider-secret lease convergence (fleet_secrets.py). A peer
+    # whose reported token sha matches the primary's store runs on the
+    # leased value; a mismatch means a stale legacy disk copy / old code.
+    try:
+        if _pt.is_primary_role() and _fs.store_rev():
+            import hashlib as _hl
+            _sv = _fs._load_store()
+            _want = {k: _hl.sha256(_sv[k].encode()).hexdigest()[:16]
+                     for k in ('github', 'umfeld') if _sv.get(k)}
+            _ls = _fs.leases()
+            _rev = _fs.store_rev()
+            _at_rev = sum(1 for v in _ls.values() if int((v or {}).get('rev') or 0) == _rev)
+            _ok = {k: 0 for k in _want}
+            _bad: dict = {}
+            _n = 0
+            for _pc in (pd.load_peers_config().get('peers') or []):
+                _pid = _pc.get('id')
+                _ps = pd.get_pushed_status(_pid) if _pid else None
+                if not _ps:
+                    continue
+                _st = _ps.get('status') or {}
+                _n += 1
+                for k, _key in (('github', 'git_token_sha'), ('umfeld', 'umfeld_token_sha')):
+                    if k not in _want:
+                        continue
+                    if _st.get(_key) == _want[k]:
+                        _ok[k] += 1
+                    elif _key in _st:
+                        _bad.setdefault(k, []).append(_pid)
+            _deny = sorted(_fs.denied())
+            _bad_s = ''.join(f' {k}_stale={",".join(sorted(v)[:8])}{"…" if len(v) > 8 else ""}'
+                             for k, v in _bad.items())
+            out.append(
+                f'secrets:  rev={_rev} leases_at_rev={_at_rev}/{len(_ls)}'
+                + ''.join(f' {k}_sha_ok={_ok[k]}/{_n}' for k in _ok)
+                + f' denied={len(_deny)}{_bad_s}'
+                + f' legacy_file={"yes" if (_fs.LEGACY_FILES["github"].exists() or _fs.LEGACY_FILES["umfeld"].exists()) else "no"}'
+            )
+    except Exception:
+        log.exception('process.txt secrets line failed')
 
     # zenodo_lock line: the :8001 broker's lease table (kg_upload pool +
     # cache-class leases). Since 340f616 kg_upload leases are tracked but
