@@ -53,7 +53,21 @@ log = logging.getLogger(__name__)
 # === SECTION: Constants ===
 
 DEFAULT_BASE_URL = "https://zenodo.org"
-DEFAULT_TOKEN = "REDACTED_ROTATED_ZENODO_TOKEN"
+
+
+def default_token(required: bool = True) -> str:
+    """The fleet Zenodo token — leased from the primary, memory-only
+    (``fleet_secrets``). Never a literal in this repo again."""
+    import fleet_secrets
+    return fleet_secrets.token("zenodo", required=required)
+
+
+def __getattr__(name):
+    # ``from zenodo_client import DEFAULT_TOKEN`` keeps working for the ~30
+    # call sites, resolved lazily at *use* time so a rotation is picked up.
+    if name == "DEFAULT_TOKEN":
+        return default_token(required=False)
+    raise AttributeError(name)
 
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
@@ -496,13 +510,13 @@ class Client:
 
     def __init__(
         self,
-        token: str = DEFAULT_TOKEN,
+        token: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         max_retries: int = 5,
         retry_base_wait: float = 4.0,
         read_only: bool = False,
     ) -> None:
-        self.token = token
+        self.token = token or default_token()
         self.base_url = base_url.rstrip("/")
         self.max_retries = max_retries
         self.retry_base_wait = retry_base_wait
@@ -510,6 +524,21 @@ class Client:
 
         self._session = requests.Session()
         self._session.headers.update({"Authorization": f"Bearer {self.token}"})
+
+    def _maybe_release_token(self) -> None:
+        """401/403 from Zenodo: the token may have been rotated on the
+        primary — re-lease once (rate-limited) and refresh the session
+        header so the caller's retry uses the new value."""
+        try:
+            import fleet_secrets
+            fleet_secrets.invalidate("zenodo")
+            new = fleet_secrets.token("zenodo")
+            if new and new != self.token:
+                self.token = new
+                self._session.headers.update({"Authorization": f"Bearer {self.token}"})
+                log.info("zenodo token refreshed from lease (rev %s)", fleet_secrets.cached_rev())
+        except Exception:
+            pass
 
     def _reset_session(self) -> None:
         """Close the underlying HTTP session and start a fresh one.
@@ -673,6 +702,8 @@ class Client:
 
                 # Non-retryable client error (4xx except 429)
                 body_text = resp.text[:1000] if not stream else "<stream>"
+                if resp.status_code in (401, 403):
+                    self._maybe_release_token()
                 raise ZenodoError(
                     f"HTTP {resp.status_code}: {body_text}",
                     status_code=resp.status_code,

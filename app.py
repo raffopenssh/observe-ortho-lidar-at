@@ -198,6 +198,7 @@ def _current_admin_token() -> str:
 # stay open so the dashboard remains usable from anywhere.
 _PROTECTED_PREFIXES = (
     '/api/v1/admin/',
+    '/api/v1/secrets/',              # fleet_secrets lease (peer token, PEER_SCOPE)
     '/api/v1/ne/declared/',          # umfeld lu relay for bev-mode peers (director holds the umfeld token)
     '/api/v1/director/vct_reported',  # fleet-wide /contrib dedupe for split blocks
     '/api/v1/director/mode',
@@ -534,6 +535,11 @@ def _tier_cookie(resp):
 
 import peer_tokens as _pt
 _pt.install_outbound_hook()   # per-destination X-Admin-Token rewriting (docs/security-tokens.md)
+import safe_load as _safe_load
+_safe_load.install()          # whitelist unpickler for np.load(allow_pickle=True) (safe_load.py)
+import fleet_secrets as _fs   # provider secrets: leased from the primary, memory-only on peers
+_fs.set_event_hook(lambda kind, msg: pd._emit_director_event(f'{kind}: {msg}', peer='director',
+                                                             level='error' if 'denied' in kind else 'info'))
 
 OWNER_EMAILS_PATH = Path('data/owner_emails')
 _OWNER_EMAILS_CACHE = {'t': 0.0, 'v': frozenset()}
@@ -764,6 +770,8 @@ def _maybe_stage_ne_tooling(peer_id: str, nt) -> None:
 
 
 def _maybe_push_umfeld_token(peer_id: str, peer_sha) -> None:
+    if _fs.store_rev() and _fs.leases().get(peer_id):
+        return   # peer leases from fleet_secrets — no disk copies any more
     """Director-side: push data/umfeld_token to a peer that reports a
     different (or no) token. Fire-and-forget thread, ≤1 push / 5 min / peer.
     The token never travels through git (public repo) — only this
@@ -812,6 +820,8 @@ def _maybe_push_git_token(peer_id: str, peer_sha) -> None:
     """Director-side: push data/github_token (read-only PAT for the private
     repo) to a peer reporting a different/no token. ≤1 push / 5 min / peer."""
     try:
+        if _fs.store_rev() and _fs.leases().get(peer_id):
+            return   # peer already leases from fleet_secrets — no disk copies any more
         mine = _git_auth.token_sha()
         if not mine or peer_sha == mine:
             return
@@ -929,6 +939,32 @@ def admin_set_private_only():
         return jsonify({'error': f'flag write failed: {e}'}), 500
     return jsonify({'status': 'unchanged' if was == enabled else ('enabled' if enabled else 'disabled'),
                     'private_only': _tiers.private_only()})
+
+
+@app.route('/api/v1/secrets/lease')
+def secrets_lease():
+    """Provider secrets (Zenodo / umfeld / GitHub) for the calling peer —
+    ``fleet_secrets.py``. Peer-token gated (PEER_SCOPE); the bundle is
+    ~300 B and is fetched once per process + on ``secrets_rev`` change
+    (piggybacked on the status-push ack). Audit in
+    ``data/secret_leases.json``; ``data/secrets_deny`` refuses a peer."""
+    if not _pt.is_primary_role():
+        return jsonify({'error': 'not_primary'}), 404
+    tok = request.headers.get('X-Admin-Token') or _tiers.request_token(request)
+    peer_id = _pt.peer_for_token(tok) if tok else None
+    if not peer_id:
+        if _request_is_loopback() or (_pt.classify(tok, _current_admin_token()) == 'master'
+                                      and _request_is_owner_channel()):
+            peer_id = 'primary'
+        else:
+            return jsonify({'error': 'peer token required'}), 401
+    b = _fs.lease_for(peer_id, _peer_of_request())
+    if not b:
+        _security_event('secret-lease-refused', f'{peer_id} from {_peer_of_request()}')
+        return jsonify({'error': 'no lease'}), 403
+    resp = jsonify(b)
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
 
 
 @app.route('/api/v1/admin/install_umfeld_token', methods=['POST'])
@@ -2998,6 +3034,8 @@ def _peer_status_push_loop():
                 try:
                     _ack = _resp.json() if _resp.ok else {}
                     _PEER_PUSH_ACK_LOG_WM = (_ack or {}).get('recent_log_wm') or None
+                    if (_ack or {}).get('secrets_rev'):
+                        _fs.note_rev(_ack.get('secrets_rev'))
                 except Exception:
                     _PEER_PUSH_ACK_LOG_WM = None
                 if not _resp.ok:
@@ -8373,7 +8411,9 @@ def director_peer_status():
     # Ack carries the newest recent_log ts we now hold for this peer so
     # its next full push can be a delta (see _peer_status_push_loop).
     return jsonify({'ok': True, 'next_push_in_s': pd.PEER_PUSH_INTERVAL,
-                    'recent_log_wm': pd.pushed_recent_log_wm(peer_id)})
+                    'recent_log_wm': pd.pushed_recent_log_wm(peer_id),
+                    # ~12 B: peers re-lease provider secrets only when this changes
+                    'secrets_rev': _fs.store_rev()})
 
 
 @app.route('/api/v1/director/proxy/status')
@@ -13906,7 +13946,7 @@ def _seg_cache_load(cache_key: str):
             p.unlink(missing_ok=True)
             return None
         with open(p, 'rb') as f:
-            data = pickle.load(f)
+            data = _safe_load.load(f)
         if data.get('key') != cache_key:
             return None
         # Restore transform as rasterio Affine
@@ -13973,7 +14013,7 @@ def _seg_share_cache_load(share_id: str):
             p.unlink(missing_ok=True)
             return None
         with open(p, 'rb') as f:
-            data = pickle.load(f)
+            data = _safe_load.load(f)
         from rasterio.transform import Affine
         t = data.get('transform')
         if isinstance(t, (list, tuple)):
@@ -14001,7 +14041,7 @@ def _seg_cache_scan(cache_key_substring: str):
             if time.time() - p.stat().st_mtime > 3600:
                 continue
             with open(p, 'rb') as f:
-                data = pickle.load(f)
+                data = _safe_load.load(f)
             if data.get('key') and cache_key_substring in data['key']:
                 from rasterio.transform import Affine
                 t = data['transform']

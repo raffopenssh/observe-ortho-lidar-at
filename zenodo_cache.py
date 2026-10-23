@@ -154,7 +154,12 @@ TILE_STORE_V2 = os.environ.get("ZENODO_TILE_STORE_V2", "1").strip() not in ("0",
 
 # Zenodo API
 ZENODO_BASE_URL = "https://zenodo.org"
-ZENODO_TOKEN = "REDACTED_ROTATED_ZENODO_TOKEN"
+
+
+def _zenodo_token() -> str:
+    """Leased from the primary (fleet_secrets); never a literal here."""
+    import fleet_secrets
+    return fleet_secrets.token("zenodo", required=True)
 
 # Local cache dirs (must match tile_cache.py)
 COP_CACHE_DIR = DATA_DIR / "copernicus_tiles"
@@ -1391,9 +1396,9 @@ class ZenodoCache:
         Zenodo API base URL.
     """
 
-    def __init__(self, token: str = ZENODO_TOKEN,
+    def __init__(self, token: str | None = None,
                  base_url: str = ZENODO_BASE_URL):
-        self.token = token
+        self.token = token or _zenodo_token()
         self.base_url = base_url.rstrip("/")
         self.manifest = CacheManifest()
         self._session = requests.Session()

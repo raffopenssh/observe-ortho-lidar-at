@@ -36,6 +36,13 @@ def token() -> str:
     env = (os.environ.get('GITHUB_TOKEN') or '').strip()
     if env:
         return env
+    try:  # leased from the primary, memory-only (fleet_secrets.py); file = legacy fallback
+        import fleet_secrets
+        v = fleet_secrets.token('github')
+        if v:
+            return v
+    except Exception:
+        pass
     now = time.time()
     with _lock:
         if now - _cache['checked'] < 5 and _cache['tok'] is not None:
@@ -105,4 +112,7 @@ def git_env(base: dict | None = None) -> dict:
     """Environment for git subprocesses: never block on a terminal prompt."""
     env = dict(base if base is not None else os.environ)
     env['GIT_TERMINAL_PROMPT'] = '0'
+    t = token()
+    if t:
+        env['GITHUB_TOKEN'] = t   # read by scripts/git_credential_helper.sh (never on disk)
     return env

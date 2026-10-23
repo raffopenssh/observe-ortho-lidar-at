@@ -43,6 +43,11 @@ try:  # keep-alive pool for module-level requests.* (see http_pool.py)
     _http_pool.install()
 except Exception:
     pass
+try:  # whitelist unpickler for np.load(allow_pickle=True) fleet-wide (safe_load.py)
+    import safe_load as _safe_load
+    _safe_load.install()
+except Exception:
+    pass
 from pyproj import Transformer
 from shapely.geometry import box, shape as shapely_shape, Point, mapping
 from shapely.ops import transform as shapely_transform
@@ -56,7 +61,13 @@ from shapely.ops import transform as shapely_transform
 RECENT_LOG_RING = 500
 import umfeld as _umfeld
 CADASTRE_BASE = _umfeld.CADASTRE_BASE  # token-gated /k tier, see umfeld.py
-ZENODO_TOKEN = "REDACTED_ROTATED_ZENODO_TOKEN"
+
+
+def _zenodo_token() -> str:
+    """Fleet Zenodo token, leased from the primary and held in memory only
+    (``fleet_secrets``). Resolved per call so a rotation lands mid-run."""
+    import fleet_secrets
+    return fleet_secrets.token("zenodo", required=True)
 # Product/model version.  ``SEG_MODEL_VERSION=v2`` switches the classifier to
 # the segv2 LightGBM (object_segmentation.segment_and_classify(model="v2")),
 # stamps products "v2" and adds the v2-only JSON/GPKG extras (parcel outline
@@ -7976,7 +7987,7 @@ def _v2_upload_and_finish(kg: dict, kg_code: str, result: dict, _report_step, *,
         from zenodo_client import (Client as _ZClientV, landscape_metadata as _lmV,
                                     Manifest as _ZManifestV)
         from zenodo_lock import zenodo_upload_lock as _zul
-        _zclientV = _ZClientV(token=ZENODO_TOKEN)
+        _zclientV = _ZClientV(token=_zenodo_token())
         _zmanifestV = _ZManifestV(str(DATA_DIR / "zenodo_manifest.json"))
         _qsV, _qgV = result.get("quality_score", 0), result.get("quality_grade", "")
         _alV, _mlV = result.get("available_layers") or [], result.get("missing_layers") or []
@@ -8365,8 +8376,9 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         if not dst.exists():
             return None
         try:
+            import safe_load as _safe_load   # checkpoints may come from Zenodo (other peers)
             with open(dst, "rb") as f:
-                ck = _pkl.load(f)
+                ck = _safe_load.load(f)
             if ck.get("model_version", "v1") != MODEL_VERSION:
                 log.info("KG %s: discarding tile %d checkpoint (model %s != %s)",
                          kg_code, tile_idx, ck.get("model_version", "v1"), MODEL_VERSION)
@@ -10235,7 +10247,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                                  f"streaming {_full_size / 1e6:.0f} MB to Zenodo")
                     try:
                         from zenodo_client import Client as _ZClient, landscape_metadata as _lm
-                        _zclient = _ZClient(token=ZENODO_TOKEN)
+                        _zclient = _ZClient(token=_zenodo_token())
                         _zmeta = lambda k, fn, v, _kg=kg_code, _name=kg.get("kg_name", ""), \
                             _qs=0, _qg="": \
                             _lm(_kg, _name, v, "gpkg")
@@ -10473,7 +10485,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 from zenodo_client import (Client as _ZClientL,
                                             landscape_metadata as _lmL,
                                             Manifest as _ZManifestL)
-                _zclientL = _ZClientL(token=ZENODO_TOKEN)
+                _zclientL = _ZClientL(token=_zenodo_token())
                 _zmetaL = lambda k, fn, v, _kg=kg_code, _name=kg.get("kg_name", ""): \
                     _lmL(_kg, _name, v, "gpkg")
                 _zmanifestL = _ZManifestL(str(DATA_DIR / "zenodo_manifest.json"))
@@ -10702,7 +10714,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 from zenodo_client import (Client as _ZClientJ,
                                             landscape_metadata as _lmJ,
                                             Manifest as _ZManifestJ)
-                _zclientJ = _ZClientJ(token=ZENODO_TOKEN)
+                _zclientJ = _ZClientJ(token=_zenodo_token())
                 _qsJ = result.get("quality_score", 0)
                 _qgJ = result.get("quality_grade", "")
                 _alJ = result.get("available_layers") or []
@@ -11376,7 +11388,7 @@ def remove_legacy_products(kg_code: str, v1_doc: dict | None = None, manifest=No
     from zenodo_client import Client as _ZC, Manifest as _ZM, landscape_metadata as _lm
     from zenodo_lock import zenodo_upload_lock as _zul
     manifest = manifest or _ZM(str(DATA_DIR / "zenodo_manifest.json"))
-    client = client or _ZC(token=ZENODO_TOKEN)
+    client = client or _ZC(token=_zenodo_token())
     done = {"json_strip": None, "light_remove": None}
     from v21_products import v2_products_complete as _v2c
     if not _v2c(manifest, kg_code):
@@ -11444,7 +11456,7 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
     from zenodo_client import Client, landscape_metadata
     from zenodo_lock import zenodo_upload_lock
 
-    client = Client(token=ZENODO_TOKEN)
+    client = Client(token=_zenodo_token())
     upload_stats = {"uploaded": [], "errors": [], "total_bytes": 0}
 
     _avail = available_layers or []
@@ -12014,7 +12026,7 @@ def _v2_fetch_v1_json(kg: dict, manifest, _step=lambda d: None):
     if not (jpath.exists() and jpath.stat().st_size == ej.size):
         try:
             try:
-                _ZC(token=ZENODO_TOKEN).download(f"{code}_json", jdir, manifest)
+                _ZC(token=_zenodo_token()).download(f"{code}_json", jdir, manifest)
             except ValueError as _ce:
                 if "Checksum mismatch" not in str(_ce):
                     raise
@@ -12024,7 +12036,7 @@ def _v2_fetch_v1_json(kg: dict, manifest, _step=lambda d: None):
                 # baseline, so accept the bytes if they parse as this KG.
                 log.warning("KG %s: v1 JSON manifest md5 stale (%s) — accepting Zenodo bytes",
                             code, str(_ce)[:120])
-                _ZC(token=ZENODO_TOKEN).download(f"{code}_json", jdir, manifest,
+                _ZC(token=_zenodo_token()).download(f"{code}_json", jdir, manifest,
                                                  verify_checksum=False)
                 with open(jpath) as _f:
                     _chk = json.load(_f)
@@ -12523,7 +12535,7 @@ def _zenodo_probe(token: str = None) -> tuple[bool, str]:
     'server', 'network'.
     """
     import requests as _requests
-    tok = token or ZENODO_TOKEN
+    tok = token or _zenodo_token()
     try:
         r = _requests.get("https://zenodo.org/api/deposit/depositions",
                           params={"access_token": tok, "size": 1},
@@ -13131,6 +13143,16 @@ def main():
         _pt.install_outbound_hook()
     except Exception:
         pass
+    try:
+        # Lease the provider secrets (Zenodo / umfeld / GitHub) from the
+        # primary into memory and export them to the per-KG subprocess
+        # env — nothing is written to disk (fleet_secrets.py).
+        import fleet_secrets as _fs
+        _fs.refresh(force=True, reason="processor-start")
+        os.environ.update(_fs.export_env())
+        log.info("fleet_secrets: %s", _fs.status())
+    except Exception as _e:
+        log.warning("fleet_secrets bootstrap failed: %s", _e)
     global _active_pool
 
     parser = argparse.ArgumentParser(description="Austria Landscape Processor")
@@ -13919,7 +13941,7 @@ def main():
                     except FileNotFoundError as _je:
                         log.info("KG %s: no v1 JSON baseline (%s) — fast relabel without baseline", kg_code, _je)
                         _v2_v1_doc = None
-                    _v2_fast = _v24.fetch_inputs(kg_code, manifest, V2_GPKG_DIR, ZENODO_TOKEN,
+                    _v2_fast = _v24.fetch_inputs(kg_code, manifest, V2_GPKG_DIR, _zenodo_token(),
                                                  n_streams=V2_UPGRADE_STREAMS,
                                                  min_free_gb=V2_UPGRADE_MIN_FREE_GB, step=_fast_step,
                                                  doc_gate=lambda _d: v24_fast_defects_ok(_d)[0])

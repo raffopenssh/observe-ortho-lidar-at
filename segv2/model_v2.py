@@ -56,13 +56,17 @@ MODEL_ZENODO = {
                  "sha1": "60118955dca4ddd3ef8f7297829763d5964a130e"},
     },
 }
-_ZENODO_TOKEN = os.environ.get("ZENODO_TOKEN") or "REDACTED_ROTATED_ZENODO_TOKEN"
+
+
+def _zenodo_token() -> str:
+    import fleet_secrets  # leased from the primary, memory-only
+    return fleet_secrets.token("zenodo", required=True)
 _dl_lock = threading.Lock()
 
 
 def _zenodo_url(spec: dict) -> str:
     return (f"https://zenodo.org/api/records/{spec['depo_id']}/draft/files/"
-            f"{spec['filename']}/content?access_token={_ZENODO_TOKEN}")
+            f"{spec['filename']}/content?access_token={_zenodo_token()}")
 
 
 def ensure_model(model: str | None = None, timeout: float = 600.0) -> tuple[Path, Path]:

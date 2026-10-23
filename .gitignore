@@ -41,3 +41,6 @@ data/ne_tooling_last.json
 data/golden/
 data/public_flags.sqlite*
 data/public_flags.salt
+data/secrets.json
+data/secret_leases.json
+data/secrets_deny

@@ -78,6 +78,7 @@ PEER_SCOPE = (
     ('/api/v1/admin/bevdirect_binary', ('GET',)),
     ('/api/v1/credentials', ('GET',)),
     ('/api/v1/net_stats', ('GET',)),
+    ('/api/v1/secrets/lease', ('GET',)),   # fleet_secrets: provider tokens, memory-only on peers
 )
 
 # Peer→peer: only the cache-manifest delta sync.
