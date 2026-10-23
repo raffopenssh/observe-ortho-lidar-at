@@ -242,6 +242,24 @@ def covers_full_cell(W: float, S: float, E: float, N: float) -> bool:
     return (ix0 + 1) * CELL_DEG <= E + 1e-9 and (iy0 + 1) * CELL_DEG <= N + 1e-9
 
 
+class UpstreamDownError(RuntimeError):
+    """bevdirect-serve (v0.3.5+) reports ``upstream.state == "down"``: BEV
+    itself is unreachable (TLS / 5xx).  Polling further cannot help — the KG
+    fails fast with the server's ``last_error`` so the fleet log says *why*
+    (2026-10-23 BEV TLS intermediate outage).  vtcseamless-py 0.3.1 raises
+    the same-named error."""
+
+
+def _upstream_of(r) -> dict:
+    """``upstream`` object from a /viewport body (502 / pending / ready all
+    carry it since bevdirect-serve v0.3.5; older servers → ``{}``)."""
+    try:
+        j = r.json()
+        return j.get("upstream") if isinstance(j, dict) and isinstance(j.get("upstream"), dict) else {}
+    except Exception:
+        return {}
+
+
 def _viewport(box: tuple, deadline: float) -> dict:
     import requests
     import ne_h3
@@ -250,6 +268,13 @@ def _viewport(box: tuple, deadline: float) -> dict:
               "layers": "parcels,footprints,landuse", "wait": "60"}
     while True:
         r = requests.get(f"http://{ne_h3.BEVDIRECT_ADDR}/viewport", params=params, timeout=180)
+        up = _upstream_of(r)
+        # v0.3.5 contract: pending/502 + upstream.ok → cold cells, keep polling;
+        # upstream.state == "down" → BEV unreachable, stop polling, alert.
+        if up.get("state") == "down":
+            raise UpstreamDownError(
+                f"BEV upstream down (tls_errors={up.get('tls_errors')}, http_5xx={up.get('http_5xx')}): "
+                f"{up.get('last_error') or 'no detail'}")
         if r.status_code == 502 and time.time() < deadline:
             time.sleep(5)
             continue
@@ -258,7 +283,7 @@ def _viewport(box: tuple, deadline: float) -> dict:
         if doc.get("ready", True) and not doc.get("pending"):
             return doc
         if time.time() > deadline:
-            raise RuntimeError("viewport still pending at deadline")
+            raise RuntimeError(f"viewport still pending at deadline (upstream={up.get('state', 'unknown')})")
         time.sleep(float(doc.get("retry_after_s") or 5))
 
 
@@ -727,7 +752,10 @@ def run(kg: str, bbox: tuple, umfeld_nec1: bytes | None, observer: str | None = 
         # v0.3.1+: the server's RAM tile LRU (/health tile_cache) — proof that
         # tiles live in memory only, and how full the budget is
         try:
-            tc = (ne_h3.bevdirect_ready().get("tile_cache") or {})
+            _rd = ne_h3.bevdirect_ready()
+            if (_rd.get("upstream") or {}).get("state"):     # v0.3.5+
+                row["upstream"] = _rd["upstream"]["state"]
+            tc = (_rd.get("tile_cache") or {})
             if tc:
                 row["lru_mb"] = round(int(tc.get("bytes") or 0) / 1e6, 1)
                 row["lru_max_mb"] = round(int(tc.get("max_bytes") or 0) / 1e6)

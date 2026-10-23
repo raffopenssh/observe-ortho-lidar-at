@@ -386,7 +386,16 @@ def _check_declared_header(sec: Section, kg: str) -> None:
 # frozen ne_cells canon crashed on ``null`` footprints); nothing changes for
 # the cells, v0.3.3 stays in the comparable tag class.  Requested by umfeld
 # together with the aligned-cell ``input_bbox`` rule (vct_pilot.run).
-BEVDIRECT_TAG = os.environ.get("BEVDIRECT_TAG", "v0.3.4")
+# v0.3.5 (2026-10-23): BEV TLS outage fix — kataster.bev.gv.at stopped sending
+# the GEANT TLS RSA 1 intermediate (~13:00Z); every tile fetch failed with
+# "x509: certificate signed by unknown authority", /viewport 502/pending,
+# zero NE builds.  v0.3.5 ships the intermediate + AIA fallback (extras via
+# -ca-bundle / BEVDIRECT_CA_BUNDLE).  No data/assembly change, same
+# equivalence class at umfeld.  /health gains ``upstream`` {state ∈
+# unknown|ok|degraded|down, tls_errors, http_5xx, last_error}; 502 and
+# pending bodies carry the same object (vct_pilot._viewport honours it).
+# Never work around with InsecureSkipVerify / curl -k.
+BEVDIRECT_TAG = os.environ.get("BEVDIRECT_TAG", "v0.3.5")
 BEVDIRECT_MODULE = "github.com/raffopenssh/vtcseamless"
 # Static release tarball (GitHub egress — NOT the metered primary); the
 # primary-served copy and ``go install`` are fallbacks.
@@ -403,6 +412,9 @@ BEVDIRECT_RELEASE_SHA256 = {
     # (QC provenance); assembly unchanged, cell-equivalent to v0.3.0-v0.3.3
     ("v0.3.4", "amd64"): "ad1fb0166139dfb1a85b0da4bd88be5df28b4dafb0cd96d7ce198559e16cacd5",
     ("v0.3.4", "arm64"): "9076ea05da6c35e86331a4bf1a6898293bed812037221b262d02b38d24188d96",
+    # v0.3.5 (2026-10-23): BEV TLS intermediate + AIA fallback; assembly unchanged
+    ("v0.3.5", "amd64"): "70ad46bbaa454d9a97a61c4291d8d6bf6e3db83c5c45e5fc30e6c8ed819a8c52",
+    ("v0.3.5", "arm64"): "d20835815fbd937edc704c59549cd79167243d07304a85994e0e11dbedd4d5b2",
 }
 # umfeld's pinned ``ne_cells`` package ships in the PUBLIC vtcseamless-py repo
 # (pip project ``vtcseamless``, modules ``vtcseamless`` + ``ne_cells``).  It
@@ -411,7 +423,7 @@ BEVDIRECT_RELEASE_SHA256 = {
 # (Oct 2026).  algo/pack/canon/ns_groups are byte-identical to umfeld's.
 NE_CELLS_REPO = "https://github.com/raffopenssh/vtcseamless-py.git"
 NE_CELLS_MIN_VERSION = "2.1.0"     # first vtcseamless-py release of the package
-VTCSEAMLESS_MIN_VERSION = "0.3.0"  # client dist: QC provenance (vtcseamless.observe.tile_provenance → tiles{} + chunks_tiles{})
+VTCSEAMLESS_MIN_VERSION = "0.3.1"  # client dist: pins bevdirect@v0.3.5, /health.upstream contract + UpstreamDownError (0.3.0: QC provenance)
 BEVDIRECT_BIN = DATA_DIR / "bin" / "bevdirect-serve"
 BEVDIRECT_PID = DATA_DIR / "bevdirect-serve.pid"
 BEVDIRECT_ADDR = os.environ.get("BEVDIRECT_ADDR", "127.0.0.1:8787")
@@ -435,7 +447,7 @@ BEVDIRECT_WORK = Path(os.environ.get("BEVDIRECT_WORK") or (
 _LEGACY_TILE_DIRS = [Path("/dev/shm/srtm_bevcache"), DATA_DIR / "bevcache"]
 if os.environ.get("BEVDIRECT_CACHE"):
     _LEGACY_TILE_DIRS.append(Path(os.environ["BEVDIRECT_CACHE"]))
-NE_CELLS_PIN = os.environ.get("NE_CELLS_PIN", "1069c16")   # vtcseamless-py 0.3.0 (QC provenance; ne_cells/ untouched)
+NE_CELLS_PIN = os.environ.get("NE_CELLS_PIN", "488403a")   # vtcseamless-py 0.3.1 (bevdirect v0.3.5 pin, upstream state; ne_cells/ untouched)
 TOOLING_LAST = DATA_DIR / "ne_tooling_last.json"   # last install attempt (rc + pip tail), for /admin/ne_tooling
 CELL_DEG = 0.02
 
@@ -484,6 +496,8 @@ def bevdirect_ready(probe_server: bool = True) -> dict:
             out["server_version"] = j.get("bevdirect_version") or j.get("version")
             if isinstance(j.get("tile_cache"), dict):   # v0.3.1+: {tiles,bytes,max_bytes,hits,misses}
                 out["tile_cache"] = j["tile_cache"]
+            if isinstance(j.get("upstream"), dict):     # v0.3.5+: {state,tls_errors,http_5xx,last_error}
+                out["upstream"] = j["upstream"]
     except Exception:
         pass
     return out
