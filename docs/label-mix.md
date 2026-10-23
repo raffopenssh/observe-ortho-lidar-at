@@ -42,6 +42,31 @@ invalidated, full rerun with the fixed restore path) → `done` when a fresh
 - CLI: `python3 label_mix.py [scan|sweep|reset <code>…]`.
 - Tests: `PYTHONPATH=. python3 tests/test_label_mix.py`.
 
+### Split parents (Oct 2026)
+
+`data/ne/<parent>.h3b` is the *merged* corpus file, so the audit fires on
+the parent code — but a split parent has block-keyed products and a
+parent-level force requeue is a no-op: `processing_queue_add` keeps the
+complete sibling blocks, the oracle stays complete and the GET prune drops
+the code within seconds (21 of 23 "requeued" entries sat like that for
+3.5 days). The sweep therefore resolves split parents to blocks: fetch
+each block's `_ne_h3b` (≤12/tick, `/tmp/label_mix_h3b`, cached per
+`uploaded_at` in `block_audit`), requeue only the affected **block**
+codes (`blocks=[…]`, shown as `code@requeued[a1]→west`), settle on fresh
+block `_json`, mark all-clean parents `fp` (merge artefact). Notes explain
+waiting states (`block audit in progress`, `no NE cells yet` for pre-2.4
+blocks). A `requeued` entry whose targets left the queue with their
+`_json` untouched for > 2 h is flipped back to `detected` (prune-reverted)
+without burning an attempt.
+
+Blocks win even when the parent still carries its own stale `_json`
+(old-split residue, zen_stall `orphan`): on 2026-10-23 14201/14235 were
+in that shape, got a parent-level POST, audited clean one tick later and
+would have sat in `retry_queue` with a live `_requeue` tombstone for a
+pointless full rerun. The `fp` verdict now cancels such a pending
+parent-level requeue (`_cancel_requeue`: drop `<code>_requeue`, DELETE
+from the queue).
+
 Why a full rerun and not a v2.4 fast fix: the full GPKG's own
 `segment_type` / `segments` layers are corrupt, and the full-GPKG upgrade
 path does not rebuild the full GPKG — only a fresh tile loop gives a

@@ -249,9 +249,12 @@ def _live(v) -> bool:
 def _blocks_of(code: str, ent: dict) -> list[str]:
     """Committed block codes of a split parent (``<code>-<dir>[-n]_json``);
     ``[]`` when the parent is unsplit (has its own ``_json``) or unknown."""
-    if _live(ent.get(f"{code}_json")):
-        return []
     pre = code + "-"
+    # NB: a parent may carry its own ``_json`` *and* block ``_json``s (old-split
+    # residue, the zen_stall ``orphan`` class — 14201/14235 on 2026-10-23).
+    # Blocks win: they are what a requeue can actually invalidate; a
+    # parent-level POST there only deletes the stale parent pointer and
+    # leaves the code stuck in the queue for a pointless full rerun.
     return sorted({k[:-5] for k, v in ent.items()
                    if k.startswith(pre) and k.endswith("_json") and _live(v)})
 
@@ -494,6 +497,8 @@ def sweep(*, requeue: bool = True, scan_budget_s: float = 20.0) -> dict:
                     # signature is a merge artefact, not an id collision
                     e.update(state="fp", fp_at=now_iso,
                              note=f"split parent: all {len(blocks)} blocks audit clean (merge artefact)")
+                    if code in queue and _cancel_requeue(code):
+                        e["note"] += "; pending parent-level requeue cancelled"
                     events.append((f"label_mix: {code} split parent — every block's own NE cells are clean; "
                                    f"parent signature is a merge artefact (fp)", code, "info"))
                     continue
@@ -541,6 +546,29 @@ def _post_requeue(code: str) -> bool:
         return False
 
 
+def _cancel_requeue(code: str) -> bool:
+    """Undo an earlier parent-level force requeue that turned out to be a
+    merge artefact: drop the ``<code>_requeue`` tombstone (else the prune
+    keeps the code) and remove it from ``retry_queue.json``."""
+    try:
+        import requests
+        headers = {}
+        try:
+            tok = Path("data/admin_token").read_text().strip()
+            if tok:
+                headers["X-Admin-Token"] = tok
+        except Exception:
+            pass
+        requests.post("http://127.0.0.1:8000/api/v1/admin/drop_tombstones",
+                      json={"keys": [f"{code}_requeue"]}, timeout=30, headers=headers)
+        r = requests.delete("http://127.0.0.1:8000/api/v1/processing/queue",
+                            params={"kg": code}, timeout=30, headers=headers)
+        return r.status_code in (200, 404)
+    except Exception as ex:  # noqa: BLE001
+        log.warning("label_mix %s: cancel requeue failed: %s", code, ex)
+        return False
+
+
 def summary() -> dict:
     d = _load()
     codes = d.get("codes") or {}
@@ -551,7 +579,8 @@ def summary() -> dict:
     return {"counts": by, "total": len(codes), "files": len(d.get("files") or {}),
             "t": d.get("t"),
             "rows": [{"code": c, "state": e.get("state"), "why": e.get("why"),
-                      "attempts": e.get("attempts", 0), "requeued_at": e.get("requeued_at")}
+                      "attempts": e.get("attempts", 0), "requeued_at": e.get("requeued_at"),
+                      "blocks": e.get("blocks") or []}
                      for c, e in rows if e.get("state") not in ("done", "fp")][:40]}
 
 
