@@ -219,6 +219,147 @@ def _manifest_entries() -> dict:
         return {}
 
 
+# ---------------------------------------------------------------------------
+# split parents (Oct 2026)
+#
+# ``data/ne/<parent>.h3b`` is the *merged* corpus file, so the audit fires on
+# the parent code — but a split parent (``61047`` → ``61047-east`` …) has no
+# ``61047_json``; its products are block-keyed.  A force requeue of the
+# *parent* is a no-op there: ``processing_queue_add`` preserves complete
+# sibling blocks (Aug 2026 guard), the coverage oracle still reads complete,
+# and the dashboard GET prune drops the code from ``retry_queue.json`` within
+# seconds.  21 of 23 "requeued" entries sat like that for 3.5 days.  So:
+# audit every block's own ``_ne_h3b`` (1–3 MB each, private bucket) and
+# requeue only the affected *block* codes — deleting a block's ``_json``
+# punches a hole in the parent bbox, which is what makes the requeue stick.
+# ---------------------------------------------------------------------------
+
+H3B_TMP = Path("/tmp/label_mix_h3b")
+MAX_BLOCK_FETCH_PER_TICK = 12
+#: a ``requeued`` entry whose codes left the queue without their ``_json``
+#: ever being invalidated was reverted by the prune → back to ``detected``
+LOST_AFTER_S = 2 * 3600
+
+
+def _live(v) -> bool:
+    return isinstance(v, dict) and "error" not in str(v.get("status") or "") \
+        and str(v.get("status") or "") != "removed"
+
+
+def _blocks_of(code: str, ent: dict) -> list[str]:
+    """Committed block codes of a split parent (``<code>-<dir>[-n]_json``);
+    ``[]`` when the parent is unsplit (has its own ``_json``) or unknown."""
+    if _live(ent.get(f"{code}_json")):
+        return []
+    pre = code + "-"
+    return sorted({k[:-5] for k, v in ent.items()
+                   if k.startswith(pre) and k.endswith("_json") and _live(v)})
+
+
+def _fetch_block_h3b(block: str, ent: dict) -> Path | None:
+    e = ent.get(f"{block}_ne_h3b")
+    if not _live(e) or not e.get("bucket_url") or not e.get("filename"):
+        return None
+    H3B_TMP.mkdir(parents=True, exist_ok=True)
+    dest = H3B_TMP / f"{block}_ne.h3b"
+    try:
+        if dest.exists() and dest.stat().st_size == int(e.get("size") or -1):
+            return dest
+    except OSError:
+        pass
+    try:
+        import requests
+        import zenodo_client
+        url = f"{e['bucket_url'].rstrip('/')}/{e['filename']}"
+        r = requests.get(url, headers={"Authorization": f"Bearer {zenodo_client.DEFAULT_TOKEN}"},
+                         stream=True, timeout=(10, 120))
+        r.raise_for_status()
+        tmp = dest.with_suffix(".part")
+        with open(tmp, "wb") as fh:
+            for chunk in r.iter_content(1 << 18):
+                fh.write(chunk)
+        tmp.replace(dest)
+        return dest
+    except Exception as ex:  # noqa: BLE001
+        log.info("label_mix: block h3b fetch %s failed: %s", block, ex)
+        return None
+
+
+def _audit_blocks(code: str, e: dict, blocks: list[str], ent: dict, budget: list) -> tuple[list, list]:
+    """Audit each block's own h3b (cached per block ``uploaded_at``).
+    Returns ``(affected_blocks, not_yet_auditable_blocks)``; ``budget`` is a
+    one-element mutable fetch counter shared across the sweep."""
+    cache = e.setdefault("block_audit", {})
+    affected, pending = [], []
+    e["no_h3b"] = []
+    for b in blocks:
+        h = ent.get(f"{b}_ne_h3b")
+        stamp = str((h or {}).get("uploaded_at") or "") if _live(h) else ""
+        c = cache.get(b)
+        if c and c.get("stamp") == stamp and stamp:
+            (affected if c.get("bad") else []).append(b)
+            continue
+        if not stamp:
+            pending.append(b)          # pre-2.4 block, no NE cells yet
+            e["no_h3b"].append(b)
+            continue
+        if budget[0] >= MAX_BLOCK_FETCH_PER_TICK:
+            pending.append(b)
+            continue
+        budget[0] += 1
+        p = _fetch_block_h3b(b, ent)
+        if p is None:
+            pending.append(b)
+            continue
+        try:
+            r = audit_h3b(p)
+        except Exception as ex:  # noqa: BLE001
+            log.info("label_mix: block audit %s: %s", b, ex)
+            pending.append(b)
+            continue
+        bad, why = is_affected(r)
+        cache[b] = {"stamp": stamp, "bad": bad, "why": why, "n": r.get("n", 0)}
+        if bad:
+            affected.append(b)
+        try:
+            p.unlink()
+        except OSError:
+            pass
+    return affected, pending
+
+
+def _fresh_json(target: str, ent: dict, since: str) -> bool:
+    j = ent.get(f"{target}_json")
+    return _live(j) and str(j.get("uploaded_at") or "") > str(since or "")
+
+
+def _requeue_lost(targets: list[str], requeued_at: str, ent: dict, queue: set, now_ts: float) -> bool:
+    """``requeued`` but every target left the queue while its ``_json`` is
+    still the *pre*-requeue one → the force requeue never invalidated
+    anything (the GET prune reverted it).  Judged after ``LOST_AFTER_S``."""
+    try:
+        age = now_ts - datetime.fromisoformat(requeued_at).timestamp()
+    except Exception:
+        return False
+    if age < LOST_AFTER_S:
+        return False
+    for t in targets:
+        if t in queue:
+            return False
+        j = ent.get(f"{t}_json")
+        if not _live(j):
+            sub = _blocks_of(t, ent)
+            if not sub:
+                return False             # invalidated → run genuinely pending / in flight
+            # parent-level requeue of a split parent: judge on its blocks
+            if not _requeue_lost(sub, requeued_at, ent, queue, now_ts):
+                return False
+            continue
+        if str(j.get("uploaded_at") or "") > str(requeued_at or ""):
+            return False
+    return True
+
+
 def _retry_queue() -> list:
     try:
         q = json.loads((DATA_DIR / "retry_queue.json").read_text())
@@ -287,14 +428,28 @@ def sweep(*, requeue: bool = True, scan_budget_s: float = 20.0) -> dict:
                f"gate — deterministic low patch inside a merged object, not an id collision (fp, no further rerun)",
                code, "info") for code in res.get("new_fp") or []]
     # --- settle requeued → done; expire old done ---
+    now_ts = time.time()
     for code, e in list(codes.items()):
         st = e.get("state")
         if st == "requeued":
-            j = ent.get(f"{code}_json")
-            if isinstance(j, dict) and "error" not in str(j.get("status") or "") \
-                    and str(j.get("uploaded_at") or "") > str(e.get("requeued_at") or ""):
+            targets = e.get("blocks") or [code]
+            # a parent-level requeue that nevertheless ran (blocks were
+            # incomplete anyway) settles on the blocks' _json
+            fresh_t = targets if e.get("blocks") else (_blocks_of(code, ent) or [code])
+            if all(_fresh_json(t, ent, e.get("requeued_at")) for t in fresh_t):
                 e["state"] = "done"; e["done_at"] = now_iso
                 events.append((f"label_mix: {code} fresh products committed — label-mix repair complete", code, "info"))
+                continue
+            # prune-reverted requeue (parent-level POST on a split parent, or
+            # the tombstone trap): nothing invalidated, nothing queued → retry
+            # with block resolution, without burning an attempt.
+            if _requeue_lost(targets, e.get("requeued_at") or "", ent, queue, now_ts):
+                e["state"] = "detected"
+                e["attempts"] = max(0, int(e.get("attempts", 0)) - 1)
+                e["note"] = f"requeue of {','.join(targets)} reverted by the queue prune at {now_iso}; re-resolving"
+                e.pop("blocks", None)
+                events.append((f"label_mix: {code} requeue was pruned (products never invalidated) — "
+                               f"re-resolving as blocks", code, "warning"))
         elif st in ("done", "fp"):
             try:
                 if time.time() - datetime.fromisoformat(e.get("done_at") or e["fp_at"]).timestamp() > DONE_TTL_S:
@@ -304,6 +459,7 @@ def sweep(*, requeue: bool = True, scan_budget_s: float = 20.0) -> dict:
     # --- requeue detected ---
     outstanding = sum(1 for e in codes.values() if e.get("state") == "requeued")
     n_rq = 0
+    fetch_budget = [0]
     if requeue:
         for code, e in sorted(codes.items()):
             if e.get("state") != "detected":
@@ -314,17 +470,43 @@ def sweep(*, requeue: bool = True, scan_budget_s: float = 20.0) -> dict:
                 e["state"] = "stuck"
                 events.append((f"label_mix: {code} still label-mixed after 2 reruns — parked (stuck)", code, "warning"))
                 continue
-            if code in queue:
-                e["state"] = "requeued"; e["requeued_at"] = now_iso; e["note"] = "already queued"
-                e["attempts"] = int(e.get("attempts", 0)) + 1
-                outstanding += 1
-                continue
-            ok = _post_requeue(code)
+            # split parent → resolve to the affected block(s)
+            blocks = _blocks_of(code, ent)
+            targets = [code]
+            if blocks:
+                affected, pending = _audit_blocks(code, e, blocks, ent, fetch_budget)
+                if affected:
+                    targets = affected
+                    e["blocks"] = affected
+                    e["note"] = (f"split parent: {len(affected)}/{len(blocks)} block(s) label-mixed"
+                                 + (f", {len(pending)} not auditable yet" if pending else ""))
+                elif pending:
+                    no_h3b = e.get("no_h3b") or []
+                    if len(no_h3b) == len(pending):
+                        e["note"] = (f"split parent: {len(pending)}/{len(blocks)} block(s) have no NE cells yet "
+                                     f"(pre-2.4) — waiting for the v2.4 upgrade / fast-path decline")
+                    else:
+                        e["note"] = (f"split parent: block audit in progress ({len(pending)}/{len(blocks)} "
+                                     f"left, {len(no_h3b)} without NE cells)")
+                    continue
+                else:
+                    # every block audits clean on its own h3b → the parent
+                    # signature is a merge artefact, not an id collision
+                    e.update(state="fp", fp_at=now_iso,
+                             note=f"split parent: all {len(blocks)} blocks audit clean (merge artefact)")
+                    events.append((f"label_mix: {code} split parent — every block's own NE cells are clean; "
+                                   f"parent signature is a merge artefact (fp)", code, "info"))
+                    continue
+            to_post = [t for t in targets if t not in queue]
+            ok = all(_post_requeue(t) for t in to_post)
             if ok:
                 e["state"] = "requeued"; e["requeued_at"] = now_iso
                 e["attempts"] = int(e.get("attempts", 0)) + 1
+                if not to_post:
+                    e["note"] = "already queued"
                 n_rq += 1; outstanding += 1
-                events.append((f"label_mix: {code} products stitched with colliding label ids ({e.get('why')}) "
+                what = f"block(s) {','.join(targets)}" if blocks else "products"
+                events.append((f"label_mix: {code} {what} stitched with colliding label ids ({e.get('why')}) "
                                f"— requeued for a full rerun (attempt {e['attempts']})", code, "warning"))
             else:
                 e["note"] = f"requeue POST failed {now_iso}"
@@ -384,6 +566,7 @@ def status_line(max_rows: int = 12) -> str | None:
     rows = s["rows"]
     if rows:
         line += " · " + " ".join(f"{r['code']}@{r['state']}" + (f"[a{r['attempts']}]" if r.get("attempts") else "")
+                                 + (f"→{','.join(b.split('-', 1)[1] for b in r['blocks'])}" if r.get("blocks") else "")
                                  for r in rows[:max_rows])
         if len(rows) > max_rows:
             line += f" … +{len(rows) - max_rows}"
@@ -412,6 +595,7 @@ def reset(codes: list) -> int:
             e = d["codes"].get(c)
             if e:
                 e["state"] = "detected"; e["attempts"] = 0; n += 1
+                e.pop("blocks", None); e.pop("note", None)
         _save(d)
     return n
 

@@ -69,9 +69,52 @@ def test_fp_deterministic(tmp_path, monkeypatch):
     assert s["new_detected"] == ["99999"] and lm._load()["codes"]["99999"]["state"] == "detected"
 
 
+def test_split_parent(tmp_path, monkeypatch):
+    """Split parent: requeue only the label-mixed block; settle on block _json;
+    a prune-reverted parent-level requeue goes back to detected."""
+    import label_mix as lm
+    monkeypatch.setattr(lm, "STATE_FILE", tmp_path / "lm.json")
+    monkeypatch.setattr(lm, "NE_DIR", tmp_path)
+    monkeypatch.setattr(lm, "H3B_TMP", tmp_path / "h3b")
+    (tmp_path / "32004.h3b").write_bytes(b"x")
+    ent = {"32004-east_json": {"status": "cf", "uploaded_at": "2026-10-06T06:12:00+00:00"},
+           "32004-west_json": {"status": "cf", "uploaded_at": "2026-10-18T21:31:00+00:00"},
+           "32004-east_ne_h3b": {"status": "cf", "uploaded_at": "2026-10-06T06:12:00+00:00", "size": 1},
+           "32004-west_ne_h3b": {"status": "cf", "uploaded_at": "2026-10-18T21:31:00+00:00", "size": 1}}
+    monkeypatch.setattr(lm, "_manifest_entries", lambda: ent)
+    queue = []
+    monkeypatch.setattr(lm, "_retry_queue", lambda: list(queue))
+    posted = []
+    monkeypatch.setattr(lm, "_post_requeue", lambda c: (posted.append(c), queue.append(c))[0] is None)
+    clean = {"n": 5000, "geb": 100, "geb_flat": 0, "wald": 4000, "wald_flat": 0}
+    bad = {"n": 5000, "geb": 2473, "geb_flat": 1993, "wald": 4378, "wald_flat": 4062}
+    monkeypatch.setattr(lm, "audit_h3b", lambda p: dict(bad if "west" in str(p) or str(p).endswith("32004.h3b") else clean))
+    monkeypatch.setattr(lm, "_fetch_block_h3b", lambda b, e: tmp_path / f"{b}_ne.h3b")
+    # 1) legacy state: parent-level requeue 3 days ago that the prune reverted
+    lm._save({"files": {}, "codes": {"32004": {"state": "requeued", "why": "x", "attempts": 1,
+                                                "requeued_at": "2026-10-19T12:30:00+00:00"}}})
+    r = lm.sweep(scan_budget_s=5)
+    d = lm._load()["codes"]["32004"]
+    assert d["state"] == "requeued" and d["blocks"] == ["32004-west"], d
+    assert posted == ["32004-west"] and d["attempts"] == 1
+    assert d["block_audit"]["32004-east"]["bad"] is False
+    # 2) block rerun lands → done
+    queue.clear()
+    ent["32004-west_json"]["uploaded_at"] = "2026-12-01T00:00:00+00:00"
+    lm.sweep(scan_budget_s=5)
+    assert lm._load()["codes"]["32004"]["state"] == "done"
+    # 3) all blocks clean on their own h3b → fp (merge artefact)
+    monkeypatch.setattr(lm, "audit_h3b", lambda p: dict(bad if str(p).endswith("32004.h3b") else clean))
+    lm._save({"files": {}, "codes": {"32004": {"state": "detected", "why": "x", "attempts": 0,
+                                                "detected_at": "2026-10-19T12:30:00+00:00"}}})
+    posted.clear()
+    lm.sweep(scan_budget_s=5)
+    assert lm._load()["codes"]["32004"]["state"] == "fp" and posted == []
+
+
 if __name__ == "__main__":
     import pathlib, tempfile
 
     class _MP:
         def setattr(self, o, n, v): setattr(o, n, v)
-    test_remap(); test_guard(); test_fp_deterministic(pathlib.Path(tempfile.mkdtemp()), _MP()); print("ok")
+    test_remap(); test_guard(); test_fp_deterministic(pathlib.Path(tempfile.mkdtemp()), _MP()); test_split_parent(pathlib.Path(tempfile.mkdtemp()), _MP()); print("ok")
