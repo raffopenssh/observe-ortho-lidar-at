@@ -6222,21 +6222,39 @@ function showAddPeerModal() {
   document.getElementById('addPeerVmName').focus();
   document.getElementById('addPeerVmName').select();
 }
+let _mintCache = {};   // vm -> {admin_token, mesh_token, director_url}
+let _mintTimer = null;
 function updateDeployCmd() {
   const vm = document.getElementById('addPeerVmName').value.trim() || '<vm-name>';
   const selfUrl = vm === '<vm-name>' ? 'https://<vm-name>.exe.xyz:8000' : `https://${vm}.exe.xyz:8000`;
-  const peerUrl = _directorPublicUrl();
-  // Bake the cluster admin token into the setup script so the new VM can
-  // join without a manual second step. Pulled from localStorage where the
-  // dashboard stashed it after first 401-prompt.
-  const adminTok = localStorage.getItem('srtm_admin_token') || '';
-  const tokEnv = adminTok ? `ADMIN_TOKEN=${adminTok} ` : '';
-  // Build the setup script that deploy.sh runs on first boot
-  const deployScript = `curl -sL https://raw.githubusercontent.com/raffopenssh/srtm-lidar-at/main/deploy.sh | ${tokEnv}SELF_URL=${selfUrl} PEER_URL=${peerUrl} bash`;
-  // exe.dev new --setup-script supports \n for newlines
-  const cmd = `new --name=${vm} --setup-script='${deployScript}'`;
-  document.getElementById('addPeerCmd').textContent = cmd;
+  const pre = document.getElementById('addPeerCmd');
   document.getElementById('addPeerPublicCmd').textContent = vm === '<vm-name>' ? 'share set-public <vm-name>' : `share set-public ${vm}`;
+  // Per-peer token (security hardening 2026-10-23): the primary mints a
+  // unique ADMIN_TOKEN + the fleet MESH_TOKEN for this VM name; the
+  // owner/master token is never baked into a deploy command.
+  const m = _mintCache[vm];
+  if (m) {
+    const deployScript = `curl -sL https://raw.githubusercontent.com/raffopenssh/srtm-lidar-at/main/deploy.sh | ADMIN_TOKEN=${m.admin_token} MESH_TOKEN=${m.mesh_token} SELF_URL=${selfUrl} PEER_URL=${m.director_url} bash`;
+    pre.textContent = `new --name=${vm} --setup-script='${deployScript}'`;
+    pre.style.color = 'var(--green)';
+    return;
+  }
+  pre.style.color = 'var(--dim)';
+  pre.textContent = /^srtm-lidar-at\d+$/.test(vm) ? 'minting per-peer token…' : 'enter a VM name like srtm-lidar-at77';
+  if (!/^srtm-lidar-at\d+$/.test(vm)) return;
+  clearTimeout(_mintTimer);
+  _mintTimer = setTimeout(async () => {
+    try {
+      const r = await fetch('/api/v1/director/peers/mint_token', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({vm})
+      });
+      const d = await r.json();
+      if (!r.ok) { pre.textContent = 'token mint failed: ' + (d.error || r.status); pre.style.color = 'var(--red)'; return; }
+      _mintCache[vm] = d;
+      if ((document.getElementById('addPeerVmName').value.trim() || '<vm-name>') === vm) updateDeployCmd();
+    } catch (e) { pre.textContent = 'token mint failed: ' + e; pre.style.color = 'var(--red)'; }
+  }, 400);
 }
 function closeAddPeerModal() {
   document.getElementById('addPeerModal').style.display = 'none';

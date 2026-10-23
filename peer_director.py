@@ -15341,6 +15341,16 @@ class PeerDirector:
             import director_ha as dha
         except Exception:
             return
+        if not dha.ha_enabled():
+            # Security: no shadow → no snapshot (credentials, peers.json)
+            # ever leaves the primary and nobody can be promoted.
+            if self.state.get('shadow_peer') or self.state.get('shadow_url'):
+                self.state['shadow_peer'] = None
+                self.state['shadow_url'] = None
+                self.state['shadow_last_push_ok'] = False
+                self._event('ha: disabled — shadow cleared, no failover',
+                            level='warning')
+            return
         cfg = self.cfg
         peers = cfg.get('peers') or []
         my_commit = _LOCAL_GIT_COMMIT

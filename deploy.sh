@@ -38,7 +38,9 @@ fi
 # Admin token for director coordination — fetch from primary if not provided.
 # Required to call protected admin endpoints (e.g. peer registration). Without
 # it the VM can run a web server but cannot join the cluster.
-ADMIN_TOKEN="${ADMIN_TOKEN:-}"
+ADMIN_TOKEN="${ADMIN_TOKEN:-}"   # this peer's UNIQUE token (minted on the primary: dashboard "+ Add Peer"
+                                 # or `python3 peer_tokens.py --new-peer atN`). Never the primary's master token.
+MESH_TOKEN="${MESH_TOKEN:-}"     # fleet-shared, cache-manifest sync only
 
 # Derive INSTANCE_ID from SELF_URL if not set
 # e.g. https://example.invalid:8000 -> srtm-lidar-at3
@@ -121,17 +123,21 @@ mkdir -p /tmp/copernicus_cache /tmp/hansen_cache
 [ -f data/austria_processor/retry_queue.json ] || echo '[]' > data/austria_processor/retry_queue.json
 [ -f data/austria_processor/failed_kgs.json ]  || echo '[]' > data/austria_processor/failed_kgs.json
 
-# Install shared admin token (cluster-wide secret). Required for the director
-# to make protected calls into this peer (start/stop processor, queue, etc.).
+# Install this peer's own token (docs/security-tokens.md). The director
+# uses it for protected calls into this peer; the primary only grants it
+# the peer scope. Without ADMIN_TOKEN the peer boots token-less and the
+# director seeds one on "+ Add Peer" (first-write-wins bootstrap).
 if [ -n "${ADMIN_TOKEN}" ]; then
     echo "${ADMIN_TOKEN}" > data/admin_token
     chmod 600 data/admin_token
-    echo "  ✓ Admin token installed (provided via env)"
+    echo "  ✓ Peer token installed (provided via env)"
 elif [ ! -f data/admin_token ]; then
-    echo "  ⚠ ADMIN_TOKEN not provided and data/admin_token missing."
-    echo "    On the primary, run: cat data/admin_token"
-    echo "    Then re-run with ADMIN_TOKEN=<value> bash deploy.sh"
-    echo "    (Cluster registration will fail without it.)"
+    echo "  ℹ ADMIN_TOKEN not provided — the director will seed one when you add this peer."
+fi
+if [ -n "${MESH_TOKEN}" ]; then
+    echo "${MESH_TOKEN}" > data/mesh_token
+    chmod 600 data/mesh_token
+    echo "  ✓ Mesh token installed"
 fi
 
 # Write peer URLs for the web API's peer sync thread

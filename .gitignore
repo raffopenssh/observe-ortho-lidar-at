@@ -21,6 +21,11 @@ rf_training_data/openeo_circuit.json
 data/austria_processor/is_director
 data/austria_processor/zenodo_manifest.json
 data/admin_token
+data/peer_tokens.json
+data/mesh_token
+data/owner_emails
+data/ha_enabled
+data/*.tmp
 data/umfeld_token
 data/api_tokens
 data/private_only

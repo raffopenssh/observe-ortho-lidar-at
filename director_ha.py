@@ -49,6 +49,37 @@ SHADOW_DIR = DATA_DIR / 'shadow'
 SHADOW_META_FILE = SHADOW_DIR / 'meta.json'
 ADMIN_TOKEN_PATH = Path('data/admin_token')
 
+# ── HA kill-switch (2026-10-23 security hardening) ───────────────
+# Automatic failover means any VM that can present a cluster token can
+# claim the director role (announce / takeover / step_down / identity
+# director_url) and redirect the whole fleet — including every peer's
+# token-bearing traffic — to itself.  HA is therefore OFF by default:
+# the primary is the only director, peers refuse to re-point, the
+# watchdog never promotes.  Re-enable deliberately by creating
+# ``data/ha_enabled`` on the primary (owner decision, never automatic).
+HA_ENABLE_FLAG = Path('data/ha_enabled')
+# Only this host may ever be ``director_url`` while HA is disabled.
+PRIMARY_HOST = 'example.invalid'
+
+
+def ha_enabled() -> bool:
+    try:
+        return HA_ENABLE_FLAG.exists()
+    except Exception:
+        return False
+
+
+def director_url_allowed(url: str | None) -> bool:
+    """While HA is off, peers only accept the pinned primary as director."""
+    if ha_enabled() or not url:
+        return True
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or '').lower().rstrip('.')
+        return host == PRIMARY_HOST
+    except Exception:
+        return False
+
 # Files that make up a director snapshot. All small JSON; total < 200 KB.
 # (cache_manifest.json + manifest_tombstones.json already sync via the
 # cluster sync thread; we include them in the snapshot so a fresh director
@@ -335,6 +366,10 @@ def set_director_url(url: str | None) -> None:
 
     Setting ``url=None`` removes both files (this VM is the director).
     """
+    if not director_url_allowed(url):
+        log.error('set_director_url: refusing %r — HA disabled, director '
+                  'pinned to %s', url, PRIMARY_HOST)
+        return
     s = load_self()
     s['director_url'] = url
     save_self(s)
@@ -1150,6 +1185,12 @@ def _watchdog_loop() -> None:
 
 
 def _watchdog_tick() -> None:
+    if not ha_enabled():
+        with _WATCHDOG.lock:
+            _WATCHDOG.misses = 0
+            _WATCHDOG.takeover_in_flight = False
+            _WATCHDOG.last_hold_reason = 'ha_disabled'
+        return
     if IS_DIRECTOR_FLAG.exists():
         # We *are* the director — nothing to watch.
         with _WATCHDOG.lock:
@@ -1412,6 +1453,9 @@ def _do_takeover(reason: str, prev_director_url: str | None = None,
       5. Broadcast announce to every peer (peers flip their pointer).
       6. Tell the previous director (if reachable) to step down.
     """
+    if not ha_enabled():
+        log.error('takeover refused (%s): HA disabled', reason)
+        return {'error': 'ha_disabled', 'reason': reason}
     if snapshot_inline is not None:
         install_result = install_snapshot_inline(snapshot_inline)
     else:
@@ -1546,6 +1590,10 @@ def step_down(announce_payload: dict) -> dict:
     director loop. Safe to call when we already aren't the director.
     """
     new_url = (announce_payload or {}).get('new_director_url') or None
+    if not ha_enabled():
+        log.error('step_down refused: HA disabled (payload=%s)',
+                  {k: v for k, v in (announce_payload or {}).items() if k != 'snapshot'})
+        return {'error': 'ha_disabled'}
     was_director = IS_DIRECTOR_FLAG.exists()
     try:
         IS_DIRECTOR_FLAG.unlink()
@@ -1597,6 +1645,10 @@ def accept_announce(payload: dict) -> dict:
     new_url = payload.get('new_director_url')
     if not new_url:
         return {'status': 'rejected', 'reason': 'no_new_director_url'}
+    if not ha_enabled() and not director_url_allowed(new_url):
+        log.error('announce refused: HA disabled, %s is not the pinned '
+                  'primary (new_id=%s)', new_url, new_id)
+        return {'status': 'rejected', 'reason': 'ha_disabled'}
     if new_id == self_id():
         return {'status': 'self', 'note': 'I am the new director'}
     # Fleet-wide flap ledger: every peer hears every takeover.
@@ -1631,6 +1683,9 @@ def do_handover(target_peer_id: str, target_peer_url: str) -> dict:
     if not IS_DIRECTOR_FLAG.exists():
         return {'error': 'not_director',
                 'note': 'Only the current director may initiate handover.'}
+    if not ha_enabled():
+        return {'error': 'ha_disabled',
+                'note': 'create data/ha_enabled on the primary to allow handover'}
     snap = build_snapshot()
     # Annotate snapshot with shadow_id so the target's takeover gate accepts it.
     snap['_meta'] = dict(snap.get('_meta') or {})

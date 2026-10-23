@@ -13126,6 +13126,11 @@ def _get_peer_claimed_kgs(peer_urls: list[str]) -> set[str]:
 
 
 def main():
+    try:
+        import peer_tokens as _pt
+        _pt.install_outbound_hook()
+    except Exception:
+        pass
     global _active_pool
 
     parser = argparse.ArgumentParser(description="Austria Landscape Processor")

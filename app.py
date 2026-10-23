@@ -532,6 +532,81 @@ def _tier_cookie(resp):
     return resp
 
 
+import peer_tokens as _pt
+_pt.install_outbound_hook()   # per-destination X-Admin-Token rewriting (docs/security-tokens.md)
+
+OWNER_EMAILS_PATH = Path('data/owner_emails')
+_OWNER_EMAILS_CACHE = {'t': 0.0, 'v': frozenset()}
+
+
+def _owner_emails() -> frozenset:
+    """exe.dev identities allowed to wield the master token (one per line,
+    ``data/owner_emails``). Empty file / missing → master works from
+    loopback only."""
+    now = time.time()
+    if now - _OWNER_EMAILS_CACHE['t'] > 5:
+        v = set()
+        try:
+            for line in OWNER_EMAILS_PATH.read_text().splitlines():
+                line = line.strip().lower()
+                if line and not line.startswith('#'):
+                    v.add(line)
+        except Exception:
+            pass
+        _OWNER_EMAILS_CACHE['v'] = frozenset(v)
+        _OWNER_EMAILS_CACHE['t'] = now
+    return _OWNER_EMAILS_CACHE['v']
+
+
+def _request_is_owner_channel() -> bool:
+    """Where the **master** token may be used on the primary:
+
+    * loopback (on-box CLI, in-process director), or
+    * the private ``:8000`` exe.dev proxy port (only exe.dev logins with
+      access to this VM can reach it) **and** the proxy-asserted
+      ``X-ExeDev-Email`` is in ``data/owner_emails``.
+
+    Never via the public ``/k`` tier — that is the peers' channel, and a
+    master token seen there is treated as stolen (401 + security event).
+    """
+    if _request_is_loopback():
+        return True
+    try:
+        if request.environ.get('srtm.tier') == 'private' \
+                or request.headers.get('X-Srtm-Tier') == 'private':
+            return False
+        fh = request.headers.get('X-Forwarded-Host') or ''
+        if not (':' in fh and fh.rsplit(':', 1)[-1] == '8000'):
+            return False
+        email = (request.headers.get('X-ExeDev-Email') or '').strip().lower()
+        return bool(email) and email in _owner_emails()
+    except Exception:
+        return False
+
+
+_SEC_EVENT_TS: dict = {}
+
+
+def _security_event(kind: str, detail: str) -> None:
+    """Rate-limited (1/min per kind) director-log line, greppable via
+    ``/process.txt?q=security``."""
+    now = time.time()
+    if now - _SEC_EVENT_TS.get(kind, 0.0) < 60:
+        return
+    _SEC_EVENT_TS[kind] = now
+    try:
+        log.error('security: %s — %s', kind, detail)
+        pd._emit_director_event(f'security {kind}: {detail}', peer='director',
+                                level='error')
+    except Exception:
+        pass
+
+
+def _peer_of_request() -> str:
+    xff = (request.headers.get('X-Forwarded-For') or '').split(',')[0].strip()
+    return xff or request.remote_addr or '?'
+
+
 @app.before_request
 def _enforce_admin_token():
     path = request.path or ''
@@ -545,8 +620,29 @@ def _enforce_admin_token():
            or request.args.get('admin_token')
            or request.cookies.get('admin_token')
            or _tiers.request_token(request))   # Bearer / X-API-Key / ?token / srtm_k cookie
-    if tok and hmac.compare_digest(tok, _current_admin_token()):
+    kind = _pt.classify(tok, _current_admin_token())
+    if kind == 'master':
+        # On the primary the master is owner-only (see _request_is_owner_channel).
+        # On a peer, its own token *is* the director's handle — full rights.
+        if _pt.is_primary_role() and not _request_is_owner_channel():
+            _security_event('master-token-off-channel',
+                            f'{request.method} {path} from {_peer_of_request()} '
+                            f'via {request.headers.get("X-Forwarded-Host") or "?"}'
+                            f'{"/k" if request.environ.get("srtm.tier") == "private" else ""}')
+            return jsonify({'error': 'admin token required',
+                            'hint': 'master token is only accepted on the owner channel'}), 401
         return None
+    if kind == 'peer':
+        if _pt.peer_scope_allowed(path, request.method):
+            return None
+        _security_event('peer-scope-deny',
+                        f'{_pt.peer_for_token(tok) or "?"} {request.method} {path}')
+        return jsonify({'error': 'forbidden', 'scope': 'peer'}), 403
+    if kind == 'mesh':
+        if _pt.mesh_scope_allowed(path, request.method):
+            return None
+        _security_event('mesh-scope-deny', f'{request.method} {path} from {_peer_of_request()}')
+        return jsonify({'error': 'forbidden', 'scope': 'mesh'}), 403
     return jsonify({'error': 'admin token required',
                     'hint': 'set X-Admin-Token header'}), 401
 
@@ -898,8 +994,16 @@ def admin_install_token():
     except Exception as e:
         return jsonify({'error': f'failed to write token: {e}'}), 500
     ADMIN_TOKEN = new_tok
-    log.info('admin_install_token: token installed/rotated (len=%d)', len(new_tok))
-    return jsonify({'status': 'installed'})
+    mesh_ok = False
+    mesh = (body.get('mesh_token') or '').strip()
+    if mesh and len(mesh) >= 16:
+        try:
+            _pt._write_secret(_pt.MESH_TOKEN_PATH, mesh)
+            mesh_ok = True
+        except Exception as e:
+            log.warning('admin_install_token: mesh token write failed: %s', e)
+    log.info('admin_install_token: token installed/rotated (len=%d, mesh=%s)', len(new_tok), mesh_ok)
+    return jsonify({'status': 'installed', 'mesh': mesh_ok})
 
 
 # === SECTION: Copernicus credentials API ===
@@ -7603,6 +7707,38 @@ def director_peers_config():
     return jsonify({'status': 'updated', 'config': new_cfg})
 
 
+@app.route('/api/v1/director/peers/mint_token', methods=['POST'])
+def director_mint_peer_token():
+    """Mint (or return the already-minted) unique token for a future peer
+    so the dashboard's deploy command can bake it in — the master token
+    never leaves the primary. Owner-channel only (master token).
+
+    Body: ``{vm: 'srtm-lidar-at77'}`` or ``{host: 'example.invalid'}``.
+    Returns ``{host, admin_token, mesh_token}``.
+    """
+    if not _request_is_owner_channel():
+        return jsonify({'error': 'owner channel required'}), 403
+    data = request.get_json(silent=True) or {}
+    host = (data.get('host') or '').strip().lower()
+    if not host:
+        vm = (data.get('vm') or '').strip().lower()
+        if not re.match(r'^srtm-lidar-at\d+$', vm):
+            return jsonify({'error': 'vm must look like srtm-lidar-at<N>'}), 400
+        host = vm + '.exe.xyz'
+    if not _tiers.is_cluster_host(host):
+        return jsonify({'error': 'not a cluster host'}), 400
+    m = _pt.load_peer_tokens(force=True)
+    tok = m.get(host)
+    if not tok:
+        tok = _pt.generate()
+        m[host] = tok
+        _pt.save_peer_tokens(m)
+    if not _pt.MESH_TOKEN_PATH.exists():
+        _pt._write_secret(_pt.MESH_TOKEN_PATH, _pt.generate())
+    return jsonify({'host': host, 'admin_token': tok, 'mesh_token': _pt.mesh_token(),
+                    'director_url': 'https://' + __import__('director_ha').PRIMARY_HOST + '/k'})
+
+
 @app.route('/api/v1/director/peers/add', methods=['POST'])
 def director_add_peer():
     """Add a new peer dynamically.
@@ -7621,6 +7757,14 @@ def director_add_peer():
         return jsonify({'error': 'id and url are required'}), 400
     if not peer_url.startswith('https://'):
         return jsonify({'error': 'url must start with https://'}), 400
+
+    # Peer tokens may only register *themselves* (deploy.sh self-registration).
+    _tok_in = (request.headers.get('X-Admin-Token') or _tiers.request_token(request) or '')
+    if not _request_is_loopback() and _pt.classify(_tok_in, _current_admin_token()) == 'peer':
+        if _pt.peer_for_token(_tok_in) != _pt.host_of(peer_url):
+            _security_event('peer-scope-deny',
+                            f'{_pt.peer_for_token(_tok_in)} tried to register {peer_url}')
+            return jsonify({'error': 'forbidden', 'scope': 'peer'}), 403
 
     cfg = pd.load_peers_config()
     # Explicit re-add clears any removal tombstone (see
@@ -7654,6 +7798,28 @@ def director_add_peer():
         except Exception:
             pass
         time.sleep(5)
+
+    # Unique per-peer token (docs/security-tokens.md). Mint (or reuse the
+    # token minted for the deploy command) and install it on the peer.
+    # Works when the peer has no token yet (deploy.sh without ADMIN_TOKEN:
+    # first-write-wins bootstrap) or already runs the minted one
+    # (idempotent). ``token`` in the body = whatever the peer currently
+    # holds, for peers deployed with a token the primary does not know.
+    token_result = {'status': 'offline'}
+    _host = _pt.host_of(peer_url)
+    _ptok = _pt.token_for_host(_host)
+    if not _ptok:
+        _ptok = _pt.generate()
+        _m = _pt.load_peer_tokens(force=True)
+        _m[_host] = _ptok
+        _pt.save_peer_tokens(_m)
+    if not _pt.MESH_TOKEN_PATH.exists():
+        _pt._write_secret(_pt.MESH_TOKEN_PATH, _pt.generate())
+    if online:
+        _cur = (data.get('token') or '').strip() or _ptok
+        token_result = _pt._install_on_peer(peer_url, _cur, _ptok, _pt.mesh_token())
+        if token_result.get('status') != 'installed':
+            log.warning('add_peer %s: token install %s', peer_id, token_result)
 
     # Push self-identity to the new peer so it knows its own id, URL and
     # who the current director is. This is the source-of-truth for
@@ -7745,6 +7911,7 @@ def director_add_peer():
     return jsonify({
         'status': 'added',
         'peer': {'id': peer_id, 'url': peer_url, 'enabled': enabled, 'online': online},
+        'token': token_result,
         'total_peers': len(cfg['peers']),
         'creds_bootstrapped': creds_pushed,
         'creds_failed': creds_failed,
@@ -9265,24 +9432,22 @@ def director_update_peers():
                 'hint': 'Pass {"skip_push": true} to update peers anyway.',
             }), 500
 
-    # Push the cluster admin token to every peer first. Idempotent: if
-    # the peer already has it, install_token is a no-op (current_token
-    # check passes). If the peer has none (fresh deploy or pre-auth code
-    # that just pulled), bootstrap-allowed first install seeds it. This
-    # makes the dashboard "Update Peers" button self-bootstrapping for
-    # the cluster auth rollout, even if the peer's web server has not
-    # yet picked up the new auth code (the install_token endpoint is
-    # part of the same release; peers running pre-release code simply
-    # skip this step harmlessly with a 404).
-    cluster_tok = _current_admin_token()
+    # Token sync (2026-10-23): the master token NEVER leaves the primary.
+    # Peers hold their own per-host token (peer_tokens.py); re-pushing
+    # the mapped token is an idempotent no-op that only re-seeds a peer
+    # whose data/admin_token was wiped by a redeploy. Unmapped peers are
+    # left alone — mint them with `python3 peer_tokens.py --new-peer`.
     token_results = {}
     for peer in cfg.get('peers', []):
         if not peer.get('url'):
             continue
         if target_id and peer['id'] != target_id:
             continue
-        token_results[peer['id']] = pd.install_token_on_peer(
-            peer['url'], cluster_tok)
+        _ptok = _pt.token_for_host(_pt.host_of(peer['url']))
+        if not _ptok:
+            token_results[peer['id']] = {'status': 'skipped_no_peer_token'}
+            continue
+        token_results[peer['id']] = pd.install_token_on_peer(peer['url'], _ptok)
 
     results = {}
     # Update peers in stepwise waves to avoid the thundering-herd
@@ -11322,8 +11487,12 @@ def director_snapshot():
     if request.method == 'GET':
         if not dha.IS_DIRECTOR_FLAG.exists():
             return jsonify({'error': 'not_director'}), 410
+        if not dha.ha_enabled() and not _request_is_loopback():
+            return jsonify({'error': 'ha_disabled'}), 403
         return jsonify(dha.build_snapshot())
     body = request.get_json(silent=True) or {}
+    if not dha.ha_enabled():
+        return jsonify({'error': 'ha_disabled'}), 403
     if not isinstance(body, dict) or '_meta' not in body:
         return jsonify({'error': 'invalid_snapshot'}), 400
     dha.stage_snapshot(body)
@@ -11355,6 +11524,9 @@ def director_combined_log_delta_put():
     dedup) so a promoted shadow already holds the fleet's log history.
     Bounded: 16 MB compressed."""
     import gzip as _gz
+    import director_ha as _dha
+    if not _dha.ha_enabled():
+        return jsonify({'error': 'ha_disabled'}), 403
     raw = request.get_data(cache=False) or b''
     if len(raw) > 16 * 1024 * 1024:
         return jsonify({'error': 'too_large'}), 413
@@ -11393,6 +11565,9 @@ def director_log_archive_put():
     Best-effort and bounded — callers MUST cap blob size; the endpoint
     rejects payloads >32 MB to keep traffic tame.
     """
+    import director_ha as _dha
+    if request.method == 'PUT' and not _dha.ha_enabled():
+        return jsonify({'error': 'ha_disabled'}), 403
     import base64 as _b64, hashlib as _hl
     import director_ha as _dha
     if request.method == 'GET':
@@ -11541,6 +11716,11 @@ def director_identity():
             if k in body and body[k] is not None:
                 cur[k] = body[k]
     prev_dir_url = (cur.get('director_url') or '').strip()
+    if 'director_url' in body and not dha.director_url_allowed(body.get('director_url')):
+        log.error('director_identity: refusing director_url=%r (HA disabled, '
+                  'pinned to %s)', body.get('director_url'), dha.PRIMARY_HOST)
+        return jsonify({'error': 'ha_disabled',
+                        'note': f'director pinned to {dha.PRIMARY_HOST}'}), 403
     if 'director_url' in body:
         cur['director_url'] = body['director_url']
     dha.save_self(cur)

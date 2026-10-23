@@ -163,6 +163,10 @@ against dead URLs:
 
 #### Admin Token (cluster auth)
 
+> **Superseded 2026-10-23** — tokens are now per peer with scopes, the
+> master is owner-channel-only and HA is off: `docs/security-tokens.md`.
+> The notes below describe the old shared-token model.
+
 All mutating admin/director/processing/zenodo endpoints require
 `X-Admin-Token: <token>`. Loopback (127.0.0.1, no XFF) is exempt so
 the in-process director and on-box CLI work without plumbing it.

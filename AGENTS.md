@@ -186,6 +186,7 @@ Products`, `docs/v2.4-rollout.md`.
 | **VTC pilot / bev mode** (vtcseamless cadastre built locally per peer, `/contrib` reports to umfeld-at, NE change protocol, the `vct_pilot:` block, tiled NEC1 build for huge parents) | `docs/vct-pilot.md` | touching `vct_pilot.py`, `vct_fleet.py`, `ne_build_tiled.py`, `vct_pilot_*` knobs, `/api/v1/admin/vct_pilot`, bevdirect-serve flags in `ne_h3.py` |
 | **API tiers** (public `public_api.py` / `landscape_query.py`, hidden `/k` tier `api_tiers.py`, `umfeld.py` upstream token, retired-route 410s, cutover checklist) | `docs/api-tiers.md` | touching `public_api.py`, `landscape_query.py`, `public_docs.py`, `api_tiers.py`, `umfeld.py`, tokens, the exe.dev port switch |
 | **Label-mix repair** (restored-checkpoint label-id collision: flat pasture as `roof`, glued polygons; `label_mix:` line, auto-requeue, `LabelMixError` stitch guard) | `docs/label-mix.md` | touching `label_mix.py`, `_remap_restored_tile_ids`, `_assert_tile_labels_consistent`, `v2_verify.segments_label_consistency`; a KG with `geb` cells at `h_max=0` |
+| **Security model** (per-peer tokens + scopes, owner channel for the master, HA off, proxy pool removed, rotation, security events) | `docs/security-tokens.md` | touching `peer_tokens.py`, `_enforce_admin_token`, `install_token`, `director_ha.py`, `deploy.sh`, "+ Add Peer"; `/process.txt?q=security` shows events |
 | Kataster purge (historical, done 2026-10-13) | `docs/kataster-purge.md` | what was deleted, what remains on purpose, golden test `tools/golden_public.py` |
 | Licensing & attribution (BEV CC BY 4.0, Copernicus, OSM ODbL) | `docs/attributions.md` | touching `attributions.py`, Zenodo metadata, GPKG metadata, adding a data source |
 | Reference algorithms summary | `docs/reference_algorithms_summary.md` | segmentation/RF internals |
@@ -447,8 +448,19 @@ POST again, then verify the code survives a GET. Full explanation + the
 - **All Zenodo writes** serialise through `/api/v1/zenodo/lock` on the primary.
 - **`CredentialRotatedError` / `CreditsExhaustedError` / `IPThrottledError`**
   must NEVER be swallowed by generic `except Exception`. See `docs/copernicus-throttle.md`.
-- **Admin token** required for mutating endpoints. Loopback exempt. Lives in
-  `data/admin_token` (gitignored, mode 0600). Same on all peers.
+- **Tokens are per peer** (`docs/security-tokens.md`): the primary's
+  `data/admin_token` is the owner-only *master* (accepted only on the
+  private `:8000` channel with the owner's exe.dev login, never via `/k`);
+  each peer has its own token (map: `data/peer_tokens.json`, primary
+  only) scoped to `peer_tokens.PEER_SCOPE` on the primary; `data/mesh_token`
+  is peer→peer cache-manifest sync only. Outbound calls are rewritten per
+  destination by `peer_tokens.install_outbound_hook` — never paste the
+  master into a peer, a deploy command or a snapshot.
+- **HA / director takeover is OFF** (`director_ha.ha_enabled()`; only the
+  file `data/ha_enabled` on the primary re-enables it). No token can move
+  the director role.
+- **No third-party proxies, ever** (`bev_proxy.py` is a direct-only stub
+  since the 2026-10-23 C2 alert).
 - **Process uid**: the processor MUST run as `exedev` (uid 1000), not root.
   See `docs/peer-director.md` (Processor uid section).
 - **Don't probe Copernicus credentials from the request path.** Only
@@ -474,7 +486,7 @@ POST again, then verify the code survives a GET. Full explanation + the
 | `self.json` | Identity (id, url, director_url) |
 | `copernicus_credentials.json` / `copernicus_credential_usage.json` | Creds + telemetry |
 | `copernicus_paused` / `openeo_circuit.json` | Throttle state |
-| `admin_token` (in `data/`) | Cluster auth; also a valid `/k` tier token |
+| `admin_token` (in `data/`) | master (primary) / own token (peer); `peer_tokens.json`, `mesh_token`, `owner_emails`, `ha_enabled` — `docs/security-tokens.md` |
 | `api_tokens` / `umfeld_token` / `private_only` (in `data/`) | extra `/k` client tokens (one per line) / cadastre-upstream bearer token / flag: app.py 404s without token. All gitignored. See `docs/api-tiers.md` |
 | `shadow/` + `shadow/meta.json` | HA: staged state for shadow promotion |
 | `zenodo_lock_url.txt` | Peer→broker pointer |

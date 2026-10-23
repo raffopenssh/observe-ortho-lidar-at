@@ -86,6 +86,15 @@ def tokens() -> frozenset:
     if now - _cache['t'] < 5:
         return _cache['tokens']
     toks = set()
+    # Peer + mesh tokens (peer_tokens.py) must pass the /k gate so the
+    # fleet reaches app.py, where _enforce_admin_token scopes them.
+    try:
+        import peer_tokens as _pt
+        toks |= _pt.all_peer_tokens()
+        if _pt.mesh_token():
+            toks.add(_pt.mesh_token())
+    except Exception:
+        pass
     for p in (ADMIN_TOKEN_PATH, API_TOKENS_PATH):
         try:
             for line in p.read_text().splitlines():

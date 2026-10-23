@@ -1,3 +1,14 @@
+# BEV proxy pool — REMOVED 2026-10-23
+
+The free-proxy pool described below was deleted for security (peers were
+connecting to thousands of anonymous third-party hosts per hour, which
+tripped a C2 network alert). `bev_proxy.py` is now a direct-only stub
+with the same API; `bev_retry._PROXY_DISABLED = True`. The `fleet_proxy:`
+line stays as `proxies=0`. See `docs/security-tokens.md → Why`.
+**Do not reintroduce proxy lists.** Historical notes follow.
+
+---
+
 # BEV proxy pool (`bev_proxy.py`) and the `fleet_proxy:` line
 
 > Moved verbatim out of `AGENTS.md` (2026-10-13). Load when touching `bev_proxy.py`, `bev_retry.py`, the proxy source lists, or when `/process.txt` shows `no_proxies=` / `stale=` on the `fleet_proxy:` line. BEV `/24` outage parks are a different mechanism: `docs/fleet-bandwidth.md → Role-based parks` #5 and `docs/peer-director.md → BEV outage handling`.

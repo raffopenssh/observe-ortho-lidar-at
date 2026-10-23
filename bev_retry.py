@@ -91,9 +91,10 @@ def _retry_delay(attempt: int, base_delay: float = BASE_DELAY) -> float:
 # while the BEV server itself returns 206 in <1.5s under 30x concurrency
 # from our peer IPs.  We now prefer direct for the first TWO attempts
 # on every read; only flaky-IP peers fall back to the proxy pool.
-# Set BEV_DISABLE_PROXY=1 in the env to skip proxies entirely.
+# 2026-10-23: the free-proxy pool was removed for security (bev_proxy.py
+# docstring). The proxy lane is permanently off; every attempt is direct.
 DIRECT_RETRIES_DEFAULT = 2
-_PROXY_DISABLED = os.environ.get("BEV_DISABLE_PROXY", "").strip().lower() in ("1", "true", "yes")
+_PROXY_DISABLED = True
 
 # Error substrings that indicate a transient / retryable failure.
 # GDAL/rasterio surface HTTP errors as CPLE_* messages or generic IOError.
