@@ -8253,11 +8253,18 @@ def director_proxy_status():
         'step_started_at', 'step_detail_ts', 'step_times', 'step_issues',
         'started_at', 'last_kg_code', 'last_kg_seconds',
         'recent_log', 'failed_kgs', 'subtile',
-        'instance', 'region', 'git_commit',
+        'instance', 'region',
     )
     for k in LIVE_KEYS:
         if k in ps and ps[k] is not None:
             base[k] = ps[k]
+    # ``git_commit`` deliberately stays the *primary's* commit: it is the
+    # rollout target the director pushes (``_LOCAL_GIT_COMMIT``) and the
+    # dashboard derives every stale-peer marker from it. Overlaying the
+    # active peer's commit made the page show a stale target whenever
+    # the frontier lagged the rollout (2026-10-23: 60b83c0 vs d16aa94).
+    if ps.get('git_commit'):
+        base['peer_git_commit'] = ps['git_commit']
     base['_director'] = _dir_view
     base['_active_peer_id'] = active_id
     base['_active_peer_url'] = peer.get('url')
