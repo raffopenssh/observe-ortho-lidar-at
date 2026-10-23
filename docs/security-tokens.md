@@ -92,6 +92,13 @@ token and can't reach the primary any more (master already rotated) →
 re-run `--rotate --peer <id>` (uses the recorded `_legacy_master`) or
 re-image it. Rotation is idempotent and safe to repeat.
 
+**After rotating or after any change to `api_tiers.py` / `peer_tokens.py`:
+`sudo systemctl restart srv_public` too.** The `/k` gate is a separate
+gunicorn (`public_api`); on 2026-10-23 it kept running the pre-rotation
+code and 404'd every peer→primary call for 35 min (status pushes, Zenodo
+lock, leases) while the director's own peer polls made the fleet look
+healthy — the only symptom was `EDGE-INBOUND-UNREACHABLE` in the banner.
+
 ## New peers
 
 * Dashboard "+ Add Peer": `POST /director/peers/mint_token {vm}` (owner
