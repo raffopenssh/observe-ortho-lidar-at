@@ -268,13 +268,22 @@ def ne_source() -> str:
 
 
 def _umfeld_base() -> str:
+    """Public (tokenless) NE read tier — ``/ne/manifest``, ``/ne/{kg}?layers=``.
+    Our token is a contributor token since 2026-10-23: every ``/k/…`` path
+    answers 404 for it (umfeld.py)."""
     import umfeld
-    return f"{umfeld.CADASTRE_BASE}/ne"
+    return umfeld.NE_PUBLIC_BASE
 
 
-def _umfeld_headers() -> dict:
+def _umfeld_contrib_base() -> str:
+    """``/contrib/api/v1/ne`` — the write tier (``/obs``, ``/report``, ``/chunks``)."""
     import umfeld
-    h = umfeld.headers()
+    return umfeld.NE_CONTRIB_BASE
+
+
+def _umfeld_headers(auth: bool = True) -> dict:
+    import umfeld
+    h = umfeld.headers() if auth else {}
     h["User-Agent"] = "srtm-lidar-at/2.4 ne_h3"
     return h
 
@@ -290,7 +299,7 @@ def fetch_manifest(timeout: float = 60.0, etag: str | None = None,
     ``delta:false``.  Callers must merge/replace accordingly (see
     ``ne_rollout.refresh_ne_manifest``).  400 = unparseable cursor."""
     import requests
-    h = _umfeld_headers()
+    h = _umfeld_headers(auth=False)
     h["Accept-Encoding"] = "gzip"
     if etag:
         h["If-None-Match"] = etag
@@ -310,7 +319,7 @@ def fetch_declared_umfeld(kg: str, timeout: float = 120.0, layer: str = "lu") ->
     last = None
     for attempt in range(3):
         try:
-            r = requests.get(url, params={"layers": layer}, headers=_umfeld_headers(), timeout=timeout)
+            r = requests.get(url, params={"layers": layer}, headers=_umfeld_headers(auth=False), timeout=timeout)
         except Exception as e:  # noqa: BLE001
             last = e
             time.sleep(2 + 3 * attempt)
@@ -395,7 +404,18 @@ def _check_declared_header(sec: Section, kg: str) -> None:
 # unknown|ok|degraded|down, tls_errors, http_5xx, last_error}; 502 and
 # pending bodies carry the same object (vct_pilot._viewport honours it).
 # Never work around with InsecureSkipVerify / curl -k.
-BEVDIRECT_TAG = os.environ.get("BEVDIRECT_TAG", "v0.3.5")
+# v0.3.6 (2026-10-24): aligned-cell lookup fix (our report, see
+# docs/vct-pilot.md → v0.3.6).  ``cellOf`` floored ``lon/0.02`` without an
+# epsilon, so an exactly aligned single-cell /viewport (15.54/0.02 =
+# 776.999…) resolved to two cells for 1 214/18 000 columns (and rows) and
+# compose() kept the NEIGHBOUR's truncated copy of any parcel wider than
+# cell+pad — border rows differed per KG / observer.  Now
+# ``floor(lon/0.02 + 1e-9)``.  Documents + ne_cells digests of affected
+# cells change ONCE (legitimate, not land-use change); all other cells are
+# byte-identical.  umfeld lists v0.3.6 in ``bev_equivalent_tags`` → same
+# source class, no re-baseline: boundary chunks flip on our first v0.3.6
+# pass (candidate), the second pass confirms.
+BEVDIRECT_TAG = os.environ.get("BEVDIRECT_TAG", "v0.3.6")
 BEVDIRECT_MODULE = "github.com/raffopenssh/vtcseamless"
 # Static release tarball (GitHub egress — NOT the metered primary); the
 # primary-served copy and ``go install`` are fallbacks.
@@ -415,6 +435,9 @@ BEVDIRECT_RELEASE_SHA256 = {
     # v0.3.5 (2026-10-23): BEV TLS intermediate + AIA fallback; assembly unchanged
     ("v0.3.5", "amd64"): "70ad46bbaa454d9a97a61c4291d8d6bf6e3db83c5c45e5fc30e6c8ed819a8c52",
     ("v0.3.5", "arm64"): "d20835815fbd937edc704c59549cd79167243d07304a85994e0e11dbedd4d5b2",
+    # v0.3.6 (2026-10-24): aligned-cell lookup epsilon; one-time digest flip on affected cell columns/rows
+    ("v0.3.6", "amd64"): "d564589300332540630b9bcb192eea2de409e40d35eacdc63d60fcf3c2ab5f2e",
+    ("v0.3.6", "arm64"): "b9ad0fe7cfa099a07999dfd1711bf0519d2ab935b38a7641ea10d07736ca564f",
 }
 # umfeld's pinned ``ne_cells`` package ships in the PUBLIC vtcseamless-py repo
 # (pip project ``vtcseamless``, modules ``vtcseamless`` + ``ne_cells``).  It
@@ -423,7 +446,7 @@ BEVDIRECT_RELEASE_SHA256 = {
 # (Oct 2026).  algo/pack/canon/ns_groups are byte-identical to umfeld's.
 NE_CELLS_REPO = "https://github.com/raffopenssh/vtcseamless-py.git"
 NE_CELLS_MIN_VERSION = "2.1.0"     # first vtcseamless-py release of the package
-VTCSEAMLESS_MIN_VERSION = "0.3.1"  # client dist: pins bevdirect@v0.3.5, /health.upstream contract + UpstreamDownError (0.3.0: QC provenance)
+VTCSEAMLESS_MIN_VERSION = "0.3.2"  # client dist: pins bevdirect@v0.3.6 + cells_for epsilon (0.3.1: /health.upstream contract; 0.3.0: QC provenance)
 BEVDIRECT_BIN = DATA_DIR / "bin" / "bevdirect-serve"
 BEVDIRECT_PID = DATA_DIR / "bevdirect-serve.pid"
 BEVDIRECT_ADDR = os.environ.get("BEVDIRECT_ADDR", "127.0.0.1:8787")
@@ -447,7 +470,7 @@ BEVDIRECT_WORK = Path(os.environ.get("BEVDIRECT_WORK") or (
 _LEGACY_TILE_DIRS = [Path("/dev/shm/srtm_bevcache"), DATA_DIR / "bevcache"]
 if os.environ.get("BEVDIRECT_CACHE"):
     _LEGACY_TILE_DIRS.append(Path(os.environ["BEVDIRECT_CACHE"]))
-NE_CELLS_PIN = os.environ.get("NE_CELLS_PIN", "488403a")   # vtcseamless-py 0.3.1 (bevdirect v0.3.5 pin, upstream state; ne_cells/ untouched)
+NE_CELLS_PIN = os.environ.get("NE_CELLS_PIN", "ca485b5")   # vtcseamless-py 0.3.2 (bevdirect v0.3.6 pin, cell_of epsilon; ne_cells/ untouched)
 TOOLING_LAST = DATA_DIR / "ne_tooling_last.json"   # last install attempt (rc + pip tail), for /admin/ne_tooling
 CELL_DEG = 0.02
 
@@ -910,7 +933,8 @@ def _ensure_bevdirect_server() -> None:
 # and whatever the cached umfeld manifest lists, so a ``BEVDIRECT_TAG`` bump can
 # never again reject every local build fleet-wide (v0.3.5 incident, 2026-10-23).
 BEV_SOURCES_OK = frozenset({"bevdirect@v0.2.0", "bevdirect@v0.2.1", "bevdirect@v0.3.0", "bevdirect@v0.3.1",
-                            "bevdirect@v0.3.2", "bevdirect@v0.3.3", "bevdirect@v0.3.4", "bevdirect@v0.3.5"})
+                            "bevdirect@v0.3.2", "bevdirect@v0.3.3", "bevdirect@v0.3.4", "bevdirect@v0.3.5",
+                            "bevdirect@v0.3.6"})
 
 
 def bev_sources_ok() -> frozenset:
@@ -1083,7 +1107,7 @@ def post_observed(kg: str, neo1_section: bytes, timeout: float = 120.0,
     body = (nec1_section + neo1_section) if nec1_section else neo1_section
     if len(body) > 16 * 1024 * 1024:
         raise NEError(f"umfeld /ne/{kg}/obs body {len(body)} B > 16 MB")
-    r = requests.post(f"{_umfeld_base()}/{kg}/obs", data=body, headers=h, timeout=timeout)
+    r = requests.post(f"{_umfeld_contrib_base()}/{kg}/obs", data=body, headers=h, timeout=timeout)
     if r.status_code in (400, 409):
         raise NEError(f"umfeld /ne/{kg}/obs {r.status_code}{' (NEC1+NEO1)' if nec1_section else ''}: {r.text[:300]}")
     r.raise_for_status()

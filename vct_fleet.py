@@ -10,7 +10,7 @@ Peers run ``vct_pilot.py`` and ship a ~250 B ``status.vct_pilot`` summary
   the sidecar on a *running* pilot peer through ``/api/v1/admin/vct_pilot``
   (no restart — the processor reads it at the next KG's NE step),
 * **confirms contributions** at umfeld-at: for every reported pilot KG,
-  ``GET /k/api/v1/ne/{kg}/report`` must list a report with our observer
+  ``GET /contrib/api/v1/ne/{kg}/report`` must list a report with our observer
   label and digest (≤5 checks / tick, once per KG, cached in
   ``data/austria_processor/vct_fleet.json``),
 * **checks the NE round-trip** of each pilot KG: umfeld's manifest
@@ -688,7 +688,7 @@ def _collect_rows(st: dict, pushes: dict) -> None:
 
 
 def _confirm_contrib(st: dict) -> None:
-    """Did umfeld store our report?  ``GET /k/api/v1/ne/{kg}/report`` lists
+    """Did umfeld store our report?  ``GET /contrib/api/v1/ne/{kg}/report`` lists
     received reports; ours must appear with our observer + digest."""
     import requests
     import umfeld
@@ -701,7 +701,7 @@ def _confirm_contrib(st: dict) -> None:
             continue
         n += 1
         try:
-            resp = requests.get(f"{umfeld.CADASTRE_BASE}/ne/{kg}/report", headers=umfeld.headers(), timeout=30)
+            resp = requests.get(f"{umfeld.NE_CONTRIB_BASE}/{kg}/report", headers=umfeld.headers(), timeout=30)
             resp.raise_for_status()
             j = resp.json() or {}
             found = None

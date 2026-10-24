@@ -5816,22 +5816,14 @@ def processing_prioritize():
     if not bbox and not kgs:
         return jsonify({'error': 'Provide bbox (west/south/east/north) or kgs array'}), 400
 
-    # Resolve bbox to KG codes via cadastre API
+    # Resolve bbox to KG codes via the local search index (umfeld's
+    # ``/k/api/v1/spatial/kgs`` is gone — contributor token, 404 since 2026-10-23)
     if bbox:
         try:
-            import requests as req
-            r = req.get(
-                _umfeld.CADASTRE_BASE + '/spatial/kgs',
-                params={
-                    'west': bbox['west'], 'south': bbox['south'],
-                    'east': bbox['east'], 'north': bbox['north'],
-                    'fields': 'kg_code,kg_name',
-                },
-                timeout=15,
-            )
-            r.raise_for_status()
-            resp = r.json()
-            kgs = resp.get('data', {}).get('kg_codes', [])
+            import search_index as _si
+            kgs = _si.get_index().kgs_in_bbox(
+                float(bbox['west']), float(bbox['south']),
+                float(bbox['east']), float(bbox['north']), processed_only=False)
         except Exception as e:
             return jsonify({'error': f'Failed to resolve bbox to KGs: {e}'}), 502
 

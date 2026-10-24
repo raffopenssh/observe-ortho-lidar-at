@@ -192,15 +192,18 @@ CELL_DEG = 0.02                                 # bevdirect-serve's assembly cel
 
 def _cells(W: float, S: float, E: float, N: float) -> list[tuple[int, int]]:
     """``(ix, iy)`` of every aligned 0.02° bevdirect cell intersecting W,S,E,N
-    (``ix = floor(lon/0.02)``; a bbox ending exactly on a grid line does not
-    include the next cell) — ``vtcseamless.bevdirect.cells_for`` when the
-    0.1.1 client is installed, the same rule inline otherwise."""
+    (``ix = floor(lon/0.02 + 1e-9)``; a bbox ending exactly on a grid line
+    does not include the next cell) — ``vtcseamless.bevdirect.cells_for``
+    when the client is installed, the same rule inline otherwise."""
     try:
         from vtcseamless.bevdirect import cells_for
         return list(cells_for(W, S, E, N))
     except Exception:
-        ix0, ix1 = math.floor(W / CELL_DEG), math.floor((E - 1e-9) / CELL_DEG)
-        iy0, iy1 = math.floor(S / CELL_DEG), math.floor((N - 1e-9) / CELL_DEG)
+        # +1e-9 cell units on the lower corner (vtcseamless 0.3.2 / server
+        # v0.3.6): 15.54/0.02 = 776.999… would otherwise fold the previous
+        # column in for ~7 % of grid lines
+        ix0, ix1 = math.floor(W / CELL_DEG + 1e-9), math.floor((E - 1e-9) / CELL_DEG)
+        iy0, iy1 = math.floor(S / CELL_DEG + 1e-9), math.floor((N - 1e-9) / CELL_DEG)
         return [(ix, iy) for ix in range(ix0, ix1 + 1) for iy in range(iy0, iy1 + 1)]
 
 

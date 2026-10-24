@@ -33,6 +33,15 @@ CADASTRE_BASE = f'{ROOT}/api/v1'
 # ``parcel=`` / ``cat=water_parcels`` removed on every tier).
 PUBLIC_BASE = f'https://{HOST}/api/v1'
 OSM_GEOMETRY_URL = f'{PUBLIC_BASE}/osm/geometry'
+# NE cells (2026-10-24): our token is a CONTRIBUTOR token — every /k/… path
+# answers 404 for it.  Writes go to the ``/contrib`` prefix
+# (``POST /contrib/api/v1/ne/{kg}/report|chunks|obs``, ``GET …/ne/revisit``,
+# ``GET …/ne/{kg}/report``, ``GET …/ne/manifest``); reads are the public,
+# tokenless ``/api/v1/ne/…`` tier (``/ne/manifest``, ``/ne/{kg}?layers=lu``).
+CONTRIB_PREFIX = '/contrib'
+CONTRIB_BASE = f'https://{HOST}{CONTRIB_PREFIX}/api/v1'
+NE_CONTRIB_BASE = f'{CONTRIB_BASE}/ne'
+NE_PUBLIC_BASE = f'{PUBLIC_BASE}/ne'
 DOCS_URL = f'{CADASTRE_BASE}/docs/llm.txt'
 
 # Anchored to the repo dir, not cwd (segv2/ tools run with cwd=segv2/).
@@ -106,6 +115,7 @@ def is_umfeld_url(url: str) -> bool:
     try:
         from urllib.parse import urlsplit
         u = urlsplit(url)
-        return (u.hostname or '').lower() == HOST and u.path.startswith(PRIVATE_PREFIX + '/')
+        return (u.hostname or '').lower() == HOST and (
+            u.path.startswith(PRIVATE_PREFIX + '/') or u.path.startswith(CONTRIB_PREFIX + '/'))
     except Exception:
         return False
