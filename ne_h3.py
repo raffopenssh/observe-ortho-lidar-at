@@ -671,13 +671,30 @@ def ensure_ne_cells_package(timeout: int = 900) -> dict:
         log.warning("ne_h3: ne_cells pip install failed: %s", e)
     # a fresh interpreter sees the new package; this process may not
     # (import caches) — probe in a subprocess so the verdict is honest.
+    # Probe BOTH halves of the dist: ``_NE_CELLS_FRESH`` short-circuits every
+    # later call in this process, so it must only be set when the pin really
+    # landed.  (Oct 2026, at205: pip failed once, the legacy ne_cells 2.1.0
+    # still imported, FRESH got set from that and the peer sat for 8 h on
+    # ``package_stale: vtcseamless 0.3.0 < 0.3.2`` with the director
+    # deferring every start — ×580 ``tooling installing`` events.)
     try:
-        pr = subprocess.run([_sys.executable, "-c", "import ne_cells,sys;print(getattr(ne_cells,'__version__',''))"],
+        pr = subprocess.run([_sys.executable, "-c",
+                             "import ne_cells;from importlib.metadata import version as v;"
+                             "print(getattr(ne_cells,'__version__',''));print(v('vtcseamless'))"],
                             capture_output=True, text=True, timeout=60)
         last["import_rc"] = pr.returncode
         last["import_tail"] = (pr.stderr or pr.stdout or "")[-300:]
-        if pr.returncode == 0 and pr.stdout.strip():
-            _NE_CELLS_FRESH[0] = pr.stdout.strip()
+        lines = [x.strip() for x in (pr.stdout or "").splitlines() if x.strip()]
+        if pr.returncode == 0 and len(lines) >= 2 and last.get("pip_rc") == 0:
+            try:
+                cv = tuple(int(x) for x in lines[1].split(".")[:3])
+                if cv >= tuple(int(x) for x in VTCSEAMLESS_MIN_VERSION.split(".")):
+                    _NE_CELLS_FRESH[0] = lines[0]
+                    last["client_version"] = lines[1]
+                else:
+                    last["client_stale"] = lines[1]
+            except Exception:
+                pass
     except Exception as e:  # noqa: BLE001
         last["import_tail"] = str(e)[:200]
     out = bevdirect_ready(probe_server=False)

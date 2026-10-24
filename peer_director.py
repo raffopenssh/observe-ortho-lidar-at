@@ -893,6 +893,36 @@ CANARY_PARK_COOLDOWN_S = 6 * 3600 # 6 h not_before (quality-grade parks)
 # they’ll soft-park again on the next tick (and eventually graduate
 # to quality-grade once persistence + network-grade both fire).
 CANARY_PARK_COOLDOWN_SOFT_S = 60 * 60   # 1 h
+# Canary slowdown is ignored while the peer's CPU is this busy (the
+# recent-window stall is compute, not shaping).  Pushed telemetry:
+# system.perf.cpu_total_ewma (10-min EWMA) / system.cpu_total.
+CANARY_COMPUTE_BOUND_CPU_PCT = 30.0
+CANARY_COMPUTE_BOUND_STEPS = ('terrain', 'segment', 'vectorise', 'gpkg_full',
+                              'gpkg_light', 'json', 'v2_verify', 'anchor')
+
+
+def _canary_peer_compute_bound(p: dict) -> bool:
+    """True when the peer's last pushed status shows a busy CPU or a
+    CPU-bound pipeline step — see the canary check for why that makes
+    a throughput collapse uninteresting.  Stale/missing status → False."""
+    try:
+        cached = _PEER_STATUS_CACHE.get(p.get('url') or '')
+        if not cached or (time.time() - cached[0]) > 900:
+            return False
+        st = cached[1] or {}
+        if str(st.get('state') or '') not in ('running', 'processing'):
+            return False
+        sysd = st.get('system') or {}
+        perf = sysd.get('perf') or {}
+        cpu = perf.get('cpu_total_ewma')
+        if cpu is None:
+            cpu = sysd.get('cpu_total')
+        if isinstance(cpu, (int, float)) and float(cpu) >= CANARY_COMPUTE_BOUND_CPU_PCT:
+            return True
+        step = str((st.get('current_kg') or {}).get('step') or st.get('current_kg_step') or '').lower()
+        return any(step.startswith(x) for x in CANARY_COMPUTE_BOUND_STEPS)
+    except Exception:
+        return False
 # Don't trip the slowdown check until the canary has actually moved
 # enough bytes for the average to be meaningful (otherwise a peer that
 # happens to be idle between KGs reads as 'shaped').
@@ -1895,6 +1925,48 @@ LOST_UPLOAD_FILE_KEYS = (            # filename suffix -> manifest key suffix
 )
 
 
+def _v2_regen_orphan(code: str, ent: dict) -> bool:
+    """True when *code*'s products are old-split residue: the parent KG's
+    bbox is covered by committed ``_json`` products WITHOUT any of this
+    code's own entries (``app._kg_coverage_complete``).  Such a code can
+    never be regenerated usefully — ``GET /processing/queue`` prunes it as
+    complete on the next poll (the requeue-revert loop of 72321 / 03123 /
+    48210-east+west, Oct 2026: requeued → pruned → "reverted" → requeued …
+    with a wasted ``v2up: … gone from Zenodo`` dispatch each round).
+    Block codes: the parent is covered by a newer unsplit run or a newer
+    layout.  Parent codes: the blocks cover it.  Conservative: any error →
+    False (not an orphan)."""
+    try:
+        import app as _app
+        code = str(code)
+        parent = code.split('-', 1)[0]
+        ent2 = {k: v for k, v in ent.items() if not k.startswith(code + '_')}
+        if code == parent and not any(k.startswith(parent + '-') and k.endswith('_json') for k in ent2):
+            return False      # unsplit parent with nothing else covering it
+        ok, _ts = _app._kg_coverage_complete(parent, ent2)
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def _v2_regen_drop_orphan_queue(code: str) -> None:
+    """Remove an orphan code from retry_queue.json + its ``_requeue``
+    tombstone so the prune/requeue loop ends (best-effort)."""
+    try:
+        qpath = DATA_DIR / 'retry_queue.json'
+        q = json.loads(qpath.read_text()) if qpath.exists() else []
+        if code in q:
+            q = [c for c in q if c != code]
+            qpath.write_text(json.dumps(q))
+    except Exception:
+        pass
+    try:
+        import app as _app
+        _app._drop_tombstone_keys([f'{code}_requeue'])
+    except Exception:
+        pass
+
+
 def _v2_regen_load() -> dict:
     try:
         d = json.loads(V2_REGEN_FILE.read_text()) if V2_REGEN_FILE.exists() else {}
@@ -2691,6 +2763,9 @@ def _reserved_kgs(cfg: dict, exclude_peer_id: str | None = None) -> set:
     return out
 
 
+_TOOLING_DEFER_COUNT: dict = {}   # peer_id -> consecutive 'tooling installing' start deferrals
+
+
 def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
                          *, cache_only: bool = False,
                          queue_whitelist: list | None = None,
@@ -2773,6 +2848,7 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
             if r.ok:
                 result = r.json()
                 result['queue_sync'] = queue_result
+                _TOOLING_DEFER_COUNT.pop(_peer_id_for_url(peer_url), None)
                 if attempt > 1:
                     result['retry'] = attempt
                 return result
@@ -2806,9 +2882,21 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
                 # peer gate: re-pinned tooling still installing — not a
                 # fault, the caller retries next tick.  Surface once.
                 try:
+                    _pid = _peer_id_for_url(peer_url)
+                    _n = _TOOLING_DEFER_COUNT.get(_pid, 0) + 1
+                    _TOOLING_DEFER_COUNT[_pid] = _n
+                    _nt = (r.json().get('ne_tooling') or {})
+                    # info for the first ~10 min; after that the install is
+                    # evidently NOT converging (at205, Oct 2026: 8 h of
+                    # deferrals hidden at info level) — escalate so it
+                    # shows in /process.txt?warn=1 with the stale reason.
+                    _lvl = 'warning' if _n >= 20 else 'info'
                     _emit_director_event('start deferred: bevdirect tooling installing ('
-                                         + str((r.json().get('ne_tooling') or {}).get('binary_version'))
-                                         + ')', peer=_peer_id_for_url(peer_url), level='info')
+                                         + str(_nt.get('binary_version')) + ')'
+                                         + (f' — {_n} consecutive deferrals, package_stale='
+                                            f'{_nt.get("package_stale")!s}; srv restart on the peer retries pip'
+                                            if _n >= 20 else ''),
+                                         peer=_pid, level=_lvl)
                 except Exception:
                     pass
                 return {'error': 'api_start_failed: bevdirect tooling installing',
@@ -6298,6 +6386,17 @@ class PeerDirector:
                 base_mbps = base['rate_bps'] / 1e6
                 recent_mbps = recent['rate_bps'] / 1e6
                 n_with_canary += 1
+                # Compute-bound ≠ shaped (Oct 2026): v2-upgrade and
+                # frontier peers pull a 2–3 GB GPKG / the BEV tiles at KG
+                # start (= the 30-min baseline) and then spend 1–2 h in
+                # terrain/segment/vectorise with ~0 network.  The ratio
+                # collapses to 0.00 while the CPU is pegged — at100 was
+                # soft-parked 4× in 8 h, at117 lost a frontier KG + 1 h.
+                # A shaped peer stalls with an idle CPU; a busy CPU means
+                # the slowdown is the workload, not the network.
+                if ratio < CANARY_SLOWDOWN_RATIO and _canary_peer_compute_bound(p):
+                    streaks.pop(pid, None)
+                    ratio = max(ratio, CANARY_SLOWDOWN_RECOVERY_RATIO)
                 if ratio < CANARY_SLOWDOWN_RATIO:
                     n_in_slowdown += 1
                     # Start / continue streak.
@@ -7903,6 +8002,19 @@ class PeerDirector:
         # --- settle requeued / expire done (no Zenodo traffic) ---
         for code, e in list(d.items()):
             st = e.get('state')
+            if st in ('requeued', 'candidate', 'confirming') and ent and _v2_regen_orphan(code, ent):
+                e['state'] = 'dismissed'; e['done_at'] = now_iso
+                e['note'] = 'orphan (old-split residue): parent covered without this code — never regenerated'
+                changed = True
+                _v2_regen_drop_orphan_queue(code)
+                try:
+                    import app as _app
+                    _app.director_event(f'v2regen: {code} dismissed — old-split residue, parent bbox is covered '
+                                        f'without it (was {st}); dropped from the queue',
+                                        peer='director', kg=code)
+                except Exception:
+                    pass
+                continue
             if st == 'requeued':
                 j2 = ent.get(f'{code}_json_v2')
                 from v21_products import v2_products_complete as _v2c

@@ -188,7 +188,11 @@ def _bundle_tile_pickles(kg_code: str) -> Optional[bytes]:
                 tar.add(str(p), arcname=p.name)
     data = buf.getvalue()
     if len(data) > MAX_BUNDLE_BYTES:
-        _log.warning("chkpt bundle for %s exceeds %d MB (%d MB) — skipping upload",
+        # Routine on big v2.x parents (a third of the fleet's KGs, Oct 2026):
+        # the metadata pickles of a 20-tile KG gzip to 200–450 MB.  Info,
+        # not warning — at warning it tagged every such KG's gpkg_light
+        # step "completed with warnings" and drowned the real signals.
+        _log.info("chkpt bundle for %s exceeds %d MB (%d MB) — skipping upload (local checkpoints still serve same-peer retries)",
                      kg_code, MAX_BUNDLE_BYTES // (1024*1024), len(data) // (1024*1024))
         return None
     return data

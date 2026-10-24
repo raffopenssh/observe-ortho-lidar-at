@@ -1277,7 +1277,23 @@ def build_declared(kg: str, bbox: tuple, cadastre: dict | None = None, is_block:
         _hybrid_check(kg, recent_for(kg, NEC_KEEP_S))
         return fp.read_bytes()
     extra = ["--out", str(fp)] + _report_policy(kg, is_block, bev_mode=True)
+    t_run = time.time()
     row = _run_helper(kg, bbox, None, extra, cadastre=cadastre)
+    # Helper killed by TIMEOUT_S *after* it wrote the NEC1 (huge parents —
+    # Wildalpen 67112, 666 k cells: the build lands at ~1400 s and the
+    # compare + /contrib report + change chunks overrun the budget).  The
+    # declared layer on disk is complete (tmp → rename), only the report is
+    # lost: use it instead of failing the attempt (which cost every block
+    # a 20 s sleep + a second helper, and logged a FAILED row per block).
+    if (not row.get("nec_out") and str(row.get("error") or "").startswith("helper timeout")):
+        try:
+            if fp.exists() and fp.stat().st_mtime >= t_run - 1 and fp.stat().st_size > 64:
+                row.update(nec_out=str(fp), declared=True, report_lost="helper timeout after NEC1 written")
+                log.warning("vct_pilot: %s helper timed out after writing the NEC1 (%.0f s) — "
+                            "declared layer kept, /contrib report lost (re-reported by the next observer)",
+                            kg, time.time() - t_run)
+        except Exception:
+            pass
     _log_row(row)
     # the NEC1 is written before the /contrib report — a 429 on the report
     # must not cost the product its declared layer
