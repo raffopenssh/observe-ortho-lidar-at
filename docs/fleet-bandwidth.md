@@ -82,6 +82,15 @@ Thresholds (peer_director.py):
   the fleet. Until then `process.txt` shows `wall=? (gathering, N
   quality obs)` instead of inventing a confident wall.
 * `CANARY_PARK_COOLDOWN_S = 6h` — quality-grade parks (real shaping).
+* **Compute-bound guard** (`_canary_peer_compute_bound`, Oct 2026): a
+  slowdown is ignored (streak reset) while the peer's last pushed status
+  shows `system.perf.cpu_total_ewma ≥ CANARY_COMPUTE_BOUND_CPU_PCT` (30 %
+  on a 2-vCPU box ≈ one pegged core) or a CPU-bound step
+  (`terrain/segment/vectorise/gpkg_*/json/v2_verify`). v2-upgrade and
+  frontier peers pull 2–3 GB at KG start (= the baseline) and then run
+  1–2 h with ~0 network — the ratio read 0.00 and at100 soft-parked 4× in
+  8 h, at117 lost a frontier KG + a 1 h cooldown. A shaped peer stalls with
+  an *idle* CPU, so the guard cannot hide real shaping.
 * `CANARY_PARK_COOLDOWN_SOFT_S = 1h` — soft parks (defensive, not
   network-grade or not persistent). Almost always upstream blips
   (Zenodo / openEO / transient internet); the short cooldown lets the

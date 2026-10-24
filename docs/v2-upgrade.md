@@ -258,6 +258,17 @@ Peer file `v2_upgrade_failed.json` = `{code: {n, defer, reason, ts}}`; read it w
   Settle loop also self-heals: a `requeued` entry that is >30 min old, not in the queue,
   without `_requeue` tombstone and with the gone key referenced again is demoted to
   `confirming` (`reverted` counter, `v2_regen <code>: requeue reverted` log line).
+  **Orphan residue is dismissed, not requeued** (Oct 2026): a candidate /
+  confirming / requeued code whose *parent bbox is covered by committed
+  `_json` products without any of the code's own entries*
+  (`_v2_regen_orphan` → `app._kg_coverage_complete(parent, entries − code_*)`)
+  is old-split residue — block codes of a superseded layout (`48210-east`
+  after the unsplit 2.4 run), or a parent whose blocks now cover it
+  (`03123`, `72321`, `66326`). Those used to loop requeue → queue-GET prune
+  → "reverted" → requeue forever, each round costing a `v2up: … gone from
+  Zenodo` dispatch. Now: `state=dismissed`, note `orphan (old-split residue)`,
+  dropped from `retry_queue.json` + `_requeue` tombstone, director event
+  `v2regen: <code> dismissed — old-split residue`.
 
 ### Primary ingest strikes (`verify_fail=N` on the `v2:` line)
 

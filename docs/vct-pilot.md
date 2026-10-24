@@ -371,6 +371,21 @@ Fixed in layers (all must hold):
   while the tooling is not ready and installs in the background; the
   director logs `start deferred: bevdirect tooling installing (<ver>)` and
   retries next tick.  It never writes `umfeld` into the sidecar any more.
+  After 20 consecutive deferrals the event is a **warning** carrying
+  `package_stale=…` (shows in `?warn=1`). Root cause seen on at205 (Oct
+  2026, 8 h / ×580 deferrals): `ne_h3.ensure_ne_cells_package` had set its
+  in-process `_NE_CELLS_FRESH` short-circuit from a *legacy* `ne_cells`
+  import after a failed pip run, so it never retried while `vtcseamless`
+  stayed at 0.3.0 (< 0.3.2 pin). FRESH is now only set when `pip_rc == 0`
+  **and** a subprocess probe shows both halves at the pin; an srv restart on
+  the peer also clears it.
+* **Helper timeout after the NEC1 was written** (`build_declared`, Oct
+  2026): on 600 k+-cell parents (Wildalpen 67112) the build lands at
+  ~1400 s and the compare + `/contrib` report overrun `VCT_PILOT_TIMEOUT_S`.
+  The on-disk NEC1 is complete (tmp → rename), so the row is upgraded to
+  `declared=True, report_lost=…` instead of failing the attempt (which
+  cost each block a 20 s sleep + a second helper and a FAILED pilot row).
+  The report is re-sent by the next observer.
 * `austria_processor` cadastre step: sidecar ≠ bevdirect → if the tooling is
   ready, **flip the sidecar itself** and run bev mode; else defer the KG
   (`_fetch_failed`, log `not in bev mode … deferring`).  A 410 from
