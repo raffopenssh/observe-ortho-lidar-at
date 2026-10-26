@@ -13025,7 +13025,8 @@ def _get_params():
                 'fallback_live', 'stand_context', 'min_tree_likelihood',
                 'detection_mode', 'reject_nonforest', 'merge_by_key',
                 'include_records', 'h_dom_basis', 'min_apex_prominence_m',
-                'legacy_ids', 'tree_id_v2', 'include_edge', 'date_b', 'source'):
+                'legacy_ids', 'tree_id_v2', 'include_edge', 'date_b', 'source',
+                'model'):
         val = request.args.get(key)
         if val is not None:
             params[key] = val
