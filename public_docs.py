@@ -325,9 +325,12 @@ Umfeld; https://example.invalid/llm.txt §"KG universe"). Both serve the SAME 7 
     POST /api/v1/parse-geometry (KML/GPX/SHP/… → GeoJSON), GET /api/v1/layers?bbox=, /api/v1/attribution
     GET /api/v1/shares, POST /api/v1/share, GET /api/v1/share/<id>, POST /api/v1/share/<id>/rename
   source= chooses where the segmentation comes from:
-    auto (default)  every KG under the area has a finished v2.x product → the frozen product
-                    segments are served (seconds; meta.source="product", meta.product_codes,
-                    meta.product_version); otherwise the live pipeline runs on the BEV rasters
+    auto (default)  cheapest path. Every KG under the area has a finished v2.x product AND
+                    those products are already cached here (or cost ≤ max(128 MB, 2 MB/ha)
+                    to fetch) → the frozen product segments are served (seconds;
+                    meta.source="product", meta.product_codes, meta.product_version).
+                    Otherwise the live pipeline runs on the BEV rasters + Zenodo tile caches
+                    (meta.source="bev"; meta.auto_reason explains a skipped product download)
     product         products only; 400 when nothing is finished there yet
     bev             always live (BEV DTM/DSM/ortho + Copernicus context; minutes for 1 km²)
   Limits: 5 km² per request, 30 heavy requests/min per client (429 + Retry-After), 2 concurrent

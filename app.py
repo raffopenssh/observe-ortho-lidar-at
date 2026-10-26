@@ -13567,9 +13567,10 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
 
         # --- product path: the fleet already segmented this area (product_segments) ---
         prod = None
+        auto_dec: dict = {}
         if source in ('auto', 'product'):
             import product_segments as _ps
-            prod = _ps.build(geom_3035, mode=source, progress=_prog)
+            prod = _ps.build(geom_3035, mode=source, progress=_prog, decision=auto_dec)
         if prod is not None:
             data = {'mask': prod['mask'], 'transform': prod['transform'],
                     'shape': prod['shape'], 'ndsm': prod['ndsm']}
@@ -13585,6 +13586,11 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
         else:
           # --- live path ("bevdirect"): BEV rasters + context layers + Felzenszwalb ---
           product_meta = {'source': 'bev'}
+          if source == 'auto' and auto_dec.get('pending_bytes'):
+              # products exist but pulling them would cost more than a live run
+              product_meta['auto_reason'] = auto_dec.get('reason')
+              product_meta['product_pending_mb'] = round(auto_dec['pending_bytes'] / 1e6)
+              product_warnings.append('auto: ' + str(auto_dec.get('reason')))
 
           # Load DTM/DSM
           _prog('Loading DTM/DSM', 'remote raster reads')

@@ -232,6 +232,28 @@ def gpkg_path(code: str, entry: dict) -> str | None:
                           md5=entry.get("checksum") or None)
 
 
+def pending_download(products: list[dict]) -> dict:
+    """Bytes still to be pulled from Zenodo before every light GPKG of
+    *products* is local.  Counts processor output and ``GpkgCache`` hits as
+    free and subtracts bytes already sitting in a resumable ``.tmp`` partial.
+    Returns ``{bytes, codes: {code: remaining_bytes}, local: [codes]}``."""
+    import search_index as si
+    cache = si.get_gpkg_cache()
+    remaining, local = {}, []
+    for prod in products:
+        code, entry = prod["code"], prod["entry"]
+        lp = Path(f"data/austria_processor/gpkg/{code}_light_v2.gpkg")
+        size = int(entry.get("size") or 0)
+        if (lp.exists() and lp.stat().st_size > 0) or cache.get(code, GPKG_VARIANT, expected_size=size):
+            local.append(code)
+            continue
+        dest = cache._path(code, GPKG_VARIANT)
+        tmp = dest.with_name(dest.name + ".tmp")
+        have = tmp.stat().st_size if tmp.exists() else 0
+        remaining[code] = max(0, size - have)
+    return {"bytes": sum(remaining.values()), "codes": remaining, "local": local}
+
+
 def prefetch_gpkgs(products: list[dict], progress=None) -> dict:
     """Pull every not-yet-local light GPKG of *products* concurrently through
     ``zenodo_fetch.prefetch_many`` so a slow Zenodo costs one round of

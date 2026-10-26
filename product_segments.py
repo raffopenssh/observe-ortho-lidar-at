@@ -20,8 +20,15 @@ products:
 
 Mode ``auto`` (the public default) only answers when ≥ ``MIN_PRODUCT_FRAC``
 of the AOI is product-covered — otherwise the caller falls back to the live
-("bevdirect") pipeline.  Mode ``product`` answers whatever is covered and
-raises when nothing is.  Nothing cadastre-derived exists in the 2.4 light
+("bevdirect") pipeline.  ``auto`` is also **cost-aware**: the light GPKGs
+are whole-KG files (100 MB – 1 GB each), so for a small AOI pulling 2 GB of
+products is slower and costs far more bandwidth/disk than a live run over
+the Zenodo tile caches.  :func:`download_budget` grants *at most*
+``max(AUTO_DL_FLOOR_MB, AUTO_DL_PER_HA_MB × area_ha)`` of Zenodo download
+(products already in ``GpkgCache`` / processor output / a resumable
+``.tmp`` partial are free); beyond that ``auto`` returns ``None`` and the
+caller segments live.  Mode ``product`` always downloads what is needed,
+answers whatever is covered and raises when nothing is.  Nothing cadastre-derived exists in the 2.4 light
 product (``v2_verify.FORBIDDEN_LIGHT_LAYERS``), so the result is clean by
 construction; ``_PROP_MAP`` is an explicit allow-list anyway.
 """
@@ -40,6 +47,14 @@ log = logging.getLogger(__name__)
 #: a product footprint (grid25 cells are unclassified over no-data / water, so
 #: the footprint fraction is rarely exactly 1).
 MIN_PRODUCT_FRAC = 0.5
+#: ``auto`` download budget — a live run of a small AOI (windowed BEV range
+#: reads + 0.1° Copernicus tiles from the Zenodo tile cache) costs roughly
+#: 1–2 MB/ha plus a few tens of MB of tiles, so beyond this products are the
+#: *slower* path.  Both tunable via env (``SEG_AUTO_DL_FLOOR_MB`` /
+#: ``SEG_AUTO_DL_PER_HA_MB``).
+import os as _os
+AUTO_DL_FLOOR_MB = float(_os.environ.get('SEG_AUTO_DL_FLOOR_MB', 128))
+AUTO_DL_PER_HA_MB = float(_os.environ.get('SEG_AUTO_DL_PER_HA_MB', 2))
 SEGMENTS_LAYER = 'segments'
 #: hard cap on polygons read per request (25 km² of dense forest ≈ 250k)
 MAX_OBJECTS = 40_000       # memory guard: ~1 GB RSS at 48k objects / 12 km²
@@ -81,6 +96,31 @@ _FLOAT_ATTRS = {
 
 class NoProductCoverage(ValueError):
     pass
+
+
+def download_budget(area_ha: float) -> int:
+    """Max bytes ``auto`` may pull from Zenodo for an AOI of *area_ha*."""
+    return int(max(AUTO_DL_FLOOR_MB, AUTO_DL_PER_HA_MB * max(0.0, area_ha)) * 1e6)
+
+
+def auto_decision(geom_3035, products: list[dict]) -> dict:
+    """Cost gate for ``auto``: ``{use: bool, pending_bytes, budget_bytes,
+    local: [codes], pending: {code: bytes}, reason}``."""
+    import trees_v3
+    pend = trees_v3.pending_download(products)
+    area_ha = float(geom_3035.area) / 1e4
+    budget = download_budget(area_ha)
+    use = pend['bytes'] <= budget
+    if use:
+        reason = ('all products local' if not pend['bytes'] else
+                  f"{pend['bytes'] / 1e6:.0f} MB download within budget ({budget / 1e6:.0f} MB for {area_ha:.1f} ha)")
+    else:
+        reason = (f"products need {pend['bytes'] / 1e6:.0f} MB from Zenodo "
+                  f"({', '.join(f'{c} {b / 1e6:.0f} MB' for c, b in sorted(pend['codes'].items()))}) "
+                  f"> {budget / 1e6:.0f} MB budget for {area_ha:.1f} ha — segmenting live from the tile caches instead "
+                  f"(source=product forces the download)")
+    return {'use': use, 'pending_bytes': pend['bytes'], 'budget_bytes': budget,
+            'local': pend['local'], 'pending': pend['codes'], 'area_ha': area_ha, 'reason': reason}
 
 
 def _grid(geom_3035):
@@ -135,11 +175,13 @@ def _row_to_object(obj_id: int, props: dict, geom) -> 'SegmentedObject':
 
 
 def build(geom_3035, mode: str = 'auto', progress=None, *, min_frac: float = MIN_PRODUCT_FRAC,
-          max_objects: int = MAX_OBJECTS) -> dict | None:
+          max_objects: int = MAX_OBJECTS, decision: dict | None = None) -> dict | None:
     """Reconstruct a segmentation of *geom_3035* from the v2.x products.
 
     Returns ``None`` when *mode* is ``auto`` and the products cover less than
-    *min_frac* of the AOI (caller runs the live pipeline), raises
+    *min_frac* of the AOI **or** fetching them would exceed the download
+    budget (:func:`auto_decision`; *decision*, if a dict, receives the verdict
+    so the caller can tell the user why it went live), raises
     :class:`NoProductCoverage` when *mode* is ``product`` and nothing is
     covered.  Otherwise ``{objects, labels, mask, transform, shape, ndsm,
     stats, codes, version, product_frac, obs_year, warnings}``.
@@ -164,6 +206,17 @@ def build(geom_3035, mode: str = 'auto', progress=None, *, min_frac: float = MIN
         log.info('product_segments: %.0f%% covered (%d products, live parents %s) → %s', frac * 100,
                  len(products), cov['live_parents'], 'live fallback' if mode == 'auto' else 'partial')
         if mode == 'auto':
+            if decision is not None:
+                decision.update({'use': False, 'reason': 'no finished product for the whole area'})
+            return None
+
+    if mode == 'auto':
+        _p('Looking up products', 'download budget')
+        d = auto_decision(geom_3035, products)
+        if decision is not None:
+            decision.update(d)
+        log.info('product_segments: auto → %s (%s)', 'products' if d['use'] else 'live', d['reason'])
+        if not d['use']:
             return None
 
     failed = trees_v3.prefetch_gpkgs(products, progress=lambda d, st: _p('Fetching products', d))

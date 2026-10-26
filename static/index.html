@@ -335,9 +335,9 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       </div>
       <div class="row">
         <div><label>Source</label>
-          <select id="source" title="auto: finished v2.x products from the fleet first, live BEV rasters only where none exists yet">
-            <option value="auto">Auto (products → live)</option>
-            <option value="product">Products only (precomputed)</option>
+          <select id="source" title="auto: cached v2.x products when they are local or cheap to fetch (≤ max(128 MB, 2 MB/ha)), otherwise live BEV rasters over the Zenodo tile caches — the fastest path for small areas. product: always download the precomputed products.">
+            <option value="auto">Auto (cheapest: cached products → live)</option>
+            <option value="product">Products only (download precomputed)</option>
             <option value="bev">Live (BEV rasters)</option>
           </select>
         </div>

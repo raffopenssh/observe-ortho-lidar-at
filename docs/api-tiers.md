@@ -157,7 +157,16 @@ a finished v2.x product (`trees_v3.resolve_coverage`, ≥50 % covered, no
 live parents) the light GPKG `segments` layer is read (GpkgCache) and
 rasterised at 1 m, so results come back in seconds with
 `meta.source="product"`, `product_codes`, `product_version`,
-`product_obs_year`. Otherwise the live BEV pipeline runs (`source="bev"`).
+`product_obs_year`. **Cost gate** (Oct 2026): light GPKGs are whole-KG
+files (0.1–1 GB each), so `auto` only downloads when the not-yet-local
+bytes (`trees_v3.pending_download`, `.tmp` partials credited) are within
+`product_segments.download_budget(area_ha)` =
+`max(SEG_AUTO_DL_FLOOR_MB=128, SEG_AUTO_DL_PER_HA_MB=2 × ha)`; a 60 ha AOI
+spanning three ~500 MB products therefore segments live (seconds of BEV
+range reads + cached 0.1° Copernicus tiles instead of a 15 min / 2 GB
+pull), with `meta.auto_reason` / a `warnings` entry saying why.
+`source=product` always downloads. Otherwise the live BEV pipeline runs
+(`source="bev"`).
 Overlays + exports use the same `_seg_cache` entry (`…_product` key).
 
 Test before touching any of this: `python3 tests/test_public_segmentation.py`
