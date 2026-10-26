@@ -349,7 +349,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
         </div>
       </div>
       <div class="cb-row">
-        <!--/*PRIVATE*/--><label><input id="include_cadastre" type="checkbox" checked> Cadastre</label><!--/*/PRIVATE*/-->
+        <label title="Buildings + property boundaries from the public BEV vector tiles (vtcseamless, local bevdirect-serve) as run-time model context for v1 masks and v2 distance features. Never part of the output."><input id="include_cadastre" type="checkbox" checked> BEV context</label>
         <label><input id="include_hansen" type="checkbox" checked> Hansen</label>
         <label><input id="include_infra" type="checkbox" checked> Infra</label>
         <label><input id="mark_uncertain" type="checkbox" checked> Mark uncertain</label>
@@ -1740,7 +1740,7 @@ async function loadRasterOverlay(typeFilter, shareId){
   if(!args)return null;
   let url='/api/v1/segment/overlay?include_ortho=true&color_mode='+colorMode;
   if(document.getElementById('include_copernicus').checked)url+='&include_copernicus=true';
-  /*PRIVATE*/if(document.getElementById('include_cadastre').checked)url+='&include_cadastre=true';/*/PRIVATE*/
+  if(document.getElementById('include_cadastre').checked)url+='&include_cadastre=true';
   url+='&source='+encodeURIComponent(getSource());
   url+='&model='+encodeURIComponent(getModel());
   if(document.getElementById('include_hansen').checked)url+='&include_hansen=true';
@@ -1832,7 +1832,7 @@ function getShareState(){
     ortho:document.getElementById('include_ortho').checked,
     temporal:document.getElementById('include_temporal').checked,
     copernicus:document.getElementById('include_copernicus').checked,
-    /*PRIVATE*/cadastre:document.getElementById('include_cadastre').checked,/*/PRIVATE*/
+    ctx_bev:document.getElementById('include_cadastre').checked,
     source:getSource(),
     model:getModel(),
     hansen:document.getElementById('include_hansen').checked,
@@ -1883,7 +1883,8 @@ function restoreShareState(s){
   if(s.ortho!==undefined) document.getElementById('include_ortho').checked=s.ortho;
   if(s.temporal!==undefined) document.getElementById('include_temporal').checked=s.temporal;
   if(s.copernicus!==undefined) document.getElementById('include_copernicus').checked=s.copernicus;
-  /*PRIVATE*/if(s.cadastre!==undefined) document.getElementById('include_cadastre').checked=s.cadastre;/*/PRIVATE*/
+  if(s.ctx_bev!==undefined) document.getElementById('include_cadastre').checked=s.ctx_bev;
+  /*PRIVATE*/else if(s.cadastre!==undefined) document.getElementById('include_cadastre').checked=s.cadastre;/*/PRIVATE*/
   if(s.source) document.getElementById('source').value=s.source;
   if(s.model) document.getElementById('model').value=s.model;
   if(s.hansen!==undefined) document.getElementById('include_hansen').checked=s.hansen;
@@ -2850,7 +2851,7 @@ document.getElementById('btn-run').onclick=async()=>{
   if(document.getElementById('include_ortho').checked)params.set('include_ortho','true');
   if(document.getElementById('include_temporal').checked)params.set('include_temporal','true');
   if(document.getElementById('include_copernicus').checked)params.set('include_copernicus','true');
-  /*PRIVATE*/if(document.getElementById('include_cadastre').checked)params.set('include_cadastre','true');/*/PRIVATE*/
+  if(document.getElementById('include_cadastre').checked)params.set('include_cadastre','true');
   if(isSeg)params.set('source',getSource());
   if(isSeg)params.set('model',getModel());
   if(document.getElementById('include_hansen').checked)params.set('include_hansen','true');
@@ -2986,6 +2987,7 @@ function showResultOnMap(data){
     if(meta.rf_n_kgs)mh+=` &nbsp; ${meta.rf_n_kgs} KGs`;
     if(meta.rf_oob)mh+=` &nbsp; OOB ${meta.rf_oob}`;
   }
+  if(meta.context_layer&&meta.context_layer.source)mh+=`<br><b>BEV context:</b> ${meta.context_layer.source} · ${meta.context_layer.cells} cells`;
   if(data.warnings&&data.warnings.length){
     mh+='<br><span style="color:#fa0">⚠ '+data.warnings.join('; ')+'</span>';
   }

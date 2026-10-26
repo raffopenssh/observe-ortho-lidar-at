@@ -333,9 +333,15 @@ Umfeld; https://example.invalid/llm.txt §"KG universe"). Both serve the SAME 7 
                     (meta.source="bev"; meta.auto_reason explains a skipped product download)
     product         products only; 400 when nothing is finished there yet
     bev             always live (BEV DTM/DSM/ortho + Copernicus context; minutes for 1 km²)
+  model=v2 (default, LightGBM — the same classifier the fleet products use) | v1 (legacy RF).
+  include_cadastre=true (UI toggle "BEV context", default on) lets a live run load buildings +
+    property boundaries from the public BEV vector tiles (vtcseamless, built locally) as
+    run-time model context only (v1 building mask, v2 distance features + INVEKOS field
+    polygons via the v2 context). meta.context_layer = {{source, cells}}; none of that
+    geometry is served or stored — only the resulting object classes.
   Limits: 5 km² per request, 30 heavy requests/min per client (429 + Retry-After), 2 concurrent
   analyses per worker (503 + Retry-After when the gate is full). Results carry the same object
-  vocabulary as the rest of this API; no property-boundary data is loaded, served or stored.
+  vocabulary as the rest of this API; no property-boundary geometry is served or stored.
 
 ## Recipe: a map client with its own vector geometry (siedler-oesterreich pattern)
 

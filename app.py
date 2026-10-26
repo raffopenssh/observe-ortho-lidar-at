@@ -402,7 +402,12 @@ def _public_params(params: dict) -> dict:
     """Pin the public-tier constraints into a params dict (also consumed by
     the async workers, which run outside the request context)."""
     params['_public'] = True
-    params['include_cadastre'] = 'false'
+    # Run-time model context (footprints / parcel edges for segv2 + the v1
+    # building mask) is allowed, but ONLY from the local bevdirect-serve
+    # (public BEV vector tiles; live_cadastre.py) — never umfeld's /k tier.
+    # Nothing of it reaches the response (meta key dropped, evaluation
+    # omitted, scrub() on the relay).
+    params['cadastre_source'] = 'bevdirect'
     if str(params.get('source', '')).lower() not in ('auto', 'product', 'bev'):
         params['source'] = 'auto'
     return params
@@ -13258,7 +13263,15 @@ def _try_copernicus_cached(bbox_dict: dict, *, ndvi=True, landcover=True,
 
 
 def _try_cadastre(geom_wgs84, transform, shape) -> np.ndarray | None:
-    """Attempt to fetch building footprints from cadastre."""
+    """Building mask for the live request path (primary-only UI). bevdirect
+    (local vtcseamless server, ``live_cadastre.py``) first; umfeld's legacy
+    ``/k`` export as the fallback.  Peers never call this."""
+    try:
+        import live_cadastre as _lc
+        if _is_primary_self_cached() and _lc.available(probe_server=False):
+            return _lc.building_mask(_lc.fetch(geom_wgs84.bounds), transform, shape)
+    except Exception as e:
+        log.warning("live cadastre (bevdirect) failed: %s — trying umfeld", e)
     try:
         import cadastre
         bbox = geom_wgs84.bounds
@@ -13656,6 +13669,12 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
     include_temporal = str(params.get('include_temporal', 'false')).lower() in ('true', '1', 'yes')
     include_copernicus = str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes')
     include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
+    # 'bevdirect' (default; local vtcseamless bevdirect-serve, public BEV
+    # vector tiles — what bev-mode peers use) | 'umfeld' (legacy /k fast
+    # paths; 404 since the Kataster purge, kept for the owner UI only)
+    cadastre_source = str(params.get('cadastre_source', 'bevdirect')).lower()
+    if cadastre_source not in ('bevdirect', 'umfeld'):
+        cadastre_source = 'bevdirect'
     include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
     include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
     mark_uncertain = str(params.get('mark_uncertain', 'false')).lower() in ('true', '1', 'yes')
@@ -13673,6 +13692,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
     all_objects = []
     all_stats = None
     all_evaluation = None
+    ctx_meta = None  # live cadastre context provenance (meta.context_layer)
     all_labels = None
     all_transform = None
     all_shape = None
@@ -13762,11 +13782,39 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
               copernicus_data = _try_copernicus(geom, sar=True, harmonics=True, year=ti.dataset_to_year(dataset))
 
           building_footprints = None
+          v2_context = None
           if include_cadastre:
               _prog('Loading cadastre', 'building footprints')
-              building_footprints = _try_cadastre(
-                  geom, data['transform'], data['shape'],
-              )
+              live_ctx = None
+              if cadastre_source == 'bevdirect' and _is_primary_self_cached():
+                  try:
+                      import live_cadastre as _lc
+                      live_ctx = _lc.fetch(geom.bounds)
+                      building_footprints = _lc.building_mask(live_ctx, data['transform'], data['shape'])
+                      ctx_meta = {'source': live_ctx['source'], 'cells': live_ctx['cells'],
+                                  'footprints': len(live_ctx['footprints']), 'parcels': len(live_ctx['parcels'])}
+                  except Exception as _ce:
+                      log.warning('live cadastre context (bevdirect) failed: %s', _ce)
+                      product_warnings.append(f'Context layer (BEV vector tiles) unavailable: {str(_ce)[:120]}')
+                      live_ctx = None
+              elif not params.get('_public'):
+                  building_footprints = _try_cadastre(
+                      geom, data['transform'], data['shape'],
+                  )
+              if seg_model == 'v2' and live_ctx is not None:
+                  # same inputs the processor gives segv2 (parcels + footprints
+                  # from cadastre_data; OSM + INVEKOS fetched by Context itself)
+                  try:
+                      import sys as _sys
+                      _sv2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'segv2')
+                      if _sv2 not in _sys.path:
+                          _sys.path.insert(0, _sv2)
+                      import inference as _v2inf
+                      v2_context = _v2inf.Context(geom_3035.bounds, parcels=live_ctx['parcels'],
+                                                  footprints=live_ctx['footprints'])
+                  except Exception as _ce:
+                      log.warning('segv2 Context from live cadastre failed: %s', _ce)
+                      v2_context = None
 
           hansen_data = None
           if include_hansen:
@@ -13806,6 +13854,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
               infra_lookup=_infra_lookup,
               mark_uncertain=mark_uncertain,
               model=seg_model,
+              v2_context=v2_context,
           )
 
           objects = result['objects']
@@ -13813,7 +13862,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
 
           # Free heavy intermediates that segment_and_classify already consumed
           copernicus_missing = copernicus_data is None
-          del dtm_dates, dsm_dates, spectral, copernicus_data, building_footprints
+          del dtm_dates, dsm_dates, spectral, copernicus_data, building_footprints, v2_context
           import gc; gc.collect()
 
           # Hansen forest loss calibration
@@ -13984,6 +14033,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
             "include_hansen": include_hansen,
             "include_infra": include_infra,
             "mark_uncertain": mark_uncertain,
+            "context_layer": ctx_meta,
             "processing_time_s": round(time.time() - t0, 2),
             **_rf_model_meta(load=product_meta.get('source') != 'product'),
             **(params.get('_geometry_meta') or {}),
