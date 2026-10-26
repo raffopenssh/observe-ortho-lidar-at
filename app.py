@@ -3535,9 +3535,11 @@ def _progress_start(task_id: str, keep_t0: bool = False):
         return
     p = _PROGRESS_DIR / f"{task_id}.json"
     t0 = time.time()
-    if keep_t0 and p.exists():
+    if p.exists():
         try:
-            t0 = json.loads(p.read_text()).get('t0') or t0
+            _old = json.loads(p.read_text())
+            if keep_t0 or _old.get('step') == 'resuming':   # worker re-entry after a resume
+                t0 = _old.get('t0') or t0
         except Exception:
             pass
     p.write_text(json.dumps(dict(step='starting', detail='', t0=t0, updated=time.time(),
