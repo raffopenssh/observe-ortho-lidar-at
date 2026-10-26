@@ -41,7 +41,9 @@ Lines worth knowing: `products:` (per-version parent histogram, `current=v2.4`),
 `v2:` (upgrade progress, store, fast path, strikes), `v2_regen:`, `repair:`
 (`docs/product-repair.md`), `legacy:` (2.4 clean-up: suspect/cf/stripped/removed
 + `local_json:`), `ne:` / `ne_ingest:` (NE cells, `docs/ne-public-api.md`),
-`vct_pilot:` (`docs/vct-pilot.md`), `chkpt_registry:` (`docs/austria-processor.md`),
+`vct_pilot:` (`docs/vct-pilot.md`),
+`ne_ingest:` → `green_fix(...)` (read-time bau/alpen→gruen override on S2-green cells,
+`ne_green_fix.py`, `docs/ne-public-api.md → Green-ground override`), `chkpt_registry:` (`docs/austria-processor.md`),
 `fleet_bw:` / `bw_learn:` / `throttle:` (`docs/fleet-bandwidth.md`),
 `fleet_proxy:` (`docs/bev-proxy.md`), `zenodo_lock:` (`docs/app.md`),
 `hansen_cover:` (missing 0.5° Hansen tiles on Zenodo + `HANSEN-GAPS` flag,

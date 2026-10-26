@@ -1884,18 +1884,45 @@ def verify_h3b(path: str | Path, expected_declared_digest: str | None = None) ->
             "trees_n": len(trees) // 4, "bld_n": len(bld) // 8, "header": hdr}
 
 
-def neo1_section_from_h3b(path: str | Path) -> bytes:
-    """Re-create the NEO1 section (for POST /obs) from a product file."""
+def neo1_rows_from_h3b(path: str | Path, green_fix: bool = True) -> tuple[dict, bytes, int]:
+    """``(header, neo1_rows, n_fixed)`` of a product file.  With *green_fix*
+    (default) the read-time green-ground override (``ne_green_fix``) is
+    applied per chunk — the file itself is never modified."""
     hdr = read_h3b_header(path)
     obs = bytearray()
+    n_fix = 0
+    if green_fix:
+        import ne_green_fix as _gf
     for ch in hdr["chunks"]:
-        obs += read_h3b_chunk(path, hdr, ch)["obs"]
+        part = read_h3b_chunk(path, hdr, ch)
+        o = part["obs"]
+        if green_fix:
+            o, k = _gf.fix_rows(o, part["lu"])
+            n_fix += k
+        obs += o
+    return hdr, bytes(obs), n_fix
+
+
+def neo1_section_from_h3b(path: str | Path, green_fix: bool = True) -> bytes:
+    """Re-create the NEO1 section (for POST /obs) from a product file.
+    ``green_fix`` applies the read-time override (``ne_green_fix``; header
+    keys ``green_fix*`` document it)."""
+    hdr, obs, n_fix = neo1_rows_from_h3b(path, green_fix=green_fix)
     h = dict(algo=ALGO_OBS, epoch=hdr["neo1"]["epoch"], source=OBS_SOURCE, kg=hdr["kg"], h3_res=H3_RES,
              cells_n=hdr["cells_n"], groups=list(GROUPS), record=OBS_REC.format, record_bytes=OBS_REC.size,
              fields=list(OBS_FIELDS), units=dict(OBS_UNITS), phenology=list(PHENOLOGY_CODES),
              verdicts=list(VERDICTS), declared_digest=hdr["nec1"]["digest"],
              declared_source=hdr["nec1"].get("source"))
-    return pack_section(MAGIC_OBS, h, bytes(obs))
+    if green_fix:
+        import ne_green_fix as _gf
+        h.update(_gf.header_note(n_fix, hdr["cells_n"]))
+    return pack_section(MAGIC_OBS, h, obs)
+
+
+def neo1_fixed_digest(path: str | Path) -> tuple[str, int]:
+    """``(digest of the green-fixed NEO1 rows, n cells touched)``."""
+    _, obs, n_fix = neo1_rows_from_h3b(path, green_fix=True)
+    return digest_of(obs), n_fix
 
 
 def nec1_section_from_h3b(path: str | Path) -> bytes:

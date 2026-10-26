@@ -24,6 +24,7 @@ import logging
 import math
 import os
 import sqlite3
+import ne_green_fix as _green_fix
 import struct
 import threading
 import time
@@ -524,7 +525,7 @@ class Chunk:
 
 
 def _load_chunk(kg: str, row: dict, hdr: dict) -> Chunk:
-    key = (kg, hdr['neo1_digest'], int(row['r10']))
+    key = (kg, hdr['neo1_digest'], int(row['r10']), _green_fix.FIX_ID)
     ch = _lru_get(_chunk_lru, key)
     if ch is not None:
         return ch
@@ -540,8 +541,13 @@ def _load_chunk(kg: str, row: dict, hdr: dict) -> Chunk:
     if shuffled:
         parts = {'obs': ne_h3._unshuffle(raw[o1:o2], r1, n), 'trees': ne_h3._unshuffle(raw[o2:o3], r2, t),
                  'bld': ne_h3._unshuffle(raw[o3:o3 + b * r3], r3, b)}
+        ctx_rows = ne_h3._unshuffle(raw[:o1], r0, n)
     else:
         parts = {'obs': raw[o1:o2], 'trees': raw[o2:o3], 'bld': raw[o3:o3 + b * r3]}
+        ctx_rows = raw[:o1]
+    # read-time green-ground override (bau/alpen on S2-green cells → gruen);
+    # the file is untouched — see ne_green_fix.py
+    parts['obs'], _ = _green_fix.fix_rows(parts["obs"], ctx_rows)
     ch = Chunk(kg, row, parts)
     _lru_put(_chunk_lru, key, ch, CHUNK_LRU_N)
     return ch
@@ -1218,6 +1224,8 @@ def _pub_header_base(h: dict, kg: str) -> dict:
                      types=list(STRUCTURE_TYPES)),
         'codes': {'consistency': list(_CONSISTENCY_NAMES), 'phenology': list(PHENOLOGY), 'aspect': list(ASPECTS)},
         'neo1_digest': h.get('neo1_digest'), 'partial_cells': bool(h.get('partial_cells')),
+        'green_fix': _green_fix.FIX_ID,
+        'green_fix_rule': _green_fix.header_note(0, 0)['green_fix_rule'] + ' (applied at read time; summary.observed_ha is pre-fix)',
         'attribution': ATTRIBUTION, 'license': 'CC-BY-4.0', 'license_url': LICENSE_URL,
         'docs': '/api/v1/docs/llm.txt#cells', 'source_service': 'srtm-lidar-at',
     }
@@ -1264,7 +1272,7 @@ def pub_file(kg: str) -> Path | None:
     h = header(kg)
     if h is None:
         return None
-    out = PUB_DIR / f'{kg}-{h["neo1_digest"]}.h3b'
+    out = PUB_DIR / f'{kg}-{h["neo1_digest"]}-{_green_fix.FIX_ID}.h3b'
     if out.exists():
         return out
     with _pub_lock:
@@ -1360,7 +1368,7 @@ def _etag(hdrs: dict, extra: str = '') -> str:
     canon = request.method + ' ' + request.path + '?' + '&'.join(f'{k}={v}' for k, v in sorted(request.args.items(multi=True)))
     if request.method == 'POST':
         canon += '#' + hashlib.sha256(request.get_data() or b'').hexdigest()[:16]
-    return '"c-' + hashlib.sha256(('|'.join(digs) + '\n' + canon + extra).encode()).hexdigest()[:16] + '"'
+    return '"c-' + hashlib.sha256(('|'.join(digs) + '\n' + canon + extra + _green_fix.FIX_ID).encode()).hexdigest()[:16] + '"'
 
 
 def _dumps(obj, pretty: bool = False) -> bytes:
@@ -1672,7 +1680,7 @@ def kg_cells(code):
         if bb is None:
             raise CellsError(404, f'unknown KG {code}')
         return _not_ready({'kgs': [], 'kgs_missing': [code]})
-    etag = '"c-' + hashlib.sha256(f'{code}|{h["neo1_digest"]}|{fmt}'.encode()).hexdigest()[:16] + '"'
+    etag = '"c-' + hashlib.sha256(f'{code}|{h["neo1_digest"]}|{fmt}|{_green_fix.FIX_ID}'.encode()).hexdigest()[:16] + '"'
     if fmt == 'json':
         d = {'kg': code, 'ready': True, 'cells_n': h['cells_n'], 'epoch': h['epoch'], 'product_version': h['product_version'],
              'partial': bool(h.get('partial_cells')), 'neo1_digest': h['neo1_digest'], 'summary': h['summary'],

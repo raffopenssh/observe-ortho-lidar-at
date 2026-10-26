@@ -332,3 +332,27 @@ Fix (public tier only, the index / director telemetry is untouched):
   "pending"` when only pending KGs intersect.
 * Per-row cost: `_files()` is cached 30 s; `ne_state` with `pv` supplied
   does no extra sqlite read, so `/kgs?limit=5000` stays ~90 ms.
+
+## Green-ground override (`ne_green_fix.py`, 2026-10-26)
+
+The segv2 classifier labels dull-ortho meadows `parking` / `rock` (NE groups
+`bau` / `alpen`) although the fused S2 NDVI says vegetation (KG 63330 cell
+`8c1e108e86e1bff`; fleet-wide median 26 % of bau cells). Until the model is
+retrained the correction is applied **at read time only — no `.h3b`, Zenodo
+product or JSON is rewritten**:
+
+* rule: cell `ndvi_mean` (fused S2) ≥ 0.5 and phenology ≠ `road_or_bare` →
+  `obs_lu[bau] + obs_lu[alpen]` → `obs_lu[gruen]`, verdict recomputed with
+  the `build_observed` rules (`unknown` stays). Idempotent, deterministic.
+* where: `cells_api._load_chunk` (public cells API, chunk LRU / pub container
+  / ETags keyed on `FIX_ID`), `ne_h3.neo1_section_from_h3b` (what the primary
+  POSTs to umfeld-at; section header carries `green_fix*`).
+* propagation: `ne_ingest._our_digest` returns the *fixed* digest (cached in
+  `data/ne/index.json` under `green_fix`, ≤ `ne_green_fix_compute_per_tick`
+  (400) fresh computations per tick), so `confirm_umfeld` sees a mismatch and
+  re-POSTs every parent at `ne_post_max_per_tick` (knob, 15 → ~180/h, ~0.3 MB
+  each) — ~1.5 days for the corpus. Knob `ne_green_fix=false` turns it off.
+* `/process.txt` → `ne_ingest:` block, line `green_fix(green-1): umfeld_confirmed=…`.
+* `summary.observed_ha` in headers is still pre-fix (documented in the pub header).
+* test: `python3 tests/test_ne_green_fix.py`; audit one file:
+  `python3 ne_green_fix.py data/ne/63330.h3b`.

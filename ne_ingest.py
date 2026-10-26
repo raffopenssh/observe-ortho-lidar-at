@@ -615,12 +615,41 @@ def merge_dirty_parents(idx: dict, entries: dict, max_n: int = 10) -> list[dict]
 
 # === SECTION: umfeld confirmation / (re)post ===
 
-def _our_digest(parent: str, idx: dict) -> str | None:
+_gf_budget = [10 ** 9]          # fixed-digest computations left in this confirm pass (full corpus read ≈ 0.3 s/file)
+GF_COMPUTE_PER_TICK = 400
+
+
+def _our_digest(parent: str, idx: dict, green_fix: bool = True) -> str | None:
+    """Digest of the NEO1 rows we would POST for *parent*: the green-fixed
+    rows (``ne_green_fix``, read-time override — the file keeps its original
+    digest) unless *green_fix* is off.  Fixed digests are cached in the index
+    under ``files[parent]["green_fix"]`` keyed on (FIX_ID, file digest)."""
     st = idx["parents"].get(parent)
-    if st and st.get("digest"):
-        return st["digest"] if st.get("complete") else None   # partial merges are never posted
     f = idx["files"].get(parent)
-    return (f or {}).get("neo1_digest")
+    if st and st.get("digest"):
+        if not st.get("complete"):
+            return None                                   # partial merges are never posted
+        raw, tgt = st["digest"], st
+    else:
+        raw, tgt = (f or {}).get("neo1_digest"), f
+    if not raw or not green_fix or not _knob("ne_green_fix", True):
+        return raw
+    gf = (tgt or {}).get("green_fix") or {}
+    import ne_green_fix
+    if gf.get("id") == ne_green_fix.FIX_ID and gf.get("of") == raw and gf.get("digest"):
+        return gf["digest"]
+    if _gf_budget[0] <= 0:
+        return None                                       # computed on a later tick (budget per confirm pass)
+    _gf_budget[0] -= 1
+    try:
+        import ne_h3
+        d, n = ne_h3.neo1_fixed_digest(path_for(parent))
+    except Exception as ex:  # noqa: BLE001
+        log.warning("ne_ingest: green-fix digest %s failed: %s", parent, ex)
+        return raw
+    if tgt is not None:
+        tgt["green_fix"] = {"id": ne_green_fix.FIX_ID, "of": raw, "digest": d, "cells": int(n)}
+    return d
 
 
 def _declared_of(parent: str, idx: dict) -> tuple[str | None, str | None]:
@@ -665,6 +694,8 @@ def confirm_umfeld(idx: dict, max_posts: int = 5) -> dict:
     now = time.time()
     posts = 0
     conf = idx.setdefault("umfeld", {})
+    max_posts = int(_knob("ne_post_max_per_tick", max_posts))
+    _gf_budget[0] = int(_knob("ne_green_fix_compute_per_tick", GF_COMPUTE_PER_TICK))
     for parent in sorted({c for c in idx["files"] if not is_block(c)} | set(idx["parents"])):
         want = _our_digest(parent, idx)
         if not want:
@@ -703,7 +734,7 @@ def confirm_umfeld(idx: dict, max_posts: int = 5) -> dict:
                 or int(c.get("post_attempts") or 0) >= POST_MAX_ATTEMPTS:
             continue
         try:
-            sec = ne_h3.neo1_section_from_h3b(path_for(parent))
+            sec = ne_h3.neo1_section_from_h3b(path_for(parent), green_fix=bool(_knob("ne_green_fix", True)))
             nec = ne_h3.nec1_section_from_h3b(path_for(parent)) if bev else None
             r = ne_h3.post_observed(parent, sec, nec1_section=nec)
             posts += 1
@@ -806,10 +837,31 @@ def status() -> dict:
         "umfeld": {k: um.get(k) for k in ("checked", "confirmed", "missing", "mismatch", "posted",
                                            "post_failed", "pending_cells", "at", "bev_checked", "bev_confirmed",
                                            "bev_declared_mismatch", "bev_posted", "bev_post_failed")},
+        "green_fix": _green_fix_status(idx),
         "bev_post_fail_at": (idx.get("stats") or {}).get("bev_post_fail_at"),
         "bev_post_fail_msg": (idx.get("stats") or {}).get("bev_post_fail_msg"),
         "last_tick": dict(_last_tick),
     }
+
+
+def _green_fix_status(idx: dict) -> dict:
+    """Read-time green-ground override (``ne_green_fix``): how many parents
+    have a fixed digest computed, how many of those umfeld confirmed."""
+    import ne_green_fix
+    conf = idx.get("umfeld") or {}
+    n = done = cells = 0
+    for parent in {c for c in idx["files"] if not is_block(c)} | set(idx["parents"]):
+        st = idx["parents"].get(parent) or {}
+        tgt = st if st.get("digest") else (idx["files"].get(parent) or {})
+        gf = tgt.get("green_fix") or {}
+        if gf.get("id") != ne_green_fix.FIX_ID:
+            continue
+        n += 1
+        cells += int(gf.get("cells") or 0)
+        if (conf.get(parent) or {}).get("confirmed_digest") == gf.get("digest"):
+            done += 1
+    return {"id": ne_green_fix.FIX_ID, "enabled": bool(_knob("ne_green_fix", True)),
+            "computed": n, "confirmed": done, "cells_touched": cells}
 
 
 def text_line(v: dict | None = None) -> str:
@@ -828,6 +880,11 @@ def text_line(v: dict | None = None) -> str:
         if um.get("bev_checked"):
             s += (f" · bev(NEC1+NEO1): ok={um.get('bev_confirmed')}/{um.get('bev_checked')}"
                   f" declared_mismatch={um.get('bev_declared_mismatch')} post_failed={um.get('bev_post_failed')}")
+        gf = v.get("green_fix") or {}
+        if gf:
+            s += (f"\n    green_fix({gf.get('id')}{'' if gf.get('enabled') else ' OFF'}): umfeld_confirmed="
+                  f"{gf.get('confirmed')}/{gf.get('computed')} parents, {gf.get('cells_touched')} cells bau/alpen→gruen"
+                  f" (read-time override, files untouched; ne_green_fix.py)")
             fa = v.get("bev_post_fail_at")
             if fa and time.time() - float(fa) < 86400:
                 s += f" LAST-FAIL {(time.time() - float(fa)) / 3600:.1f}h ago: {str(v.get('bev_post_fail_msg'))[:90]}"
