@@ -341,6 +341,12 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
             <option value="bev">Live (BEV rasters)</option>
           </select>
         </div>
+        <div><label>Model</label>
+          <select id="model" title="Classifier for live runs. v2 = segv2 LightGBM, the same model the fleet uses for the v2.x products (austria_processor default since Sep 2026). v1 = legacy Random Forest. Ignored when results come from precomputed products (always v2).">
+            <option value="v2">v2 — LightGBM (fleet / v2.4 products)</option>
+            <option value="v1">v1 — legacy RF</option>
+          </select>
+        </div>
       </div>
       <div class="cb-row">
         <!--/*PRIVATE*/--><label><input id="include_cadastre" type="checkbox" checked> Cadastre</label><!--/*/PRIVATE*/-->
@@ -823,6 +829,7 @@ function _checkAreaWarningFromGeometry(){
 
 // ============ SOURCE (products vs live) ============
 function getSource(){const el=document.getElementById('source');return (el&&el.value)||'auto';}
+function getModel(){const el=document.getElementById('model');return (el&&el.value)||'v2';}
 const MAX_AREA_KM2=window.SRTM_PUBLIC?(window.SRTM_PUBLIC_MAX_KM2||10):25;
 
 // ============ STATE ============
@@ -1735,6 +1742,7 @@ async function loadRasterOverlay(typeFilter, shareId){
   if(document.getElementById('include_copernicus').checked)url+='&include_copernicus=true';
   /*PRIVATE*/if(document.getElementById('include_cadastre').checked)url+='&include_cadastre=true';/*/PRIVATE*/
   url+='&source='+encodeURIComponent(getSource());
+  url+='&model='+encodeURIComponent(getModel());
   if(document.getElementById('include_hansen').checked)url+='&include_hansen=true';
   if(document.getElementById('include_infra').checked)url+='&include_infra=true';
   if(document.getElementById('mark_uncertain').checked)url+='&mark_uncertain=true';
@@ -1826,6 +1834,7 @@ function getShareState(){
     copernicus:document.getElementById('include_copernicus').checked,
     /*PRIVATE*/cadastre:document.getElementById('include_cadastre').checked,/*/PRIVATE*/
     source:getSource(),
+    model:getModel(),
     hansen:document.getElementById('include_hansen').checked,
     infra:document.getElementById('include_infra').checked,
     mark_uncertain:document.getElementById('mark_uncertain').checked,
@@ -1876,6 +1885,7 @@ function restoreShareState(s){
   if(s.copernicus!==undefined) document.getElementById('include_copernicus').checked=s.copernicus;
   /*PRIVATE*/if(s.cadastre!==undefined) document.getElementById('include_cadastre').checked=s.cadastre;/*/PRIVATE*/
   if(s.source) document.getElementById('source').value=s.source;
+  if(s.model) document.getElementById('model').value=s.model;
   if(s.hansen!==undefined) document.getElementById('include_hansen').checked=s.hansen;
   if(s.infra!==undefined) document.getElementById('include_infra').checked=s.infra;
   if(s.mark_uncertain!==undefined) document.getElementById('mark_uncertain').checked=s.mark_uncertain;
@@ -2842,6 +2852,7 @@ document.getElementById('btn-run').onclick=async()=>{
   if(document.getElementById('include_copernicus').checked)params.set('include_copernicus','true');
   /*PRIVATE*/if(document.getElementById('include_cadastre').checked)params.set('include_cadastre','true');/*/PRIVATE*/
   if(isSeg)params.set('source',getSource());
+  if(isSeg)params.set('model',getModel());
   if(document.getElementById('include_hansen').checked)params.set('include_hansen','true');
   if(document.getElementById('include_infra').checked)params.set('include_infra','true');
   if(document.getElementById('mark_uncertain').checked)params.set('mark_uncertain','true');
