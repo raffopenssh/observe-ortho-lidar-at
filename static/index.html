@@ -2909,11 +2909,18 @@ document.getElementById('btn-run').onclick=async()=>{
 };
 
 // Poll progress + fetch result when done. Resilient to screen-off / network blips.
+// Background tabs (esp. mobile) freeze timers; a visibilitychange wakes the
+// sleeping poll at once so a revisited tab re-syncs instead of showing a
+// frozen "(147.7s)".  Server side, a task orphaned by a srv restart is
+// re-run under the same id (app._resume_task) — the loop just keeps polling.
+let _pollWake=null;
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&_pollWake){const w=_pollWake;_pollWake=null;w();}});
+function _pollSleep(ms){return new Promise(r=>{const t=setTimeout(()=>{_pollWake=null;r();},ms);_pollWake=()=>{clearTimeout(t);r();};});}
 async function _pollForResult(taskId, intervalMs=2000, maxWaitMs=3600000){
-  const t0=Date.now();
+  const t0=Date.now();let _gone=0;
   while(Date.now()-t0<maxWaitMs){
     if(_aborted)throw new Error('Cancelled');
-    await new Promise(r=>setTimeout(r,intervalMs));
+    await _pollSleep(intervalMs);
     if(_aborted)throw new Error('Cancelled');
     try{
       const pr=await fetch(`/api/v1/segment/progress?task_id=${taskId}`);
@@ -2929,6 +2936,12 @@ async function _pollForResult(taskId, intervalMs=2000, maxWaitMs=3600000){
         const rr=await fetch(`/api/v1/segment/result?task_id=${taskId}`);
         return await rr.json();
       }
+      if(!pj.active&&!pj.done&&!pj.error){
+        // progress file gone (expired / cleaned) — 3 strikes before giving up
+        if(++_gone>=3)throw new Error('Task no longer exists on the server — please run the analysis again');
+        continue;
+      }
+      _gone=0;
       if(pj.active){
         const el=pj.elapsed?` (${pj.elapsed}s)`:'';
         const det=pj.detail?` — ${pj.detail}`:'';

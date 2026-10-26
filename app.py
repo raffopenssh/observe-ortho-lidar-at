@@ -3496,13 +3496,15 @@ def _progress_set(task_id: str, step: str, detail: str = "", fetch: dict | None 
         return
     p = _PROGRESS_DIR / f"{task_id}.json"
     try:
-        t0 = 0.0
+        t0, pid = 0.0, os.getpid()
         if p.exists():
             try:
-                t0 = json.loads(p.read_text()).get('t0', 0.0)
+                _old = json.loads(p.read_text())
+                t0 = _old.get('t0', 0.0)
+                pid = _old.get('pid') or pid
             except Exception:
                 pass
-        d = dict(step=step, detail=detail, t0=t0, updated=time.time())
+        d = dict(step=step, detail=detail, t0=t0, updated=time.time(), pid=pid)
         if fetch:
             keep = ('status', 'label', 'file', 'bytes_done', 'bytes_total', 'pct', 'rate_mbps',
                     'eta_s', 'elapsed_s', 'attempt', 'files_done', 'files_total', 'files_failed',
@@ -3528,12 +3530,131 @@ def _bind_fetch_progress(task_id: str, step: str = 'download'):
         return
     zenodo_fetch.set_hook(lambda st: _progress_set(task_id, step, st.get('detail', ''), fetch=st))
 
-def _progress_start(task_id: str):
+def _progress_start(task_id: str, keep_t0: bool = False):
     if not task_id:
         return
     p = _PROGRESS_DIR / f"{task_id}.json"
-    p.write_text(json.dumps(dict(step='starting', detail='',
-                                 t0=time.time(), updated=time.time())))
+    t0 = time.time()
+    if keep_t0 and p.exists():
+        try:
+            t0 = json.loads(p.read_text()).get('t0') or t0
+        except Exception:
+            pass
+    p.write_text(json.dumps(dict(step='starting', detail='', t0=t0, updated=time.time(),
+                                 pid=os.getpid())))
+
+
+# --- Orphaned-task recovery -------------------------------------------------
+# Async workers are daemon threads inside a gunicorn worker: a ``systemctl
+# restart srv`` (deploys!) or an OOM kill leaves the progress file frozen on
+# its last step and the client polling forever ("stuck at 147 s").  The
+# request is therefore persisted as ``<task>.req.json`` and a task whose
+# recorded ``pid`` is no longer a live gunicorn worker is re-run (same task
+# id, so the client's poll loop / localStorage resume just keeps working) —
+# lazily on the next progress poll and once on srv start-up.
+_TASK_RESUME_MAX = 2
+
+
+def _save_task_request(task_id: str, kind: str, features: list, params: dict,
+                       geometry_text: str = ''):
+    if not task_id:
+        return
+    try:
+        from shapely.geometry import mapping
+        feats = []
+        for f in features:
+            g = f.get('geometry')
+            feats.append({'geometry': mapping(g) if hasattr(g, 'geom_type') else g,
+                          'properties': f.get('properties') or {}})
+        clean = {k: v for k, v in params.items() if isinstance(v, (str, int, float, bool, list, dict, type(None)))}
+        d = {'task_id': task_id, 'kind': kind, 'features': feats, 'params': clean,
+             'geometry_text': geometry_text, 'created': time.time(), 'resumes': 0}
+        p = _PROGRESS_DIR / f"{task_id}.req.json"
+        tmp = p.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps(d))
+        tmp.replace(p)
+    except Exception as e:
+        log.warning('task %s: request not persisted (%s)', task_id, e)
+
+
+def _pid_is_worker(pid) -> bool:
+    try:
+        pid = int(pid or 0)
+        if pid <= 0:
+            return False
+        cmd = Path(f'/proc/{pid}/cmdline').read_bytes()
+        return b'gunicorn' in cmd or b'app:app' in cmd or pid == os.getpid()
+    except Exception:
+        return False
+
+
+def _task_orphaned(info: dict) -> bool:
+    step = info.get('step', '')
+    if step in ('done', 'error', ''):
+        return False
+    return not _pid_is_worker(info.get('pid'))
+
+
+def _resume_task(task_id: str, info: dict | None = None) -> bool:
+    """Re-run an orphaned async task in this process.  Returns True when a
+    worker thread was started (or the task is already being resumed)."""
+    import fcntl
+    rp = _PROGRESS_DIR / f"{task_id}.req.json"
+    if not rp.exists():
+        _progress_error(task_id, 'Server restarted while this analysis was running — please run it again.')
+        return False
+    try:
+        with open(rp, 'r+') as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            req = json.load(fh)
+            # re-read progress under the lock: another worker may have resumed it already
+            try:
+                cur = json.loads((_PROGRESS_DIR / f"{task_id}.json").read_text())
+            except Exception:
+                cur = info or {}
+            if not _task_orphaned(cur):
+                return True
+            if req.get('resumes', 0) >= _TASK_RESUME_MAX:
+                _progress_error(task_id, 'Server restarted repeatedly while this analysis was running — please run it again.')
+                return False
+            req['resumes'] = req.get('resumes', 0) + 1
+            fh.seek(0); fh.truncate(); json.dump(req, fh)
+            _progress_start(task_id, keep_t0=True)
+            _progress_set(task_id, 'resuming', f"server restarted — re-running (attempt {req['resumes']})")
+    except Exception as e:
+        log.warning('task %s: resume failed: %s', task_id, e)
+        return False
+    from shapely.geometry import shape as _shp
+    features = [{'geometry': _shp(f['geometry']), 'properties': f.get('properties') or {}}
+                for f in req['features']]
+    params = req.get('params') or {}
+    kind = req.get('kind', 'segment')
+    log.warning('task %s (%s): orphaned by pid %s → resuming in pid %d (attempt %d)',
+                task_id, kind, (info or {}).get('pid'), os.getpid(), req['resumes'])
+    if kind == 'segment':
+        target, args = _segment_worker, (task_id, features, params, req.get('geometry_text', ''))
+    else:
+        return False
+    threading.Thread(target=target, args=args, daemon=True).start()
+    return True
+
+
+def _resume_orphaned_tasks_once():
+    """Start-up sweep (one per process; the req-file lock dedupes workers)."""
+    try:
+        for p in _PROGRESS_DIR.glob('*.json'):
+            if p.name.endswith('.req.json') or p.name.endswith('.onestop.json'):
+                continue
+            try:
+                info = json.loads(p.read_text())
+            except Exception:
+                continue
+            if time.time() - p.stat().st_mtime > 7200:
+                continue
+            if _task_orphaned(info):
+                _resume_task(p.stem, info)
+    except Exception as e:
+        log.warning('orphan sweep failed: %s', e)
 
 def _mark_public_task(task_id: str):
     """Tag an async task as created through the public tier (``X-Srtm-Public``)."""
@@ -3640,6 +3761,7 @@ def _cleanup_old_results(max_age_s: int = 14400):
         for f in _PROGRESS_DIR.glob('*.json'):
             if f.stat().st_mtime < cutoff:
                 f.unlink(missing_ok=True)
+                f.with_name(f.stem + '.public').unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -3662,6 +3784,9 @@ def segment_progress():
         return jsonify(dict(active=False, step='', detail='', elapsed=0, done=False, error=None))
     try:
         info = json.loads(p.read_text())
+        if _task_orphaned(info):
+            _resume_task(task_id, info)
+            info = json.loads(p.read_text())
         step = info.get('step', '')
         elapsed = round(time.time() - info.get('t0', time.time()), 1)
         is_done = step == 'done'
@@ -13356,6 +13481,7 @@ def segment_objects():
             if _TASK_QUEUE_SIZE >= MAX_QUEUE_SIZE:
                 return _error('Server busy — too many tasks queued. Try again in a few minutes.', 503)
         _progress_start(task_id)
+        _save_task_request(task_id, 'segment', features, params, geometry_text)
         _cleanup_old_results()
         thread = threading.Thread(
             target=_segment_worker,
@@ -23445,6 +23571,14 @@ def index():
             url += '?' + qs
         return redirect(url)
     return app.send_static_file('index.html')
+
+
+def _orphan_sweep_thread():
+    time.sleep(15)   # let the old gunicorn workers finish dying first
+    _resume_orphaned_tasks_once()
+
+
+threading.Thread(target=_orphan_sweep_thread, daemon=True, name='task-orphan-sweep').start()
 
 
 if __name__ == '__main__':
