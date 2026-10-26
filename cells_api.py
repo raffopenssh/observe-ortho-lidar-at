@@ -1216,7 +1216,7 @@ def _pub_header_base(h: dict, kg: str) -> dict:
         'chunk_layout': PUB_CHUNK_LAYOUT,
         'record_bytes': {'nec1': 0, 'neo1': REC, 'net1': 4, 'neb1': 8},
         'neo1': {'algo': ne_h3.ALGO_OBS, 'digest': h.get('neo1_digest'), 'record': ne_h3.OBS_REC.format,
-                 'epoch': h.get('epoch'), 'source': ne_h3.OBS_SOURCE, 'fields': _NEO1_REC_FIELDS,
+                 'epoch': h.get('epoch'), 'source': ne_h3.OBS_SOURCE_FIXED, 'fields': _NEO1_REC_FIELDS,
                  'units': UNITS},
         'net1': dict(h.get('net1') or {}, record='u32: dx:5 dy:5 h:8(0.25m) crown:6(log2*5) species:4 vitality:3 flag:1',
                      species=list(SPECIES), vitality=list(VITALITY)),

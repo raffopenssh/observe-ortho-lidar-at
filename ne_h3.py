@@ -51,6 +51,7 @@ ALGO_TREES = "obs-trees-1"
 ALGO_BLD = "obs-bld-1"
 ALGO_DECLARED = "ne-cells-2"          # the frozen umfeld algo we accept
 OBS_SOURCE = "srtm-lidar-at@2.4"
+OBS_SOURCE_FIXED = "srtm-lidar-at@2.4.1"   # NEO1 export with the green-ground override applied (ne_green_fix; epoch unchanged)
 H3_RES = 12
 CHUNK_RES = 10
 
@@ -1915,6 +1916,7 @@ def neo1_section_from_h3b(path: str | Path, green_fix: bool = True) -> bytes:
              declared_source=hdr["nec1"].get("source"))
     if green_fix:
         import ne_green_fix as _gf
+        h["source"] = OBS_SOURCE_FIXED      # umfeld's manifest shows which KGs carry the corrected export
         h.update(_gf.header_note(n_fix, hdr["cells_n"]))
     return pack_section(MAGIC_OBS, h, obs)
 

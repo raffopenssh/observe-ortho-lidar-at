@@ -60,6 +60,8 @@ ZENODO_TIMEOUT = 120
 MAX_FAILS = 4
 POST_MAX_ATTEMPTS = 6
 POST_BACKOFF_S = 1800
+POST_GIB_PER_DAY = 2.0             # umfeld /contrib token limit is 4 GiB/day; a full resync (~2.4 GB) spreads over ≥1 day
+POST_MIN_GAP_S = 0.6               # umfeld: ≤2 POST/s
 CHANNEL = "ne"
 
 _lock = threading.Lock()
@@ -615,6 +617,25 @@ def merge_dirty_parents(idx: dict, entries: dict, max_n: int = 10) -> list[dict]
 
 # === SECTION: umfeld confirmation / (re)post ===
 
+def _disk_row(parent: str, idx: dict) -> tuple[dict | None, str]:
+    """``(index row, "merge"|"file")`` describing the ``.h3b`` actually on
+    disk for *parent*.  A block merge (``parents[parent]``) normally wins over
+    the pre-merge upload row — but a whole-parent product ingested AFTER the
+    last merge (``files[parent].at`` newer, different NEO1 digest) overwrote
+    the merged file: then the ``files`` row is the truth.  Preferring the
+    stale merge row posted a bevdirect-cell NEO1 as a bare (lu) NEO1 →
+    umfeld 409 "cell set ≠ our NEC1 lu cell set" every 30 min (03212, 01806,
+    2026-10-26)."""
+    f = idx["files"].get(parent)
+    st = idx["parents"].get(parent)
+    if st and st.get("digest"):
+        if f and f.get("at") and str(f["at"]) > str(st.get("merged_at") or "") \
+                and f.get("neo1_digest") and f["neo1_digest"] != st["digest"]:
+            return f, "file"
+        return st, "merge"
+    return f, "file"
+
+
 _gf_budget = [10 ** 9]          # fixed-digest computations left in this confirm pass (full corpus read ≈ 0.3 s/file)
 GF_COMPUTE_PER_TICK = 400
 
@@ -624,14 +645,13 @@ def _our_digest(parent: str, idx: dict, green_fix: bool = True) -> str | None:
     rows (``ne_green_fix``, read-time override — the file keeps its original
     digest) unless *green_fix* is off.  Fixed digests are cached in the index
     under ``files[parent]["green_fix"]`` keyed on (FIX_ID, file digest)."""
-    st = idx["parents"].get(parent)
-    f = idx["files"].get(parent)
-    if st and st.get("digest"):
-        if not st.get("complete"):
+    tgt, kind = _disk_row(parent, idx)
+    if kind == "merge":
+        if not tgt.get("complete"):
             return None                                   # partial merges are never posted
-        raw, tgt = st["digest"], st
+        raw = tgt["digest"]
     else:
-        raw, tgt = (f or {}).get("neo1_digest"), f
+        raw = (tgt or {}).get("neo1_digest")
     if not raw or not green_fix or not _knob("ne_green_fix", True):
         return raw
     gf = (tgt or {}).get("green_fix") or {}
@@ -657,7 +677,8 @@ def _declared_of(parent: str, idx: dict) -> tuple[str | None, str | None]:
     header read once as fallback for pre-Oct-2026 index rows)."""
     f = idx["files"].get(parent) or {}
     st = idx["parents"].get(parent) or {}
-    if st.get("merged_at") and st.get("nec1_source"):
+    row, kind = _disk_row(parent, idx)
+    if kind == "merge" and st.get("nec1_source"):
         return st["nec1_source"], st.get("nec1_digest")   # merged file on disk wins over the pre-merge upload row
     if f.get("nec1_source"):
         return f["nec1_source"], f.get("nec1_digest")
@@ -690,11 +711,19 @@ def confirm_umfeld(idx: dict, max_posts: int = 5) -> dict:
         return {"skipped": "no umfeld manifest"}
     out = {"checked": 0, "confirmed": 0, "missing": 0, "mismatch": 0, "posted": 0, "post_failed": 0,
            "pending_cells": 0, "bev_checked": 0, "bev_confirmed": 0, "bev_declared_mismatch": 0,
-           "bev_posted": 0, "bev_post_failed": 0}
+           "bev_posted": 0, "bev_post_failed": 0, "needs_bevdirect": 0, "day_cap_hold": 0}
     now = time.time()
     posts = 0
     conf = idx.setdefault("umfeld", {})
     max_posts = int(_knob("ne_post_max_per_tick", max_posts))
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    pd = idx["stats"].get("post_day") or {}
+    if pd.get("day") != day:
+        pd = {"day": day, "bytes": 0, "posts": 0}
+    idx["stats"]["post_day"] = pd
+    day_cap = float(_knob("ne_post_gib_per_day", POST_GIB_PER_DAY)) * 2 ** 30
+    out["day_bytes"] = int(pd["bytes"])
+    last_post = 0.0
     _gf_budget[0] = int(_knob("ne_green_fix_compute_per_tick", GF_COMPUTE_PER_TICK))
     for parent in sorted({c for c in idx["files"] if not is_block(c)} | set(idx["parents"])):
         want = _our_digest(parent, idx)
@@ -730,14 +759,29 @@ def confirm_umfeld(idx: dict, max_posts: int = 5) -> dict:
         if not bev and rec.get("status") not in (None, "built"):
             out["pending_cells"] += 1
             continue     # umfeld has not built the KG's declared layer yet (bev posts carry their own)
+        if want != c.get("posted_digest") and c.get("posted_digest"):
+            # our export changed (new product / post-processing pass) → fresh retry ladder
+            c.update(post_attempts=0); c.pop("post_next", None); c.pop("needs_bevdirect", None)
+        if c.get("needs_bevdirect"):
+            out["needs_bevdirect"] += 1
+            continue     # bare NEO1 can never match umfeld's lu cell set — needs a bevdirect NEC1 (see below)
         if posts >= max_posts or float(c.get("post_next") or 0) > now \
                 or int(c.get("post_attempts") or 0) >= POST_MAX_ATTEMPTS:
             continue
+        if pd["bytes"] >= day_cap:
+            out["day_cap_hold"] += 1
+            continue     # umfeld per-token daily volume — resumes at 00:00 UTC
         try:
             sec = ne_h3.neo1_section_from_h3b(path_for(parent), green_fix=bool(_knob("ne_green_fix", True)))
             nec = ne_h3.nec1_section_from_h3b(path_for(parent)) if bev else None
+            gap = POST_MIN_GAP_S - (time.time() - last_post)
+            if gap > 0:
+                time.sleep(gap)
+            last_post = time.time()
             r = ne_h3.post_observed(parent, sec, nec1_section=nec)
             posts += 1
+            pd["bytes"] += len(sec) + (len(nec) if nec else 0)
+            pd["posts"] += 1
             c.update(post_attempts=int(c.get("post_attempts") or 0) + 1, posted_digest=want,
                      posted_at=_now(), post_result=str(r)[:160])
             c.pop("post_error", None)
@@ -754,6 +798,15 @@ def confirm_umfeld(idx: dict, max_posts: int = 5) -> dict:
             n = int(c.get("post_attempts") or 0) + 1
             c.update(post_attempts=n, post_error=str(ex)[:200], post_next=now + POST_BACKOFF_S * (2 ** min(n, 4)))
             out["post_failed"] += 1
+            if not bev and " 409" in str(ex) and "cell set" in str(ex):
+                # our (lu-declared) cell set ≠ umfeld's lu and umfeld has no bev
+                # layer for this KG: retrying the bare NEO1 is pointless — the
+                # KG needs a bevdirect NEC1 in front of the obs (reprocess on
+                # a bev-mode peer).  Park it until our digest changes.
+                c["needs_bevdirect"] = _now()
+                out["needs_bevdirect"] += 1
+                log.warning("ne_ingest: NEO1 %s parked: bare NEO1 cell set ≠ umfeld lu and no bev layer — "
+                            "needs a bevdirect NEC1+NEO1 product", parent)
             if bev:
                 out["bev_post_failed"] += 1
                 idx["stats"]["bev_post_fail_at"] = now
@@ -836,7 +889,9 @@ def status() -> dict:
         "posts": int((idx.get("stats") or {}).get("posts") or 0),
         "umfeld": {k: um.get(k) for k in ("checked", "confirmed", "missing", "mismatch", "posted",
                                            "post_failed", "pending_cells", "at", "bev_checked", "bev_confirmed",
-                                           "bev_declared_mismatch", "bev_posted", "bev_post_failed")},
+                                           "bev_declared_mismatch", "bev_posted", "bev_post_failed",
+                                           "needs_bevdirect", "day_cap_hold", "day_bytes")},
+        "post_day": (idx.get("stats") or {}).get("post_day"),
         "green_fix": _green_fix_status(idx),
         "bev_post_fail_at": (idx.get("stats") or {}).get("bev_post_fail_at"),
         "bev_post_fail_msg": (idx.get("stats") or {}).get("bev_post_fail_msg"),
@@ -851,9 +906,8 @@ def _green_fix_status(idx: dict) -> dict:
     conf = idx.get("umfeld") or {}
     n = done = cells = 0
     for parent in {c for c in idx["files"] if not is_block(c)} | set(idx["parents"]):
-        st = idx["parents"].get(parent) or {}
-        tgt = st if st.get("digest") else (idx["files"].get(parent) or {})
-        gf = tgt.get("green_fix") or {}
+        tgt, _ = _disk_row(parent, idx)
+        gf = (tgt or {}).get("green_fix") or {}
         if gf.get("id") != ne_green_fix.FIX_ID:
             continue
         n += 1
@@ -885,9 +939,16 @@ def text_line(v: dict | None = None) -> str:
             s += (f"\n    green_fix({gf.get('id')}{'' if gf.get('enabled') else ' OFF'}): umfeld_confirmed="
                   f"{gf.get('confirmed')}/{gf.get('computed')} parents, {gf.get('cells_touched')} cells bau/alpen→gruen"
                   f" (read-time override, files untouched; ne_green_fix.py)")
-            fa = v.get("bev_post_fail_at")
-            if fa and time.time() - float(fa) < 86400:
-                s += f" LAST-FAIL {(time.time() - float(fa)) / 3600:.1f}h ago: {str(v.get('bev_post_fail_msg'))[:90]}"
+        pdy = v.get("post_day") or {}
+        s += (f"\n    resync(by digest): today {int(pdy.get('posts') or 0)} POSTs {(pdy.get('bytes') or 0) / 2 ** 20:.0f} MiB"
+              f" (cap {float(_knob('ne_post_gib_per_day', POST_GIB_PER_DAY)):.1f} GiB/day, ≤2/s)")
+        if um.get("day_cap_hold"):
+            s += f" DAY-CAP-HOLD {um['day_cap_hold']} waiting"
+        if um.get("needs_bevdirect"):
+            s += f" · needs_bevdirect={um['needs_bevdirect']} (lu cell-set 409, parked — reprocess on a bev-mode peer)"
+        fa = v.get("bev_post_fail_at")
+        if fa and time.time() - float(fa) < 86400:
+            s += f" LAST-FAIL {(time.time() - float(fa)) / 3600:.1f}h ago: {str(v.get('bev_post_fail_msg'))[:90]}"
     return s
 
 

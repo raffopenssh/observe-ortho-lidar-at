@@ -352,7 +352,28 @@ product or JSON is rewritten**:
   (400) fresh computations per tick), so `confirm_umfeld` sees a mismatch and
   re-POSTs every parent at `ne_post_max_per_tick` (knob, 15 → ~180/h, ~0.3 MB
   each) — ~1.5 days for the corpus. Knob `ne_green_fix=false` turns it off.
-* `/process.txt` → `ne_ingest:` block, line `green_fix(green-1): umfeld_confirmed=…`.
+* the fixed export is labelled `source: srtm-lidar-at@2.4.1` (epoch stays
+  `2026-10`; `ne_h3.OBS_SOURCE_FIXED`) so umfeld's `/ne/manifest`
+  `kgs[kg].obs.source` shows which KGs carry it. Bytes served by umfeld
+  (`GET example.invalid/api/v1/ne/cell/{h3}`) == bytes from `/api/v1/cells`
+  once the resync has reached the KG.
+* **standing rule — resync by digest, never blindly**: `confirm_umfeld`
+  compares `kgs[kg].obs.digest` with our fixed digest and re-POSTs only on
+  mismatch (`replaced:true`; `unchanged:true` is free). Limits honoured:
+  ≥0.6 s between POSTs (`POST_MIN_GAP_S`), `ne_post_gib_per_day` (2 GiB,
+  umfeld's token limit is 4 GiB/day) tracked in `index.json → stats.post_day`
+  (`DAY-CAP-HOLD` on the `resync(by digest)` line). When our digest for a KG
+  changes the retry ladder (`post_attempts`/`post_next`) resets.
+* **which index row describes the file on disk** (`ne_ingest._disk_row`): a
+  whole-parent product ingested *after* the last block merge overwrites the
+  merged file — its `files` row wins over the stale `parents` row. Before
+  this (03212, 01806, 2026-10-26) a bevdirect-cell NEO1 was POSTed bare →
+  409 "cell set ≠ our NEC1 lu cell set" every 30 min; now NEC1+NEO1.
+* a *genuinely* lu-declared file that 409s on cell set while umfeld has
+  `bev == null` is parked (`needs_bevdirect`, shown on the resync line) until
+  its digest changes — it has to be reprocessed on a bev-mode peer.
+* `/process.txt` → `ne_ingest:` block, lines `green_fix(green-1): umfeld_confirmed=…`
+  and `resync(by digest): today N POSTs M MiB …`.
 * `summary.observed_ha` in headers is still pre-fix (documented in the pub header).
 * test: `python3 tests/test_ne_green_fix.py`; audit one file:
   `python3 ne_green_fix.py data/ne/63330.h3b`.
