@@ -1027,7 +1027,7 @@ def fetch_declared_director(kg: str, timeout: float = 120.0) -> Section:
     import director_ha
     kg = str(kg).zfill(5)
     base = director_ha.director_url() or "http://127.0.0.1:8000"
-    h = {"User-Agent": "srtm-lidar-at/2.4 ne_h3"}
+    h = {"User-Agent": "srtm-lidar-at/2.4.1 ne_h3"}
     try:
         h["X-Admin-Token"] = (DATA_DIR / "admin_token").read_text().strip()
     except Exception:
