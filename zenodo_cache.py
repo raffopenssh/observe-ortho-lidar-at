@@ -654,13 +654,20 @@ class HTTPRangeFile:
     Caches the central directory region for efficiency.
     """
 
-    def __init__(self, url: str, session: Optional[requests.Session] = None):
+    def __init__(self, url: str, session: Optional[requests.Session] = None,
+                 size: Optional[int] = None):
         self.url = url
         self._session = session or requests.Session()
         self._pos = 0
         self._size = None
         self._cache: Dict[Tuple[int, int], bytes] = {}  # (start, end) → data
-        self._fetch_size()
+        if size and int(size) > 0:
+            # Known size (cache_manifest ``files[name].size``): skip the
+            # HEAD — on a slow Zenodo (2026-10-27: 15-24 s per HEAD) that
+            # was the dominant cost of every central-directory fetch.
+            self._size = int(size)
+        else:
+            self._fetch_size()
 
     def _fetch_size(self):
         r = self._session.head(self.url, timeout=15, allow_redirects=True)
@@ -834,9 +841,11 @@ class ZipIndex:
     """
 
     def __init__(self, url: str, cache_dir: Path = _ZIP_INDEX_CACHE_DIR,
-                 session: Optional[requests.Session] = None):
+                 session: Optional[requests.Session] = None,
+                 size_hint: Optional[int] = None):
         self.url = url
         self._session = session
+        self._size_hint = int(size_hint) if size_hint else None
         self._cache_dir = cache_dir
         self._entries: Optional[Dict[str, zipfile.ZipInfo]] = None
         self._cache_key = hashlib.md5(url.encode()).hexdigest()[:12]
@@ -926,9 +935,18 @@ class ZipIndex:
         # Fetch central directory from remote ZIP
         log.info("Fetching ZIP index from %s", self.url)
         try:
-            hrf = HTTPRangeFile(self.url, session=self._session)
-            with zipfile.ZipFile(hrf) as zf:
-                entries = {zi.filename: zi for zi in zf.infolist()}
+            try:
+                hrf = HTTPRangeFile(self.url, session=self._session, size=self._size_hint)
+                with zipfile.ZipFile(hrf) as zf:
+                    entries = {zi.filename: zi for zi in zf.infolist()}
+            except Exception:
+                if not self._size_hint:
+                    raise
+                # manifest size stale (file rewritten) → authoritative HEAD
+                self._size_hint = None
+                hrf = HTTPRangeFile(self.url, session=self._session)
+                with zipfile.ZipFile(hrf) as zf:
+                    entries = {zi.filename: zi for zi in zf.infolist()}
         except Exception as exc:
             code = getattr(getattr(exc, "response", None), "status_code", None)
             self._fail_n += 1
@@ -2255,7 +2273,8 @@ class ZenodoCache:
 
         try:
             session = self._authed_session() if not self.manifest.record_id else None
-            idx = ZipIndex(url, session=session)
+            _fe = self.manifest.get_file(zip_name) or {}
+            idx = ZipIndex(url, session=session, size_hint=int(_fe.get("size") or 0) or None)
             self._zip_indices[zip_name] = idx
             return idx
         except Exception as e:

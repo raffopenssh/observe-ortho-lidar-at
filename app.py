@@ -286,6 +286,33 @@ def _request_is_loopback() -> bool:
         return False
 
 
+def _invalidate_zip_indices(entries: dict) -> int:
+    """Drop the on-disk ``ZipIndex`` cache for exactly the ``.zip`` entries
+    in *entries* (``{name: manifest_entry}``) — keyed like ``ZipIndex`` by
+    md5(url)[:12].  2026-10-27: both manifest merge paths wiped the WHOLE
+    index dir whenever any non-tile entry changed, and ``chkpt_*``
+    registry rows change every few minutes → 48 central directories
+    re-fetched from Zenodo per sync (15-50 s each when Zenodo is slow,
+    stalling the director tick and ``/process.txt``)."""
+    import hashlib as _hl
+    zip_idx_dir = Path('data/austria_processor/zenodo_zip_index')
+    n = 0
+    for zn, e in (entries or {}).items():
+        if not str(zn).endswith('.zip') or not isinstance(e, dict):
+            continue
+        url = e.get('url') or ''
+        if not url:
+            continue
+        f = zip_idx_dir / f"{_hl.md5(url.encode()).hexdigest()[:12]}.json"
+        try:
+            if f.exists():
+                f.unlink()
+                n += 1
+        except OSError:
+            pass
+    return n
+
+
 # === SECTION: public-tier relay (``/segmentation`` on srv_public) ===
 #
 # ``public_api.py`` forwards a whitelisted set of analysis endpoints
@@ -2447,6 +2474,7 @@ def _sync_peer_data():
                   local_depo = local_cm.get('depo_id')
                   cm_updated = 0
                   cm_updated_zip = 0
+                  cm_changed_zips = {}
                   for zn, entry in incoming_merged.items():
                       loc = local_files.get(zn)
                       if loc is None or entry.get('updated_at', '') > loc.get('updated_at', ''):
@@ -2461,6 +2489,8 @@ def _sync_peer_data():
                           local_files[zn] = entry
                           cm_updated += 1
                           cm_updated_zip += int(entry.get('kind') != 'tile')
+                          if str(zn).endswith('.zip'):
+                              cm_changed_zips[zn] = entry
                   if cm_updated > 0 or cm_shards_added:
                       local_cm['files'] = local_files
                       import tempfile as _tf2
@@ -2474,13 +2504,10 @@ def _sync_peer_data():
                           try: os.unlink(tmp2)
                           except OSError: pass
                           raise
-                      # Invalidate zip index cache
-                      zip_idx_dir = Path('data/austria_processor/zenodo_zip_index')
-                      if cm_updated_zip and zip_idx_dir.exists():
-                          for zf in zip_idx_dir.iterdir():
-                              zf.unlink(missing_ok=True)
-                      log.info('Peer sync: merged %d cache manifest entries from peers (%d ZIP)',
-                               cm_updated, cm_updated_zip)
+                      # Invalidate only the changed ZIPs' index cache
+                      _n_inv = _invalidate_zip_indices(cm_changed_zips)
+                      log.info('Peer sync: merged %d cache manifest entries from peers (%d ZIP, %d index invalidated)',
+                               cm_updated, cm_updated_zip, _n_inv)
                 finally:
                     _cm_lock.__exit__(None, None, None)
 
@@ -4974,6 +5001,7 @@ def processing_cache_manifest():
         incoming_files = incoming.get('files', {})
         updated = 0
         updated_zip = 0
+        changed_zips = {}
         for zip_name, inc_entry in incoming_files.items():
             # Rewrite URL to target deposit (tile-store objects excluded)
             if inc_entry.get('url') and target_depo and inc_entry.get('kind') != 'tile':
@@ -4984,6 +5012,7 @@ def processing_cache_manifest():
                 local_files[zip_name] = inc_entry
                 updated += 1
                 updated_zip += int(inc_entry.get('kind') != 'tile')
+                changed_zips[zip_name] = inc_entry
             else:
                 # Compare updated_at timestamps
                 loc_ts = loc_entry.get('updated_at', '')
@@ -4992,6 +5021,7 @@ def processing_cache_manifest():
                     local_files[zip_name] = inc_entry
                     updated += 1
                     updated_zip += int(inc_entry.get('kind') != 'tile')
+                    changed_zips[zip_name] = inc_entry
         # Also rewrite existing file URLs in case depo_id changed
         if target_depo:
             for zn, entry in local_files.items():
@@ -5017,12 +5047,10 @@ def processing_cache_manifest():
       # — only when a ZIP (non-tile) entry changed; tile-store objects
       # never touch a ZIP index, and with ~10 tiles/h landing fleet-wide
       # every 5-min sync was wiping every peer's index cache for nothing.
-      zip_idx_dir = Path('data/austria_processor/zenodo_zip_index')
-      if updated_zip > 0 and zip_idx_dir.exists():
-          for f in zip_idx_dir.iterdir():
-              f.unlink(missing_ok=True)
-          log.info('Cache manifest: merged %d entries (%d ZIP), cleared zip index cache',
-                   updated, updated_zip)
+      if updated_zip > 0:
+          _n_inv = _invalidate_zip_indices(changed_zips)
+          log.info('Cache manifest: merged %d entries (%d ZIP), %d zip index invalidated',
+                   updated, updated_zip, _n_inv)
 
       return jsonify({'updated': updated, 'total_files': len(local_files)})
     except Exception as e:
