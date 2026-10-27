@@ -66,6 +66,14 @@ integrate (ne_ingest tick, ≤6/tick) ── ne_ingest.merge_blocks(parent, [par
    → ne_ingest.confirm_umfeld sees digest ≠ umfeld's → re-POST /contrib …/obs (bev: NEC1+NEO1) → done
 ```
 
+**Guard — KGs that ran on the new envelope are never swept**
+(`_products_cover_bbox_new`, in `scan` before the lu fetch): if the union of
+the parent's own `_json_v2` product bboxes in `kg_v2_store` (blocks, sweep
+codes excluded) already reaches `bbox_new` on every side (5e-5°), the parent
+goes `clean` with `clean_reason="products on bbox_new"`.  Audit:
+`python3 -c` over `kg_v2_store.get_bbox` vs `kg_bbox_r1.json` (2026-10-27:
+0 of 250 fresh docs beyond r1 — the pin holds).
+
 States per parent: `wait → clean | pending → dispatched → received → done`,
 `failed` after `MAX_ATTEMPTS` (3) parent attempts or 3 integrate failures.
 A dispatch with no result for 8 h goes back to `pending` (+1 attempt).

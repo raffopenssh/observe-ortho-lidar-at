@@ -340,6 +340,29 @@ def _file_digest(parent: str, idx: dict | None) -> str | None:
     return None
 
 
+def _products_cover_bbox_new(parent: str, bbox_new, tol: float = 5e-5) -> bool:
+    """True when the parent's own (non-sweep) ``_json_v2`` product bboxes in
+    ``kg_v2_store`` already extend to ``bbox_new`` on every side — i.e. the
+    KG actually ran on the revision-2 envelope and the strip is observed.
+    Split parents: the union of the block bboxes.  Unknown → False."""
+    try:
+        if not bbox_new:
+            return False
+        import kg_v2_store, kg_splitter
+        codes = [c for c in (kg_v2_store.codes_for_parent(parent) or [])
+                 if not kg_splitter.is_sweep_code(c)]
+        boxes = [b for b in (kg_v2_store.get_bbox(c) for c in codes) if b]
+        if not boxes:
+            return False
+        w = min(b[0] for b in boxes); s = min(b[1] for b in boxes)
+        e = max(b[2] for b in boxes); n = max(b[3] for b in boxes)
+        bw, bs, be, bn = [float(x) for x in bbox_new]
+        return w <= bw + tol and s <= bs + tol and e >= be - tol and n >= bn - tol
+    except Exception as ex:  # noqa: BLE001
+        log.debug("sliver_sweep: products_cover_bbox_new %s: %s", parent, ex)
+        return False
+
+
 def scan(max_n: int = SCAN_PER_TICK, entries: dict | None = None, idx: dict | None = None,
          lu_budget: int | None = None) -> dict:
     """Advance ``wait`` KGs: complete + h3b on disk → ``clean`` (no unseen
@@ -373,6 +396,16 @@ def scan(max_n: int = SCAN_PER_TICK, entries: dict | None = None, idx: dict | No
                 k["scan_tried"] = time.time()
                 n_done += 1
                 out["wait"] += 1
+                continue
+            # Products already rasterised on the new envelope (a KG run on
+            # bbox_r2, e.g. a post-revision re-run) have no strip to sweep:
+            # clean, without spending an lu fetch or planning units.
+            if _products_cover_bbox_new(code, k.get("bbox_new")):
+                k["scan_tried"] = time.time()
+                n_done += 1
+                k.update(state="clean", units=[], scanned_at=_now(), unseen_out=0,
+                         scan_digest=_file_digest(code, idx), clean_reason="products on bbox_new")
+                out["scanned"] += 1; out["clean"] += 1
                 continue
             src = _nec1_source(code, idx)
             k["nec1_source"] = src
