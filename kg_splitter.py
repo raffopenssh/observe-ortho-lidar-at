@@ -17,6 +17,7 @@ Usage:
 
 import logging
 import math
+import re
 import numpy as np
 from collections import defaultdict
 
@@ -403,6 +404,22 @@ def is_block_code(code: str) -> bool:
     # The parent part must be numeric (KG codes are always numeric)
     parent = code.split("-", 1)[0]
     return parent.isdigit()
+
+
+_SWEEP_RX = re.compile(r"^\d+-sw\d+$")
+
+
+def is_sweep_code(code: str) -> bool:
+    """``'63308-sw1'`` — a sliver-sweep UNIT of parent 63308 (sliver_sweep.py).
+
+    Sweep units upload ``_light_gpkg_v2`` + ``_json_v2`` only (no ``_json``
+    completion marker, no ``_full_gpkg``, no ``_ne_h3b``).  They are
+    *add-on* products of the parent: part of the parent's product set for
+    the bbox-keyed services (trees v3, grid25 heightfield, product
+    segments) but NEVER part of its split layout / completion / index
+    aggregate / stall accounting.  Every ``<parent>-*`` enumeration that
+    means "the blocks of this KG" must skip them."""
+    return bool(code) and bool(_SWEEP_RX.match(str(code)))
 
 
 def parent_kg_code(code: str) -> str:

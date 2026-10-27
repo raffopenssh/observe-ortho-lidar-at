@@ -435,8 +435,12 @@ def _unit_open(u: dict) -> bool:
 
 def spec_for(code: str, k: dict) -> dict:
     """What a peer needs to run the open units of *code*."""
+    # ``attempt`` is the peer's mid-run injection gate (monotonic per parent:
+    # a peer injects a spec only when attempt > the one it already ran) —
+    # a products re-run (``rerun_missing_products``) bumps ``rerun`` so the
+    # reset attempt counter still reads as new.
     return {"parent": code, "bbox_new": k.get("bbox_new"), "bbox_old": k.get("bbox_old"),
-            "attempt": int(k.get("attempts") or 0),
+            "attempt": int(k.get("attempts") or 0) + 10 * int(k.get("rerun") or 0),
             "units": [{"id": u["id"], "bbox": u["bbox"], "cells": u.get("cells"), "side": u.get("side")}
                       for u in k.get("units") or [] if _unit_open(u) or u.get("state") == "dispatched"]}
 
@@ -527,9 +531,15 @@ def release(peer_id: str, reason: str = "") -> int:
 
 def accept_result(unit: str, parent: str, peer: str, attempt: int, status: str,
                   body: bytes | None, cells_observed: int | None = None, error: str | None = None,
-                  seconds: float | None = None) -> dict:
-    """Store a peer's unit result.  ``status`` ∈ ok | nodata | failed."""
+                  seconds: float | None = None, products: str | None = None) -> dict:
+    """Store a peer's unit result.  ``status`` ∈ ok | nodata | failed.
+
+    ``products`` = outcome of the unit's add-on products (``<unit>_light_gpkg_v2``
+    + ``_json_v2`` on Zenodo): ``ok``, ``upload: …`` (transient — the unit is
+    re-dispatched while it has attempts left; the h3b is kept so NE cells
+    never wait on Zenodo), ``verify: …`` (deterministic — accepted, logged)."""
     status = str(status or "failed")
+    products = str(products or "")
     with _Locked() as st:
         k = st["kgs"].get(parent)
         if k is None:
@@ -560,7 +570,15 @@ def accept_result(unit: str, parent: str, peer: str, attempt: int, status: str,
                     u["bytes"] = len(body)
                 except Exception as ex:  # noqa: BLE001
                     status, error = "failed", f"h3b rejected: {ex}"[:200]
+        if status == "ok" and products.startswith("upload:") \
+                and int(u.get("attempts") or 0) + 1 < MAX_ATTEMPTS:
+            # h3b accepted (file kept); products missing → one more try
+            status, error = "failed", products
         u.update(state=status, peer=peer, at=_now(), cells_observed=cells_observed, seconds=seconds)
+        if products:
+            u["products"] = products[:200]
+        else:
+            u.pop("products", None)
         if error:
             u["error"] = str(error)[:200]
         else:
@@ -569,7 +587,8 @@ def accept_result(unit: str, parent: str, peer: str, attempt: int, status: str,
             u["attempts"] = int(u.get("attempts") or 0) + 1
         st["stats"]["results"] = int(st["stats"].get("results") or 0) + 1
         st["stats"]["last"] = {"unit": unit, "status": status, "peer": peer, "at": _now(),
-                               "cells": cells_observed, "error": (error or "")[:120]}
+                               "cells": cells_observed, "error": (error or "")[:120],
+                               "products": products[:80]}
         units = k.get("units") or []
         if any(x.get("state") in ("pending", "dispatched") for x in units):
             return {"ok": True, "unit": unit, "status": status, "parent_state": k.get("state")}
@@ -583,6 +602,35 @@ def accept_result(unit: str, parent: str, peer: str, attempt: int, status: str,
             k.pop("error", None)
         k["received_at"] = _now()
         return {"ok": True, "unit": unit, "status": status, "parent_state": k["state"]}
+
+
+def rerun_missing_products(codes: list[str] | None = None, st_locked: dict | None = None) -> list[str]:
+    """Put ``ok`` units WITHOUT add-on products (``products != "ok"``: units
+    swept before the products existed, or verify-dropped) back to
+    ``pending`` and their parent to ``pending`` — the h3b merge is
+    idempotent, so a re-run only costs the unit's segmentation.  Codes =
+    None → every such parent.  Returns the parents touched."""
+    def _do(st):
+        out = []
+        for c, k in st["kgs"].items():
+            if codes is not None and c not in codes:
+                continue
+            if k.get("state") not in ("done", "received", "pending", "dispatched", "failed"):
+                continue
+            hit = False
+            for u in k.get("units") or []:
+                if u.get("state") == "ok" and str(u.get("products") or "") != "ok":
+                    u.update(state="pending", attempts=0); u.pop("error", None); u.pop("products", None)
+                    hit = True
+            if hit:
+                k.update(state="pending", attempts=0, rerun=int(k.get("rerun") or 0) + 1); k.pop("error", None)
+                k.pop("dispatched_ts", None); k.pop("peer", None)
+                out.append(c)
+        return out
+    if st_locked is not None:
+        return _do(st_locked)
+    with _Locked() as st:
+        return _do(st)
 
 
 def sweep_paths(parent: str, st: dict | None = None) -> list[Path]:
@@ -728,12 +776,19 @@ def status() -> dict:
     except Exception:
         pass
     seen_elsewhere = sum(int(k.get("seen_elsewhere") or 0) for k in kgs.values())
+    prod = {"ok": 0, "missing": 0, "unknown": 0}
+    for k in kgs.values():
+        for u in k.get("units") or []:
+            if u.get("state") != "ok":
+                continue
+            pr = str(u.get("products") or "")
+            prod["ok" if pr == "ok" else ("unknown" if pr in ("", "unknown") else "missing")] += 1
     lu_fetched = sum(1 for k in kgs.values() if k.get("lu_cells_n"))
     return {"enabled": enabled(), "revision": st.get("revision"), "fetched_at": st.get("fetched_at"),
             "kgs": len(kgs), "by_state": by, "seen_elsewhere": seen_elsewhere, "lu_fetched": lu_fetched, "units_open": units_open, "cells_open": cells_open,
             "cells_filled": cells_done, "nodata_cells": nodata, "done_24h": len(day), "rate_per_h": round(rate, 2),
             "eta_h": round(eta_h, 1) if eta_h is not None else None, "peers": st.get("peers") or {},
-            "contrib_confirmed": confirmed, "stats": st.get("stats"),
+            "contrib_confirmed": confirmed, "stats": st.get("stats"), "products": prod,
             "knobs": {"sweep_peers": _knob("sweep_peers", SWEEP_PEERS_DEFAULT),
                       "sweep_per_peer": _knob("sweep_per_peer", SWEEP_PER_PEER_DEFAULT),
                       "sweep_min_delta": _knob("sweep_min_delta", MIN_DELTA_DEG)}}
@@ -765,9 +820,11 @@ def text_lines(v: dict | None = None) -> list[str]:
             f"done={by.get('done', 0)} failed={by.get('failed', 0)} · open units={v['units_open']} cells={v['cells_open']:,} "
             f"· filled={v['cells_filled']:,} nodata={v['nodata_cells']:,} · @{v['rate_per_h']}/h eta={eta} "
             f"· contrib re-posted={v['contrib_confirmed']}/{by.get('done', 0)}")
+    pr = v.get("products") or {}
     lines = [head,
              f"    scan: umfeld lu fetched={v.get('lu_fetched', 0)} (bevdirect parents, {_knob('sweep_lu_per_tick', LU_PER_TICK_DEFAULT)}/tick) "
-             f"· cells skipped as observed by a neighbour={v.get('seen_elsewhere', 0):,}"]
+             f"· cells skipped as observed by a neighbour={v.get('seen_elsewhere', 0):,} "
+             f"· add-on products (light_v2+json_v2): ok={pr.get('ok', 0)} missing={pr.get('missing', 0)} pre-products={pr.get('unknown', 0)}"]
     peers = v.get("peers") or {}
     if peers:
         parts = []
@@ -785,7 +842,7 @@ def text_lines(v: dict | None = None) -> list[str]:
         lines.append(f"    peers: none assigned yet (sweep_peers={v['knobs']['sweep_peers']}, rides the cache-only orchestrator)")
     last = (v.get("stats") or {}).get("last")
     if last:
-        lines.append(f"    last result: {last.get('unit')} {last.get('status')} cells={last.get('cells')} {last.get('peer')} {_age(last.get('at'))} ago"
+        lines.append(f"    last result: {last.get('unit')} {last.get('status')} cells={last.get('cells')} products={last.get('products') or '-'} {last.get('peer')} {_age(last.get('at'))} ago"
                      + (f" — {last.get('error')}" if last.get("error") else ""))
     recent = sorted((k for k in st["kgs"].values() if k.get("state") == "done" and k.get("done_at")),
                     key=lambda k: k["done_at"], reverse=True)[:6]
@@ -877,7 +934,9 @@ def peer_report(kg: dict, result: dict | None, seconds: float | None = None) -> 
     except Exception:
         me = ""
     params = {"unit": unit, "parent": parent, "peer": me, "attempt": int(kg.get("_sweep_attempt") or 0),
-              "status": status, "cells": cells or 0, "error": err or "", "seconds": int(seconds or 0)}
+              "status": status, "cells": cells or 0, "error": err or "", "seconds": int(seconds or 0),
+              # add-on products (light_v2 + json_v2 on Zenodo): "ok" | "upload: …" | "verify: …"
+              "products": str((result or {}).get("sweep_products") or ("" if status != "ok" else "unknown"))[:200]}
     last = None
     for i in range(4):
         try:
@@ -917,6 +976,9 @@ if __name__ == "__main__":
         idx = ne_ingest._load_index()
         print(json.dumps(integrate(idx, max_n=int(sys.argv[2]) if len(sys.argv) > 2 else 3), default=str))
         ne_ingest._save_index(idx)
+    elif cmd == "rerun":
+        # re-dispatch ok units that have no add-on products (all parents when no codes given)
+        print(json.dumps(rerun_missing_products(sys.argv[2:] or None)))
     elif cmd == "reset":
         with _Locked() as st:
             for c in sys.argv[2:]:

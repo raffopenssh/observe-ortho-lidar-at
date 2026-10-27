@@ -522,12 +522,76 @@ class SearchIndex:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             if not force and self._can_skip_full_rebuild(kg_list_path):
+                try:
+                    self.apply_rtree_bbox_r2(kg_list_path)
+                except Exception as e:  # noqa: BLE001
+                    log.warning('search index: rtree bbox_r2 migration failed: %s', e)
                 return self._build_incremental(
                     kg_list_path, json_dir, manifest_path, t0)
             return self._build_inner(kg_list_path, json_dir, manifest_path, t0)
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_fd.close()
+
+    # ── R-tree envelope = umfeld bbox revision 2 ─────────────────────
+    # The ``kg`` row bbox stays the pinned revision-1 processing bbox (the
+    # coverage oracle ``app._kg_coverage_complete`` compares block rects
+    # against it — widening it would turn every complete split parent into
+    # a "hole"; docs/sliver-sweep.md).  Only the SPATIAL LOOKUP envelope
+    # (``kg_rtree``: /kgs?bbox, trees v3, heightfield, cells) is the
+    # polygon-complete ``bbox_r2`` ∪ ``bbox``, so a query in the sliver
+    # strip finds the parent whose sweep add-on products cover it.
+    RTREE_BBOX_REV_KEY = 'rtree_bbox_rev'
+    RTREE_BBOX_REV = '2'
+
+    @staticmethod
+    def _rtree_envelope(kg: dict) -> tuple:
+        bb = kg.get('bbox') or {}
+        r2 = kg.get('bbox_r2') or {}
+        def _f(k, fn):
+            vals = [v for v in (bb.get(k), r2.get(k)) if v is not None]
+            return fn(vals) if vals else 0
+        return (_f('min_lon', min), _f('max_lon', max), _f('min_lat', min), _f('max_lat', max))
+
+    def apply_rtree_bbox_r2(self, kg_list_path='data/austria_processor/kg_list.json') -> int:
+        """Re-point ``kg_rtree`` at the revision-2 envelopes without a full
+        rebuild.  Idempotent (``index_meta[rtree_bbox_rev]``); ~1 s for
+        7 850 rows.  Returns the number of rows updated (0 = already done)."""
+        c = self._conn()
+        try:
+            meta = {r[0]: r[1] for r in c.execute('SELECT key, value FROM index_meta')}
+        except Exception:
+            return 0
+        if meta.get(self.RTREE_BBOX_REV_KEY) == self.RTREE_BBOX_REV:
+            return 0
+        try:
+            kg_list = json.loads(Path(kg_list_path).read_text())
+        except Exception as e:  # noqa: BLE001
+            log.warning('search index: rtree bbox_r2 migration skipped (%s)', e)
+            return 0
+        if not any(k.get('bbox_r2') for k in kg_list):
+            return 0          # kg_list not on revision 2 yet (peer / stale) — retry next build
+        n = 0
+        with self._write_lock:
+            c.execute('BEGIN IMMEDIATE')
+            try:
+                for kg in kg_list:
+                    env = self._rtree_envelope(kg)
+                    if not all(env):
+                        continue
+                    row = c.execute('SELECT rowid FROM kg WHERE kg_code=?', (kg['kg_code'],)).fetchone()
+                    if not row:
+                        continue
+                    c.execute('INSERT OR REPLACE INTO kg_rtree VALUES (?,?,?,?,?)', (row[0],) + env)
+                    n += 1
+                c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                          (self.RTREE_BBOX_REV_KEY, self.RTREE_BBOX_REV))
+                c.execute('COMMIT')
+            except Exception:
+                c.execute('ROLLBACK')
+                raise
+        log.info('search index: kg_rtree re-pointed at bbox_r2 envelopes (%d rows)', n)
+        return n
 
     def _can_skip_full_rebuild(self, kg_list_path: str) -> bool:
         """Decide whether the on-disk index is good enough to skip the
@@ -734,7 +798,7 @@ class SearchIndex:
                     self._normalize_name(sn)))
                 rowid = i + 1
                 if mn_lon and mx_lon and mn_lat and mx_lat:
-                    rtree_rows.append((rowid, mn_lon, mx_lon, mn_lat, mx_lat))
+                    rtree_rows.append((rowid,) + self._rtree_envelope(kg))
 
             c.executemany(
                 '''INSERT OR REPLACE INTO kg VALUES (
@@ -799,6 +863,9 @@ class SearchIndex:
                       ('processed_count', str(n_processed)))
             c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
                       ('schema_version', self.SCHEMA_VERSION))
+            c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
+                      (self.RTREE_BBOX_REV_KEY,
+                       self.RTREE_BBOX_REV if any(k.get('bbox_r2') for k in kg_list) else '1'))
             try:
                 _kg_size = Path(kg_list_path).stat().st_size if Path(kg_list_path).exists() else 0
             except Exception:

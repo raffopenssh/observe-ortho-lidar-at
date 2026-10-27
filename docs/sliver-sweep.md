@@ -54,10 +54,12 @@ director cache-only orchestrator ── sliver_sweep.assign(all_workers) ──�
    parents prepended to the peer's whitelist slice (PUT /processing/queue)
 peer processor ── sliver_sweep.peer_units → kg dicts {kg_code '63308-sw1', _parent_kg_code,
    bbox=unit, _parent_bbox=bbox_new, _sweep=True}  (head of pending; mid-run injection on new/higher attempt)
-   process_one_kg: block mode (fixed bbox) → tiles → NE declared on bbox_new → light-GPKG step builds the
-   NE h3b → _SweepFinished (no full GPKG, no JSON, no verify, no Zenodo, no vct pilot)
-   main(): sliver_sweep.peer_report → POST primary /api/v1/director/sweep/result?unit&parent&status&cells (body = h3b)
+   process_one_kg: block mode (fixed bbox) → tiles → NE declared on bbox_new → full light-GPKG step
+   (NE h3b + tree_apices/crowns, rasters, vectors, terrain_coarse) → json_v2 → v2_verify →
+   Zenodo: <unit>_light_gpkg_v2 + <unit>_json_v2 (NO _json / _full_gpkg / _ne_h3b) → _SweepFinished
+   main(): sliver_sweep.peer_report → POST primary /api/v1/director/sweep/result?unit&parent&status&cells&products (body = h3b)
    status ok | nodata (out_of_coverage / 'No tiles cover' / 0 cells) | failed (error text)
+   products ok | "upload: …" (unit re-dispatched while attempts remain, h3b kept) | "verify: …" (accepted, logged)
 primary accept_result ── verify_h3b → data/ne/sweeps/<unit>.h3b; every unit in → parent received
 integrate (ne_ingest tick, ≤6/tick) ── ne_ingest.merge_blocks(parent, [parent.h3b] + sweeps) → parent.h3b
    (per cell the best-observed source wins; interior cells untouched), index rows digest updated
@@ -95,14 +97,76 @@ switches on:
   set the scan diffed against; any failure falls back to the regular path;
 * **tiles**: `_compute_tile_grid_clipped` — equal-split tiles that end at
   the unit bbox (the 130 m `PAD_M` and the 0.1 km overlap stay);
-* **light step**: `build_light_gpkg_tiled(sweep_only=True)` returns right
-  after the NE h3b (no crowns, nothing written).
+* **light step / products**: the full light step runs (see *Products*);
+  it is seconds-to-a-minute on a sliver — the parent-wide NEC1 build and
+  the overshooting tiles were the waste, not the light extras.
 
-Expected unit wall time: ~1 min + ~5 min per ≤ 1.5 km tile of the unit
-(was ~10 min + 5 min per overshooting tile).  The `app.py` interactive
-`/segment` path was considered and rejected: it runs the same
-`object_segmentation` core, so it cannot beat this — the waste was all
-around the segmentation, not in it.
+Expected unit wall time: ~1–2 min + ~5 min per ≤ 1.5 km tile of the unit
+(was ~10 min + 5 min per overshooting tile) — always well under a fresh
+KG (no full GPKG, no BEV re-reads, no Copernicus beyond the unit's tiles).
+The `app.py` interactive `/segment` path was considered and rejected: it
+runs the same `object_segmentation` core, so it cannot beat this.
+
+## Products (2026-10-27): the strip must not be a hole in the tree services
+
+Every bbox-keyed product service — `/api/v3/trees` (tree_apices +
+tree_crowns from the light GPKG), `/api/v1/heightfield` + `/landscape`
+(grid25 from `_json_v2`), the public `/segmentation` product mode
+(`product_segments`), hillshade tiles — reads the parent's **products**,
+all rasterised on `bbox_r1`.  The NE cells alone would have left the
+revision-2 strip as a hole there.  So a unit uploads **two add-on
+products of the parent**, under its own code:
+
+| key | content | notes |
+|---|---|---|
+| `<parent>-sw<k>_light_gpkg_v2` | light_v2 GPKG of the unit bbox (segments, segment_points, rasters, tree_apices + R-tree, tree_crowns, terrain_coarse, new_buildings, infrastructure) | `v2_verify.verify_before_upload` gate, status `cf` |
+| `<parent>-sw<k>_json_v2` | kgjson/2 of the unit incl. grid25 | ingested by `v2_ingest` into `kg_v2_store` under `parent=<parent>` |
+
+Never uploaded: `_json` (completion marker), `_full_gpkg`, `_ne_h3b` (the
+h3b goes to the director and is merged into `data/ne/<parent>.h3b`).
+
+**Visibility rule — `kg_splitter.is_sweep_code('63308-sw1')`.**  A sweep
+code is part of the parent's product set for `kg_v2_store.codes_for_parent`
+(trees v3 `resolve_coverage`, `landscape_query.grids_for_kg`,
+`app._grid25_for_kg`, `product_segments`, `hillshade_tiles`) and
+**invisible** wherever `<parent>-*` means "the blocks of the layout":
+
+* `kg_docs.codes_for_parent` → the search-index parent row never sums a
+  sliver (the 130 m pad would double-count);
+* `v2_ingest.ingest_one` stores it and returns (no index row, no
+  `product_repair` row, no quality-flag scan); `v2_ingest.status` folds
+  skip it;
+* `ne_ingest._live_blocks` (h3b block merge) skips it;
+* `/process.txt` `zen_stall:` skips it (light_v2 + json_v2 only is *by
+  design*, never "stalled");
+* the re-queue invalidation in `POST /processing/queue` keeps `c-swN`
+  products when parent `c` is re-run (the strip is keyed on bbox_r2, not
+  on the parent's run);
+* the dup-KG reconciler still sees it as a block (one peer per parent).
+
+Overlap with the parent (the pad) is handled by the consumers: trees v3
+dedupes by `tree_id` (integer-metre anchored since 2.2),
+`grid25_sample.merge` prefers interior cells, footprints are unioned.
+
+**R-tree envelope.** `search_index.kg_rtree` (what `/kgs?bbox`, trees v3
+`parents_for_bbox_wgs`, `heightfield`, cells use to find parents) is the
+`bbox ∪ bbox_r2` envelope (`SearchIndex._rtree_envelope`; one-off
+migration `apply_rtree_bbox_r2` keyed `index_meta[rtree_bbox_rev]=2`,
+run on every `build()`), so a query inside the strip finds the parent.
+The `kg` row bbox itself stays revision 1 — `app._kg_coverage_complete`
+compares block rects against it.
+
+**Failure policy** (`sliver_sweep.accept_result`, `products=`): the h3b
+is stored first, always.  `upload: …` (Zenodo / lock) → the unit goes
+`failed` and is re-dispatched while it has attempts left (`MAX_ATTEMPTS`);
+on the last attempt it is accepted without products — NE cells never
+wait on Zenodo.  `verify: …` is deterministic → accepted, products
+dropped, logged.  `sweep:` line: `add-on products: ok= missing=
+pre-products=` (pre-products = units swept before 2026-10-27 or reported
+by a peer still on old code).  Backfill: `python3 sliver_sweep.py rerun
+[codes]` / `POST /api/v1/director/sweep {"rerun": true | [codes]}` puts
+such `ok` units back to pending (merge is idempotent; the spec `attempt`
+is bumped by 10·rerun so a peer's mid-run gate sees it as new).
 
 ## Operating
 
@@ -110,7 +174,7 @@ around the segmentation, not in it.
 curl -s 'https://example.invalid:8000/process.txt?roster=0&log=0' | grep -A4 '^sweep:'
 curl -s 'https://example.invalid:8000/process.txt?q=sweep&log=100'       # dispatch / result events
 curl -s 'http://localhost:8000/api/v1/director/sweep?kg=63308'                   # status + one parent's plan
-python3 sliver_sweep.py status | plan <kg> | refresh [--force] | scan [N] | integrate [N] | reset <kg>…
+python3 sliver_sweep.py status | plan <kg> | refresh [--force] | scan [N] | integrate [N] | reset <kg>… | rerun [<kg>…]
 ```
 
 Knobs (`director_config.json`): `sliver_sweep` (bool, default on),
@@ -126,8 +190,9 @@ uncached 0.1° cell) fail the unit; 3 attempts then `failed` — check
 
 ## Invariants
 
-* Sweep units never touch Zenodo, the retry queue, strikes, completed
-  sets or `_json`; `result` is dropped after `peer_report`.
+* Sweep units never touch the retry queue, strikes, completed sets or
+  `_json`; on Zenodo they own exactly `<unit>_light_gpkg_v2` +
+  `<unit>_json_v2` (→ *Products*); `result` is dropped after `peer_report`.
 * `GET /processing/queue` keeps a parent queued while a sweep spec for it
   exists on the peer (`_v2_keep`), even though it is complete.
 * The dup-KG reconciler sees `63308-sw1` as a block of 63308 — only one

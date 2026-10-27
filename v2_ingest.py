@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 import kg_docs
+from kg_splitter import is_sweep_code as _is_sweep
 import kg_v2_store as store
 import v2_verify
 
@@ -576,6 +577,17 @@ def ingest_one(code: str, entries: dict, *, delete_v1: bool = True,
             return {"code": code, "ok": False, "reason": rep.summary()}
     # 1) store FIRST — the index selector reads the store
     info = store.put(code, blob, uploaded_at=up_at, doc=doc, source="zenodo")
+    if _is_sweep(code):
+        # Sliver-sweep add-on (docs/sliver-sweep.md → Products): it only
+        # needs to exist in the store (bbox + grid25 for trees v3 /
+        # heightfield / product segments via codes_for_parent).  No index
+        # row (the parent aggregate would double-count the pad strip), no
+        # repair registry row, no quality-flag scan.
+        _clear_failure(code)
+        log.info("v2_ingest: %s sweep add-on stored (%d B gz, %s, %.1fs)",
+                 code, info["size"], rep.summary().split(" |")[0], time.time() - t0)
+        return {"code": code, "ok": True, "size": info["size"], "freed": 0,
+                "warnings": rep["warnings"], "sweep": True}
     try:  # repairable-layer registry (docs/product-repair.md)
         import product_repair as _pr
         _pr.observe(code, doc, up_at, str(e.get("version") or ""))
@@ -744,6 +756,8 @@ def status(total_kgs: int = None, ttl: float = 60.0) -> dict:
             if not _committed(e) or not k.endswith("_json_v2"):
                 continue
             code = k[:-8]
+            if _is_sweep(code):
+                continue            # add-on, not a block of the layout
             parent = code.split("-", 1)[0]
             v = str(e.get("version") or "v2")
             if parent not in par or _vkey(v) < _vkey(par[parent]):

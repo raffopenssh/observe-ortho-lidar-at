@@ -555,10 +555,11 @@ def _index_cells(path: Path) -> None:
 
 def _live_blocks(parent: str, entries: dict) -> list[str]:
     """Block codes of *parent* with a committed ``_json_v2`` (the live split layout)."""
+    from kg_splitter import is_sweep_code
     out = []
     pre = parent + "-"
     for k, e in entries.items():
-        if k.startswith(pre) and k.endswith("_json_v2") and _committed(e):
+        if k.startswith(pre) and k.endswith("_json_v2") and _committed(e) and not is_sweep_code(k[:-8]):
             out.append(k[:-8])
     return sorted(out)
 

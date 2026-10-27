@@ -5467,12 +5467,8 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                            cadastre_data, new_buildings, infrastructure,
                            obs_year=0, mark_uncertain=False, label_remap=None,
                            outline_profiler=None, out_path=None, v21_out=None,
-                           report_step=None, ne_declared=None, sweep_only=False):
+                           report_step=None, ne_declared=None):
     """Light GPKG: stitched segment rasters + v2.1 layers (+ NE cells, v2.4).
-
-    ``sweep_only`` (sliver-sweep units): stop right after the NE h3b is
-    written — no tree crowns, no rasters / vectors / terrain_coarse /
-    apex layers, no parcel enrichment (the GPKG is never kept).
 
     v2.4: no cadastre vectors are written any more (``CADASTRE_PRODUCTS``).
     ``ne_declared`` (``ne_h3.Section``, NEC1 of the parent KG) switches on
@@ -5691,8 +5687,7 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                 _v21_apex_rows = _v21.build_tree_apices(
                     seg_height_full, full_tf, seg_type_full, labels_full, all_objects,
                     tile_seg_results, _bg, det_info=_di, grid25=_g25,
-                    crowns_out=None if sweep_only else _v21_crowns,
-                    canopy_counts_out=_v21_canopy_counts)
+                    crowns_out=_v21_crowns, canopy_counts_out=_v21_canopy_counts)
                 if _lc25 and _v21_canopy_counts and _v21_canopy_counts[0] is not None:
                     _v21.attach_canopy_frac(_lc25, _v21_canopy_counts[0])
                 v21_out["n_apices"] = len(_v21_apex_rows)
@@ -5746,8 +5741,6 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                 except Exception as _e:  # noqa: BLE001
                     log.warning("  v2.4 NE cells build failed: %s", _e, exc_info=True)
                     v21_out["ne"] = {"error": str(_e)[:200]}
-            if sweep_only:
-                return out_path
 
         # Write stitched segment rasters
         _write_raster('segment_type', [seg_type_full], full_h, full_w, full_tf,
@@ -8045,13 +8038,18 @@ def _stitch_copernicus_subtiles(
 
 
 def _v2_upload_and_finish(kg: dict, kg_code: str, result: dict, _report_step, *, v1_doc, ne_post: dict,
-                          parent_code: str, v2_upgrade: bool) -> None:
+                          parent_code: str, v2_upgrade: bool,
+                          only_keys: tuple | None = None) -> None:
     """Shared v2 tail (fresh, full-upgrade and v2.4 fast path): stream
     light_gpkg_v2 → ne_h3b → json_v2 (→ json, fresh only) to Zenodo in
     order, then — only once EVERYTHING landed — POST NEO1 to umfeld-at and
     run the legacy clean-up.  Mutates *result* (``_uploaded_keys``,
     ``files[..]=""``, ``legacy_cleanup`` …); the parent uploads whatever is
-    left in ``result["files"]`` if we stop early."""
+    left in ``result["files"]`` if we stop early.
+
+    ``only_keys`` (sliver-sweep units): upload just these product keys and
+    skip the post-upload tail (NEO1 post / legacy clean-up — the sweep's
+    h3b goes to the director, the parent's legacy state is not ours)."""
     _v2_upgrade = v2_upgrade
     _parent_code = parent_code
     result.setdefault("_uploaded_keys", [])
@@ -8064,7 +8062,7 @@ def _v2_upload_and_finish(kg: dict, kg_code: str, result: dict, _report_step, *,
         _qsV, _qgV = result.get("quality_score", 0), result.get("quality_grade", "")
         _alV, _mlV = result.get("available_layers") or [], result.get("missing_layers") or []
         with _zul(purpose="kg_upload_v2", kg=kg_code):
-            for _fk in ("light_gpkg_v2", NE_PRODUCT_KEY, "json_v2", "json"):
+            for _fk in (only_keys or ("light_gpkg_v2", NE_PRODUCT_KEY, "json_v2", "json")):
                 _fp = result["files"].get(_fk)
                 if not _fp or not os.path.exists(_fp) or os.path.getsize(_fp) == 0:
                     continue
@@ -8095,8 +8093,11 @@ def _v2_upload_and_finish(kg: dict, kg_code: str, result: dict, _report_step, *,
                     pass
                 log.info("KG %s: %s streamed to Zenodo (%.1f MB)", kg_code, _fk, _szV / 1e6)
     except Exception as _vue:  # noqa: BLE001
+        result["_v2_upload_error"] = str(_vue)[:200]
         log.warning("KG %s: v2 in-subprocess upload stopped (%s) — parent uploads the rest "
                     "in order", kg_code, _vue)
+    if only_keys:
+        return
     # --- 7b''. v2.4 post-upload: NE round-trip + legacy clean-up ---
     # Strict order (owner rule): the v2.4 products are VERIFIED and
     # UPLOADED first; only then is the legacy (cadastre-shaped) data
@@ -10537,8 +10538,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             obs_year=obs_year, mark_uncertain=mark_uncertain,
             label_remap=_boundary_remap, outline_profiler=_outline_prof,
             out_path=(GPKG_DIR / f"{kg_code}_light_v2.gpkg") if _is_v2 else None,
-            v21_out=_v21_extras, report_step=_report_step, ne_declared=_ne_declared,
-            sweep_only=bool(kg.get("_sweep")))
+            v21_out=_v21_extras, report_step=_report_step, ne_declared=_ne_declared)
         result["files"][_light_key] = light_gpkg
         if _v21_extras:
             result["v21"] = {k: v for k, v in _v21_extras.items()
@@ -10551,19 +10551,13 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                                 "seconds": _ne_out.get("seconds")}
             elif _ne_out.get("error"):
                 result["ne_status"] = "error:" + _ne_out["error"]
-        if kg.get("_sweep"):
-            # Sliver-sweep unit (sliver_sweep.py): the NE h3b IS the product.
-            # No JSON, no verify, no Zenodo — the parent process ships the
-            # h3b to the director (sliver_sweep.peer_report), which merges
-            # it into the parent's corpus file and re-posts to umfeld.
-            try:
-                os.unlink(light_gpkg)
-            except OSError:
-                pass
-            result["files"][_light_key] = ""
-            if not result["files"].get(NE_PRODUCT_KEY):
-                raise RuntimeError("sweep unit produced no NE h3b: " + str(result.get("ne_status") or "unknown"))
-            raise _SweepFinished()
+        _is_sweep = bool(kg.get("_sweep"))
+        if _is_sweep and not result["files"].get(NE_PRODUCT_KEY):
+            # Sliver-sweep unit (sliver_sweep.py): the NE h3b is the primary
+            # product (shipped to the director by the parent process); the
+            # light_v2 GPKG + json_v2 become the parent's ``<unit>`` add-on
+            # products on Zenodo (docs/sliver-sweep.md → Products).
+            raise RuntimeError("sweep unit produced no NE h3b: " + str(result.get("ne_status") or "unknown"))
 
         # --- 6b. Validate light GPKG ---
         _light_size = os.path.getsize(light_gpkg) if os.path.exists(light_gpkg) else 0
@@ -10576,7 +10570,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 log.info("KG %s: light GPKG validated OK (%.0f MB)", kg_code, _light_size / 1e6)
 
         # Throttle mode: delete light GPKG immediately
-        if THROTTLE_FILE.exists() and _light_size > 0:
+        if THROTTLE_FILE.exists() and _light_size > 0 and not _is_sweep:
             log.info("KG %s: throttle mode \u2014 deleting light GPKG locally (%.0f MB saved)",
                      kg_code, _light_size / 1e6)
             try:
@@ -10681,7 +10675,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             result["files"]["json_v2"] = json_v2_path
             log.info("KG %s: kgjson/2 written (%.2f MB gz)", kg_code, _n_v2 / 1e6)
             json_path = ""
-            if not _v2_upgrade:
+            if not _v2_upgrade and not _is_sweep:
                 json_path = str(JSON_DIR / f"{kg_code}.json")
                 with open(json_path, 'w') as f:
                     json.dump(json_summary, f, separators=(",", ":"), default=str)
@@ -10704,6 +10698,21 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             if _rep["ok"]:
                 log.info("KG %s: %s", kg_code, _vmsg)
                 _relay_info(_vmsg, "v2_verify")
+            elif _is_sweep:
+                # Sweep unit: the h3b still ships; the add-on products are
+                # dropped (a verify failure is deterministic — not worth a
+                # re-segmentation; the director records ``products``).
+                log.warning("KG %s: %s — sweep add-on products dropped, h3b only", kg_code, _vmsg)
+                for _pth in (json_v2_path, light_gpkg):
+                    try:
+                        if _pth and os.path.exists(_pth):
+                            os.unlink(_pth)
+                    except OSError:
+                        pass
+                result["files"] = {k: v for k, v in result["files"].items()
+                                   if k not in ("json_v2", _light_key)}
+                result["sweep_products"] = ("verify: " + "; ".join(_rep.get("errors") or [])[:160]) or "verify: failed"
+                raise _SweepFinished()
             elif not _v2_upgrade:
                 # Fresh KG: the gate is advisory for *completion*.  Before
                 # 2026-09-18 a FAIL here discarded everything incl. the
@@ -10779,6 +10788,25 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # mode nothing else is on Zenodo yet for this KG, so this is the
         # whole upload.  Fresh v2 additionally has the early full GPKG
         # upload above (gate: it must have landed).
+        if _is_sweep:
+            # Sliver-sweep unit: light_v2 + json_v2 are the add-on products
+            # (never _json / _full_gpkg / _ne_h3b — the h3b goes to the
+            # director).  Both must land or the unit reports ``products``
+            # = upload error (the director re-dispatches while the unit has
+            # attempts left; the h3b is kept either way).
+            if not _is_v2:
+                result["sweep_products"] = "skipped: v1 model"
+                raise _SweepFinished()
+            _v2_upload_and_finish(kg, kg_code, result, _report_step, v1_doc=None,
+                                  ne_post={}, parent_code=_parent_code, v2_upgrade=False,
+                                  only_keys=("light_gpkg_v2", "json_v2"))
+            _up = set(result.get("_uploaded_keys") or ())
+            if {"light_gpkg_v2", "json_v2"} <= _up:
+                result["sweep_products"] = "ok"
+            else:
+                result["sweep_products"] = "upload: " + str(result.get("_v2_upload_error") or
+                                                            f"landed={sorted(_up)}")[:160]
+            raise _SweepFinished()
         if _is_v2 and not THROTTLE_FILE.exists() and not result.get("zenodo_failed") \
                 and (_v2_upgrade or result.get("_full_gpkg_uploaded")):
             _v2_upload_and_finish(kg, kg_code, result, _report_step,
@@ -14546,8 +14574,9 @@ def main():
                     _rep = {"ok": False, "status": "failed", "error": str(_swe)[:120]}
                 _st = _rep.get("status")
                 _cells = ((result or {}).get("ne") or {}).get("cells_observed")
-                progress.add_log("info" if _rep.get("ok") and _st != "failed" else "warning",
-                                 f"sweep: {kg_code} {_st} cells={_cells} "
+                _prd = str((result or {}).get("sweep_products") or "")
+                progress.add_log("info" if _rep.get("ok") and _st != "failed" and _prd in ("ok", "") else "warning",
+                                 f"sweep: {kg_code} {_st} cells={_cells} products={_prd or '-'} "
                                  f"{'→ director' if _rep.get('ok') else 'report FAILED ' + str(_rep.get('error'))[:100]}"
                                  + (f" — {str((result or {}).get('error'))[:120]}" if _st == 'failed' and result else ''),
                                  kg_code)

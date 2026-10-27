@@ -117,10 +117,13 @@ def codes_for_parent(parent: str, json_dir=None) -> tuple[bool, list[str]]:
     st = _store()
     if st is not None:
         try:
+            from kg_splitter import is_sweep_code as _is_sw
             for c in st.codes_for_parent(parent):
                 if c == parent:
                     plain = True
-                elif c.startswith(parent + "-"):
+                elif c.startswith(parent + "-") and not _is_sw(c):
+                    # sliver-sweep add-ons are not blocks of the layout —
+                    # the index row (sum over blocks) must not see them
                     blocks.add(c)
         except Exception:
             pass

@@ -6908,6 +6908,7 @@ def processing_queue_add():
             # partial manifest entries can be keyed by either form.  Match
             # both: ``c_<suffix>`` AND ``c-<dir>_<suffix>``.
             partial_keys = []
+            from kg_splitter import is_sweep_code as _is_sweep_code
             if mentries is not None:
                 suffixes = ('_full_gpkg', '_light_gpkg', '_json', '_light_gpkg_v2', '_json_v2')
                 for key in mentries:
@@ -6920,7 +6921,10 @@ def processing_queue_add():
                         if key.endswith(s):
                             code = key[:-len(s)]
                             break
-                    if code == c or code.startswith(c + '-'):
+                    if code == c or (code.startswith(c + '-') and not _is_sweep_code(code)):
+                        # sliver-sweep add-ons (``c-swN``) are keyed on the
+                        # bbox_r2 strip, not on the parent's run — a parent
+                        # re-run never invalidates them (docs/sliver-sweep.md)
                         partial_keys.append(key)
             # --- Preserve COMPLETE sibling blocks (Aug 2026) ----------
             # The match above sweeps in every product of every block of a
@@ -10702,9 +10706,12 @@ def director_sweep_result():
         secs = None
     r = _sls.accept_result(unit, parent, str(a.get('peer') or ''), int(a.get('attempt') or 0),
                            str(a.get('status') or 'failed'), body if body else None,
-                           cells_observed=cells, error=a.get('error') or None, seconds=secs)
+                           cells_observed=cells, error=a.get('error') or None, seconds=secs,
+                           products=a.get('products') or None)
     if r.get('ok'):
+        _prd = str(a.get('products') or '')
         director_event(f"sweep: {unit} {r.get('status')} cells={cells or 0} ({len(body) // 1024} KB)"
+                       + (f" products={_prd[:100]}" if _prd and _prd != 'ok' else '')
                        + (f" — {a.get('error')}" if r.get('status') == 'failed' else '')
                        + (f" → parent {r.get('parent_state')}" if r.get('parent_state') in ('received', 'pending') else ''),
                        peer=str(a.get('peer') or ''), kg=parent,
@@ -10717,7 +10724,9 @@ def director_sweep_result():
 def director_sweep():
     """GET → ``sliver_sweep.status()`` (+ ``?kg=`` plan of one parent).
     POST ``{"refresh":true}`` re-pulls umfeld's bbox_changes; ``{"reset":
-    [codes]}`` puts parents back to ``wait``; ``{"scan": N}`` scans now."""
+    [codes]}`` puts parents back to ``wait``; ``{"scan": N}`` scans now;
+    ``{"rerun": [codes] | true}`` re-dispatches ok units lacking add-on
+    products (``sliver_sweep.rerun_missing_products``)."""
     import sliver_sweep as _sls
     if request.method == 'POST':
         body = request.get_json(silent=True) or {}
@@ -10733,6 +10742,10 @@ def director_sweep():
                         out.setdefault('reset', []).append(str(c))
         if body.get('scan'):
             out['scan'] = _sls.scan(max_n=int(body['scan']))
+        if body.get('rerun') is not None:
+            # ok units without add-on products → pending again (list of codes, or true = all)
+            _codes = None if body['rerun'] is True else [str(c) for c in body['rerun']]
+            out['rerun'] = _sls.rerun_missing_products(_codes)
         return jsonify(out)
     out = _sls.status()
     if request.args.get('kg'):
@@ -21847,12 +21860,15 @@ def process_txt():
             # add-on (upgrade or fresh), never part of the triple.
             _rx = _re.compile(
                 r'^(\d+(?:-[a-z][-a-z0-9]*)?)_(json|full_gpkg|light_gpkg|light_gpkg_v2)$')
+            from kg_splitter import is_sweep_code as _is_sweep_code
             _trip = {}
             for k, e in real.items():
                 m = _rx.match(k)
                 if not m:
                     continue
                 c, prod = m.groups()
+                if _is_sweep_code(c):
+                    continue   # sliver-sweep add-on: light_v2 + json_v2 only, by design
                 if prod == 'light_gpkg_v2':
                     prod = 'light_gpkg'
                 g = _trip.setdefault(c, {'p': set(), 'first': None})
