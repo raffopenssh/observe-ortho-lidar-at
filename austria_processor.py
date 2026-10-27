@@ -15428,6 +15428,17 @@ def main():
             if _sw:
                 log.info("\u21bb sweep: %d unit(s) of %s (attempt %d) injected mid-run", len(_sw), rq_code, _att)
             _known_queue_codes.add(rq_code)
+        # Sweep units already waiting at the head of pending keep their
+        # place: every mid-run whitelist insert below lands *behind* them.
+        # Before 2026-10-27 each new cache KG the director pushed went to
+        # queue pos 1, so a busy cache-only sweeper (ready_kgs≈200) never
+        # reached its units — 57117/84014 sat 0/4u on at203 for 4.5 h while
+        # the peer ran one fresh KG after another.
+        _insert_offset = 0
+        for _p in pending[i + 1:]:
+            if not _p.get("_sweep"):
+                break
+            _insert_offset += 1
         for rq_code in _read_retry_queue():
             if rq_code in _known_queue_codes:
                 continue  # already injected this one
