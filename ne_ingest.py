@@ -148,12 +148,19 @@ def pending(entries: dict | None = None, idx: dict | None = None) -> list[tuple[
     """``[(code, entry)]`` oldest upload first."""
     entries = entries if entries is not None else load_manifest_entries()
     idx = idx if idx is not None else _load_index()
+    from kg_splitter import is_sweep_code
     files, failed = idx["files"], idx.get("failed") or {}
     out = []
     for k, e in entries.items():
         if not k.endswith("_ne_h3b") or not _committed(e):
             continue
         code = k[:-7]
+        if is_sweep_code(code):
+            # ``<parent>-sw<k>_ne_h3b`` is the sliver sweep's durability
+            # archive: the authoritative copy arrives via
+            # ``sliver_sweep.accept_result`` (data/ne/sweeps/) and is merged
+            # by ``sliver_sweep.integrate`` — never a block of the layout.
+            continue
         have = files.get(code) or {}
         if have.get("uploaded_at") == e.get("uploaded_at") and path_for(code).exists():
             continue
@@ -226,6 +233,9 @@ def pull(code: str, e: dict) -> tuple[bytes, str, str | None]:
 
 def ingest_one(code: str, e: dict, idx: dict) -> dict:
     import ne_h3
+    from kg_splitter import is_sweep_code
+    if is_sweep_code(code):
+        return {"code": code, "ok": False, "reason": "sweep unit — not an ingest product"}
     t0 = time.time()
     try:
         blob, src, peer = pull(code, e)

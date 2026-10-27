@@ -28,6 +28,32 @@ ent = {"57306-south_json_v2": {"size": 10, "uploaded_at": "2026-10-27T00:00:00Z"
        "57306-sw2_json_v2": {"size": 10, "uploaded_at": "2026-10-27T00:00:00Z"}}
 assert ne_ingest._live_blocks("57306", ent) == ["57306-south"], ne_ingest._live_blocks("57306", ent)
 
+# --- ne_ingest.pending / ingest_one never pull a <parent>-sw<k>_ne_h3b archive ---
+ent_h3b = {"57306-south_ne_h3b": {"size": 10, "uploaded_at": "2026-10-27T00:00:00Z"},
+           "57306-sw2_ne_h3b": {"size": 10, "uploaded_at": "2026-10-27T00:00:00Z"}}
+pend = [c for c, _ in ne_ingest.pending(ent_h3b, {"files": {}, "failed": {}})]
+assert pend == ["57306-south"], pend
+r = ne_ingest.ingest_one("57306-sw2", ent_h3b["57306-sw2_ne_h3b"], {"files": {}, "failed": {}, "parents": {}, "stats": {}})
+assert not r["ok"] and "sweep" in r["reason"], r
+
+# --- ne_rollout.audit_manifest counts sweep h3bs separately ---
+import ne_rollout
+a = ne_rollout.audit_manifest({"57306_ne_h3b": {"size": 10, "uploaded_at": "x", "status": "cf"},
+                               "57306-sw2_ne_h3b": {"size": 10, "uploaded_at": "x", "status": "cf"}})
+assert a["h3b"] == 1 and a["h3b_sweep"] == 1, a
+
+# --- cells_api never indexes a sweep file ---
+import cells_api
+for bad in ("data/ne/sweeps/57306-sw2.h3b", "data/ne/57306-sw2.h3b", "data/ne/.57306.sweep_merge.h3b"):
+    try:
+        cells_api.index_file(bad); raise AssertionError(bad)
+    except ValueError:
+        pass
+
+# --- /processing/product key regex accepts sweep codes (mirrors app.py) ---
+prx = re.compile(r'([0-9]{5}(?:-[a-z]+[0-9]*)?)_(ne(?:_h3b|\.h3b)|json_v2)')
+assert prx.fullmatch("57306-sw2_ne_h3b") and prx.fullmatch("57306-south_ne_h3b") and not prx.fullmatch("57306-sw2-x_ne_h3b")
+
 # --- kg_docs.codes_for_parent skips sweep codes (index aggregate) ---
 import kg_docs
 class _St:
@@ -69,6 +95,24 @@ with tempfile.TemporaryDirectory() as td:
     assert r["status"] == "ok" and k["units"][0]["state"] == "ok" and k["state"] == "received", (r, k)
     assert sls.status()["products"] == {"ok": 0, "missing": 2, "unknown": 0}, sls.status()["products"]
     assert any("add-on products" in ln for ln in sls.text_lines())
+    # 4) sweep_paths: present files are returned; a missing file is restored
+    #    from the <unit>_ne_h3b archive only when the manifest has it
+    assert sorted(p.name for p in sls.sweep_paths("57306", None, {})) == ["57306-sw1.h3b", "57306-sw2.h3b"]
+    (sls.SWEEP_DIR / "57306-sw2.h3b").unlink()
+    assert [p.name for p in sls.sweep_paths("57306", None, {})] == ["57306-sw1.h3b"]      # no archive → skipped
+    calls = []
+    def _fake_pull(code, e):
+        calls.append(code); return b"h3b-from-zenodo", "zenodo", None
+    ne_ingest.pull, _orig_pull = _fake_pull, ne_ingest.pull
+    import ne_h3
+    ne_h3.verify_h3b, _orig_v = (lambda p, **k: {"ok": True}), ne_h3.verify_h3b
+    try:
+        arch = {"57306-sw2_ne_h3b": {"size": 15, "uploaded_at": "2026-10-27T00:00:00Z", "status": "cf"}}
+        got = sorted(p.name for p in sls.sweep_paths("57306", None, arch))
+        assert got == ["57306-sw1.h3b", "57306-sw2.h3b"] and calls == ["57306-sw2"], (got, calls)
+        assert (sls.SWEEP_DIR / "57306-sw2.h3b").read_bytes() == b"h3b-from-zenodo"
+    finally:
+        ne_ingest.pull, ne_h3.verify_h3b = _orig_pull, _orig_v
 
 # --- search index: R-tree envelope = bbox ∪ bbox_r2; kg row untouched ---
 import search_index as si

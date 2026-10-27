@@ -79,7 +79,9 @@ def audit_manifest(entries: dict | None = None) -> dict:
     removed = 0
     stripped = 0
     cf = 0
+    from kg_splitter import is_sweep_code as _is_sweep
     h3b = 0
+    h3b_sweep = 0
     h3b_bytes = 0
     suspect_codes: set[str] = set()
     removed_keys: list[str] = []
@@ -102,8 +104,11 @@ def audit_manifest(entries: dict | None = None) -> dict:
         if suf == "_json":
             codes_with_json.add(code)
         if suf == "_ne_h3b":
-            h3b += 1
-            h3b_bytes += int(e.get("size") or 0)
+            if _is_sweep(code):
+                h3b_sweep += 1          # sliver-sweep archive copies — not parent coverage
+            else:
+                h3b += 1
+                h3b_bytes += int(e.get("size") or 0)
             continue
         if suf == "_full_gpkg":
             continue
@@ -134,6 +139,7 @@ def audit_manifest(entries: dict | None = None) -> dict:
         "stripped": stripped,
         "cf": cf,
         "h3b": h3b,
+        "h3b_sweep": h3b_sweep,
         "h3b_gb": round(h3b_bytes / 1e9, 2),
         "_suspect_code_set": suspect_codes,
     }
@@ -443,7 +449,7 @@ def summary(force: bool = False) -> dict:
                 b_disk += p.stat().st_size
         except Exception:
             pass
-        ne.update(h3b_zenodo=a["h3b"], h3b_zenodo_gb=a["h3b_gb"], h3b_disk=n_disk,
+        ne.update(h3b_zenodo=a["h3b"], h3b_zenodo_gb=a["h3b_gb"], h3b_sweep=a.get("h3b_sweep", 0), h3b_disk=n_disk,
                   h3b_disk_gb=round(b_disk / 1e9, 2))
         # bevdirect tooling readiness across the fleet (peers ship
         # ``status.ne_tooling`` on full pushes; cross-worker cache on disk).
@@ -494,7 +500,8 @@ def process_txt_lines() -> list[str]:
     l2 = (f"ne:       source={ne['source']} umfeld_built={ne.get('umfeld_built')}/{ne.get('umfeld_total')} "
           f"(queue {q.get('done')}/{q.get('total')} @{q.get('avg_seconds')}s{' done' if q.get('finished') else ''}) "
           f"obs_posted={ne.get('obs_posted')}{(' obs_on_bev=' + str(ne.get('kgs_obs_on_bev'))) if ne.get('kgs_obs_on_bev') is not None else ''}"
-          f" · h3b: zenodo={ne['h3b_zenodo']} ({ne['h3b_zenodo_gb']} GB) "
+          f" · h3b: zenodo={ne['h3b_zenodo']} ({ne['h3b_zenodo_gb']} GB)"
+          + (f" +sweep={ne['h3b_sweep']}" if ne.get('h3b_sweep') else "") + " "
           f"disk={ne['h3b_disk']} ({ne['h3b_disk_gb']} GB)")
     if ne.get("umfeld_token_reporting"):
         l2 += f" · contrib_token={ne.get('umfeld_token_ok')}/{ne.get('umfeld_token_reporting')}"

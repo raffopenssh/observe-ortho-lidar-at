@@ -633,17 +633,64 @@ def rerun_missing_products(codes: list[str] | None = None, st_locked: dict | Non
         return _do(st)
 
 
-def sweep_paths(parent: str, st: dict | None = None) -> list[Path]:
-    """Accepted sweep h3b files of *parent* (for the ingest merge)."""
+RESTORE_PER_CALL = 2     # Zenodo-archive restores per sweep_paths() call (rare: disk loss)
+
+
+def sweep_paths(parent: str, st: dict | None = None, entries: dict | None = None) -> list[Path]:
+    """Accepted sweep h3b files of *parent* (for the ingest merge).
+
+    Authoritative copy = ``data/ne/sweeps/<unit>.h3b`` (``accept_result``).
+    If an ``ok`` unit's file is gone but the manifest has the unit's
+    ``<unit>_ne_h3b`` archive (uploaded by the peer next to its light_v2 /
+    json_v2 add-ons), restore it from there via ``ne_ingest.pull`` (peer
+    first, Zenodo fallback; ≤ ``RESTORE_PER_CALL`` per call, verified before
+    use).  Never happens on the happy path — the primary never *pulls*
+    sweep h3bs otherwise."""
     st = st or load_state()
     k = st["kgs"].get(parent) or {}
     out = []
+    restores = 0
     for u in k.get("units") or []:
-        if u.get("state") == "ok":
-            p = SWEEP_DIR / f"{u['id']}.h3b"
-            if p.exists():
-                out.append(p)
+        if u.get("state") != "ok":
+            continue
+        p = SWEEP_DIR / f"{u['id']}.h3b"
+        if not p.exists() and restores < RESTORE_PER_CALL:
+            restores += 1
+            if _restore_from_archive(u["id"], p, entries):
+                u["restored_at"] = _now()
+        if p.exists():
+            out.append(p)
     return out
+
+
+def _restore_from_archive(unit: str, dest: Path, entries: dict | None = None) -> bool:
+    """``<unit>_ne_h3b`` (manifest) → *dest*; False when absent / failed."""
+    try:
+        import ne_ingest
+        import ne_h3
+        if entries is None:
+            entries = ne_ingest.load_manifest_entries()
+        e = entries.get(f"{unit}_ne_h3b")
+        if not ne_ingest._committed(e):
+            return False
+        blob, src, _peer = ne_ingest.pull(unit, e)
+        import inbound_budget
+        inbound_budget.add("sweep", len(blob))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".tmp")
+        tmp.write_bytes(blob)
+        chk = ne_h3.verify_h3b(tmp)
+        if not chk.get("ok"):
+            tmp.unlink(missing_ok=True)
+            log.warning("sliver_sweep: archived %s_ne_h3b failed verify: %s", unit,
+                        "; ".join(chk.get("errors") or [])[:160])
+            return False
+        tmp.replace(dest)
+        log.info("sliver_sweep: restored %s.h3b from %s archive (%.2f MB)", unit, src, len(blob) / 1e6)
+        return True
+    except Exception as ex:  # noqa: BLE001
+        log.info("sliver_sweep: restore %s from archive failed: %s", unit, str(ex)[:160])
+        return False
 
 
 def integrate(idx: dict, entries: dict | None = None, max_n: int = INTEGRATE_PER_TICK) -> list[dict]:
@@ -663,11 +710,11 @@ def integrate(idx: dict, entries: dict | None = None, max_n: int = INTEGRATE_PER
             if s == "received":
                 cands.append(code)
             elif s == "done" and k.get("integrated_digest") and _file_digest(code, idx) not in (None, k["integrated_digest"]) \
-                    and sweep_paths(code, st):
+                    and sweep_paths(code, st, entries):
                 cands.append(code)
         for code in cands[:max_n]:
             k = st["kgs"][code]
-            paths = sweep_paths(code, st)
+            paths = sweep_paths(code, st, entries)
             parent_p = _parent_path(code)
             if not paths:
                 # nothing observed (all nodata / out of coverage) — nothing to merge

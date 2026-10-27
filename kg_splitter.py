@@ -412,8 +412,10 @@ _SWEEP_RX = re.compile(r"^\d+-sw\d+$")
 def is_sweep_code(code: str) -> bool:
     """``'63308-sw1'`` — a sliver-sweep UNIT of parent 63308 (sliver_sweep.py).
 
-    Sweep units upload ``_light_gpkg_v2`` + ``_json_v2`` only (no ``_json``
-    completion marker, no ``_full_gpkg``, no ``_ne_h3b``).  They are
+    Sweep units upload ``_light_gpkg_v2`` + ``_ne_h3b`` (durability archive
+    only — the primary merges the copy POSTed to the director, never this
+    one) + ``_json_v2`` (no ``_json`` completion marker, no ``_full_gpkg``).
+    They are
     *add-on* products of the parent: part of the parent's product set for
     the bbox-keyed services (trees v3, grid25 heightfield, product
     segments) but NEVER part of its split layout / completion / index

@@ -10555,8 +10555,9 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         if _is_sweep and not result["files"].get(NE_PRODUCT_KEY):
             # Sliver-sweep unit (sliver_sweep.py): the NE h3b is the primary
             # product (shipped to the director by the parent process); the
-            # light_v2 GPKG + json_v2 become the parent's ``<unit>`` add-on
-            # products on Zenodo (docs/sliver-sweep.md → Products).
+            # light_v2 GPKG + h3b archive + json_v2 become the parent's
+            # ``<unit>`` add-on products on Zenodo (docs/sliver-sweep.md →
+            # Products).
             raise RuntimeError("sweep unit produced no NE h3b: " + str(result.get("ne_status") or "unknown"))
 
         # --- 6b. Validate light GPKG ---
@@ -10789,19 +10790,23 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # whole upload.  Fresh v2 additionally has the early full GPKG
         # upload above (gate: it must have landed).
         if _is_sweep:
-            # Sliver-sweep unit: light_v2 + json_v2 are the add-on products
-            # (never _json / _full_gpkg / _ne_h3b — the h3b goes to the
-            # director).  Both must land or the unit reports ``products``
-            # = upload error (the director re-dispatches while the unit has
-            # attempts left; the h3b is kept either way).
+            # Sliver-sweep unit: light_v2 + ne_h3b + json_v2 are the add-on
+            # products (never _json / _full_gpkg).  The ``<unit>_ne_h3b`` is a
+            # durability archive only — the authoritative copy still goes
+            # peer→director (``peer_report``, ``sliver_sweep.accept_result``)
+            # and the primary's ``ne_ingest`` never pulls sweep h3bs.  All
+            # three must land or the unit reports ``products`` = upload
+            # error (the director re-dispatches while the unit has attempts
+            # left; the h3b is kept either way — ``upload_stream`` only
+            # deletes gpkg files, so the file survives for ``peer_report``).
             if not _is_v2:
                 result["sweep_products"] = "skipped: v1 model"
                 raise _SweepFinished()
             _v2_upload_and_finish(kg, kg_code, result, _report_step, v1_doc=None,
                                   ne_post={}, parent_code=_parent_code, v2_upgrade=False,
-                                  only_keys=("light_gpkg_v2", "json_v2"))
+                                  only_keys=("light_gpkg_v2", NE_PRODUCT_KEY, "json_v2"))
             _up = set(result.get("_uploaded_keys") or ())
-            if {"light_gpkg_v2", "json_v2"} <= _up:
+            if {"light_gpkg_v2", NE_PRODUCT_KEY, "json_v2"} <= _up:
                 result["sweep_products"] = "ok"
             else:
                 result["sweep_products"] = "upload: " + str(result.get("_v2_upload_error") or

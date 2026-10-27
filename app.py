@@ -4772,7 +4772,7 @@ def processing_product():
     """
     import re as _re
     key = (request.args.get('key') or '').strip()
-    m = _re.fullmatch(r'([0-9]{5}(?:-[a-z]+)?)_(ne(?:_h3b|\.h3b)|json_v2)', key)
+    m = _re.fullmatch(r'([0-9]{5}(?:-[a-z]+[0-9]*)?)_(ne(?:_h3b|\.h3b)|json_v2)', key)
     if not m:
         return jsonify({'error': 'key must be <code>_ne_h3b or <code>_json_v2'}), 400
     code, kind = m.group(1), m.group(2)

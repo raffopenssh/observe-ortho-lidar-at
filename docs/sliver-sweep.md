@@ -56,7 +56,7 @@ peer processor ── sliver_sweep.peer_units → kg dicts {kg_code '63308-sw1',
    bbox=unit, _parent_bbox=bbox_new, _sweep=True}  (head of pending; mid-run injection on new/higher attempt)
    process_one_kg: block mode (fixed bbox) → tiles → NE declared on bbox_new → full light-GPKG step
    (NE h3b + tree_apices/crowns, rasters, vectors, terrain_coarse) → json_v2 → v2_verify →
-   Zenodo: <unit>_light_gpkg_v2 + <unit>_json_v2 (NO _json / _full_gpkg / _ne_h3b) → _SweepFinished
+   Zenodo: <unit>_light_gpkg_v2 + <unit>_ne_h3b (archive) + <unit>_json_v2 (NO _json / _full_gpkg) → _SweepFinished
    main(): sliver_sweep.peer_report → POST primary /api/v1/director/sweep/result?unit&parent&status&cells&products (body = h3b)
    status ok | nodata (out_of_coverage / 'No tiles cover' / 0 cells) | failed (error text)
    products ok | "upload: …" (unit re-dispatched while attempts remain, h3b kept) | "verify: …" (accepted, logged)
@@ -114,16 +114,26 @@ tree_crowns from the light GPKG), `/api/v1/heightfield` + `/landscape`
 (grid25 from `_json_v2`), the public `/segmentation` product mode
 (`product_segments`), hillshade tiles — reads the parent's **products**,
 all rasterised on `bbox_r1`.  The NE cells alone would have left the
-revision-2 strip as a hole there.  So a unit uploads **two add-on
-products of the parent**, under its own code:
+revision-2 strip as a hole there.  So a unit uploads **three add-on
+products of the parent**, under its own code (order light_v2 → ne_h3b →
+json_v2; `products=ok` requires all three):
 
 | key | content | notes |
 |---|---|---|
 | `<parent>-sw<k>_light_gpkg_v2` | light_v2 GPKG of the unit bbox (segments, segment_points, rasters, tree_apices + R-tree, tree_crowns, terrain_coarse, new_buildings, infrastructure) | `v2_verify.verify_before_upload` gate, status `cf` |
+| `<parent>-sw<k>_ne_h3b` | the unit's NE h3b — **durability archive only** (2026-10-27 pm). The authoritative copy is still POSTed peer→director (`peer_report` → `accept_result` → `data/ne/sweeps/<unit>.h3b`) and merged by `integrate`; the Zenodo `<parent>_ne_h3b` stays pre-sweep | `ne_ingest.pending/ingest_one` skip it, `cells_api.index_file` refuses it, `ne_rollout` counts it as `h3b_sweep` (`+sweep=` on the `ne:` line); only reader: `sweep_paths` restore (below) |
 | `<parent>-sw<k>_json_v2` | kgjson/2 of the unit incl. grid25 | ingested by `v2_ingest` into `kg_v2_store` under `parent=<parent>` |
 
-Never uploaded: `_json` (completion marker), `_full_gpkg`, `_ne_h3b` (the
-h3b goes to the director and is merged into `data/ne/<parent>.h3b`).
+Never uploaded: `_json` (completion marker), `_full_gpkg`.  The h3b upload
+does not touch primary bandwidth (peer → Zenodo; `upload_stream` deletes
+only gpkg files, so the h3b survives for `peer_report`).
+
+**Archive restore** (`sliver_sweep.sweep_paths`): if an `ok` unit's
+`data/ne/sweeps/<unit>.h3b` is gone (disk loss) and the manifest has a
+committed `<unit>_ne_h3b`, it is pulled back via `ne_ingest.pull` (peer
+first, Zenodo fallback; ≤ `RESTORE_PER_CALL`=2 per call, `verify_h3b`
+before use, counted on inbound channel `sweep`) so `integrate` can still
+merge.  Never fires on the happy path.
 
 **Visibility rule — `kg_splitter.is_sweep_code('63308-sw1')`.**  A sweep
 code is part of the parent's product set for `kg_v2_store.codes_for_parent`
@@ -136,7 +146,9 @@ code is part of the parent's product set for `kg_v2_store.codes_for_parent`
 * `v2_ingest.ingest_one` stores it and returns (no index row, no
   `product_repair` row, no quality-flag scan); `v2_ingest.status` folds
   skip it;
-* `ne_ingest._live_blocks` (h3b block merge) skips it;
+* `ne_ingest._live_blocks` (h3b block merge), `ne_ingest.pending` /
+  `ingest_one` (the `-sw<k>_ne_h3b` archive is never pulled) and
+  `cells_api.index_file` skip it;
 * `/process.txt` `zen_stall:` skips it (light_v2 + json_v2 only is *by
   design*, never "stalled");
 * the re-queue invalidation in `POST /processing/queue` keeps `c-swN`

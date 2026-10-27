@@ -218,6 +218,11 @@ def index_file(path: str | Path, *, conn: sqlite3.Connection | None = None) -> d
     """(Re)insert one ``data/ne/<kg>.h3b`` into ``cells.sqlite``.  Called by
     ``ne_ingest`` after every successful write / merge."""
     p = Path(path)
+    from kg_splitter import is_sweep_code
+    if is_sweep_code(p.stem) or p.parent.name == 'sweeps' or p.name.startswith('.'):
+        # sliver-sweep unit files (data/ne/sweeps/<parent>-sw<k>.h3b) and
+        # merge temps are never indexed — only the merged data/ne/<kg>.h3b.
+        raise ValueError(f'not a corpus file: {p.name}')
     hdr = ne_h3.read_h3b_header(p)
     kg = str(hdr['kg']).zfill(5)
     chunks = hdr.get('chunks') or []
@@ -262,6 +267,8 @@ def rebuild_index() -> dict:
         c.execute('DELETE FROM chunk'); c.execute('DELETE FROM file'); c.commit()
     n = 0
     for p in sorted(NE_DIR.glob('*.h3b')):
+        if p.name.startswith('.'):
+            continue
         try:
             index_file(p, conn=c)
             n += 1
