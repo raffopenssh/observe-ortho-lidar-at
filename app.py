@@ -22751,7 +22751,7 @@ def process_txt():
         # steady state). Persistent gaps raise HANSEN-GAPS in the banner.
         try:
             import hansen_coverage as _hc
-            _hc_st = _hc.summary()
+            _hc_st = _hc.summary(background=True)  # never block on Zenodo here
             _hc_lines, _hc_flag = _hc.render_lines(_hc_st)
             out.extend(_hc_lines)
             if _hc_flag:

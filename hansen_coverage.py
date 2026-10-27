@@ -35,6 +35,7 @@ import math
 import os
 import re
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -195,10 +196,21 @@ def refresh(allow_remote: bool = True) -> dict:
     return st
 
 
-def summary(max_age_s: float = TTL_S, allow_remote: bool = True) -> dict:
-    """Cached coverage state (refreshes when older than ``max_age_s``)."""
+def summary(max_age_s: float = TTL_S, allow_remote: bool = True,
+            background: bool = False) -> dict:
+    """Cached coverage state (refreshes when older than ``max_age_s``).
+
+    ``background=True`` (request paths — ``/process.txt``): never block on
+    the refresh.  Return the on-disk state and kick a single-flight daemon
+    thread when it is stale.  2026-10-27: Zenodo 504s made the inline
+    ZIP-index re-probe take minutes per ``/process.txt`` call and every
+    concurrent poller piled onto it."""
     st = _load_state()
-    if not st or time.time() - float(st.get("at") or 0) > max_age_s:
+    stale = not st or time.time() - float(st.get("at") or 0) > max_age_s
+    if stale and background and st:
+        _refresh_in_background(allow_remote)
+        return st
+    if stale:
         try:
             st = refresh(allow_remote=allow_remote)
         except Exception as e:
@@ -206,6 +218,30 @@ def summary(max_age_s: float = TTL_S, allow_remote: bool = True) -> dict:
             if not st:
                 raise
     return st
+
+
+_bg_lock = threading.Lock()
+_bg_running = False
+
+
+def _refresh_in_background(allow_remote: bool) -> None:
+    global _bg_running
+    with _bg_lock:
+        if _bg_running:
+            return
+        _bg_running = True
+
+    def _run():
+        global _bg_running
+        try:
+            refresh(allow_remote=allow_remote)
+        except Exception as e:  # noqa: BLE001
+            log.debug("hansen_coverage: background refresh failed: %s", e)
+        finally:
+            with _bg_lock:
+                _bg_running = False
+
+    threading.Thread(target=_run, name="hansen-coverage-refresh", daemon=True).start()
 
 
 def _age_h(iso: str) -> float:
