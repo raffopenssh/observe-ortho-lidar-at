@@ -190,7 +190,24 @@ python3 sliver_sweep.py status | plan <kg> | refresh [--force] | scan [N] | inte
 ```
 
 Knobs (`director_config.json`): `sliver_sweep` (bool, default on),
-`sweep_peers` (4), `sweep_per_peer` (3), `sweep_min_delta` (0.0002°).
+`sweep_peers` (4 — the **floor**), `sweep_per_peer` (3), `sweep_min_delta`
+(0.0002°), `sweep_peers_auto` (bool, default on), `sweep_peers_max` (24).
+
+**Auto-scale (2026-10-27)**: every sweep-capable cache-only worker the v2
+upgrade does not need this tick becomes a sweeper —
+`n = clamp(len(capable workers) − (new v2 units this tick + workers mid
+v2 unit), sweep_peers, sweep_peers_max)`.  The upgrade is the cache-only
+pool's first job (`v24_first`), so as its candidate list drains (dispatch
+`3/3cand` on 2026-10-27) the surplus workers sweep instead of only chewing
+fresh cache-ready KGs the frontiers also cover.  Sweeps sit at the head of
+the slice; fresh work fills behind.  Newly added sweeper slots prefer
+workers not on a v2 unit with the emptiest slice; previous sweepers stay
+sticky.  Director event `sweep: auto-scale → N sweeper(s) (capable
+workers=…, v2 demand=…)` (`?q=auto-scale`) on every change; the `sweep:`
+`peers(N, floor 4, …)` line shows the live count.  `sweep_peers_auto: false`
+pins the floor.  Only peers on ≥ `SWEEP_MIN_COMMIT` (`f778efe`: fast path +
+add-on products + h3b archive) count as capable — older code produced slow
+`pre-products` units.
 `POST /api/v1/director/sweep {"refresh":true | "reset":[codes] | "scan":N}`.
 
 Sweep workers are chosen from the cache-only worker set (sticky, sorted

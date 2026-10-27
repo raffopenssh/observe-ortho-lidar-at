@@ -445,14 +445,19 @@ def spec_for(code: str, k: dict) -> dict:
                       for u in k.get("units") or [] if _unit_open(u) or u.get("state") == "dispatched"]}
 
 
-def assign(workers: list[str], in_progress: set | None = None) -> dict:
-    """Pick the sweep workers (sticky; ``sweep_peers`` of *workers*) and give
-    each up to ``sweep_per_peer`` parents.  Returns ``{peer_id: {code:
-    spec}}`` for the peers that carry sweep work this tick.  Also expires
-    stale dispatches."""
+def assign(workers: list[str], in_progress: set | None = None,
+           n_peers: int | None = None, prefer: list[str] | None = None) -> dict:
+    """Pick the sweep workers (sticky; ``sweep_peers`` of *workers*, or
+    ``n_peers`` when the director auto-scales) and give each up to
+    ``sweep_per_peer`` parents.  ``prefer`` orders the candidates for newly
+    added sweeper slots (sticky previous sweepers always come first).
+    Returns ``{peer_id: {code: spec}}`` for the peers that carry sweep work
+    this tick.  Also expires stale dispatches."""
     if not enabled() or not workers:
         return {}
-    n_peers = max(0, int(_knob("sweep_peers", SWEEP_PEERS_DEFAULT)))
+    if n_peers is None:
+        n_peers = int(_knob("sweep_peers", SWEEP_PEERS_DEFAULT))
+    n_peers = max(0, int(n_peers))
     per_peer = max(1, int(_knob("sweep_per_peer", SWEEP_PER_PEER_DEFAULT)))
     in_progress = set(in_progress or ())
     now = time.time()
@@ -471,7 +476,9 @@ def assign(workers: list[str], in_progress: set | None = None) -> dict:
         wset = set(workers)
         prev = [p for p in (st.get("peers") or {}) if p in wset]
         chosen = prev[:n_peers]
-        for p in sorted(wset):
+        for p in list(prefer or []) + sorted(wset):
+            if p not in wset:
+                continue
             if len(chosen) >= n_peers:
                 break
             if p not in chosen:
@@ -884,7 +891,7 @@ def text_lines(v: dict | None = None) -> list[str]:
                 n_ok = sum(1 for u in us if u.get("state") in ("ok", "nodata"))
                 frag.append(f"{c}[{n_ok}/{len(us)}u {int(k.get('unseen_out') or 0)}c {_age(k.get('dispatched_at'))}]")
             parts.append(f"{pid}: " + (" ".join(frag) if frag else "idle"))
-        lines.append("    peers(%d of %s): %s" % (len(peers), v["knobs"]["sweep_peers"], " · ".join(parts)))
+        lines.append("    peers(%d, floor %s, auto-scale to idle v2 capacity): %s" % (len(peers), v["knobs"]["sweep_peers"], " · ".join(parts)))
     else:
         lines.append(f"    peers: none assigned yet (sweep_peers={v['knobs']['sweep_peers']}, rides the cache-only orchestrator)")
     last = (v.get("stats") or {}).get("last")

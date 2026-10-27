@@ -101,7 +101,7 @@ def _peer_commit_is_ahead_or_equal(peer_commit: str) -> bool:
 # Peers below it answer 405 to the spec push and would never report a
 # unit — ``_orchestrate_cache_only`` only offers sweep work to peers at
 # or past this commit (docs/sliver-sweep.md).
-SWEEP_MIN_COMMIT = 'c3e4405'
+SWEEP_MIN_COMMIT = 'f778efe'  # fast path + add-on products + h3b archive (older code yields slow pre-products units)
 
 
 def _peer_sweep_capable(ps: dict | None) -> bool:
@@ -258,6 +258,7 @@ DIRECTOR_KNOBS = {
     # Sliver sweep (docs/sliver-sweep.md): on/off, how many cache-only
     # workers sweep, parents per worker, umfeld bbox_changes min_delta.
     'sliver_sweep': bool, 'sweep_peers': int, 'sweep_per_peer': int, 'sweep_min_delta': float,
+    'sweep_peers_auto': bool, 'sweep_peers_max': int,
     # Gradual ramp (docs/vct-pilot.md → Ramp): every 24h/N the director
     # moves ONE more eligible peer into vct_bev_peers (health-gated,
     # sticky) until the whole fleet builds its declared layer locally.
@@ -14125,7 +14126,37 @@ class PeerDirector:
             _cap_status = {c['peer']['id']: c.get('status') for c in candidates}
             _sweep_workers = [w for w in all_workers
                               if _peer_sweep_capable(_cap_status.get(w))]
-            _sw = _sls.assign(_sweep_workers, in_progress=in_progress)
+            # Auto-scale (2026-10-27): every sweep-capable cache-only
+            # worker the v2 upgrade does NOT need this tick becomes a
+            # sweeper — the upgrade is the cache-only pool's first job
+            # (v24_first), so as it runs out of candidates (dispatch
+            # 3/3 cand today) the surplus workers would otherwise just
+            # chew fresh cache-ready KGs that the frontiers also cover.
+            # Floor = ``sweep_peers`` (4), ceiling = ``sweep_peers_max``
+            # (24; ``sweep_peers_auto: false`` pins the floor). Workers
+            # currently on a v2 unit / with the emptiest slice are
+            # preferred when the sweeper set grows.
+            _n_sw = int(knob(cfg, 'sweep_peers', _sls.SWEEP_PEERS_DEFAULT))
+            _prefer: list[str] = []
+            if knob(cfg, 'sweep_peers_auto', True) and _sweep_workers:
+                _v2_running = {w for w in _sweep_workers
+                               if (_cap_status.get(w) or {}).get('current_kg_v2_upgrade')}
+                _v2_demand = len(v2_codes or []) + len(_v2_running)
+                _cap_sw = int(knob(cfg, 'sweep_peers_max', 24))
+                _n_auto = len(_sweep_workers) - _v2_demand
+                _n_sw = max(_n_sw, min(_cap_sw, _n_auto))
+                _prefer = sorted((w for w in _sweep_workers if w not in _v2_running),
+                                 key=lambda w: (len(slices.get(w, [])), w))
+                _sig = (_n_sw, len(_sweep_workers), _v2_demand)
+                if _sig != getattr(self, '_sweep_auto_sig', None):
+                    self._sweep_auto_sig = _sig
+                    _emit_director_event(
+                        f"sweep: auto-scale → {_n_sw} sweeper(s) "
+                        f"(capable workers={len(_sweep_workers)}, v2 demand={_v2_demand}, "
+                        f"floor={knob(cfg, 'sweep_peers', _sls.SWEEP_PEERS_DEFAULT)} cap={_cap_sw})",
+                        peer='director')
+            _sw = _sls.assign(_sweep_workers, in_progress=in_progress,
+                              n_peers=_n_sw, prefer=_prefer)
             for _pid, _specs in _sw.items():
                 _pp = get_peer_by_id(cfg, _pid)
                 if not _pp:
