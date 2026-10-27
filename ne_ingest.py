@@ -694,15 +694,59 @@ def _declared_of(parent: str, idx: dict) -> tuple[str | None, str | None]:
         return None, None
 
 
+def _view_of(rec: dict) -> tuple[str | None, str | None]:
+    """umfeld manifest ``declared{source,state}`` → ``(source, state)``;
+    source ``chunks@<state>`` = the KG has a chunk-log view (has_view)."""
+    d = rec.get("declared") or {}
+    return d.get("source"), d.get("state")
+
+
+def _has_view(rec: dict) -> bool:
+    return str(_view_of(rec)[0] or "").startswith("chunks@")
+
+
+def _post_bare_on_view(parent: str, want: str, c: dict, green_fix: bool) -> tuple[dict, bytes, dict]:
+    """Bare NEO1 re-keyed onto umfeld's ``/declared`` view (ne-change.md §4b):
+    fetch → rebuild → POST; a 409 that carries ``view{}`` means the view moved
+    between GET and POST → refetch once and rebuild.  Returns
+    ``(server answer, posted section, rekey stats)``.  Raises on failure."""
+    import ne_h3
+    last = None
+    for attempt in range(2):
+        view = ne_h3.fetch_declared_view(parent)
+        if view is None:
+            raise ne_h3.NEError(f"umfeld {parent}/declared: 404 (KG holds nothing)")
+        sec, st = ne_h3.neo1_section_on_view(path_for(parent), view, green_fix=green_fix)
+        try:
+            return ne_h3.post_observed(parent, sec), sec, st
+        except ne_h3.NEError as ex:
+            last = ex
+            if " 409" in str(ex) and '"view"' in str(ex) and attempt == 0:
+                log.info("ne_ingest: NEO1 %s 409 on view %s — view moved, refetching", parent, st.get("state"))
+                continue
+            raise
+    raise last  # pragma: no cover
+
+
 def confirm_umfeld(idx: dict, max_posts: int = 5) -> dict:
     """Compare umfeld's stored obs digest with ours for every parent on disk;
     (re)POST on miss / mismatch.  Returns counters.
 
-    bevdirect-declared products (``nec1.source`` = ``bevdirect@…``) are
-    confirmed on THREE digests — ``obs.digest == ours`` AND
-    ``obs.declared_digest == bev.digest == our NEC1 digest`` — and re-posted
-    as a NEC1+NEO1 container (``nec1_section_from_h3b``); lu-declared ones
-    stay on the bare NEO1 path.  ``bev_*`` counters feed the VTC ramp gate."""
+    * bevdirect-declared products (``nec1.source`` = ``bevdirect@…``) are
+      confirmed on THREE digests — ``obs.digest == ours`` AND
+      ``obs.declared_digest == bev.digest == our NEC1 digest`` — and re-posted
+      as a NEC1+NEO1 container (``nec1_section_from_h3b``).
+    * lu-declared products post a **bare NEO1 built on umfeld's ``/declared``
+      view** (since 2026-10-27, ne-change.md §4b): our rows re-keyed onto the
+      view's cell set (extra cells dropped, unobserved view cells = unseen
+      rows).  Confirmed when umfeld's ``obs.declared_source`` is
+      ``chunks@…`` and its digest equals the rows we posted for the current
+      file digest (``conf[p].view``).  An obs still validated against
+      ``index-2026-03`` while the KG has a view (= umfeld's
+      ``revisit.obs_on_index``) is re-posted first; KGs without a view keep
+      the old lu-set path.  The view itself is fetched only right before a
+      POST (~0.2 MB, never stored) — primary bandwidth stays per-post.
+    ``bev_*`` counters feed the VTC ramp gate."""
     import ne_h3
     import ne_rollout
     mf = ne_rollout.refresh_ne_manifest() or {}
@@ -711,9 +755,9 @@ def confirm_umfeld(idx: dict, max_posts: int = 5) -> dict:
         return {"skipped": "no umfeld manifest"}
     out = {"checked": 0, "confirmed": 0, "missing": 0, "mismatch": 0, "posted": 0, "post_failed": 0,
            "pending_cells": 0, "bev_checked": 0, "bev_confirmed": 0, "bev_declared_mismatch": 0,
-           "bev_posted": 0, "bev_post_failed": 0, "needs_bevdirect": 0, "day_cap_hold": 0}
+           "bev_posted": 0, "bev_post_failed": 0, "needs_bevdirect": 0, "day_cap_hold": 0,
+           "obs_on_index": 0, "on_view": 0, "view_posted": 0, "view_dropped": 0, "view_filled": 0, "no_view": 0}
     now = time.time()
-    posts = 0
     conf = idx.setdefault("umfeld", {})
     max_posts = int(_knob("ne_post_max_per_tick", max_posts))
     day = time.strftime("%Y-%m-%d", time.gmtime())
@@ -723,10 +767,18 @@ def confirm_umfeld(idx: dict, max_posts: int = 5) -> dict:
     idx["stats"]["post_day"] = pd
     day_cap = float(_knob("ne_post_gib_per_day", POST_GIB_PER_DAY)) * 2 ** 30
     out["day_bytes"] = int(pd["bytes"])
-    last_post = 0.0
     _gf_budget[0] = int(_knob("ne_green_fix_compute_per_tick", GF_COMPUTE_PER_TICK))
+    green_fix = bool(_knob("ne_green_fix", True))
+    if mf.get("kgs_obs_on_index") is not None:
+        vp = idx["stats"].setdefault("view_pass", {})
+        vp.setdefault("obs_on_index_before", int(mf["kgs_obs_on_index"]))
+        vp.setdefault("started_at", _now())
+        vp["obs_on_index_now"] = int(mf["kgs_obs_on_index"])
+        vp["manifest_at"] = mf.get("generated_at")
+    # --- phase 1: classify every parent; collect post candidates with a priority
+    cands: list[tuple[tuple, str, dict]] = []
     for parent in sorted({c for c in idx["files"] if not is_block(c)} | set(idx["parents"])):
-        want = _our_digest(parent, idx)
+        want = _our_digest(parent, idx, green_fix=green_fix)
         if not want:
             continue
         out["checked"] += 1
@@ -738,13 +790,28 @@ def confirm_umfeld(idx: dict, max_posts: int = 5) -> dict:
         c = conf.setdefault(parent, {})
         src, nec_digest = _declared_of(parent, idx)
         bev = bool(src and str(src).startswith("bevdirect@"))
+        has_view = _has_view(rec)
+        on_index = bool(have) and str(obs.get("declared_source") or "").startswith("index-")
         decl_ok = True
+        ok = False
         if bev:
             out["bev_checked"] += 1
             bev_digest = (rec.get("bev") or {}).get("digest")
             decl_ok = bool(nec_digest) and obs.get("declared_digest") == nec_digest and bev_digest == nec_digest
             c["bev"] = {"nec1": nec_digest, "umfeld_bev": bev_digest, "obs_declared": obs.get("declared_digest")}
-        if have == want and decl_ok:
+            ok = have == want and decl_ok
+        elif has_view:
+            v = c.get("view") or {}
+            ok = bool(have) and have == v.get("obs_digest") and v.get("of") == want \
+                and str(obs.get("declared_source") or "").startswith("chunks@")
+            if ok:
+                out["on_view"] += 1
+            elif on_index:
+                out["obs_on_index"] += 1
+        else:
+            out["no_view"] += 1
+            ok = have == want
+        if ok:
             if c.get("confirmed_digest") != want:
                 c.update(confirmed_digest=want, confirmed_at=_now(), post_attempts=0)
                 c.pop("post_next", None)
@@ -752,7 +819,7 @@ def confirm_umfeld(idx: dict, max_posts: int = 5) -> dict:
             if bev:
                 out["bev_confirmed"] += 1
             continue
-        if have == want and not decl_ok:
+        if bev and have == want and not decl_ok:
             out["bev_declared_mismatch"] += 1
         else:
             out["missing" if not have else "mismatch"] += 1
@@ -762,25 +829,67 @@ def confirm_umfeld(idx: dict, max_posts: int = 5) -> dict:
         if want != c.get("posted_digest") and c.get("posted_digest"):
             # our export changed (new product / post-processing pass) → fresh retry ladder
             c.update(post_attempts=0); c.pop("post_next", None); c.pop("needs_bevdirect", None)
+        if c.get("needs_bevdirect") and has_view and not c.get("needs_bevdirect_view"):
+            # parked on the lu cell set — the view path can take it now (one fresh try)
+            c.pop("needs_bevdirect", None); c.update(post_attempts=0); c.pop("post_next", None)
         if c.get("needs_bevdirect"):
             out["needs_bevdirect"] += 1
             continue     # bare NEO1 can never match umfeld's lu cell set — needs a bevdirect NEC1 (see below)
-        if posts >= max_posts or float(c.get("post_next") or 0) > now \
-                or int(c.get("post_attempts") or 0) >= POST_MAX_ATTEMPTS:
+        if float(c.get("post_next") or 0) > now or int(c.get("post_attempts") or 0) >= POST_MAX_ATTEMPTS:
             continue
+        # umfeld's order: obs_on_index (has_view first) → missing → mismatch
+        prio = (0 if (on_index and has_view) else 1 if not have else 2, 0 if has_view else 1, parent)
+        cands.append((prio, parent, {"want": want, "have": have, "bev": bev, "has_view": has_view,
+                                     "on_index": on_index, "c": c}))
+    # --- phase 2: POST in priority order within the tick / day budgets
+    cands.sort(key=lambda t: t[0])
+    posts = 0
+    last_post = 0.0
+    for _prio, parent, k in cands:
+        if posts >= max_posts:
+            break
         if pd["bytes"] >= day_cap:
             out["day_cap_hold"] += 1
             continue     # umfeld per-token daily volume — resumes at 00:00 UTC
+        want, have, bev, has_view, c = k["want"], k["have"], k["bev"], k["has_view"], k["c"]
+        why = "missing" if not have else ("on-index" if k["on_index"] and has_view else
+                                          ("declared-mismatch" if have == want else "mismatch"))
         try:
-            sec = ne_h3.neo1_section_from_h3b(path_for(parent), green_fix=bool(_knob("ne_green_fix", True)))
-            nec = ne_h3.nec1_section_from_h3b(path_for(parent)) if bev else None
             gap = POST_MIN_GAP_S - (time.time() - last_post)
             if gap > 0:
                 time.sleep(gap)
             last_post = time.time()
-            r = ne_h3.post_observed(parent, sec, nec1_section=nec)
+            st = None
+            if bev:
+                sec = ne_h3.neo1_section_from_h3b(path_for(parent), green_fix=green_fix)
+                nec = ne_h3.nec1_section_from_h3b(path_for(parent))
+                r = ne_h3.post_observed(parent, sec, nec1_section=nec)
+                nbytes = len(sec) + len(nec)
+            elif has_view:
+                r, sec, st = _post_bare_on_view(parent, want, c, green_fix)
+                nbytes = len(sec)
+                c["view"] = {"of": want, "obs_digest": st["digest"], "state": st["state"], "view_digest": st["view_digest"],
+                             "cells_n": st["cells_n"], "dropped": st["dropped"], "filled": st["filled"],
+                             "hidden": st.get("hidden"), "at": _now()}
+                c.pop("needs_bevdirect_view", None)
+                out["view_posted"] += 1
+                out["view_dropped"] += int(st["dropped"]); out["view_filled"] += int(st["filled"])
+                vp = idx["stats"].setdefault("view_pass", {})
+                vp["posted"] = int(vp.get("posted") or 0) + 1
+                vp["cells_filled"] = int(vp.get("cells_filled") or 0) + int(st["filled"])
+                vp["cells_dropped"] = int(vp.get("cells_dropped") or 0) + int(st["dropped"])
+                if k["on_index"]:
+                    vp["reposted_on_index"] = int(vp.get("reposted_on_index") or 0) + 1
+                vp["last_at"] = _now()
+                if isinstance(r, dict) and r.get("declared_layer") == "lu":
+                    log.warning("ne_ingest: NEO1 %s answered declared_layer=lu on the view path — pipeline bug? %s",
+                                parent, str(r)[:200])
+            else:
+                sec = ne_h3.neo1_section_from_h3b(path_for(parent), green_fix=green_fix)
+                r = ne_h3.post_observed(parent, sec)
+                nbytes = len(sec)
             posts += 1
-            pd["bytes"] += len(sec) + (len(nec) if nec else 0)
+            pd["bytes"] += nbytes
             pd["posts"] += 1
             c.update(post_attempts=int(c.get("post_attempts") or 0) + 1, posted_digest=want,
                      posted_at=_now(), post_result=str(r)[:160])
@@ -791,28 +900,32 @@ def confirm_umfeld(idx: dict, max_posts: int = 5) -> dict:
             if bev:
                 out["bev_posted"] += 1
                 c["lu_diff"] = r.get("lu_diff") if isinstance(r, dict) else None
-            log.info("ne_ingest: NEO1 %s %s at umfeld (ours %s, theirs %s) — posted%s: %s", parent,
-                     "missing" if not have else ("declared-mismatch" if have == want else "mismatch"), want, have,
-                     " as NEC1+NEO1" if bev else "", str(r)[:120])
+            log.info("ne_ingest: NEO1 %s %s at umfeld (ours %s, theirs %s) — posted%s: %s", parent, why, want, have,
+                     " as NEC1+NEO1" if bev else (f" on view {st['state']} (cells={st['cells_n']} dropped={st['dropped']}"
+                                                  f" filled={st['filled']} hidden={st.get('hidden')})" if st else ""),
+                     str(r)[:120])
         except Exception as ex:  # noqa: BLE001
             n = int(c.get("post_attempts") or 0) + 1
             c.update(post_attempts=n, post_error=str(ex)[:200], post_next=now + POST_BACKOFF_S * (2 ** min(n, 4)))
             out["post_failed"] += 1
-            if not bev and " 409" in str(ex) and "cell set" in str(ex):
+            if not bev and " 409" in str(ex) and ("cell set" in str(ex) or has_view):
                 # our (lu-declared) cell set ≠ umfeld's lu and umfeld has no bev
                 # layer for this KG: retrying the bare NEO1 is pointless — the
                 # KG needs a bevdirect NEC1 in front of the obs (reprocess on
                 # a bev-mode peer).  Park it until our digest changes.
                 c["needs_bevdirect"] = _now()
+                if has_view:
+                    c["needs_bevdirect_view"] = _now()   # even the view path 409s — do not retry on this digest
                 out["needs_bevdirect"] += 1
-                log.warning("ne_ingest: NEO1 %s parked: bare NEO1 cell set ≠ umfeld lu and no bev layer — "
-                            "needs a bevdirect NEC1+NEO1 product", parent)
+                log.warning("ne_ingest: NEO1 %s parked: bare NEO1 cell set ≠ umfeld %s and no bev layer — "
+                            "needs a bevdirect NEC1+NEO1 product", parent, "view" if has_view else "lu")
             if bev:
                 out["bev_post_failed"] += 1
                 idx["stats"]["bev_post_fail_at"] = now
                 idx["stats"]["bev_post_fail_msg"] = f"{parent}: {str(ex)[:160]}"
             log.warning("ne_ingest: NEO1 post %s%s failed (attempt %d): %s", parent,
-                        " (NEC1+NEO1)" if bev else "", n, str(ex)[:160])
+                        " (NEC1+NEO1)" if bev else (" (on view)" if has_view else ""), n, str(ex)[:160])
+    out["candidates"] = len(cands)
     idx["stats"]["umfeld_last"] = dict(out, at=_now())
     return out
 
@@ -899,7 +1012,9 @@ def status() -> dict:
         "umfeld": {k: um.get(k) for k in ("checked", "confirmed", "missing", "mismatch", "posted",
                                            "post_failed", "pending_cells", "at", "bev_checked", "bev_confirmed",
                                            "bev_declared_mismatch", "bev_posted", "bev_post_failed",
-                                           "needs_bevdirect", "day_cap_hold", "day_bytes")},
+                                           "needs_bevdirect", "day_cap_hold", "day_bytes", "obs_on_index", "on_view",
+                                           "view_posted", "view_dropped", "view_filled", "no_view", "candidates")},
+        "view_pass": (idx.get("stats") or {}).get("view_pass"),
         "post_day": (idx.get("stats") or {}).get("post_day"),
         "green_fix": _green_fix_status(idx),
         "bev_post_fail_at": (idx.get("stats") or {}).get("bev_post_fail_at"),
@@ -953,6 +1068,13 @@ def text_line(v: dict | None = None) -> str:
               f" (cap {float(_knob('ne_post_gib_per_day', POST_GIB_PER_DAY)):.1f} GiB/day, ≤2/s)")
         if um.get("day_cap_hold"):
             s += f" DAY-CAP-HOLD {um['day_cap_hold']} waiting"
+        vp = v.get("view_pass") or {}
+        if vp or um.get("obs_on_index") is not None:
+            s += (f"\n    view_pass(ne-change §4b): umfeld kgs_obs_on_index {vp.get('obs_on_index_before')}→{vp.get('obs_on_index_now')}"
+                  f" · ours: on_view_ok={um.get('on_view')} obs_on_index={um.get('obs_on_index')} no_view={um.get('no_view')}"
+                  f" · posted_on_view={vp.get('posted') or 0} (of which on-index {vp.get('reposted_on_index') or 0})"
+                  f" cells filled={vp.get('cells_filled') or 0} dropped={vp.get('cells_dropped') or 0}"
+                  f" since {vp.get('started_at')} last {vp.get('last_at')} · ?q=on+view for rows")
         if um.get("needs_bevdirect"):
             s += f" · needs_bevdirect={um['needs_bevdirect']} (lu cell-set 409, parked — reprocess on a bev-mode peer)"
         fa = v.get("bev_post_fail_at")

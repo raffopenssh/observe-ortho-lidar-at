@@ -1127,7 +1127,7 @@ def post_observed(kg: str, neo1_section: bytes, timeout: float = 120.0,
         raise NEError(f"umfeld /ne/{kg}/obs body {len(body)} B > 16 MB")
     r = requests.post(f"{_umfeld_contrib_base()}/{kg}/obs", data=body, headers=h, timeout=timeout)
     if r.status_code in (400, 409):
-        raise NEError(f"umfeld /ne/{kg}/obs {r.status_code}{' (NEC1+NEO1)' if nec1_section else ''}: {r.text[:300]}")
+        raise NEError(f"umfeld /ne/{kg}/obs {r.status_code}{' (NEC1+NEO1)' if nec1_section else ''}: {r.text[:700]}")
     r.raise_for_status()
     try:
         out = r.json()
@@ -1919,6 +1919,94 @@ def neo1_section_from_h3b(path: str | Path, green_fix: bool = True) -> bytes:
         h["source"] = OBS_SOURCE_FIXED      # umfeld's manifest shows which KGs carry the corrected export
         h.update(_gf.header_note(n_fix, hdr["cells_n"]))
     return pack_section(MAGIC_OBS, h, obs)
+
+
+# === SECTION: declared view (umfeld chunk-log view, 2026-10-27) ===
+
+def fetch_declared_view(kg: str, timeout: float = 120.0) -> "Section | None":
+    """``GET /contrib/api/v1/ne/{kg}/declared`` → the NEC1 section umfeld
+    assembles from its chunk log (``source: chunks@<state>``, header
+    ``view{state,hidden,…}``, register bytes zero).  This is the cell set a
+    bare NEO1 is validated against since 2026-10-27 (ne-change.md §4b).
+    ``None`` when the KG holds nothing (404).  ~0.2 MB per KG, never cached
+    on disk — call it only right before a POST."""
+    import requests
+    kg = str(kg).zfill(5)
+    url = f"{_umfeld_contrib_base()}/{kg}/declared"
+    last = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=_umfeld_headers(), timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(2 + 3 * attempt)
+            continue
+        if r.status_code == 404:
+            return None
+        if r.status_code in (429, 500, 502, 503, 504):
+            last = NEError(f"umfeld {kg}/declared: HTTP {r.status_code}")
+            time.sleep(5 + 10 * attempt)
+            continue
+        if r.status_code in (401, 403):
+            raise NEError(f"umfeld {kg}/declared: HTTP {r.status_code} — token refused")
+        r.raise_for_status()
+        secs = [s for s in unpack_sections(r.content) if s.magic == MAGIC_LU]
+        if not secs:
+            raise NEError(f"umfeld {kg}/declared: no NEC1 section in answer")
+        sec = secs[0]
+        sec.header.setdefault("_etag", r.headers.get("ETag"))
+        return sec
+    raise NEError(f"umfeld {kg}/declared: {last}")
+
+
+def unseen_obs_row(cid: int) -> bytes:
+    """An all-nodata NEO1 row (what the builder writes for a declared cell
+    no raster covered — ``ne_ingest.row_observed`` → False)."""
+    return OBS_REC.pack(int(cid), bytes(9), 0, 0, NODATA_U8, NODATA_U8, NODATA_U8, 0, NODATA_U8, NODATA_U8,
+                        NODATA_U8, NODATA_U8, NODATA_I8, 0, V_CONSISTENT,
+                        65535, NODATA_U8, NODATA_U8, NODATA_U8, NODATA_U8, NODATA_U8, NODATA_I8, NODATA_I8,
+                        NODATA_U8, NODATA_U8)
+
+
+def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = True) -> tuple[bytes, dict]:
+    """NEO1 section for POST /obs whose cell set is exactly *view*'s (the
+    ``/declared`` NEC1): our rows re-keyed onto the view's ids in the view's
+    order; cells the view lacks are dropped (they would 409 — superseded or
+    moved to a neighbour KG), view cells we never observed get an unseen
+    (all-nodata) row.  Returns ``(section, {cells_n, dropped, filled, digest,
+    state})``.  Header ``declared_digest/source`` name the view."""
+    hdr, obs, n_fix = neo1_rows_from_h3b(path, green_fix=green_fix)
+    n = len(obs) // OBS_REC.size
+    ob = np.frombuffer(obs, np.uint8).reshape(n, OBS_REC.size)
+    ours = ob[:, :8].copy().view("<u8").reshape(n)
+    vn = int(view.header["cells_n"])
+    vids = np.frombuffer(view.raw[:vn * LU_REC.size], np.uint8).reshape(vn, LU_REC.size)[:, :8].copy().view("<u8").reshape(vn)
+    order = np.argsort(ours, kind="stable")
+    pos = np.searchsorted(ours[order], vids)
+    pos = np.minimum(pos, max(n - 1, 0))
+    hit = (n > 0) & (ours[order][pos] == vids)
+    out = np.empty((vn, OBS_REC.size), np.uint8)
+    if n:
+        out[hit] = ob[order[pos[hit]]]
+    miss = np.flatnonzero(~hit)
+    for i in miss:
+        out[i] = np.frombuffer(unseen_obs_row(int(vids[i])), np.uint8)
+    raw = out.tobytes()
+    h = dict(algo=ALGO_OBS, epoch=hdr["neo1"]["epoch"], source=OBS_SOURCE, kg=hdr["kg"], h3_res=H3_RES,
+             cells_n=vn, groups=list(GROUPS), record=OBS_REC.format, record_bytes=OBS_REC.size,
+             fields=list(OBS_FIELDS), units=dict(OBS_UNITS), phenology=list(PHENOLOGY_CODES),
+             verdicts=list(VERDICTS), declared_digest=view.header.get("digest"),
+             declared_source=view.header.get("source"),
+             view_rekey={"dropped": int(n - int(hit.sum())), "filled": int(len(miss)),
+                         "product_cells_n": int(n), "product_declared_digest": hdr["nec1"]["digest"]})
+    if green_fix:
+        import ne_green_fix as _gf
+        h["source"] = OBS_SOURCE_FIXED
+        h.update(_gf.header_note(n_fix, n))
+    st = (view.header.get("view") or {}).get("state")
+    stats = {"cells_n": vn, "dropped": int(n - int(hit.sum())), "filled": int(len(miss)), "digest": digest_of(raw),
+             "state": st, "view_digest": view.header.get("digest"), "hidden": (view.header.get("view") or {}).get("hidden")}
+    return pack_section(MAGIC_OBS, h, raw), stats
 
 
 def neo1_fixed_digest(path: str | Path) -> tuple[str, int]:
