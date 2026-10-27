@@ -201,6 +201,8 @@ _PROTECTED_PREFIXES = (
     '/api/v1/secrets/',              # fleet_secrets lease (peer token, PEER_SCOPE)
     '/api/v1/ne/declared/',          # umfeld lu relay for bev-mode peers (director holds the umfeld token)
     '/api/v1/director/vct_reported',  # fleet-wide /contrib dedupe for split blocks
+    '/api/v1/director/sweep',         # sliver sweep: peer results (POST), status (GET) — sliver_sweep.py
+    '/api/v1/processing/sweep_spec',  # director → peer sweep units
     '/api/v1/director/mode',
     '/api/v1/director/activate',
     '/api/v1/director/stop',
@@ -6688,6 +6690,13 @@ def processing_queue_get():
                     and int(e_g.get('size') or 0) > 0
                     and not _v2c(_mf_entries, c)):
                 _v2_keep.add(c)
+    # Sliver-sweep parents (director-pushed sweep_spec.json, sliver_sweep.py)
+    # are complete by definition — the spec is what keeps them queued.
+    try:
+        import sliver_sweep as _sls
+        _v2_keep |= {c for c in codes if c in _sls.peer_specs()}
+    except Exception:
+        pass
     dirty = len(codes)
     codes = [c for c in codes if
              (c not in completed and not _parent_fully_done(c))
@@ -10664,6 +10673,86 @@ def director_vct_reported():
     return jsonify({'kg': kg, 'source': source, 'reported': rep})
 
 
+# === SECTION: sliver sweep (sliver_sweep.py, docs/sliver-sweep.md) ===
+
+@app.route('/api/v1/director/sweep/result', methods=['POST'])
+def director_sweep_result():
+    """Peer → primary: outcome of one sweep unit.  Query: ``unit``,
+    ``parent``, ``peer``, ``attempt``, ``status`` (ok|nodata|failed),
+    ``cells``, ``error``, ``seconds``; body = the unit's ``.h3b`` (status
+    ok).  Counted on inbound channel ``sweep``."""
+    import sliver_sweep as _sls
+    import inbound_budget
+    a = request.args
+    unit = str(a.get('unit') or '')
+    parent = str(a.get('parent') or (unit.split('-')[0] if unit else ''))
+    if not unit or not parent:
+        return jsonify({'error': 'unit/parent required'}), 400
+    body = request.get_data() or b''
+    if len(body) > 64 * 1024 * 1024:
+        return jsonify({'error': 'body > 64 MB'}), 413
+    inbound_budget.add('sweep', len(body))
+    try:
+        cells = int(a.get('cells') or 0) or None
+    except Exception:
+        cells = None
+    try:
+        secs = float(a.get('seconds') or 0) or None
+    except Exception:
+        secs = None
+    r = _sls.accept_result(unit, parent, str(a.get('peer') or ''), int(a.get('attempt') or 0),
+                           str(a.get('status') or 'failed'), body if body else None,
+                           cells_observed=cells, error=a.get('error') or None, seconds=secs)
+    if r.get('ok'):
+        director_event(f"sweep: {unit} {r.get('status')} cells={cells or 0} ({len(body) // 1024} KB)"
+                       + (f" — {a.get('error')}" if r.get('status') == 'failed' else '')
+                       + (f" → parent {r.get('parent_state')}" if r.get('parent_state') in ('received', 'pending') else ''),
+                       peer=str(a.get('peer') or ''), kg=parent,
+                       level='warning' if r.get('status') == 'failed' else 'info')
+        return jsonify(r)
+    return jsonify(r), 404
+
+
+@app.route('/api/v1/director/sweep', methods=['GET', 'POST'])
+def director_sweep():
+    """GET → ``sliver_sweep.status()`` (+ ``?kg=`` plan of one parent).
+    POST ``{"refresh":true}`` re-pulls umfeld's bbox_changes; ``{"reset":
+    [codes]}`` puts parents back to ``wait``; ``{"scan": N}`` scans now."""
+    import sliver_sweep as _sls
+    if request.method == 'POST':
+        body = request.get_json(silent=True) or {}
+        out = {}
+        if body.get('refresh'):
+            out['refresh'] = _sls.refresh(force=True)
+        if body.get('reset'):
+            with _sls._Locked() as st:
+                for c in body['reset']:
+                    k = st['kgs'].get(str(c))
+                    if k:
+                        k.update(state='wait', attempts=0, units=[]); k.pop('error', None)
+                        out.setdefault('reset', []).append(str(c))
+        if body.get('scan'):
+            out['scan'] = _sls.scan(max_n=int(body['scan']))
+        return jsonify(out)
+    out = _sls.status()
+    if request.args.get('kg'):
+        out['plan'] = _sls.load_state()['kgs'].get(str(request.args['kg']))
+    return jsonify(out)
+
+
+@app.route('/api/v1/processing/sweep_spec', methods=['GET', 'PUT'])
+def processing_sweep_spec():
+    """Director → peer: replace this peer's sliver-sweep units
+    (``{"specs": {parent: spec}}``, see ``sliver_sweep.spec_for``).  The
+    processor turns whitelisted parents with a spec into bbox units."""
+    import sliver_sweep as _sls
+    if request.method == 'GET':
+        return jsonify({'specs': _sls.peer_specs()})
+    body = request.get_json(force=True, silent=True) or {}
+    n = _sls.peer_store_spec(body.get('specs') or {})
+    return jsonify({'ok': True, 'parents': n})
+
+
 @app.route('/api/v1/admin/vct_pilot', methods=['GET', 'POST'])
 def admin_vct_pilot():
     """VTC pilot switch + telemetry on this peer (docs/vct-pilot.md).
@@ -11938,6 +12027,11 @@ def director_identity():
 # instance should run it. Enabled by the flag file data/austria_processor/is_director.
 def _start_director():
     time.sleep(3)  # let Flask boot first
+    if os.environ.get('SRTM_APP_IMPORT_ONLY'):
+        # CLI tools (sliver_sweep.py, ne_ingest.py …) import app for
+        # helpers such as _kg_coverage_complete — never run a second
+        # director (+ identity broadcast) from a shell.
+        return
     flag = Path('data/austria_processor/is_director')
     stepped_down = Path('data/austria_processor/stepped_down')
     if stepped_down.exists() and flag.exists():
@@ -22243,6 +22337,13 @@ def process_txt():
             out.append(_nei.text_line())
         except Exception as _e:  # noqa: BLE001
             log.debug('process.txt ne_ingest line: %s', _e)
+        # Sliver sweep (docs/sliver-sweep.md): umfeld bbox revision 2 strips
+        # → scan / dispatch / integrate / re-post progress + sweep peers.
+        try:
+            import sliver_sweep as _sls
+            out.extend(_sls.text_lines())
+        except Exception as _e:  # noqa: BLE001
+            log.debug('process.txt sweep lines: %s', _e)
         # VTC pilot (docs/vct-pilot.md): which peers, bevdirect bandwidth,
         # agreement vs umfeld, /contrib report outcomes, obs round-trip and
         # split-parent assembly for every pilot KG.

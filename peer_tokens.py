@@ -63,6 +63,7 @@ PEER_SCOPE = (
     ('/api/v1/zenodo/lock', None),
     ('/api/v1/ne/declared/', ('GET',)),
     ('/api/v1/director/vct_reported', None),
+    ('/api/v1/director/sweep/result', ('POST',)),   # sliver-sweep unit results (sliver_sweep.py)
     ('/api/v1/director/peer_status', ('POST',)),
     ('/api/v1/director/peers/add', ('POST',)),   # self-registration only (handler checks host == token owner)
     ('/api/v1/director/probe', ('GET',)),

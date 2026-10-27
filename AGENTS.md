@@ -41,7 +41,7 @@ Lines worth knowing: `products:` (per-version parent histogram, `current=v2.4`),
 `v2:` (upgrade progress, store, fast path, strikes), `v2_regen:`, `repair:`
 (`docs/product-repair.md`), `legacy:` (2.4 clean-up: suspect/cf/stripped/removed
 + `local_json:`), `ne:` / `ne_ingest:` (NE cells, `docs/ne-public-api.md`),
-`vct_pilot:` (`docs/vct-pilot.md`),
+`vct_pilot:` (`docs/vct-pilot.md`), `sweep:` (`docs/sliver-sweep.md`),
 `ne_ingest:` → `green_fix(...)` (read-time bau/alpen→gruen override on S2-green cells,
 `ne_green_fix.py`, `docs/ne-public-api.md → Green-ground override`), `chkpt_registry:` (`docs/austria-processor.md`),
 `fleet_bw:` / `bw_learn:` / `throttle:` (`docs/fleet-bandwidth.md`),
@@ -189,6 +189,7 @@ Products`, `docs/v2.4-rollout.md`.
 | **API tiers** (public `public_api.py` / `landscape_query.py`, hidden `/k` tier `api_tiers.py`, `umfeld.py` upstream token, retired-route 410s, cutover checklist) | `docs/api-tiers.md` | touching `public_api.py`, `landscape_query.py`, `public_docs.py`, `api_tiers.py`, `umfeld.py`, tokens, the exe.dev port switch |
 | **Label-mix repair** (restored-checkpoint label-id collision: flat pasture as `roof`, glued polygons; `label_mix:` line, auto-requeue, `LabelMixError` stitch guard) | `docs/label-mix.md` | touching `label_mix.py`, `_remap_restored_tile_ids`, `_assert_tile_labels_consistent`, `v2_verify.segments_label_consistency`; a KG with `geb` cells at `h_max=0` |
 | **Security model** (per-peer tokens + scopes, owner channel for the master, HA off, proxy pool removed, rotation, security events) | `docs/security-tokens.md` | touching `peer_tokens.py`, `_enforce_admin_token`, `install_token`, `director_ha.py`, `deploy.sh`, "+ Add Peer"; `/process.txt?q=security` shows events |
+| **Sliver sweep** (umfeld bbox revision 2, 2026-10-27: processing bbox pinned to `kg_bbox_r1.json`, `bbox_r2` = NE viewport only; `sliver_sweep.py` sweeps unseen edge cells in small units on a few cache-only peers, merges into `data/ne/<kg>.h3b`, re-POSTs to umfeld; `sweep:` line, `?q=sweep`) | `docs/sliver-sweep.md` | touching `sliver_sweep.py`, `_normalise_umfeld_kg`, `_parent_bbox_wgs`, `/api/v1/director/sweep*`, `/processing/sweep_spec`; a KG with nodata cells along its bbox edge |
 | Kataster purge (historical, done 2026-10-13) | `docs/kataster-purge.md` | what was deleted, what remains on purpose, golden test `tools/golden_public.py` |
 | Licensing & attribution (BEV CC BY 4.0, Copernicus, OSM ODbL) | `docs/attributions.md` | touching `attributions.py`, Zenodo metadata, GPKG metadata, adding a data source |
 | Reference algorithms summary | `docs/reference_algorithms_summary.md` | segmentation/RF internals |

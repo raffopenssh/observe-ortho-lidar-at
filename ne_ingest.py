@@ -849,6 +849,15 @@ def run_tick(max_n: int = MAX_PER_TICK) -> dict:
         except Exception as ex:  # noqa: BLE001
             log.warning("ne_ingest merge pass: %s", ex)
         try:
+            # Sliver sweep (sliver_sweep.py): refresh umfeld's bbox_changes,
+            # plan units for complete parents, merge received sweep h3bs
+            # into the parent files → confirm_umfeld below sees the new
+            # digest and re-posts.
+            import sliver_sweep as _sls
+            out["sweep"] = _sls.tick(idx, entries)
+        except Exception as ex:  # noqa: BLE001
+            log.warning("ne_ingest sweep pass: %s", ex)
+        try:
             out["umfeld"] = confirm_umfeld(idx)
         except Exception as ex:  # noqa: BLE001
             log.warning("ne_ingest umfeld confirm: %s", ex)

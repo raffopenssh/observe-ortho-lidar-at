@@ -1509,6 +1509,22 @@ KG_LIST_REFRESH_S = 24 * 3600   # local cache lifetime before a conditional GET
 KG_LIST_MIN_REFETCH_S = 3600    # never hit umfeld more often than hourly
 
 
+_FROZEN_BBOX_R1: dict | None = None
+
+
+def _frozen_bbox_r1() -> dict:
+    """``{kg_code: [w, s, e, n]}`` — the revision-1 umfeld bboxes the whole
+    product line was processed on (repo file ``kg_bbox_r1.json``)."""
+    global _FROZEN_BBOX_R1
+    if _FROZEN_BBOX_R1 is None:
+        try:
+            _FROZEN_BBOX_R1 = json.loads((Path(__file__).resolve().parent / 'kg_bbox_r1.json').read_text())['bbox']
+        except Exception as e:  # noqa: BLE001
+            log.warning("kg_bbox_r1.json unreadable (%s) — bbox pin disabled", e)
+            _FROZEN_BBOX_R1 = {}
+    return _FROZEN_BBOX_R1
+
+
 def _normalise_umfeld_kg(row: dict, prev: dict | None, state_filter=None) -> dict | None:
     """Map one ``/api/v1/kgs`` row onto the legacy kg_list.json shape
     (``bbox`` dict with min/max_lon/lat, ``lat``/``lon`` centroid). Count
@@ -1522,6 +1538,20 @@ def _normalise_umfeld_kg(row: dict, prev: dict | None, state_filter=None) -> dic
         bb = {'min_lon': bb[0], 'min_lat': bb[1], 'max_lon': bb[2], 'max_lat': bb[3]}
     elif not isinstance(bb, dict):
         bb = (prev or {}).get('bbox') or {}
+    # umfeld bbox_revision 2 (2026-10-27): ``bbox`` = old ∪ VGD envelope.
+    # The fleet's processing bbox stays PINNED to the frozen revision-1
+    # envelope (kg_bbox_r1.json): split layouts, tile grids and the
+    # coverage oracle (app._kg_coverage_complete) are all keyed on it and
+    # a silent growth would re-open thousands of complete parents.  The
+    # new envelope is kept as ``bbox_r2`` (NE declared-layer viewport,
+    # sliver_sweep units close the strip for every complete KG).
+    bb_r2 = None
+    r1 = _frozen_bbox_r1().get(code)
+    if r1 and bb:
+        cur = (bb.get('min_lon'), bb.get('min_lat'), bb.get('max_lon'), bb.get('max_lat'))
+        if any(abs(float(a) - float(b)) > 1e-7 for a, b in zip(cur, r1)):
+            bb_r2 = dict(bb)
+        bb = {'min_lon': r1[0], 'min_lat': r1[1], 'max_lon': r1[2], 'max_lat': r1[3]}
     cen = row.get('centroid')
     if isinstance(cen, (list, tuple)) and len(cen) == 2:
         lon, lat = cen
@@ -1539,6 +1569,7 @@ def _normalise_umfeld_kg(row: dict, prev: dict | None, state_filter=None) -> dic
         'district_name': row.get('district_name', ''),
         'state_name': row.get('state_name', ''),
         'bbox': bb, 'lat': lat, 'lon': lon,
+        'bbox_r2': bb_r2 or (prev or {}).get('bbox_r2'),
         'parcel_count': (prev or {}).get('parcel_count', 0),
         'building_count': (prev or {}).get('building_count', 0),
         'total_area_sqm': (prev or {}).get('total_area_sqm', 0),
@@ -2131,9 +2162,10 @@ def _kg_bbox_lookup(kg_code: str) -> dict | None:
     the director's ``kg_list.json`` → the local bevdirect-serve ``/kg/<kg>``
     (BEV VGD admin bbox) → our own public API."""
     try:
-        b = _parent_bbox_wgs(kg_code)
-        if b:
-            return {"min_lon": b[0], "min_lat": b[1], "max_lon": b[2], "max_lat": b[3]}
+        # PROCESSING bbox (pinned revision 1) — not the NE viewport.
+        for k in json.loads(KG_LIST_FILE.read_text()):
+            if str(k.get("kg_code")) == str(kg_code) and (k.get("bbox") or {}).get("min_lon") is not None:
+                return {x: float(k["bbox"][x]) for x in ("min_lon", "min_lat", "max_lon", "max_lat")}
     except Exception:
         pass
     try:
@@ -8574,7 +8606,10 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # Oct-07 75110/57010 failure).
         _ne_bbox = (full_west, full_south, full_east, full_north)
         if kg.get("_parent_kg_code"):
-            _ne_bbox = _parent_bbox_wgs(_parent_code) or _ne_bbox
+            # Sliver-sweep units carry umfeld's bbox_new for the parent
+            # (sliver_sweep.peer_units) — kg_list.json may still hold the
+            # pre-revision-2 bbox on this peer.
+            _ne_bbox = kg.get("_parent_bbox") or _parent_bbox_wgs(_parent_code) or _ne_bbox
         import ne_h3 as _neh_cad
         _cad_src = _neh_cad.cadastre_source()
         if _cad_src != "bevdirect":
@@ -8662,7 +8697,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 # ne_source=bevdirect: the declared layer above IS the pilot
                 # run (viewport + report happened in build_declared) — nothing
                 # to compare against umfeld here (lu_diff comes from /obs).
-                if _vct.enabled() and not (_ne_declared is not None and _neh.is_bev_declared(_ne_declared)):
+                if _vct.enabled() and not kg.get("_sweep") \
+                        and not (_ne_declared is not None and _neh.is_bev_declared(_ne_declared)):
                     _nec_bytes = None
                     if _ne_declared is not None:
                         try:
@@ -8676,7 +8712,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     # 75110/57010 failure (cells=0 → HTTP 400, only_umfeld≫0).
                     _vct_bbox = (full_west, full_south, full_east, full_north)
                     if kg.get("_parent_kg_code"):
-                        _pb = _parent_bbox_wgs(_parent_code)
+                        _pb = kg.get("_parent_bbox") or _parent_bbox_wgs(_parent_code)
                         if _pb is None:
                             raise RuntimeError(f"parent bbox for {_parent_code} unknown — pilot skipped for block")
                         _vct_bbox = _pb
@@ -10063,11 +10099,12 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # the v1 full GPKG we are reading from, so there is nothing new to
         # write or upload.  The light GPKG runs the boundary merge itself
         # when label_remap is None.
-        if _v2_upgrade:
+        if _v2_upgrade or kg.get("_sweep"):
             _boundary_remap = None
             full_gpkg = None
             _light_size = 0
-            _report_step("gpkg_full", "skipped (v2 upgrade — rasters unchanged)")
+            _report_step("gpkg_full", "skipped (v2 upgrade — rasters unchanged)" if _v2_upgrade
+                         else "skipped (sliver sweep — NE cells only)")
         else:
             # --- 5. Build full GPKG ---
             result["step"] = "gpkg_full"
@@ -10446,6 +10483,19 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                                 "seconds": _ne_out.get("seconds")}
             elif _ne_out.get("error"):
                 result["ne_status"] = "error:" + _ne_out["error"]
+        if kg.get("_sweep"):
+            # Sliver-sweep unit (sliver_sweep.py): the NE h3b IS the product.
+            # No JSON, no verify, no Zenodo — the parent process ships the
+            # h3b to the director (sliver_sweep.peer_report), which merges
+            # it into the parent's corpus file and re-posts to umfeld.
+            try:
+                os.unlink(light_gpkg)
+            except OSError:
+                pass
+            result["files"][_light_key] = ""
+            if not result["files"].get(NE_PRODUCT_KEY):
+                raise RuntimeError("sweep unit produced no NE h3b: " + str(result.get("ne_status") or "unknown"))
+            raise _SweepFinished()
 
         # --- 6b. Validate light GPKG ---
         _light_size = os.path.getsize(light_gpkg) if os.path.exists(light_gpkg) else 0
@@ -10764,6 +10814,12 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         except Exception as _pwe:
             log.debug("Frontier cell pre-warm at KG end: %s", _pwe)
 
+    except _SweepFinished:
+        result["success"] = True
+        result["step"] = "done"
+        _clear_tile_checkpoints()
+        log.info("KG %s: sliver-sweep unit done — %s cells observed",
+                 kg_code, (result.get("ne") or {}).get("cells_observed"))
     except Exception as e:
         result["error"] = str(e)
         result["traceback"] = traceback.format_exc()
@@ -11919,6 +11975,11 @@ def _v2_free_gb() -> float:
     return _sh.disk_usage("/").free / (1024 ** 3)
 
 
+class _SweepFinished(Exception):
+    """Raised inside process_one_kg once a sliver-sweep unit has its NE h3b
+    (skips GPKG validation / JSON / verify / upload)."""
+
+
 def _parent_bbox_wgs(parent_code: str):
     """(W, S, E, N) of a PARENT KG from the cached kg_list.json (no network);
     None when unknown.  Used where a split block must act for its parent
@@ -11926,7 +11987,10 @@ def _parent_bbox_wgs(parent_code: str):
     try:
         for k in json.loads(KG_LIST_FILE.read_text()):
             if str(k.get("kg_code")) == str(parent_code):
-                b = k.get("bbox") or {}
+                # bbox_r2 (umfeld revision 2, VGD envelope) when known: the
+                # declared layer must cover the whole KG polygon; the
+                # processing bbox stays the pinned revision-1 one.
+                b = k.get("bbox_r2") or k.get("bbox") or {}
                 return (float(b["min_lon"]), float(b["min_lat"]), float(b["max_lon"]), float(b["max_lat"]))
     except Exception as e:  # noqa: BLE001
         log.debug("parent bbox %s: %s", parent_code, e)
@@ -13711,6 +13775,24 @@ def main():
     # upgraded regardless of the whitelist.
     _v2_units = []
     _kg_index = {k["kg_code"]: k for k in kgs}
+    # --- sliver-sweep units (sliver_sweep.py) ---
+    # Whitelisted parents with a director-pushed sweep spec become small
+    # bbox units at the HEAD of pending: the parent is complete, only its
+    # bbox_new − bbox_old strip is rasterised, and the NE h3b goes back
+    # to the director instead of Zenodo.
+    try:
+        import sliver_sweep as _sls
+        _sw_units = _sls.peer_units(list(_read_retry_queue()), _kg_index)
+    except Exception as _swe:  # noqa: BLE001
+        log.warning("sliver sweep: unit build failed (ignored): %s", _swe)
+        _sw_units = []
+    if _sw_units:
+        _pend_codes = {k["kg_code"] for k in pending}
+        _sw_units = [u for u in _sw_units if u["kg_code"] not in _pend_codes]
+        pending = _sw_units + pending
+        log.info("sliver sweep: %d unit(s) for %d parent(s) at the head of pending: %s",
+                 len(_sw_units), len({u['_parent_kg_code'] for u in _sw_units}),
+                 [u["kg_code"] for u in _sw_units[:10]])
     if v2_upgrade:
         if args.kg:
             _v2_codes = [args.kg]
@@ -13779,6 +13861,7 @@ def main():
     # Track which retry-queue KG codes we've already injected into pending,
     # so we only pick up *new* additions from the file each iteration.
     _known_queue_codes: set[str] = set(priority_codes)
+    _sweep_ran: dict = {u["_parent_kg_code"]: int(u.get("_sweep_attempt") or 0) for u in _sw_units}
 
     i = 0
     while i < len(pending):
@@ -14383,6 +14466,31 @@ def main():
                                      f"{V2_UPGRADE_MAX_STRIKES}) — {str(result.get('error', ''))[:160]}",
                                      kg_code)
 
+            if kg.get("_sweep"):
+                # Sliver-sweep unit: the outcome (ok / nodata / failed + the
+                # h3b) goes to the director — never Zenodo, never the retry
+                # queue / strikes / completed set.  The director re-dispatches
+                # failed units itself (sliver_sweep.MAX_ATTEMPTS).
+                try:
+                    import sliver_sweep as _sls
+                    _rep = _sls.peer_report(kg, result, seconds=time.time() - t_kg)
+                except Exception as _swe:  # noqa: BLE001
+                    _rep = {"ok": False, "status": "failed", "error": str(_swe)[:120]}
+                _st = _rep.get("status")
+                _cells = ((result or {}).get("ne") or {}).get("cells_observed")
+                progress.add_log("info" if _rep.get("ok") and _st != "failed" else "warning",
+                                 f"sweep: {kg_code} {_st} cells={_cells} "
+                                 f"{'→ director' if _rep.get('ok') else 'report FAILED ' + str(_rep.get('error'))[:100]}"
+                                 + (f" — {str((result or {}).get('error'))[:120]}" if _st == 'failed' and result else ''),
+                                 kg_code)
+                progress.update(sweep_units=int(progress.get().get("sweep_units") or 0) + 1)
+                for _f in ((result or {}).get("files") or {}).values():
+                    try:
+                        if _f and os.path.exists(_f):
+                            os.unlink(_f)
+                    except OSError:
+                        pass
+                result = None            # fall through the chain as a no-op
             if result is None:
                 # All retries exhausted or permanent failure — already logged
                 pass
@@ -15189,6 +15297,35 @@ def main():
         # detect new entries added by the API while the processor runs.
         _insert_offset = 0
         _rq_manifest = None
+        # --- sliver-sweep specs (director push): a parent whose spec is new
+        # or carries a higher attempt than the one we ran → inject its units
+        # right after the current KG (sliver_sweep.peer_units).
+        try:
+            import sliver_sweep as _sls
+            _sw_specs = _sls.peer_specs()
+        except Exception:  # noqa: BLE001
+            _sw_specs = {}
+        for rq_code in _read_retry_queue():
+            _sp = _sw_specs.get(str(rq_code))
+            if not _sp:
+                continue
+            _att = int(_sp.get("attempt") or 0)
+            if _sweep_ran.get(rq_code, -1) >= _att \
+                    or any(p.get("_parent_kg_code") == rq_code and p.get("_sweep") for p in pending[i + 1:]) \
+                    or (kg.get("_sweep") and kg.get("_parent_kg_code") == rq_code):
+                continue
+            try:
+                _sw = _sls.peer_units([rq_code], _kg_index)
+            except Exception as _swe:  # noqa: BLE001
+                log.debug("sweep unit injection %s: %s", rq_code, _swe)
+                _sw = []
+            _sweep_ran[rq_code] = _att
+            for _u in _sw:
+                pending.insert(i + 1 + _insert_offset, _u)
+                _insert_offset += 1
+            if _sw:
+                log.info("\u21bb sweep: %d unit(s) of %s (attempt %d) injected mid-run", len(_sw), rq_code, _att)
+            _known_queue_codes.add(rq_code)
         for rq_code in _read_retry_queue():
             if rq_code in _known_queue_codes:
                 continue  # already injected this one

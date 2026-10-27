@@ -237,6 +237,9 @@ DIRECTOR_KNOBS = {
     # NE layer is built locally from the BEV vector tiles (per-peer
     # ``ne_source=bevdirect``; NEO1 posted as NEC1+NEO1 to umfeld /obs).
     'vct_bev_peers': list,
+    # Sliver sweep (docs/sliver-sweep.md): on/off, how many cache-only
+    # workers sweep, parents per worker, umfeld bbox_changes min_delta.
+    'sliver_sweep': bool, 'sweep_peers': int, 'sweep_per_peer': int, 'sweep_min_delta': float,
     # Gradual ramp (docs/vct-pilot.md → Ramp): every 24h/N the director
     # moves ONE more eligible peer into vct_bev_peers (health-gated,
     # sticky) until the whole fleet builds its declared layer locally.
@@ -2628,6 +2631,15 @@ def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
     except Exception as e:
         log.warning('Queue sync to %s failed: %s', peer_url, e)
         return {'error': str(e)}
+
+
+def _push_sweep_spec(peer_url: str, specs: dict) -> dict:
+    """Director → peer: replace the peer's sliver-sweep unit specs
+    (``sliver_sweep.spec_for`` per parent).  Tiny JSON."""
+    r = requests.put(f"{peer_url.rstrip('/')}/api/v1/processing/sweep_spec",
+                     json={'specs': specs}, headers=_admin_headers(), timeout=20)
+    r.raise_for_status()
+    return r.json()
 
 
 def _push_queue_to_peer(peer_url: str, codes: list) -> dict:
@@ -14080,6 +14092,34 @@ class PeerDirector:
                          'their prior owners (stride wanted to reshuffle)',
                          stolen)
             slices = fixed
+
+        # --- Sliver sweep (sliver_sweep.py, docs/sliver-sweep.md): a few
+        # of the cache-only workers (knob ``sweep_peers``) get the pending
+        # sweep parents at the HEAD of their slice; the unit spec goes to
+        # the peer first (PUT /processing/sweep_spec) so the queue push
+        # that follows turns the parents into bbox units instead of KGs.
+        try:
+            import sliver_sweep as _sls
+            _sw = _sls.assign(all_workers, in_progress=in_progress)
+            for _pid, _specs in _sw.items():
+                _pp = get_peer_by_id(cfg, _pid)
+                if not _pp:
+                    continue
+                try:
+                    _push_sweep_spec(_pp['url'], _specs)
+                except Exception as _e:  # noqa: BLE001
+                    log.warning('sweep spec push to %s failed: %s', _pid, _e)
+                    continue
+                _codes = list(_specs.keys())
+                slices[_pid] = _codes + [c for c in slices.get(_pid, []) if c not in _codes]
+                _new = [c for c in _codes if c not in (self.state.get('sweep_pushed') or {}).get(_pid, [])]
+                if _new:
+                    _emit_director_event(f"sweep: {_pid} ← {len(_codes)} parent(s) "
+                                         f"({', '.join(_new[:4])}{'…' if len(_new) > 4 else ''})", peer=_pid)
+            with self._lock:
+                self.state['sweep_pushed'] = {pid: list(sp.keys()) for pid, sp in _sw.items()}
+        except Exception as _e:  # noqa: BLE001
+            log.warning('sliver sweep assign failed: %s', _e)
 
         # Start new peers with their slice.
         for p in to_start:
