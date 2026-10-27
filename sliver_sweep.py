@@ -460,6 +460,28 @@ def assign(workers: list[str], in_progress: set | None = None) -> dict:
     return out
 
 
+def release(peer_id: str, reason: str = "") -> int:
+    """Hand a peer's dispatched parents back to ``pending`` without counting
+    an attempt (the spec never reached the peer — e.g. the peer's app is
+    still on a pre-sweep commit and answers 405 on ``/processing/sweep_spec``).
+    Returns the number of parents released."""
+    n = 0
+    with _Locked() as st:
+        for code, k in st["kgs"].items():
+            if k.get("state") == "dispatched" and k.get("peer") == peer_id:
+                k["state"] = "pending"
+                for u in k.get("units") or []:
+                    if u.get("state") == "dispatched":
+                        u["state"] = "pending"
+                if reason:
+                    k["error"] = reason
+                n += 1
+        peers = st.get("peers") or {}
+        if peer_id in peers:
+            peers[peer_id] = {"codes": [], "ts": time.time()}
+    return n
+
+
 # === SECTION: results (primary) ===
 
 def accept_result(unit: str, parent: str, peer: str, attempt: int, status: str,

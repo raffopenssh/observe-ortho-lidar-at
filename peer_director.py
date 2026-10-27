@@ -66,31 +66,47 @@ except Exception:
 # push to origin/main and peers already auto-pulled past us.
 _PEER_COMMIT_AHEAD_CACHE: dict[str, bool] = {}
 
-def _peer_commit_is_ahead_or_equal(peer_commit: str) -> bool:
-    """True iff *peer_commit* contains _LOCAL_GIT_COMMIT in its history.
-
-    Cached; resolved via ``git merge-base --is-ancestor LOCAL PEER``.
-    Returns False on any git error (peer commit unknown locally, etc.).
-    """
-    if not peer_commit or _LOCAL_GIT_COMMIT in ('', 'unknown'):
+def _peer_commit_contains(base: str, peer_commit: str) -> bool:
+    """True iff *peer_commit* has *base* in its history (or equals it).
+    Cached per (base, peer); ``git merge-base --is-ancestor BASE PEER``.
+    False on any git error (peer commit unknown locally, etc.)."""
+    if not peer_commit or not base or base == 'unknown':
         return False
-    if peer_commit == _LOCAL_GIT_COMMIT:
+    if peer_commit == base or peer_commit.startswith(base) or base.startswith(peer_commit):
         return True
-    cached = _PEER_COMMIT_AHEAD_CACHE.get(peer_commit)
+    key = f'{base}:{peer_commit}'
+    cached = _PEER_COMMIT_AHEAD_CACHE.get(key)
     if cached is not None:
         return cached
     try:
         rc = subprocess.call(
-            ['git', 'merge-base', '--is-ancestor',
-             _LOCAL_GIT_COMMIT, peer_commit],
+            ['git', 'merge-base', '--is-ancestor', base, peer_commit],
             cwd=str(Path(__file__).parent),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         result = (rc == 0)
     except Exception:
         result = False
-    _PEER_COMMIT_AHEAD_CACHE[peer_commit] = result
+    _PEER_COMMIT_AHEAD_CACHE[key] = result
     return result
+
+
+def _peer_commit_is_ahead_or_equal(peer_commit: str) -> bool:
+    """True iff *peer_commit* contains _LOCAL_GIT_COMMIT in its history."""
+    return _peer_commit_contains(_LOCAL_GIT_COMMIT, peer_commit)
+
+
+# First commit whose app.py / austria_processor.py understand the sliver
+# sweep (``PUT /processing/sweep_spec`` + ``sliver_sweep.peer_units``).
+# Peers below it answer 405 to the spec push and would never report a
+# unit — ``_orchestrate_cache_only`` only offers sweep work to peers at
+# or past this commit (docs/sliver-sweep.md).
+SWEEP_MIN_COMMIT = 'c3e4405'
+
+
+def _peer_sweep_capable(ps: dict | None) -> bool:
+    commit = ((ps or {}).get('git_commit') or '').strip()[:7]
+    return bool(commit) and _peer_commit_contains(SWEEP_MIN_COMMIT, commit)
 
 DATA_DIR = Path('data/austria_processor')
 PEERS_CONFIG = DATA_DIR / 'peers.json'
@@ -14100,7 +14116,14 @@ class PeerDirector:
         # that follows turns the parents into bbox units instead of KGs.
         try:
             import sliver_sweep as _sls
-            _sw = _sls.assign(all_workers, in_progress=in_progress)
+            # Only peers whose running code knows the sweep protocol
+            # (SWEEP_MIN_COMMIT): the rollout is graceful, so for hours
+            # after a deploy most cache-only peers still run the old
+            # commit and would 405 the spec push / never report.
+            _cap_status = {c['peer']['id']: c.get('status') for c in candidates}
+            _sweep_workers = [w for w in all_workers
+                              if _peer_sweep_capable(_cap_status.get(w))]
+            _sw = _sls.assign(_sweep_workers, in_progress=in_progress)
             for _pid, _specs in _sw.items():
                 _pp = get_peer_by_id(cfg, _pid)
                 if not _pp:
@@ -14109,6 +14132,10 @@ class PeerDirector:
                     _push_sweep_spec(_pp['url'], _specs)
                 except Exception as _e:  # noqa: BLE001
                     log.warning('sweep spec push to %s failed: %s', _pid, _e)
+                    try:
+                        _sls.release(_pid, f'spec push failed: {str(_e)[:80]}')
+                    except Exception:  # noqa: BLE001
+                        pass
                     continue
                 _codes = list(_specs.keys())
                 slices[_pid] = _codes + [c for c in slices.get(_pid, []) if c not in _codes]
