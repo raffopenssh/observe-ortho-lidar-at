@@ -536,7 +536,13 @@ def accept_result(unit: str, parent: str, peer: str, attempt: int, status: str,
             return {"error": "unknown parent", "parent": parent}
         u = next((x for x in k.get("units") or [] if x.get("id") == unit), None)
         if u is None:
-            return {"error": "unknown unit", "unit": unit}
+            # The parent was re-planned (``reset`` / bbox moved again) while
+            # the peer was still mid-unit on the old plan: discard quietly —
+            # the re-scan dispatches fresh units; a 404 would only make the
+            # peer log a FAILED report for work nobody is waiting for.
+            st["stats"]["stale"] = int(st["stats"].get("stale") or 0) + 1
+            return {"ok": True, "unit": unit, "status": status, "stale": True,
+                    "parent_state": k.get("state")}
         if status == "ok":
             if not body:
                 status, error = "failed", "ok without body"
