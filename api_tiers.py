@@ -51,8 +51,8 @@ _PWD_CACHE = {'t': 0.0, 'v': ''}
 
 def process_txt_pwd_ok(req) -> bool:
     """True iff the request is ``GET /k/process.txt`` carrying the right ``pwd``."""
-    if req.method != 'GET' or req.path != PRIVATE_PREFIX + '/process.txt':
-        return False
+    if req.method != 'GET' or req.path not in ('/process.txt', PRIVATE_PREFIX + '/process.txt'):
+        return False   # app.py sees the path with /k already stripped
     now = time.time()
     if now - _PWD_CACHE['t'] > 5:
         try:
