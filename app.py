@@ -489,6 +489,8 @@ def _enforce_private_only():
     tok = _tiers.request_token(request)
     if _tiers.token_valid(tok):
         return None
+    if not on_peer and _tiers.process_txt_pwd_ok(request):
+        return None                       # /k/process.txt?pwd= stop-gap (api_tiers)
     if on_peer:
         return _peer_gate_response()
     return jsonify({'error': 'not_found', 'docs': _tiers.PUBLIC_BASE + '/api/v1/docs/llm.txt'}), 404
