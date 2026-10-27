@@ -246,6 +246,8 @@ DIRECTOR_KNOBS = {
     'v2_upgrade': bool, 'ne_source': str, 'v2_ingest_mb_per_h': float,
     'ne_ingest_mb_per_h': float, 'ne_ingest_enabled': bool, 'v2_upgrade_fill_below_ready': int,
     'ne_require_built': bool, 'v24_first': bool,
+    # umfeld /obs re-post pacing (ne_ingest.confirm_umfeld): posts per 5-min tick, GiB/day (token limit 4)
+    'ne_post_max_per_tick': int, 'ne_post_gib_per_day': float, 'ne_green_fix': bool,
     # VTC pilot (docs/vct-pilot.md): explicit peer ids + how many frontier
     # peers the director may auto-enrol (0 = manual only).
     'vct_pilot_peers': list, 'vct_pilot_auto': int,
