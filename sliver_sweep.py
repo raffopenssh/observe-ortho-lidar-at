@@ -260,6 +260,54 @@ def _units_for(ll: np.ndarray, bbox_old: list, parent: str) -> list[dict]:
     return units
 
 
+def _nec1_source(parent: str, idx: dict | None) -> str:
+    try:
+        import ne_ingest
+        if idx is None:
+            idx = ne_ingest.load_index_ro()
+        src, _d = ne_ingest._declared_of(parent, idx)
+        return str(src or "")
+    except Exception:
+        return ""
+
+
+MIN_SLIVER_DEG = 2e-5     # ~2 m: thinner umfeld sliver rects cannot hold a cell centroid
+
+
+def _sliver_units(k: dict, parent: str, have: list[dict]) -> list[dict]:
+    """Units from umfeld's sliver rects (bbox_new − bbox_old).  Used when the
+    parent's declared layer was built by bevdirect on the OLD viewport: the
+    strip's cells are then absent from our file altogether (not merely
+    unseen), so the precise unseen-cell scan cannot see them.  The unit's
+    NEC1 build on bbox_new brings them in; the merge re-keys the parent
+    onto the larger cell set."""
+    w, s, e, n = [float(x) for x in k["bbox_old"]]
+    lat0 = (s + n) / 2
+    m_lat = 1 / 111_000.0
+    m_lon = 1 / (111_000.0 * max(0.2, np.cos(np.radians(lat0))))
+    pad_lat = (PAD_M + CELL_R_M) * m_lat
+    pad_lon = (PAD_M + CELL_R_M) * m_lon
+    out = []
+    for r in k.get("slivers") or []:
+        try:
+            rw, rs, re_, rn = [float(x) for x in r]
+        except Exception:
+            continue
+        if re_ - rw < MIN_SLIVER_DEG or rn - rs < MIN_SLIVER_DEG:
+            continue
+        cx, cy = (rw + re_) / 2, (rs + rn) / 2
+        side = "W" if cx < w else "E" if cx > e else "S" if cy < s else "N"
+        bb = [round(rw - pad_lon, 6), round(rs - pad_lat, 6), round(re_ + pad_lon, 6), round(rn + pad_lat, 6)]
+        if any(h["bbox"][0] <= bb[0] and h["bbox"][1] <= bb[1] and h["bbox"][2] >= bb[2] and h["bbox"][3] >= bb[3]
+               for h in have):
+            continue   # already enclosed by a precise unit
+        out.append({"side": side, "cells": None, "bbox": bb, "sliver": True})
+    out.sort(key=lambda u: (u["side"], u["bbox"][1], u["bbox"][0]))
+    for i, u in enumerate(out, len(have) + 1):
+        u.update(id=f"{parent}-sw{i}", state="pending", attempts=0)
+    return out
+
+
 def _file_digest(parent: str, idx: dict | None) -> str | None:
     """NEO1 digest of the parent's h3b per the ingest index (cheap)."""
     try:
@@ -305,11 +353,25 @@ def scan(max_n: int = SCAN_PER_TICK, entries: dict | None = None, idx: dict | No
             k.update(scanned_at=_now(), scan_digest=_file_digest(code, idx), cells_n=int(n),
                      unseen_out=int(len(un)))
             out["scanned"] += 1
-            if not len(un):
+            units = _units_for(ll, k["bbox_old"], code) if len(un) else []
+            src = _nec1_source(code, idx)
+            k["nec1_source"] = src
+            if not src.startswith("index-"):
+                # bevdirect (or unknown) declared layer = clipped to the old
+                # viewport → strip cells are missing, not unseen: sweep the
+                # umfeld sliver rects; precise units they enclose are dropped.
+                sl = _sliver_units(k, code, [])
+                def _encl(u):
+                    return any(h["bbox"][0] <= u["bbox"][0] and h["bbox"][1] <= u["bbox"][1]
+                               and h["bbox"][2] >= u["bbox"][2] and h["bbox"][3] >= u["bbox"][3] for h in sl)
+                units = sl + [u for u in units if not _encl(u)]
+                for i, u in enumerate(units, 1):
+                    u["id"] = f"{code}-sw{i}"
+            if not units:
                 k.update(state="clean", units=[])
                 out["clean"] += 1
             else:
-                k["units"] = _units_for(ll, k["bbox_old"], code)
+                k["units"] = units
                 k.update(state="pending", attempts=0)
                 out["pending"] += 1; out["cells"] += int(len(un))
             if time.time() - t0 > 40:
@@ -378,7 +440,7 @@ def assign(workers: list[str], in_progress: set | None = None) -> dict:
                         u["state"] = "pending"
         pending = sorted((c for c, k in kgs.items() if k.get("state") == "pending" and c not in in_progress
                           and any(_unit_open(u) for u in k.get("units") or [])),
-                         key=lambda c: (-int(kgs[c].get("unseen_out") or 0), c))
+                         key=lambda c: (-int(kgs[c].get("priority") or 0), -int(kgs[c].get("unseen_out") or 0), c))
         out: dict = {}
         peers_state = {}
         for pid in chosen:
