@@ -2064,7 +2064,7 @@ def fetch_cadastre_data(kg_code: str) -> dict:
 _CADASTRE_BEV_ATTEMPTS = 2
 
 
-def fetch_cadastre_data_bevdirect(kg_code: str, bbox_wgs: tuple) -> dict:
+def fetch_cadastre_data_bevdirect(kg_code: str, bbox_wgs: tuple, cadastre_only: bool = False) -> dict:
     """bev mode (``ne_h3.cadastre_source() == 'bevdirect'``): the pipeline's
     parcels + footprints from the public BEV vector tiles — the SAME one
     viewport grid ``vct_pilot.build_declared`` turns into the parent's NEC1
@@ -2085,6 +2085,10 @@ def fetch_cadastre_data_bevdirect(kg_code: str, bbox_wgs: tuple) -> dict:
     The data arrives over a pipe from the helper subprocess and lives only
     in this process (never a file).  Transient failure → ``_fetch_failed``
     (the KG is deferred, exactly like the umfeld path).
+
+    ``cadastre_only`` (sliver-sweep units): viewport fetch for *bbox_wgs*
+    only (``vct_pilot.fetch_cadastre_only``) — no parent-wide NEC1 build
+    (that was ~590 s of a ~1 100 s unit on 57306, Oct 2026), no report.
     """
     import vct_pilot as _vct
     result = {"parcels": [], "building_footprints": [], "landuse": [],
@@ -2095,7 +2099,10 @@ def fetch_cadastre_data_bevdirect(kg_code: str, bbox_wgs: tuple) -> dict:
     for attempt in range(1, _CADASTRE_BEV_ATTEMPTS + 1):
         box_ = {}
         try:
-            _vct.build_declared(kg_code, bbox_wgs, cadastre=box_)
+            if cadastre_only:
+                _vct.fetch_cadastre_only(kg_code, bbox_wgs, box_)
+            else:
+                _vct.build_declared(kg_code, bbox_wgs, cadastre=box_)
         except _vct.DeclaredDeficient as e:
             log.info("KG %s: %s (cadastre itself is complete)", kg_code, e)
         except Exception as e:  # noqa: BLE001
@@ -5460,8 +5467,12 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                            cadastre_data, new_buildings, infrastructure,
                            obs_year=0, mark_uncertain=False, label_remap=None,
                            outline_profiler=None, out_path=None, v21_out=None,
-                           report_step=None, ne_declared=None):
+                           report_step=None, ne_declared=None, sweep_only=False):
     """Light GPKG: stitched segment rasters + v2.1 layers (+ NE cells, v2.4).
+
+    ``sweep_only`` (sliver-sweep units): stop right after the NE h3b is
+    written — no tree crowns, no rasters / vectors / terrain_coarse /
+    apex layers, no parcel enrichment (the GPKG is never kept).
 
     v2.4: no cadastre vectors are written any more (``CADASTRE_PRODUCTS``).
     ``ne_declared`` (``ne_h3.Section``, NEC1 of the parent KG) switches on
@@ -5680,7 +5691,8 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                 _v21_apex_rows = _v21.build_tree_apices(
                     seg_height_full, full_tf, seg_type_full, labels_full, all_objects,
                     tile_seg_results, _bg, det_info=_di, grid25=_g25,
-                    crowns_out=_v21_crowns, canopy_counts_out=_v21_canopy_counts)
+                    crowns_out=None if sweep_only else _v21_crowns,
+                    canopy_counts_out=_v21_canopy_counts)
                 if _lc25 and _v21_canopy_counts and _v21_canopy_counts[0] is not None:
                     _v21.attach_canopy_frac(_lc25, _v21_canopy_counts[0])
                 v21_out["n_apices"] = len(_v21_apex_rows)
@@ -5734,6 +5746,8 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                 except Exception as _e:  # noqa: BLE001
                     log.warning("  v2.4 NE cells build failed: %s", _e, exc_info=True)
                     v21_out["ne"] = {"error": str(_e)[:200]}
+            if sweep_only:
+                return out_path
 
         # Write stitched segment rasters
         _write_raster('segment_type', [seg_type_full], full_h, full_w, full_tf,
@@ -7571,6 +7585,32 @@ def _compute_tile_grid(west, south, east, north, tile_km=1.5, overlap_km=0.1):
     return tiles
 
 
+def _compute_tile_grid_clipped(west, south, east, north, tile_km=1.5, overlap_km=0.1):
+    """Like :func:`_compute_tile_grid` but the tiles never leave the bbox:
+    each axis is split into ``ceil(len / tile_km)`` equal tiles (≤ tile_km
+    + overlap), neighbours overlapping by *overlap_km*.  Sliver-sweep units
+    only (their bbox carries its own padding); the regular grid's overshoot
+    stays for KGs (tile geometry feeds checkpoints / split layouts)."""
+    import math
+    cos_lat = np.cos(np.radians((south + north) / 2))
+    m_lon = 1.0 / (111.0 * cos_lat)        # deg per km
+    m_lat = 1.0 / 111.0
+    len_x = max((east - west) / m_lon, 1e-6)
+    len_y = max((north - south) / m_lat, 1e-6)
+    nx = max(1, int(math.ceil(len_x / tile_km)))
+    ny = max(1, int(math.ceil(len_y / tile_km)))
+    sx, sy = len_x / nx, len_y / ny
+    tiles = []
+    for j in range(ny):
+        s = south + j * sy * m_lat
+        n = min(north, south + ((j + 1) * sy + overlap_km) * m_lat)
+        for i in range(nx):
+            w = west + i * sx * m_lon
+            e = min(east, west + ((i + 1) * sx + overlap_km) * m_lon)
+            tiles.append((w, s, e, n))
+    return tiles
+
+
 def _merge_terrain_stats(stats_list: list[tuple[dict, int]]) -> dict:
     """Merge terrain stats from multiple tiles.
 
@@ -8640,8 +8680,17 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             # bev mode: parcels + footprints from the parent's ONE viewport
             # grid (the same run that builds the NEC1 below; blocks use the
             # parent bbox) — umfeld's /k tier is never called from a peer.
-            _report_step("cadastre", f"bevdirect viewport {_parent_code}")
-            cadastre_data = fetch_cadastre_data_bevdirect(_parent_code, _ne_bbox)
+            if kg.get("_sweep"):
+                # Sliver-sweep unit: parcels/footprints for the UNIT bbox only
+                # (model context + footprint mask) — the parent-wide NEC1
+                # build is skipped; the declared set is umfeld's lu via the
+                # director relay below (docs/sliver-sweep.md → Fast path).
+                _report_step("cadastre", f"bevdirect viewport (unit) {_parent_code}")
+                cadastre_data = fetch_cadastre_data_bevdirect(
+                    _parent_code, (full_west, full_south, full_east, full_north), cadastre_only=True)
+            else:
+                _report_step("cadastre", f"bevdirect viewport {_parent_code}")
+                cadastre_data = fetch_cadastre_data_bevdirect(_parent_code, _ne_bbox)
         else:
             cadastre_data = {"parcels": [], "building_footprints": [], "landuse": [],
                              "parcels_geojson": [], "buildings_geojson": [],
@@ -8667,6 +8716,15 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 if _nep and os.path.exists(_nep):
                     _secs = [x for x in _neh.unpack_sections(open(_nep, "rb").read()) if x.magic == _neh.MAGIC_LU]
                     _ne_declared = _secs[0] if _secs else None
+                if _ne_declared is None and kg.get("_sweep"):
+                    # umfeld's lu via the director relay (cached there): the
+                    # cell set the sweep scan diffed against — no parent-wide
+                    # bevdirect build for a few km² unit.  Failure → normal path.
+                    try:
+                        _ne_declared = _neh.fetch_declared_director(_parent_code)
+                    except Exception as _ce:  # noqa: BLE001
+                        log.warning("KG %s: lu NEC1 relay for %s failed (%s) — regular declared fetch",
+                                    kg_code, _parent_code, str(_ce)[:120])
                 if _ne_declared is None:
                     _ne_declared = _neh.fetch_declared(_parent_code, _ne_bbox, code=kg_code)
                 _ne_status = "ok"
@@ -8928,9 +8986,18 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
 
         # --- 2. Compute tile grid ---
         tile_km = max_km if max_km is not None else MAX_KG_AREA_KM
-        base_tiles_wgs = _compute_tile_grid(
-            full_west, full_south, full_east, full_north,
-            tile_km=tile_km, overlap_km=0.1)
+        if kg.get("_sweep"):
+            # Sliver-sweep unit: the bbox is already padded (sliver_sweep.PAD_M)
+            # — equal-split tiles that END at the bbox instead of 1.5 km
+            # squares overshooting it (a 0.3×1.7 km strip was 2×2.25 km² of
+            # segmentation for 0.3 km² of cells, Oct 2026).
+            base_tiles_wgs = _compute_tile_grid_clipped(
+                full_west, full_south, full_east, full_north,
+                tile_km=tile_km, overlap_km=0.1)
+        else:
+            base_tiles_wgs = _compute_tile_grid(
+                full_west, full_south, full_east, full_north,
+                tile_km=tile_km, overlap_km=0.1)
 
         tiles_wgs = base_tiles_wgs
         n_tiles = len(tiles_wgs)
@@ -10470,7 +10537,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             obs_year=obs_year, mark_uncertain=mark_uncertain,
             label_remap=_boundary_remap, outline_profiler=_outline_prof,
             out_path=(GPKG_DIR / f"{kg_code}_light_v2.gpkg") if _is_v2 else None,
-            v21_out=_v21_extras, report_step=_report_step, ne_declared=_ne_declared)
+            v21_out=_v21_extras, report_step=_report_step, ne_declared=_ne_declared,
+            sweep_only=bool(kg.get("_sweep")))
         result["files"][_light_key] = light_gpkg
         if _v21_extras:
             result["v21"] = {k: v for k, v in _v21_extras.items()

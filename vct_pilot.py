@@ -1303,6 +1303,21 @@ def build_declared(kg: str, bbox: tuple, cadastre: dict | None = None, is_block:
     return fp.read_bytes()
 
 
+def fetch_cadastre_only(kg: str, bbox: tuple, cadastre: dict) -> None:
+    """bev-mode cadastre (parcels of *kg* + every footprint) for an arbitrary
+    *bbox* — the helper's ``--cadastre-only`` mode: viewport fetch (warm
+    cells from the local bevdirect-serve), no NEC1 build, no report.  Used
+    by sliver-sweep units (``austria_processor.fetch_cadastre_data_bevdirect
+    (cadastre_only=True)``): a unit covers a few km² of one parent, so the
+    parent-wide build (10+ min on a 500 k-cell parent, Oct 2026) is pure
+    overhead — the NEC1 comes from the director's lu relay instead."""
+    kg = str(kg).zfill(5)
+    row = _run_helper(kg, bbox, None, ["--cadastre-only"], cadastre=cadastre)
+    _log_row(row)
+    if not row.get("ok"):
+        raise RuntimeError(f"vct cadastre fetch failed: {row.get('error') or 'helper failed'}")
+
+
 def run_async(kg: str, bbox: tuple, umfeld_nec1: bytes | None, *, on_done=None,
               is_block: bool = False) -> threading.Thread | None:
     """Processor hook: launch the helper subprocess in a thread (non-daemon so

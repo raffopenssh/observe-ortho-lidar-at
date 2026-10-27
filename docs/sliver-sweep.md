@@ -76,6 +76,34 @@ coverage resolves as `nodata` (never a failure, never re-dispatched); a
 parent with only nodata units goes `done` with `nodata = unseen_out` and
 no merge. `sweep:` reports `filled` vs `nodata` cells.
 
+## Fast path (2026-10-27, unit cost ÷ ~5)
+
+A unit ran the stock KG pipeline: the parent-wide bevdirect NEC1 build
+(~590 s of an ~1 100 s unit on 57306; 1 400 s on Wildalpen-class
+parents), 1.5 km tiles overshooting the padded unit bbox (57306-sw3:
+2 × 2.25 km² segmented for 0.3 km² of cells), and the full light-GPKG
+step (tree crowns, rasters, vectors, terrain_coarse, parcel enrichment)
+before the h3b was thrown away.  Per-tile segmentation (~5 min / 2.25 Mpx,
+92 % of tile time) is the only irreducible part, so `kg["_sweep"]` now
+switches on:
+
+* **cadastre**: `fetch_cadastre_data_bevdirect(…, cadastre_only=True)` →
+  `vct_pilot.fetch_cadastre_only` = the helper's `--cadastre-only` mode on
+  the *unit* bbox (viewport fetch, no NEC1 build, no /contrib report);
+* **declared layer**: umfeld's lu via the director relay
+  (`ne_h3.fetch_declared_director`, cached on the primary 30 d) — the cell
+  set the scan diffed against; any failure falls back to the regular path;
+* **tiles**: `_compute_tile_grid_clipped` — equal-split tiles that end at
+  the unit bbox (the 130 m `PAD_M` and the 0.1 km overlap stay);
+* **light step**: `build_light_gpkg_tiled(sweep_only=True)` returns right
+  after the NE h3b (no crowns, nothing written).
+
+Expected unit wall time: ~1 min + ~5 min per ≤ 1.5 km tile of the unit
+(was ~10 min + 5 min per overshooting tile).  The `app.py` interactive
+`/segment` path was considered and rejected: it runs the same
+`object_segmentation` core, so it cannot beat this — the waste was all
+around the segmentation, not in it.
+
 ## Operating
 
 ```bash
