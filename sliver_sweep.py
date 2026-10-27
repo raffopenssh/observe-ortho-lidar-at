@@ -212,6 +212,32 @@ def unseen_outside(path: Path, bbox_old: list) -> tuple[np.ndarray, np.ndarray, 
     return un[out], ll[out], n
 
 
+
+def observed_elsewhere(ids: np.ndarray) -> np.ndarray:
+    """Boolean mask over *ids*: the cell already carries an observed row
+    somewhere in the corpus (``data/ne/*.h3b`` via the public cells index,
+    ``cells_api`` — typically the neighbour KG whose old bbox covered the
+    strip).  Such cells are served and posted already (both tiers dedupe by
+    cell id), so sweeping them again would only re-observe known ground."""
+    ids = np.asarray(ids, dtype=np.uint64)
+    if not ids.size:
+        return np.zeros(0, bool)
+    try:
+        import h3.api.numpy_int as h3n
+        import cells_api
+        r10 = np.unique(np.array([h3n.cell_to_parent(int(c), 10) for c in ids], dtype=np.uint64))
+        chunks, _h = cells_api.chunks_for_r10(r10)
+        t = cells_api.gather(chunks, ids)
+        if not len(t):
+            return np.zeros(ids.size, bool)
+        obs = t.obs
+        seen = (obs["hm"] != 255) | (obs["cover"].sum(axis=1) > 0)
+        return np.isin(ids, t.ids[seen])
+    except Exception as ex:  # noqa: BLE001
+        log.warning("sliver_sweep: observed_elsewhere lookup failed (%s) — nothing excluded", ex)
+        return np.zeros(ids.size, bool)
+
+
 def _units_for(ll: np.ndarray, bbox_old: list, parent: str) -> list[dict]:
     """Group unseen cells by side of the old bbox, cluster along the strip at
     gaps > GAP_M, pad → unit bboxes (lon/lat)."""
@@ -271,41 +297,33 @@ def _nec1_source(parent: str, idx: dict | None) -> str:
         return ""
 
 
-MIN_SLIVER_DEG = 2e-5     # ~2 m: thinner umfeld sliver rects cannot hold a cell centroid
+LU_PER_TICK_DEFAULT = 3   # umfeld ``lu`` fetches per scan tick (~1.2 MB each; primary is metered)
 
 
-def _sliver_units(k: dict, parent: str, have: list[dict]) -> list[dict]:
-    """Units from umfeld's sliver rects (bbox_new − bbox_old).  Used when the
-    parent's declared layer was built by bevdirect on the OLD viewport: the
-    strip's cells are then absent from our file altogether (not merely
-    unseen), so the precise unseen-cell scan cannot see them.  The unit's
-    NEC1 build on bbox_new brings them in; the merge re-keys the parent
-    onto the larger cell set."""
-    w, s, e, n = [float(x) for x in k["bbox_old"]]
-    lat0 = (s + n) / 2
-    m_lat = 1 / 111_000.0
-    m_lon = 1 / (111_000.0 * max(0.2, np.cos(np.radians(lat0))))
-    pad_lat = (PAD_M + CELL_R_M) * m_lat
-    pad_lon = (PAD_M + CELL_R_M) * m_lon
-    out = []
-    for r in k.get("slivers") or []:
-        try:
-            rw, rs, re_, rn = [float(x) for x in r]
-        except Exception:
-            continue
-        if re_ - rw < MIN_SLIVER_DEG or rn - rs < MIN_SLIVER_DEG:
-            continue
-        cx, cy = (rw + re_) / 2, (rs + rn) / 2
-        side = "W" if cx < w else "E" if cx > e else "S" if cy < s else "N"
-        bb = [round(rw - pad_lon, 6), round(rs - pad_lat, 6), round(re_ + pad_lon, 6), round(rn + pad_lat, 6)]
-        if any(h["bbox"][0] <= bb[0] and h["bbox"][1] <= bb[1] and h["bbox"][2] >= bb[2] and h["bbox"][3] >= bb[3]
-               for h in have):
-            continue   # already enclosed by a precise unit
-        out.append({"side": side, "cells": None, "bbox": bb, "sliver": True})
-    out.sort(key=lambda u: (u["side"], u["bbox"][1], u["bbox"][0]))
-    for i, u in enumerate(out, len(have) + 1):
-        u.update(id=f"{parent}-sw{i}", state="pending", attempts=0)
-    return out
+def missing_outside(path: Path, lu_ids: np.ndarray, bbox_old: list) -> tuple[np.ndarray, np.ndarray, int]:
+    """Like :func:`unseen_outside`, but against umfeld's frozen ``lu`` cell
+    set (``ne_h3.fetch_declared_umfeld(kg, layer="lu")``, which covers the
+    whole VGD polygon): a cell counts when it is in ``lu_ids`` and NOT
+    observed in *path* — i.e. unseen there OR absent altogether.  Needed for
+    parents whose declared layer was built by bevdirect on the OLD viewport:
+    the strip's cells are then missing from our file, not merely unseen, so
+    :func:`unseen_outside` cannot see them (and sweeping umfeld's whole
+    sliver rects blind — 4 full-length edge strips per parent, 94 % of them
+    without a single cell — cost 5 min of tile work per empty 1.5 km tile)."""
+    import h3.api.numpy_int as h3n
+    import ne_ingest
+    r = ne_ingest._read_compact(path, want_rows=False)
+    n = int(r["obs"].shape[0])
+    ids = ne_ingest._lu_ids(r["lu"], n)
+    seen_ids = ids[ne_ingest.row_observed(r["obs"])]
+    lu_ids = np.unique(np.asarray(lu_ids, dtype=np.uint64))
+    un = np.setdiff1d(lu_ids, seen_ids, assume_unique=True)
+    if not len(un):
+        return un, np.zeros((0, 2)), n
+    ll = np.array([h3n.cell_to_latlng(int(c)) for c in un], dtype=float).reshape(-1, 2)
+    w, s, e, nn = [float(x) for x in bbox_old]
+    out = (ll[:, 1] < w) | (ll[:, 1] > e) | (ll[:, 0] < s) | (ll[:, 0] > nn)
+    return un[out], ll[out], n
 
 
 def _file_digest(parent: str, idx: dict | None) -> str | None:
@@ -322,51 +340,76 @@ def _file_digest(parent: str, idx: dict | None) -> str | None:
     return None
 
 
-def scan(max_n: int = SCAN_PER_TICK, entries: dict | None = None, idx: dict | None = None) -> dict:
+def scan(max_n: int = SCAN_PER_TICK, entries: dict | None = None, idx: dict | None = None,
+         lu_budget: int | None = None) -> dict:
     """Advance ``wait`` KGs: complete + h3b on disk → ``clean`` (no unseen
-    cell outside the old bbox) or ``pending`` (units planned)."""
+    cell outside the old bbox) or ``pending`` (units planned).
+
+    Parents with an ``index-*`` (umfeld lu) declared layer are scanned from
+    the local file alone; bevdirect-declared parents need umfeld's ``lu``
+    cell set (one ~1.2 MB GET each, :func:`missing_outside`) — at most
+    ``lu_budget`` (knob ``sweep_lu_per_tick``) of those per call, the rest
+    stay ``wait`` for the next tick."""
     import ne_ingest
     if entries is None:
         entries = ne_ingest.load_manifest_entries()
     if idx is None:
         idx = ne_ingest.load_index_ro()
-    out = {"scanned": 0, "clean": 0, "pending": 0, "cells": 0, "wait": 0}
+    if lu_budget is None:
+        lu_budget = max(0, int(_knob("sweep_lu_per_tick", LU_PER_TICK_DEFAULT)))
+    out = {"scanned": 0, "clean": 0, "pending": 0, "cells": 0, "wait": 0, "lu_fetched": 0, "lu_deferred": 0}
     with _Locked() as st:
         todo = [c for c, k in st["kgs"].items() if k.get("state") == "wait"]
         # round-robin fairness: oldest scan attempt first
         todo.sort(key=lambda c: (st["kgs"][c].get("scan_tried") or 0, c))
         t0 = time.time()
-        for code in todo[:max_n]:
+        n_done = 0
+        for code in todo:
+            if n_done >= max_n or time.time() - t0 > 40:
+                break
             k = st["kgs"][code]
-            k["scan_tried"] = time.time()
             p = _parent_path(code)
             if not p.exists() or not ne_ingest._coverage_complete(code, entries):
+                k["scan_tried"] = time.time()
+                n_done += 1
                 out["wait"] += 1
                 continue
+            src = _nec1_source(code, idx)
+            k["nec1_source"] = src
+            need_lu = not src.startswith("index-")
+            if need_lu and out["lu_fetched"] >= lu_budget:
+                # over budget this tick: leave scan_tried alone so the parent
+                # keeps its place at the head of the queue
+                out["lu_deferred"] += 1
+                continue
+            k["scan_tried"] = time.time()
+            n_done += 1
             try:
-                un, ll, n = unseen_outside(p, k["bbox_old"])
+                if need_lu:
+                    # bevdirect (or unknown) declared layer = clipped to the
+                    # old viewport → strip cells are missing, not unseen:
+                    # diff against umfeld's lu (whole VGD polygon) instead.
+                    import ne_h3
+                    sec = ne_h3.fetch_declared_umfeld(code, layer="lu")
+                    out["lu_fetched"] += 1
+                    k["lu_cells_n"] = int(sec.header.get("cells_n") or 0)
+                    k["lu_bytes"] = int(len(sec.raw))
+                    un, ll, n = missing_outside(p, sec.cell_ids(), k["bbox_old"])
+                else:
+                    un, ll, n = unseen_outside(p, k["bbox_old"])
             except Exception as ex:  # noqa: BLE001
                 log.warning("sliver_sweep: scan %s failed: %s", code, ex)
                 k["scan_error"] = str(ex)[:160]
                 continue
             k.pop("scan_error", None)
+            # cells a neighbour's product already observed are no hole
+            elsewhere = observed_elsewhere(un) if len(un) else np.zeros(0, bool)
+            k["seen_elsewhere"] = int(elsewhere.sum())
+            un, ll = un[~elsewhere], ll[~elsewhere]
             k.update(scanned_at=_now(), scan_digest=_file_digest(code, idx), cells_n=int(n),
                      unseen_out=int(len(un)))
             out["scanned"] += 1
             units = _units_for(ll, k["bbox_old"], code) if len(un) else []
-            src = _nec1_source(code, idx)
-            k["nec1_source"] = src
-            if not src.startswith("index-"):
-                # bevdirect (or unknown) declared layer = clipped to the old
-                # viewport → strip cells are missing, not unseen: sweep the
-                # umfeld sliver rects; precise units they enclose are dropped.
-                sl = _sliver_units(k, code, [])
-                def _encl(u):
-                    return any(h["bbox"][0] <= u["bbox"][0] and h["bbox"][1] <= u["bbox"][1]
-                               and h["bbox"][2] >= u["bbox"][2] and h["bbox"][3] >= u["bbox"][3] for h in sl)
-                units = sl + [u for u in units if not _encl(u)]
-                for i, u in enumerate(units, 1):
-                    u["id"] = f"{code}-sw{i}"
             if not units:
                 k.update(state="clean", units=[])
                 out["clean"] += 1
@@ -374,8 +417,6 @@ def scan(max_n: int = SCAN_PER_TICK, entries: dict | None = None, idx: dict | No
                 k["units"] = units
                 k.update(state="pending", attempts=0)
                 out["pending"] += 1; out["cells"] += int(len(un))
-            if time.time() - t0 > 40:
-                break
     if out["scanned"]:
         log.info("sliver_sweep: scan %s", out)
     return out
@@ -680,8 +721,10 @@ def status() -> dict:
                 confirmed += 1
     except Exception:
         pass
+    seen_elsewhere = sum(int(k.get("seen_elsewhere") or 0) for k in kgs.values())
+    lu_fetched = sum(1 for k in kgs.values() if k.get("lu_cells_n"))
     return {"enabled": enabled(), "revision": st.get("revision"), "fetched_at": st.get("fetched_at"),
-            "kgs": len(kgs), "by_state": by, "units_open": units_open, "cells_open": cells_open,
+            "kgs": len(kgs), "by_state": by, "seen_elsewhere": seen_elsewhere, "lu_fetched": lu_fetched, "units_open": units_open, "cells_open": cells_open,
             "cells_filled": cells_done, "nodata_cells": nodata, "done_24h": len(day), "rate_per_h": round(rate, 2),
             "eta_h": round(eta_h, 1) if eta_h is not None else None, "peers": st.get("peers") or {},
             "contrib_confirmed": confirmed, "stats": st.get("stats"),
@@ -716,7 +759,9 @@ def text_lines(v: dict | None = None) -> list[str]:
             f"done={by.get('done', 0)} failed={by.get('failed', 0)} · open units={v['units_open']} cells={v['cells_open']:,} "
             f"· filled={v['cells_filled']:,} nodata={v['nodata_cells']:,} · @{v['rate_per_h']}/h eta={eta} "
             f"· contrib re-posted={v['contrib_confirmed']}/{by.get('done', 0)}")
-    lines = [head]
+    lines = [head,
+             f"    scan: umfeld lu fetched={v.get('lu_fetched', 0)} (bevdirect parents, {_knob('sweep_lu_per_tick', LU_PER_TICK_DEFAULT)}/tick) "
+             f"· cells skipped as observed by a neighbour={v.get('seen_elsewhere', 0):,}"]
     peers = v.get("peers") or {}
     if peers:
         parts = []

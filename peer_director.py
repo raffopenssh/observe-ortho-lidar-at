@@ -14134,10 +14134,19 @@ class PeerDirector:
                     _push_sweep_spec(_pp['url'], _specs)
                 except Exception as _e:  # noqa: BLE001
                     log.warning('sweep spec push to %s failed: %s', _pid, _e)
-                    try:
-                        _sls.release(_pid, f'spec push failed: {str(_e)[:80]}')
-                    except Exception:  # noqa: BLE001
-                        pass
+                    # Release only when the peer does not know the route
+                    # (404/405 = pre-sweep commit).  A 503 / timeout is the
+                    # peer's gunicorn being busy: it still holds the last
+                    # spec and is mid-unit — releasing would hand its
+                    # parents to another peer and leave the in-flight unit
+                    # orphaned (the 08:03 at226 churn, 2026-10-27); the
+                    # spec is re-pushed next tick anyway.
+                    _sc = getattr(getattr(_e, 'response', None), 'status_code', None)
+                    if _sc in (404, 405):
+                        try:
+                            _sls.release(_pid, f'spec push failed: {str(_e)[:80]}')
+                        except Exception:  # noqa: BLE001
+                            pass
                     continue
                 _codes = list(_specs.keys())
                 slices[_pid] = _codes + [c for c in slices.get(_pid, []) if c not in _codes]
