@@ -1071,7 +1071,7 @@ def green_fix_lines(limit: int = 20) -> list[str]:
     st = idx.get("stats") or {}
     now = time.time()
     rows_conf, rows_wait = [], []
-    by = {"confirmed": 0, "posted": 0, "queued": 0, "struck_out": 0, "parked": 0, "no_fix": 0}
+    by = {"confirmed": 0, "posted": 0, "queued": 0, "struck_out": 0, "over_cap": 0, "parked": 0, "no_fix": 0}
     cells = 0
     parents = {c for c in idx["files"] if not is_block(c)} | set(idx["parents"])
     for parent in parents:
@@ -1092,7 +1092,7 @@ def green_fix_lines(limit: int = 20) -> list[str]:
             elif c.get("needs_bevdirect"):
                 why = "parked"
             elif int(c.get("post_attempts") or 0) >= POST_MAX_ATTEMPTS:
-                why = "struck_out"
+                why = "over_cap" if "over-cap" in str(c.get("post_error") or "") or "> 16 MB" in str(c.get("post_error") or "") else "struck_out"
             else:
                 why = "queued"
             by[why] += 1
@@ -1103,14 +1103,14 @@ def green_fix_lines(limit: int = 20) -> list[str]:
     out = [f"green_fix detail ({ne_green_fix.FIX_ID}{'' if _knob('ne_green_fix', True) else ' OFF'}, ndvi≥{ne_green_fix.NDVI_MIN} & not road/bare → "
            f"{'+'.join(ne_green_fix.MOVE_GROUPS)}→{ne_green_fix.TARGET_GROUP}; read-time only, files untouched):",
            f"    parents fixed={len(parents) - by['no_fix']}/{len(parents)} cells_moved={cells:,} · umfeld confirmed={by['confirmed']} "
-           f"posted(awaiting manifest)={by['posted']} queued={by['queued']} struck_out={by['struck_out']} parked(needs_bevdirect)={by['parked']} "
+           f"posted(awaiting manifest)={by['posted']} queued={by['queued']} struck_out={by['struck_out']} over_cap(body>umfeld /obs cap, ne_h3.OBS_BODY_CAP)={by['over_cap']} parked(needs_bevdirect)={by['parked']} "
            f"no_fix_digest_yet={by['no_fix']} (computed {_knob('ne_green_fix_compute_per_tick', GF_COMPUTE_PER_TICK)}/tick)",
            f"    budget: today {int(pdy.get('posts') or 0)} POSTs {(pdy.get('bytes') or 0) / 2 ** 20:.0f}/{cap * 1024:.0f} MiB · "
            f"max {POST_MAX_ATTEMPTS} attempts/digest · confirmed = umfeld manifest obs.digest == our green-fixed digest"]
     rows_conf.sort(reverse=True)
     if rows_conf:
         out.append("    recently confirmed: " + " ".join(f"{p}({n}c {at[11:16]}Z)" for at, p, n in rows_conf[:limit]))
-    rows_wait.sort(key=lambda r: (0 if r[3] == 'struck_out' else 1 if r[3] == 'parked' else 2, r[0], r[1]))
+    rows_wait.sort(key=lambda r: (0 if r[3] in ('struck_out', 'over_cap') else 1 if r[3] == 'parked' else 2, r[0], r[1]))
     for at, p, n, why, att, nxt in rows_wait[:limit]:
         extra = f" next in {max(0, int(nxt - now)) // 60}m" if nxt > now else ""
         out.append(f"    {p:<8} {why:<10} cells={n:<7} attempts={att}{extra} last_confirmed={at[:16] or '-'}")

@@ -1104,6 +1104,9 @@ def fetch_declared(kg: str, bbox_wgs: tuple | None = None, code: str | None = No
     return fetch_declared_umfeld(kg)
 
 
+OBS_BODY_CAP = 32 * 1024 * 1024
+
+
 def post_observed(kg: str, neo1_section: bytes, timeout: float = 120.0,
                   nec1_section: bytes | None = None) -> dict:
     """POST the observed layer to umfeld-at ``/obs``.  Returns the server's
@@ -1123,8 +1126,10 @@ def post_observed(kg: str, neo1_section: bytes, timeout: float = 120.0,
     h = _umfeld_headers()
     h["Content-Type"] = "application/vnd.ne-cells"
     body = (nec1_section + neo1_section) if nec1_section else neo1_section
-    if len(body) > 16 * 1024 * 1024:
-        raise NEError(f"umfeld /ne/{kg}/obs body {len(body)} B > 16 MB")
+    if len(body) > OBS_BODY_CAP:
+        # umfeld's /obs cap (16 MB until 2026-10-27, 32 MB since — raised for
+        # 80110 Sölden, 1.55 M cells = 17.5 MB NEO1 / 21.5 MB NEC1+NEO1)
+        raise NEError(f"umfeld /ne/{kg}/obs body {len(body)} B > {OBS_BODY_CAP // (1024 * 1024)} MB (over-cap)")
     r = requests.post(f"{_umfeld_contrib_base()}/{kg}/obs", data=body, headers=h, timeout=timeout)
     if r.status_code in (400, 409):
         raise NEError(f"umfeld /ne/{kg}/obs {r.status_code}{' (NEC1+NEO1)' if nec1_section else ''}: {r.text[:700]}")
