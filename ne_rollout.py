@@ -319,7 +319,8 @@ def _merge_ne_delta(base: dict, delta: dict) -> dict:
         else:
             kgs[code] = ent
     out["kgs"] = kgs
-    for k in ("built", "kgs_total", "obs_posted", "kgs_obs_on_bev", "generated_at", "obs_public"):
+    for k in ("built", "kgs_total", "obs_posted", "kgs_obs_on_bev", "kgs_obs_on_index",
+              "generated_at", "obs_public"):
         if k in delta:
             out[k] = delta[k]
     out["delta"] = False  # our merged copy is a full view
