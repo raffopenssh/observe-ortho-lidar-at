@@ -42,6 +42,28 @@ API_TOKENS_PATH = Path('data/api_tokens')
 PRIVATE_ONLY_FLAG = Path('data/private_only')
 COOKIE = 'srtm_k'
 
+# Page password for /k/process.txt ONLY (``?pwd=…``), stop-gap while the
+# exe.dev :8000 alternate-port route is broken (2026-10-27). Not a tier
+# token: it unlocks nothing else. File gitignored, one line.
+PROCESS_TXT_PWD_PATH = Path('data/process_txt_pwd')
+_PWD_CACHE = {'t': 0.0, 'v': ''}
+
+
+def process_txt_pwd_ok(req) -> bool:
+    """True iff the request is ``GET /k/process.txt`` carrying the right ``pwd``."""
+    if req.method != 'GET' or req.path != PRIVATE_PREFIX + '/process.txt':
+        return False
+    now = time.time()
+    if now - _PWD_CACHE['t'] > 5:
+        try:
+            _PWD_CACHE['v'] = PROCESS_TXT_PWD_PATH.read_text().strip()
+        except Exception:
+            _PWD_CACHE['v'] = ''
+        _PWD_CACHE['t'] = now
+    want = _PWD_CACHE['v']
+    got = (req.args.get('pwd') or '').strip()
+    return bool(want) and bool(got) and hmac.compare_digest(got, want)
+
 # --- /k retirement hooks (docs/ne-public-api.md §7) -------------------------
 # Landscape routes of the hidden tier that have a public, cell-keyed
 # replacement in cells_api.  When ``data/k_landscape_off`` exists they answer

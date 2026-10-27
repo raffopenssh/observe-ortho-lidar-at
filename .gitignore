@@ -44,3 +44,4 @@ data/public_flags.salt
 data/secrets.json
 data/secret_leases.json
 data/secrets_deny
+data/process_txt_pwd

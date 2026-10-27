@@ -196,7 +196,7 @@ _HOP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
            methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
 def private_tier(path):
     tok = tiers.request_token(request)
-    if not tiers.token_valid(tok):
+    if not tiers.token_valid(tok) and not tiers.process_txt_pwd_ok(request):
         return _not_found()
     if tiers.k_landscape_off() and tiers.landscape_route_retired(request.path):
         return _json({'gone': True, 'see': tiers.LANDSCAPE_GONE_SEE}, 410)
