@@ -66,6 +66,10 @@ GAP_M = 1500.0                  # split a side's cells into clusters at gaps wid
 MAX_UNITS_PER_PARENT = 8
 MAX_ATTEMPTS = 3
 DISPATCH_STALE_S = 8 * 3600     # no result from the peer → back to pending
+RESWEEP_COOLDOWN_S = 6 * 3600   # a done parent with struck-out (failed) units gets its units re-opened after this
+HOLD_RECHECK_S = 15 * 60        # a unit on hold (openEO cell not cached) is re-checked against the Zenodo index this often
+HOLD_MAX_CELLS = 40             # cap on held cells handed to the director's prewarm.repair_cells plan per tick
+_CACHE_CHECK_TTL_S = 10 * 60    # CopernicusTileCache / HansenTileCache instance reuse (ZIP index parse is costly)
 SCAN_PER_TICK = 400
 INTEGRATE_PER_TICK = 6
 SWEEP_PEERS_DEFAULT = 4
@@ -466,6 +470,71 @@ def _unit_open(u: dict) -> bool:
     return u.get("state") in ("pending", "failed") and int(u.get("attempts") or 0) < MAX_ATTEMPTS
 
 
+_cache_chk: dict = {"ts": 0.0, "cop": None, "hansen": None}
+
+
+def _missing_cells(bbox: list | tuple, year: int = 2024) -> list[dict]:
+    """``[{w,s,e,n,products:[…]}]`` of *bbox* not yet in the Zenodo tile
+    store — same check the director uses for the cache-ready whitelist
+    (``has_cached(local_ok=False)``) and the same shape ``prewarm.repair_cells``
+    ships to the frontiers (``product_repair.missing_cells``).  Empty list
+    = every cell cached, i.e. a peer's "not cached" was a transient Zenodo
+    fetch error."""
+    from tile_cache import CopernicusTileCache, HansenTileCache
+    now = time.time()
+    if _cache_chk["cop"] is None or now - _cache_chk["ts"] > _CACHE_CHECK_TTL_S:
+        _cache_chk.update(ts=now, cop=CopernicusTileCache(), hansen=HansenTileCache())
+    cop, hansen = _cache_chk["cop"], _cache_chk["hansen"]
+    w, s, e, n = (float(x) for x in bbox)
+    bb = {"west": w, "south": s, "east": e, "north": n}
+    out = []
+    for cw, cs, ce, cn in cop._iter_cells(bb):
+        cell = {"west": cw, "south": cs, "east": ce, "north": cn}
+        miss = []
+        for p, kw in (("ndvi", {"ndvi": True}), ("worldcover", {"landcover": True}),
+                      ("sar", {"sar": True}), ("harmonics", {"harmonics": True})):
+            full = {"ndvi": False, "landcover": False, "sar": False, "harmonics": False}
+            full.update(kw)
+            try:
+                ok = cop.has_cached(cell, year=year, local_ok=False, **full)
+            except Exception:
+                ok = False
+            if not ok:
+                miss.append(p)
+        try:
+            if not hansen.has_cached((cw, cs, ce, cn), local_ok=False):
+                miss.append("hansen")
+        except Exception:
+            miss.append("hansen")
+        if miss:
+            out.append({"w": cw, "s": cs, "e": ce, "n": cn, "products": miss})
+    return out
+
+
+def _is_cache_miss(error: str | None) -> bool:
+    e = str(error or "")
+    return "not cached" in e or "cache_miss" in e or "cache-only" in e
+
+
+def held_cells(limit: int = HOLD_MAX_CELLS) -> list[dict]:
+    """Cells the held sweep units wait for — merged by the director into
+    ``prewarm.repair_cells`` so a frontier fetches them (the same path a
+    `-partial` product repair rides; ``docs/product-repair.md``)."""
+    st = load_state()
+    out: dict[tuple, dict] = {}
+    for k in st["kgs"].values():
+        for u in k.get("units") or []:
+            if u.get("state") != "hold":
+                continue
+            for c in u.get("hold_cells") or []:
+                key = (c["w"], c["s"])
+                cur = out.setdefault(key, dict(c, products=[]))
+                cur["products"] = sorted(set(cur["products"]) | set(c.get("products") or []))
+                if len(out) >= limit:
+                    return list(out.values())
+    return list(out.values())
+
+
 def spec_for(code: str, k: dict) -> dict:
     """What a peer needs to run the open units of *code*."""
     # ``attempt`` is the peer's mid-run injection gate (monotonic per parent:
@@ -623,7 +692,22 @@ def accept_result(unit: str, parent: str, peer: str, attempt: int, status: str,
             u["error"] = str(error)[:200]
         else:
             u.pop("error", None)
-        if status == "failed":
+        if status == "failed" and _is_cache_miss(error):
+            # Same as a cache-only KG hitting a miss: no strike, the unit
+            # waits for the frontier to fill the cell (hold → repair_cells
+            # → _reopen_unswept).  No missing cell on the Zenodo index =
+            # transient Zenodo fetch error → plain retry after HOLD_RECHECK_S.
+            try:
+                miss = _missing_cells(u["bbox"])
+            except Exception as ex:  # noqa: BLE001
+                miss = [{"error": str(ex)[:80]}]
+            status = "hold"
+            u.update(hold_cells=miss, hold_at=time.time(), misses=int(u.get("misses") or 0) + 1)
+            u["state"] = "hold"
+            st["stats"]["cache_miss"] = int(st["stats"].get("cache_miss") or 0) + 1
+            log.info("sliver_sweep: %s on hold (cache miss, %d cell(s) uncached on Zenodo): %s",
+                     unit, len(miss), (error or "")[:100])
+        elif status == "failed":
             u["attempts"] = int(u.get("attempts") or 0) + 1
         st["stats"]["results"] = int(st["stats"].get("results") or 0) + 1
         st["stats"]["last"] = {"unit": unit, "status": status, "peer": peer, "at": _now(),
@@ -757,10 +841,14 @@ def integrate(idx: dict, entries: dict | None = None, max_n: int = INTEGRATE_PER
             paths = sweep_paths(code, st, entries)
             parent_p = _parent_path(code)
             if not paths:
-                # nothing observed (all nodata / out of coverage) — nothing to merge
-                k.update(state="done", done_at=_now(), nodata=int(k.get("unseen_out") or 0),
-                         unseen_after=int(k.get("unseen_out") or 0), integrated_digest=_file_digest(code, idx))
-                done.append({"parent": code, "merged": 0, "nodata": True})
+                # nothing observed (all nodata / out of coverage / every unit on hold) — nothing to merge
+                unswept = sum(int(u.get("cells") or 0) for u in (k.get("units") or []) if u.get("state") in ("failed", "hold"))
+                uo = int(k.get("unseen_out") or 0)
+                k.update(state="done", done_at=_now(), nodata=max(0, uo - min(uo, unswept)), unswept=unswept,
+                         unseen_after=uo, integrated_digest=_file_digest(code, idx))
+                if unswept:
+                    k["resweep_after"] = time.time() + RESWEEP_COOLDOWN_S
+                done.append({"parent": code, "merged": 0, "nodata": not unswept, "unswept": unswept})
                 continue
             if not parent_p.exists():
                 k.update(state="wait", error="parent h3b vanished")
@@ -801,8 +889,14 @@ def integrate(idx: dict, entries: dict | None = None, max_n: int = INTEGRATE_PER
                 after = int(len(un))
             except Exception:
                 after = None
+            # cells of units that struck out are *unswept*, not nodata — they
+            # are re-opened after RESWEEP_COOLDOWN_S (see _reopen_unswept)
+            unswept = sum(int(u.get("cells") or 0) for u in (k.get("units") or []) if u.get("state") in ("failed", "hold"))
+            nodata = None if after is None else max(0, after - min(after, unswept))
             k.update(state="done", done_at=_now(), integrated_digest=digest, unseen_after=after,
-                     nodata=after, cells_observed=stp.get("cells_observed"))
+                     nodata=nodata, unswept=unswept or 0, cells_observed=stp.get("cells_observed"))
+            if unswept:
+                k["resweep_after"] = time.time() + RESWEEP_COOLDOWN_S
             k.pop("error", None)
             st["stats"]["integrated"] = int(st["stats"].get("integrated") or 0) + 1
             log.info("sliver_sweep: %s integrated %d unit(s): unseen outside old bbox %s → %s, digest %s",
@@ -829,6 +923,52 @@ def tick(idx: dict, entries: dict) -> dict:
         out["integrated"] = integrate(idx, entries)
     except Exception as ex:  # noqa: BLE001
         log.warning("sliver_sweep: integrate failed: %s", ex)
+    try:
+        out["reopened"] = _reopen_unswept()
+    except Exception as ex:  # noqa: BLE001
+        log.warning("sliver_sweep: reopen failed: %s", ex)
+    return out
+
+
+def _reopen_unswept() -> list[str]:
+    """A ``done`` parent whose units struck out (3× cache-miss / crash) kept
+    its strip unswept.  After ``RESWEEP_COOLDOWN_S`` (the frontier has had
+    time to fill the missing openEO cells) those units go back to
+    ``pending`` with a fresh attempt budget; the h3b merge is idempotent."""
+    now = time.time()
+    out = []
+    with _Locked() as st:
+        for code, k in st["kgs"].items():
+            if k.get("state") != "done" or not k.get("unswept"):
+                continue
+            hit = False
+            for u in k.get("units") or []:
+                if u.get("state") == "hold":
+                    # like the director's cache-ready whitelist: back in once the Zenodo index has the cells
+                    if now - float(u.get("hold_at") or 0) < HOLD_RECHECK_S:
+                        continue
+                    try:
+                        miss = _missing_cells(u["bbox"])
+                    except Exception as ex:  # noqa: BLE001
+                        log.debug("sliver_sweep: hold recheck %s: %s", u.get("id"), ex)
+                        u["hold_at"] = now
+                        continue
+                    if miss:
+                        u.update(hold_cells=miss, hold_at=now)
+                        continue
+                    if int(u.get("misses") or 0) >= 2 * MAX_ATTEMPTS:
+                        # cells cached but the peer keeps missing them → count it as a real attempt
+                        u["attempts"] = int(u.get("attempts") or 0) + 1; u["misses"] = 0
+                    u["state"] = "pending"; u.pop("hold_cells", None); u.pop("error", None)
+                    hit = True
+                elif u.get("state") == "failed" and float(k.get("resweep_after") or 0) <= now:
+                    u.update(state="pending", attempts=0); u.pop("error", None)
+                    hit = True
+            if hit:
+                k.update(state="pending", attempts=0, resweeps=int(k.get("resweeps") or 0) + 1)
+                k.pop("resweep_after", None); k.pop("error", None)
+                out.append(code)
+                log.info("sliver_sweep: %s re-opened %d unswept cells (resweep #%d)", code, k["unswept"], k["resweeps"])
     return out
 
 
@@ -845,7 +985,10 @@ def status() -> dict:
     cells_open = sum(int(k.get("unseen_out") or 0) for k in pend)
     done = [k for k in kgs.values() if k.get("state") == "done"]
     cells_done = sum(int(k.get("unseen_out") or 0) - int(k.get("unseen_after") or 0) for k in done)
-    nodata = sum(int(k.get("unseen_after") or 0) for k in done)
+    nodata = sum(int(k.get("nodata") or 0) for k in done)
+    unswept = sum(int(k.get("unswept") or 0) for k in done)
+    hold_units = sum(1 for k in kgs.values() for u in k.get("units") or [] if u.get("state") == "hold")
+    hold_cells = len(held_cells(10 ** 6))
     now = time.time()
     day = [k for k in done if k.get("done_at") and now - _ts(k["done_at"]) < 86400]
     rate = len(day) / 24.0
@@ -873,7 +1016,10 @@ def status() -> dict:
     lu_fetched = sum(1 for k in kgs.values() if k.get("lu_cells_n"))
     return {"enabled": enabled(), "revision": st.get("revision"), "fetched_at": st.get("fetched_at"),
             "kgs": len(kgs), "by_state": by, "seen_elsewhere": seen_elsewhere, "lu_fetched": lu_fetched, "units_open": units_open, "cells_open": cells_open,
-            "cells_filled": cells_done, "nodata_cells": nodata, "done_24h": len(day), "rate_per_h": round(rate, 2),
+            "cells_filled": cells_done, "nodata_cells": nodata, "unswept_cells": unswept,
+            "unswept_parents": sum(1 for k in done if k.get("unswept")),
+            "hold_units": hold_units, "hold_cells": hold_cells, "cache_miss_total": int((st.get("stats") or {}).get("cache_miss") or 0),
+            "done_24h": len(day), "rate_per_h": round(rate, 2),
             "eta_h": round(eta_h, 1) if eta_h is not None else None, "peers": st.get("peers") or {},
             "contrib_confirmed": confirmed, "stats": st.get("stats"), "products": prod,
             "knobs": {"sweep_peers": _knob("sweep_peers", SWEEP_PEERS_DEFAULT),
@@ -905,7 +1051,10 @@ def text_lines(v: dict | None = None) -> list[str]:
     head = (f"sweep:    bbox rev={v.get('revision')} kgs={v['kgs']} wait={by.get('wait', 0)} clean={by.get('clean', 0)} "
             f"pending={by.get('pending', 0)} dispatched={by.get('dispatched', 0)} received={by.get('received', 0)} "
             f"done={by.get('done', 0)} failed={by.get('failed', 0)} · open units={v['units_open']} cells={v['cells_open']:,} "
-            f"· filled={v['cells_filled']:,} nodata={v['nodata_cells']:,} · @{v['rate_per_h']}/h eta={eta} "
+            f"· filled={v['cells_filled']:,} nodata={v['nodata_cells']:,}"
+            + (f" unswept={v['unswept_cells']:,}({v['unswept_parents']}p)" if v.get("unswept_cells") else "")
+            + (f" hold={v['hold_units']}u/{v['hold_cells']}cells→repair_cells" if v.get("hold_units") else "")
+            + f" · @{v['rate_per_h']}/h eta={eta} "
             f"· contrib re-posted={v['contrib_confirmed']}/{by.get('done', 0)}")
     pr = v.get("products") or {}
     lines = [head,
@@ -922,7 +1071,8 @@ def text_lines(v: dict | None = None) -> list[str]:
                 k = st["kgs"].get(c) or {}
                 us = k.get("units") or []
                 n_ok = sum(1 for u in us if u.get("state") in ("ok", "nodata"))
-                frag.append(f"{c}[{n_ok}/{len(us)}u {int(k.get('unseen_out') or 0)}c {_age(k.get('dispatched_at'))}]")
+                n_h = sum(1 for u in us if u.get("state") == "hold")
+                frag.append(f"{c}[{n_ok}/{len(us)}u{' hold' + str(n_h) if n_h else ''} {int(k.get('unseen_out') or 0)}c {_age(k.get('dispatched_at'))}]")
             parts.append(f"{pid}: " + (" ".join(frag) if frag else "idle"))
         lines.append("    peers(%d, floor %s, auto-scale to idle v2 capacity): %s" % (len(peers), v["knobs"]["sweep_peers"], " · ".join(parts)))
     else:
@@ -935,13 +1085,86 @@ def text_lines(v: dict | None = None) -> list[str]:
                     key=lambda k: k["done_at"], reverse=True)[:6]
     if recent:
         lines.append("    recent: " + " ".join(
-            f"{next(c for c, kk in st['kgs'].items() if kk is k)}({k.get('unseen_out')}→{k.get('unseen_after')} {_age(k.get('done_at'))})"
+            f"{next(c for c, kk in st['kgs'].items() if kk is k)}({k.get('unseen_out')}→{k.get('unseen_after')}"
+            f"{'!' + str(k.get('unswept')) + 'unswept' if k.get('unswept') else ''} {_age(k.get('done_at'))})"
             for k in recent))
     bad = [(c, k) for c, k in st["kgs"].items() if k.get("state") == "failed"][:5]
     if bad:
         lines.append("    failed: " + " ".join(f"{c}({(k.get('error') or '')[:60]})" for c, k in bad))
-    lines.append("    debug: ?q=sweep · python3 sliver_sweep.py status|plan <kg> · docs/sliver-sweep.md")
+    lines.append("    debug: ?sweep=1 (per-parent umfeld round-trip) · ?q=sweep · python3 sliver_sweep.py status|plan <kg> · docs/sliver-sweep.md")
     return lines
+
+
+def detail_lines(limit: int = 30) -> list[str]:
+    """``/process.txt?sweep=1`` — one row per swept parent (done first, then
+    received / dispatched / pending-with-attempts), answering "did the
+    sweep land AND did umfeld get the merged cells?" without reading the
+    state file.  Columns: parent, unseen→after (nodata / unswept), units
+    ok/total, umfeld round-trip (``confirmed`` = umfeld holds our post-sweep
+    digest; ``posted`` = sent, awaiting manifest; ``queued`` = re-POST
+    pending in the ne_ingest ladder; ``parked`` = needs_bevdirect / day cap /
+    strike-out), add-on products."""
+    import ne_ingest
+    st = load_state()
+    try:
+        idx = ne_ingest.load_index_ro()
+    except Exception:
+        idx = {}
+    um = idx.get("umfeld") or {}
+    parents = idx.get("parents") or {}
+    order = {"done": 0, "received": 1, "dispatched": 2, "pending": 3, "failed": 4}
+    rows = [(c, k) for c, k in st["kgs"].items()
+            if k.get("state") in order and (k.get("units") or k.get("state") in ("done", "failed"))]
+    rows.sort(key=lambda t: (order[t[1]["state"]], -(_ts(t[1].get("done_at") or t[1].get("received_at")
+                                                        or t[1].get("dispatched_at") or ""))))
+    n_conf = n_wait = 0
+    out = []
+    for c, k in rows:
+        us = k.get("units") or []
+        n_ok = sum(1 for u in us if u.get("state") in ("ok", "nodata"))
+        n_fail = sum(1 for u in us if u.get("state") == "failed")
+        n_hold = sum(1 for u in us if u.get("state") == "hold")
+        hold_s = ""
+        if n_hold:
+            cells = sorted({(c["w"], c["s"]) for u in us if u.get("state") == "hold" for c in (u.get("hold_cells") or []) if "w" in c})
+            hold_s = f" hold={n_hold}(" + ("transient, retry" if not cells else "waiting cells " + " ".join(f"{w:g}/{s_:g}" for w, s_ in cells[:4])) + ")"
+        prod_ok = sum(1 for u in us if u.get("state") == "ok" and str(u.get("products") or "") == "ok")
+        prod_n = sum(1 for u in us if u.get("state") == "ok")
+        if k["state"] == "done":
+            cu = um.get(c) or {}
+            want = None
+            try:
+                want = ne_ingest._our_digest(c, idx)
+            except Exception:
+                pass
+            swept_at = (parents.get(c) or {}).get("swept_at") or k.get("done_at") or ""
+            if want and cu.get("confirmed_digest") == want and str(cu.get("confirmed_at") or "") >= str(swept_at):
+                rt = f"umfeld=confirmed {_age(cu.get('confirmed_at'))} ago"; n_conf += 1
+            elif want and cu.get("posted_digest") == want:
+                rt = f"umfeld=posted {_age(cu.get('posted_at'))} ago (awaiting manifest)"; n_wait += 1
+            elif cu.get("needs_bevdirect"):
+                rt = "umfeld=parked(needs_bevdirect)"; n_wait += 1
+            elif int(cu.get("post_attempts") or 0) >= ne_ingest.POST_MAX_ATTEMPTS:
+                rt = f"umfeld=struck-out({cu.get('post_attempts')} attempts)"; n_wait += 1
+            else:
+                rt = "umfeld=queued (re-POST pending, sweep-priority)"; n_wait += 1
+            tail = f"{k.get('unseen_out')}→{k.get('unseen_after')} nodata={k.get('nodata') or 0}"
+            if k.get("unswept"):
+                ra = float(k.get("resweep_after") or 0)
+                tail += f" UNSWEPT={k['unswept']}" + (f" (struck-out, re-open in {max(0, int(ra - time.time())) // 60}m)" if n_fail else "")
+            out.append(f"    {c:<16} done {_age(k.get('done_at'))} ago · {tail} · units {n_ok}/{len(us)}"
+                       f"{' fail=' + str(n_fail) if n_fail else ''}{hold_s} · {rt} · products {prod_ok}/{prod_n}")
+        else:
+            err = (k.get("error") or "")[:70]
+            fails = "; ".join(f"{u['id']}:{(u.get('error') or '')[:50]}" for u in us if u.get("state") == "failed")[:160]
+            out.append(f"    {c:<16} {k['state']}{'@' + k['peer'] if k.get('peer') else ''} "
+                       f"{_age(k.get('dispatched_at') or k.get('received_at'))} · unseen={k.get('unseen_out')} "
+                       f"· units {n_ok}/{len(us)}{' fail=' + str(n_fail) if n_fail else ''}{hold_s} attempts={k.get('attempts', 0)}"
+                       + (f" · {fails or err}" if (fails or err) else ""))
+    head = (f"sweep detail: parents={len(rows)} done={sum(1 for _, k in rows if k['state'] == 'done')} "
+            f"umfeld confirmed={n_conf} pending={n_wait} · rows capped at {limit} (?sweep=N) · "
+            "confirmed = umfeld manifest obs.digest == our post-sweep (green-fixed) digest")
+    return [head] + out[:limit]
 
 
 # === SECTION: peer side ===

@@ -848,8 +848,13 @@ def confirm_umfeld(idx: dict, max_posts: int = 5) -> dict:
             continue     # bare NEO1 can never match umfeld's lu cell set — needs a bevdirect NEC1 (see below)
         if float(c.get("post_next") or 0) > now or int(c.get("post_attempts") or 0) >= POST_MAX_ATTEMPTS:
             continue
-        # umfeld's order: obs_on_index (has_view first) → missing → mismatch
-        prio = (0 if (on_index and has_view) else 1 if not have else 2, 0 if has_view else 1, parent)
+        # umfeld's order: obs_on_index (has_view first) → missing → mismatch;
+        # a freshly swept parent (sliver_sweep integrated after the last
+        # confirmation) jumps the mismatch backlog — the strip cells are
+        # the whole point of the sweep (docs/sliver-sweep.md).
+        swept_at = str((idx["parents"].get(parent) or {}).get("swept_at") or "")
+        sweep_fresh = bool(swept_at) and swept_at > str(c.get("confirmed_at") or "")
+        prio = (-1 if sweep_fresh else 0 if (on_index and has_view) else 1 if not have else 2, 0 if has_view else 1, parent)
         cands.append((prio, parent, {"want": want, "have": have, "bev": bev, "has_view": has_view,
                                      "on_index": on_index, "c": c}))
     # --- phase 2: POST in priority order within the tick / day budgets
@@ -1051,6 +1056,67 @@ def _green_fix_status(idx: dict) -> dict:
             done += 1
     return {"id": ne_green_fix.FIX_ID, "enabled": bool(_knob("ne_green_fix", True)),
             "computed": n, "confirmed": done, "cells_touched": cells}
+
+
+def green_fix_lines(limit: int = 20) -> list[str]:
+    """``/process.txt?greenfix=1`` — the read-time bau/alpen→gruen override
+    (``ne_green_fix``) end to end: how many parents have a fixed digest,
+    how many umfeld confirmed, the re-POST backlog by reason (queued /
+    posted-awaiting-manifest / struck-out / parked / day-cap), today's
+    budget, and the *limit* most recently confirmed + oldest unconfirmed
+    parents.  Everything comes from the ingest index (no disk walk)."""
+    import ne_green_fix
+    idx = load_index_ro()
+    conf = idx.get("umfeld") or {}
+    st = idx.get("stats") or {}
+    now = time.time()
+    rows_conf, rows_wait = [], []
+    by = {"confirmed": 0, "posted": 0, "queued": 0, "struck_out": 0, "parked": 0, "no_fix": 0}
+    cells = 0
+    parents = {c for c in idx["files"] if not is_block(c)} | set(idx["parents"])
+    for parent in parents:
+        tgt, _ = _disk_row(parent, idx)
+        gf = (tgt or {}).get("green_fix") or {}
+        if gf.get("id") != ne_green_fix.FIX_ID:
+            by["no_fix"] += 1
+            continue
+        cells += int(gf.get("cells") or 0)
+        c = conf.get(parent) or {}
+        want = gf.get("digest")
+        if c.get("confirmed_digest") == want:
+            by["confirmed"] += 1
+            rows_conf.append((str(c.get("confirmed_at") or ""), parent, int(gf.get("cells") or 0)))
+        else:
+            if c.get("posted_digest") == want:
+                why = "posted"
+            elif c.get("needs_bevdirect"):
+                why = "parked"
+            elif int(c.get("post_attempts") or 0) >= POST_MAX_ATTEMPTS:
+                why = "struck_out"
+            else:
+                why = "queued"
+            by[why] += 1
+            rows_wait.append((str(c.get("confirmed_at") or ""), parent, int(gf.get("cells") or 0), why,
+                              int(c.get("post_attempts") or 0), float(c.get("post_next") or 0)))
+    pdy = st.get("post_day") or {}
+    cap = float(_knob("ne_post_gib_per_day", POST_GIB_PER_DAY))
+    out = [f"green_fix detail ({ne_green_fix.FIX_ID}{'' if _knob('ne_green_fix', True) else ' OFF'}, ndvi≥{ne_green_fix.NDVI_MIN} & not road/bare → "
+           f"{'+'.join(ne_green_fix.MOVE_GROUPS)}→{ne_green_fix.TARGET_GROUP}; read-time only, files untouched):",
+           f"    parents fixed={len(parents) - by['no_fix']}/{len(parents)} cells_moved={cells:,} · umfeld confirmed={by['confirmed']} "
+           f"posted(awaiting manifest)={by['posted']} queued={by['queued']} struck_out={by['struck_out']} parked(needs_bevdirect)={by['parked']} "
+           f"no_fix_digest_yet={by['no_fix']} (computed {_knob('ne_green_fix_compute_per_tick', GF_COMPUTE_PER_TICK)}/tick)",
+           f"    budget: today {int(pdy.get('posts') or 0)} POSTs {(pdy.get('bytes') or 0) / 2 ** 20:.0f}/{cap * 1024:.0f} MiB · "
+           f"max {POST_MAX_ATTEMPTS} attempts/digest · confirmed = umfeld manifest obs.digest == our green-fixed digest"]
+    rows_conf.sort(reverse=True)
+    if rows_conf:
+        out.append("    recently confirmed: " + " ".join(f"{p}({n}c {at[11:16]}Z)" for at, p, n in rows_conf[:limit]))
+    rows_wait.sort(key=lambda r: (0 if r[3] == 'struck_out' else 1 if r[3] == 'parked' else 2, r[0], r[1]))
+    for at, p, n, why, att, nxt in rows_wait[:limit]:
+        extra = f" next in {max(0, int(nxt - now)) // 60}m" if nxt > now else ""
+        out.append(f"    {p:<8} {why:<10} cells={n:<7} attempts={att}{extra} last_confirmed={at[:16] or '-'}")
+    if len(rows_wait) > limit:
+        out.append(f"    … +{len(rows_wait) - limit} more unconfirmed (?greenfix=N)")
+    return out
 
 
 def text_line(v: dict | None = None) -> str:

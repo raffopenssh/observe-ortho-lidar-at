@@ -21208,6 +21208,11 @@ def process_txt():
             'verbose=1  keep GDAL/bev_retry chatter + full-length log msgs '
             '(default: noise hidden, msgs capped at 220 chars, consecutive '
             'duplicates collapsed as \xd7N)\n'
+            'sweep=N    sliver-sweep drill-down: one row per swept parent '
+            '(done -> umfeld confirmed/posted/queued, unswept/held units + '
+            'the openEO cells they wait for); implies roster=0&log=0\n'
+            'greenfix=N green-fix override drill-down: fixed/confirmed/queued '
+            'parents, budget, oldest unconfirmed rows; implies roster=0&log=0\n'
             '\n'
             '# cheap combos\n'
             'roster=0&log=0   banner + fleet lines only (~3k tokens)\n'
@@ -21263,6 +21268,27 @@ def process_txt():
         hours_back = 24.0
     if hours_back <= 0:
         hours_back = 24.0
+    # Focus views (token-cheap subsystem drill-downs, docs/sliver-sweep.md /
+    # docs/ne-public-api.md → Green-ground override):
+    #   sweep=N    per-parent sliver-sweep rows (done → umfeld round-trip,
+    #              held/failed units + the cells they wait for); N rows
+    #   greenfix=N green-fix override: fixed/confirmed/queued parents + rows
+    # Either implies roster=0 and log=0 unless given explicitly.
+    def _focus_n(name):
+        v = request.args.get(name)
+        if v in (None, '', '0', 'false', 'no'):
+            return 0
+        try:
+            return max(1, min(100, int(v)))
+        except ValueError:
+            return 30
+    sweep_n = _focus_n('sweep')
+    greenfix_n = _focus_n('greenfix')
+    if sweep_n or greenfix_n:
+        if 'roster' not in request.args:
+            show_roster = False
+        if 'log' not in request.args:
+            nlog = 0
 
     # Render cache: per-worker, keyed on the (effective) query, TTL 10 s.
     # Multiple gunicorn workers each maintain their own cache; the
@@ -21270,7 +21296,7 @@ def process_txt():
     # work avoided here is pure Python text formatting + log scanning.
     _cache_key = (nlog, warn_only, show_hidden, peer_q, msg_q, hours_back,
                   attn_only, show_roster, creds_full, show_bw,
-                  uploads_full, verbose,
+                  uploads_full, verbose, sweep_n, greenfix_n,
                   request.args.get('stall', '10'))
     _now_t = _t.time()
     cache = getattr(process_txt, '_render_cache', None)
@@ -22388,8 +22414,18 @@ def process_txt():
         try:
             import sliver_sweep as _sls
             out.extend(_sls.text_lines())
+            if sweep_n:
+                out.extend(_sls.detail_lines(limit=sweep_n))
         except Exception as _e:  # noqa: BLE001
             log.debug('process.txt sweep lines: %s', _e)
+            if sweep_n:
+                out.append(f'sweep detail: unavailable ({_e})')
+        if greenfix_n:
+            try:
+                import ne_ingest as _nei2
+                out.extend(_nei2.green_fix_lines(limit=greenfix_n))
+            except Exception as _e:  # noqa: BLE001
+                out.append(f'green_fix detail: unavailable ({_e})')
         # VTC pilot (docs/vct-pilot.md): which peers, bevdirect bandwidth,
         # agreement vs umfeld, /contrib report outcomes, obs round-trip and
         # split-parent assembly for every pilot KG.
@@ -23607,7 +23643,7 @@ def process_txt():
 
     out.append('')
     out.append(
-        '# params: log=N|0 warn=1 hidden=1 attn=1 roster=0 creds=1 bw=1 '
+        '# params: log=N|0 warn=1 hidden=1 attn=1 roster=0 creds=1 bw=1 sweep=N greenfix=N '
         'uploads=1 stall=N peer=<substr> q=<substr> hours=H verbose=1 help=1'
     )
     # --- Distil health banner (inserted just under the title) ----

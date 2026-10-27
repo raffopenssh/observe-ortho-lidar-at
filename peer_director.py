@@ -11572,6 +11572,19 @@ class PeerDirector:
         except Exception:
             pass
         cells = list(st.get('cells') or []) if (cop_ok and openeo_ok) else []
+        if cop_ok and openeo_ok:
+            # Sliver-sweep units on hold (cache-only peer hit an uncached
+            # openEO cell) ride the same frontier fill; docs/sliver-sweep.md.
+            try:
+                import sliver_sweep as _sls
+                have = {(c.get('w'), c.get('s')) for c in cells}
+                for c in _sls.held_cells():
+                    if (c.get('w'), c.get('s')) not in have and 'w' in c:
+                        cells.append(c); have.add((c['w'], c['s']))
+                    if len(cells) >= 2 * PRODUCT_REPAIR_MAX_CELLS:
+                        break
+            except Exception as e:
+                log.debug('sweep held cells: %s', e)
         with self._lock:
             self.state['_product_repair_gate'] = {
                 'cop_ok': bool(cop_ok), 'openeo_ok': bool(openeo_ok),
