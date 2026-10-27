@@ -846,9 +846,38 @@ class ZipIndex:
         # central directory -> 404 -> swallowed by the caller -> next tile.
         self._fail_until: float = 0.0
         self._fail_exc: Optional[BaseException] = None
+        self._fail_n: int = 0
 
     FAIL_TTL_404_S = 1800.0   # file gone: don't re-probe for 30 min
-    FAIL_TTL_OTHER_S = 180.0  # transient (5xx / timeout): 3 min
+    FAIL_TTL_OTHER_S = 180.0  # transient (5xx / timeout): 3 min, doubling per repeat (≤ 1 h)
+    FAIL_TTL_MAX_S = 3600.0
+
+    # Global index-fetch circuit (2026-10-27): with Zenodo hanging/504ing,
+    # every missing central directory cost a 15 s timeout and the director
+    # tick (``_compute_cache_ready_kgs`` → ``has_entry``) ballooned to
+    # minutes, re-probing ~20 URLs every 3 min.  ≥3 fetch failures within
+    # 120 s open the circuit for 300 s: callers get the remembered failure
+    # instantly instead of a fresh timeout each.
+    _fetch_fail_ts: List[float] = []
+    _fetch_open_until: float = 0.0
+    _FETCH_TRIP_N = 3
+    _FETCH_TRIP_WINDOW_S = 120.0
+    _FETCH_OPEN_S = 300.0
+
+    @classmethod
+    def _fetch_circuit_open(cls) -> bool:
+        return time.monotonic() < cls._fetch_open_until
+
+    @classmethod
+    def _note_fetch_failure(cls) -> None:
+        now = time.monotonic()
+        cls._fetch_fail_ts = [t for t in cls._fetch_fail_ts if now - t < cls._FETCH_TRIP_WINDOW_S]
+        cls._fetch_fail_ts.append(now)
+        if len(cls._fetch_fail_ts) >= cls._FETCH_TRIP_N and now >= cls._fetch_open_until:
+            cls._fetch_open_until = now + cls._FETCH_OPEN_S
+            log.warning("ZIP index fetch circuit OPEN for %ds (%d failures in %ds) — "
+                        "remote central directories are not probed meanwhile",
+                        int(cls._FETCH_OPEN_S), len(cls._fetch_fail_ts), int(cls._FETCH_TRIP_WINDOW_S))
 
     def _load_or_fetch(self) -> Dict[str, zipfile.ZipInfo]:
         """Return dict of entry_name → ZipInfo."""
@@ -891,6 +920,9 @@ class ZipIndex:
                 raise self._fail_exc
             self._fail_exc = None
 
+        if self._fetch_circuit_open():
+            raise RuntimeError(f"ZIP index fetch circuit open (Zenodo degraded) — {self.url}")
+
         # Fetch central directory from remote ZIP
         log.info("Fetching ZIP index from %s", self.url)
         try:
@@ -899,8 +931,10 @@ class ZipIndex:
                 entries = {zi.filename: zi for zi in zf.infolist()}
         except Exception as exc:
             code = getattr(getattr(exc, "response", None), "status_code", None)
+            self._fail_n += 1
             ttl = (self.FAIL_TTL_404_S if code in (403, 404, 410)
-                   else self.FAIL_TTL_OTHER_S)
+                   else min(self.FAIL_TTL_OTHER_S * (2 ** (self._fail_n - 1)), self.FAIL_TTL_MAX_S))
+            self._note_fetch_failure()
             self._fail_exc = exc
             self._fail_until = time.monotonic() + ttl
             log.warning("ZIP index fetch failed for %s (%s); suppressing "
@@ -927,6 +961,7 @@ class ZipIndex:
             pass
 
         self._entries = entries
+        self._fail_n = 0
         return entries
 
     def has_entry(self, name: str) -> bool:
