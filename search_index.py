@@ -3240,7 +3240,8 @@ def _parent_product_version(manifest, codes) -> str | None:
     lagging block keeps the parent at the lower version so it is not
     counted as upgraded twice (once per re-upgrade wave)."""
     versions = []
-    for cc in codes:
+    voters = [cc for cc in codes if not _ignored_version_voter(cc, codes, manifest)]
+    for cc in voters or codes:
         zj = manifest.get(f'{cc}_json')
         zj2 = manifest.get(f'{cc}_json_v2')
         if not isinstance(zj, dict) and not isinstance(zj2, dict):
@@ -3252,6 +3253,51 @@ def _parent_product_version(manifest, codes) -> str | None:
     if not versions:
         return None
     return min(versions, key=_version_key)
+
+
+def _ignored_version_voter(cc, codes, manifest) -> bool:
+    """Codes that must NOT drag a parent's ``product_version`` down
+    (2026-10-28, the "last 25 non-v2.4 parents" tail):
+
+    * **sweep units** (``<parent>-sw<k>``, `kg_splitter.is_sweep_code`) —
+      add-on products, never a completion marker;
+    * **out-of-coverage blocks** — a tiny v1 ``_json`` (< 20 kB) whose
+      doc says ``out_of_coverage`` (80110-southeast-3/-6: no BEV LiDAR,
+      nothing to upgrade, ever);
+    * **superseded parent-level residue** — the parent's own ``_json``
+      when at least one *block* of it carries a NEWER committed ``_json``
+      (66326/72321/56314: the June v1 parent run was re-done as -east/-west
+      blocks in Oct; the stale parent record is old-split residue that
+      ``remove_legacy_products`` never touches because the parent code
+      itself is no longer scheduled).  Only the parent's own record is
+      ignored — a lagging real block still keeps the parent down.
+    """
+    try:
+        from kg_splitter import is_sweep_code as _isw, is_block_code as _isb
+    except Exception:
+        return False
+    if _isw(cc):
+        return True
+    zj = manifest.get(f'{cc}_json')
+    if not isinstance(zj, dict):
+        return False
+    if _isb(cc) and int(zj.get('size') or 0) < 20000:
+        try:
+            _jd = json.loads((Path('data/austria_processor/json') / f'{cc}.json').read_text())
+            if _jd.get('out_of_coverage'):
+                return True
+        except Exception:
+            pass
+    if not _isb(cc):
+        own_ts = str(zj.get('uploaded_at') or '')
+        for bc in codes:
+            if bc == cc or not _isb(bc) or _isw(bc):
+                continue
+            bj = manifest.get(f'{bc}_json')
+            if isinstance(bj, dict) and 'error' not in str(bj.get('status') or '') \
+                    and str(bj.get('uploaded_at') or '') > own_ts:
+                return True
+    return False
 
 
 _ZENODO_LINK_COLS = [
