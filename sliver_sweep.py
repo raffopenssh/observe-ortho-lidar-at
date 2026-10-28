@@ -387,8 +387,12 @@ def scan(max_n: int = SCAN_PER_TICK, entries: dict | None = None, idx: dict | No
     out = {"scanned": 0, "clean": 0, "pending": 0, "cells": 0, "wait": 0, "lu_fetched": 0, "lu_deferred": 0}
     with _Locked() as st:
         todo = [c for c, k in st["kgs"].items() if k.get("state") == "wait"]
-        # round-robin fairness: oldest scan attempt first
-        todo.sort(key=lambda c: (st["kgs"][c].get("scan_tried") or 0, c))
+        # operator ``priority`` first (same knob the dispatcher honours —
+        # otherwise a bumped parent still queues behind thousands of
+        # never-scanned ones), then round-robin fairness: oldest scan
+        # attempt first
+        todo.sort(key=lambda c: (-int(st["kgs"][c].get("priority") or 0),
+                                 st["kgs"][c].get("scan_tried") or 0, c))
         t0 = time.time()
         n_done = 0
         for code in todo:
