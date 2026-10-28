@@ -14171,8 +14171,10 @@ class PeerDirector:
                         f"(capable workers={len(_sweep_workers)}, v2 demand={_v2_demand}, "
                         f"floor={knob(cfg, 'sweep_peers', _sls.SWEEP_PEERS_DEFAULT)} cap={_cap_sw})",
                         peer='director')
+            _busy = {w for w in _sweep_workers
+                     if ((_cap_status.get(w) or {}).get('current_kg') or {}).get('code')}
             _sw = _sls.assign(_sweep_workers, in_progress=in_progress,
-                              n_peers=_n_sw, prefer=_prefer)
+                              n_peers=_n_sw, prefer=_prefer, busy=_busy)
             for _pid, _specs in _sw.items():
                 _pp = get_peer_by_id(cfg, _pid)
                 if not _pp:

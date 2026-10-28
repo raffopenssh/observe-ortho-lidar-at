@@ -554,13 +554,20 @@ def spec_for(code: str, k: dict) -> dict:
 
 
 def assign(workers: list[str], in_progress: set | None = None,
-           n_peers: int | None = None, prefer: list[str] | None = None) -> dict:
+           n_peers: int | None = None, prefer: list[str] | None = None,
+           busy: set | None = None) -> dict:
     """Pick the sweep workers (sticky; ``sweep_peers`` of *workers*, or
     ``n_peers`` when the director auto-scales) and give each up to
     ``sweep_per_peer`` parents.  ``prefer`` orders the candidates for newly
     added sweeper slots (sticky previous sweepers always come first).
     Returns ``{peer_id: {code: spec}}`` for the peers that carry sweep work
-    this tick.  Also expires stale dispatches."""
+    this tick.  Also expires stale dispatches.
+
+    ``busy`` = sweep workers currently inside a KG / unit.  Pending parents
+    are handed to **idle** workers first (least-loaded first) so a parent
+    bumped by the operator (``priority``) doesn't queue behind another
+    peer's hour-long stalled upload (63308 on at209, 2026-10-28: dispatched
+    10:39Z, started 11:30Z while 7 sweepers sat idle)."""
     if not enabled() or not workers:
         return {}
     if n_peers is None:
@@ -603,8 +610,13 @@ def assign(workers: list[str], in_progress: set | None = None,
                          key=lambda c: (-int(kgs[c].get("priority") or 0), -int(kgs[c].get("unseen_out") or 0), c))
         out: dict = {}
         peers_state = {}
-        for pid in chosen:
-            mine = [c for c, k in kgs.items() if k.get("state") == "dispatched" and k.get("peer") == pid]
+        busy = set(busy or ())
+        held = {pid: [c for c, k in kgs.items() if k.get("state") == "dispatched" and k.get("peer") == pid]
+                for pid in chosen}
+        # fill order: idle peers first, then fewest held parents, then sticky order
+        fill_order = sorted(chosen, key=lambda pid: (pid in busy, len(held[pid]), chosen.index(pid)))
+        for pid in fill_order:
+            mine = held[pid]
             while len(mine) < per_peer and pending:
                 c = pending.pop(0)
                 k = kgs[c]
