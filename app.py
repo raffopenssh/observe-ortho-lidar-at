@@ -21927,7 +21927,8 @@ def process_txt():
                     continue   # sliver-sweep add-on: light_v2 + json_v2 only, by design
                 if prod == 'light_gpkg_v2':
                     prod = 'light_gpkg'
-                g = _trip.setdefault(c, {'p': set(), 'first': None})
+                g = _trip.setdefault(c, {'p': set(), 'first': None,
+                                         'last': 0})
                 g['p'].add(prod)
                 ts = e.get('uploaded_at')
                 if ts:
@@ -21936,6 +21937,8 @@ def process_txt():
                             ts.replace('Z', '+00:00')).timestamp()
                         if g['first'] is None or tt < g['first']:
                             g['first'] = tt
+                        if tt > g['last']:
+                            g['last'] = tt
                     except Exception:
                         pass
             try:
@@ -21955,9 +21958,19 @@ def process_txt():
             except Exception:
                 _struck = set()
             rows = []  # (kind, stale_ts, code, missing, verdict)
+            n_settling = 0
             for c, g in _trip.items():
                 miss = [p for p in _PRODS if p not in g['p']]
                 if not miss:
+                    continue
+                # Upload sequence still in flight (full -> light -> h3b ->
+                # json_v2 -> json takes minutes) or a best-effort
+                # /manifest/push was lost and the 5-min peer sync has not
+                # backfilled it yet: the primary manifest briefly shows
+                # e.g. _json without _full_gpkg. Don't render a scary
+                # 'orphan*' for that (seen 2026-10-28, KG 21019).
+                if _now2 - g['last'] < 600:
+                    n_settling += 1
                     continue
                 first = g['first'] or 0
                 stale_at = first + 48 * 3600
@@ -22039,6 +22052,7 @@ def process_txt():
                 rows.append((kind, stale_at, c, miss, verdict))
             process_txt._stall_view = _sv = {
                 'mt': _mf_mt, 'ts': _t.time(), 'rows': rows,
+                'settling': n_settling,
                 'done': sum(1 for g in _trip.values()
                             if len(g['p']) == 3)}
         rows = _sv['rows']
@@ -22072,7 +22086,9 @@ def process_txt():
                if n_requeued else '')
             + (f' drift={n_drift}' if n_drift else '')
             + (f' ooc={n_ooc}' if n_ooc else '')
-            + (' (suppressed)' if n_drift or n_ooc else ''))
+            + (' (suppressed)' if n_drift or n_ooc else '')
+            + (f' settling={_sv.get("settling", 0)} (<10 min, upload in flight)'
+               if _sv.get('settling') else ''))
         if _stall_lim and rows:
             # partial first (active), then GAPs and never-requeue
             # orphan* rows (both need follow-up), then stalled
