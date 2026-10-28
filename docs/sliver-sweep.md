@@ -202,7 +202,11 @@ Knobs (`director_config.json`): `sliver_sweep` (bool, default on),
 (0.0002°), `sweep_peers_auto` (bool, default on), `sweep_peers_max` (24),
 `sweep_lu_per_tick` (3; umfeld `lu` fetches per 5-min scan tick ≈ 1.2 MB each —
 the sweep's throughput ceiling once the sweepers idle; the `sweep:` line shows
-`scan backlog=Np @x/h` and folds it into the eta. Set to 9 on 2026-10-28).
+`scan backlog=Np @x/h` and folds it into the eta. Set to 9, then 27 on
+2026-10-28 (~200 MB/h primary inbound while the 2 600-parent backlog drains;
+the scan time cap scales as `max(40, 5·lu)` s). ~80 % of scanned parents go
+`clean`, so the lu fetch, not the sweepers, is the bottleneck — idle sweepers
+with `pending=0` are expected.
 
 **Auto-scale (2026-10-27)**: every sweep-capable cache-only worker the v2
 upgrade does not need this tick becomes a sweeper —

@@ -392,7 +392,9 @@ def scan(max_n: int = SCAN_PER_TICK, entries: dict | None = None, idx: dict | No
         t0 = time.time()
         n_done = 0
         for code in todo:
-            if n_done >= max_n or time.time() - t0 > 40:
+            # time cap scales with the lu budget (~3 s per umfeld ``lu``
+            # GET): at 27/tick the old flat 40 s cut the scan short.
+            if n_done >= max_n or time.time() - t0 > max(40, 5 * lu_budget):
                 break
             k = st["kgs"][code]
             p = _parent_path(code)

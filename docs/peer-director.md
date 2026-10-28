@@ -112,7 +112,14 @@ New/relevant fields:
    - Stopped unexpectedly? → Restart it (if bandwidth remains)
    - Unreachable? → Deactivate, pick another
 4. **Enforces single-active**: Stops any non-active peer found running
-5. **Syncs priority queue** to the active peer every ~2.5 min
+5. **Syncs priority queue** to the active peer every ~2.5 min (hash keyed on
+   queue + active peer id). Every frontier also gets it once at start.
+   **Priority overrides cell pinning** (2026-10-28): the processor runs
+   queued codes even when they lie outside its `KG_CELL_FILTER` — before,
+   out-of-cell queue entries were dropped at start *and* marked known, so
+   the mid-run injector never picked them up and the queue sat for days.
+   Cache-only peers keep the strict whitelist. Dups are bounded by
+   `_excluded_kgs` (in-progress) + the 150 s dispatch claim + dup-kg reconciler.
 6. **Saves state** to `director_state.json`
 
 **File lock**: Only one gunicorn worker runs the director loop (fcntl file lock

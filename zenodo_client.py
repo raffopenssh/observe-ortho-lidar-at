@@ -447,6 +447,16 @@ def _md5_of_file(local_path: "Path") -> str:
     return h.hexdigest()
 
 
+class UploadStalledError(requests.exceptions.ConnectionError):
+    """Raised from ``ProgressFileWrapper.read`` when the Zenodo edge drains
+    the request body far below the normal rate for a long time (2026-10-28:
+    ~60 KB/s for 8–12 h on 1.9 GB full GPKGs while sibling peers streamed
+    the same size in 10–30 min; the 240 s socket timeout never fires because
+    bytes do trickle).  A ``ConnectionError`` so the single-PUT retry ladder
+    in ``_put_file_to_bucket`` handles it like a dropped socket: verify the
+    bucket, delete the partial, fresh TCP+TLS session, re-PUT."""
+
+
 class ProgressFileWrapper:
     """Wrap a file object to track read progress during uploads.
 
@@ -454,17 +464,56 @@ class ProgressFileWrapper:
     ``Content-Length`` without relying on ``fileno()``/``fstat``.
     """
 
-    def __init__(self, fh, total_size: int, callback=None, callback_interval: float = 0.5):
+    def __init__(self, fh, total_size: int, callback=None, callback_interval: float = 0.5,
+                 stall_min_bps: float = 0.0, stall_window_s: float = 0.0,
+                 stall_grace_s: float = 0.0, stall_skip_frac: float = 1.0):
         self._fh = fh
         self._total = total_size
         self._sent = 0
         self._callback = callback
         self._interval = callback_interval
         self._last_cb = 0.0
+        # Throughput watchdog (see ``_put_file_to_bucket``): abort the PUT
+        # when the trailing ``stall_window_s`` averaged below
+        # ``stall_min_bps`` after ``stall_grace_s``, unless the body is
+        # already ≥ ``stall_skip_frac`` sent (finishing is cheaper).
+        self._stall_min_bps = float(stall_min_bps or 0.0)
+        self._stall_window_s = float(stall_window_s or 0.0)
+        self._stall_grace_s = float(stall_grace_s or 0.0)
+        self._stall_skip_frac = float(stall_skip_frac)
+        self._t0 = time.time()
+        self._marks: list[tuple[float, int]] = []   # (ts, sent) ring, ~1/s
+        self.stalled_reason: str | None = None
 
     # --- size introspection for requests/urllib3 ---
     def __len__(self) -> int:
         return self._total
+
+    def _check_stall(self, now: float) -> None:
+        if self._stall_min_bps <= 0 or self._stall_window_s <= 0:
+            return
+        if not self._marks or now - self._marks[-1][0] >= 1.0:
+            self._marks.append((now, self._sent))
+            cutoff = now - self._stall_window_s - 5.0
+            while len(self._marks) > 2 and self._marks[0][0] < cutoff:
+                self._marks.pop(0)
+        if now - self._t0 < self._stall_grace_s:
+            return
+        if self._total and self._sent / self._total >= self._stall_skip_frac:
+            return
+        t_old, s_old = self._marks[0]
+        span = now - t_old
+        if span < self._stall_window_s:
+            return
+        bps = (self._sent - s_old) / span
+        if bps < self._stall_min_bps:
+            remain = self._total - self._sent
+            eta_h = remain / bps / 3600.0 if bps > 0 else float("inf")
+            self.stalled_reason = (
+                f"upload stalled: {bps / 1024:.0f} KB/s over last {span / 60:.0f} min "
+                f"({self._sent / 1e6:.0f}/{self._total / 1e6:.0f} MB sent, "
+                f"eta {eta_h:.1f} h at this rate)")
+            raise UploadStalledError(self.stalled_reason)
 
     def read(self, size=-1):
         # Force large reads even when http.client asks for 8 KB.
@@ -477,10 +526,13 @@ class ProgressFileWrapper:
             if self._callback and (now - self._last_cb >= self._interval):
                 self._callback(self._sent, self._total)
                 self._last_cb = now
+            self._check_stall(now)
         return data
 
     def seek(self, *args, **kwargs):
         self._sent = 0
+        self._marks = []
+        self._t0 = time.time()
         return self._fh.seek(*args, **kwargs)
 
     def tell(self):
@@ -763,6 +815,17 @@ class Client:
     _MULTIPART_PART_SIZE = 256 * 1024 * 1024  # 256 MB
     # Socket timeout while *sending* a request body (see _do_request).
     _SEND_TIMEOUT_S = 240
+    # Throughput watchdog for single-PUT bodies (``UploadStalledError``):
+    # abort when the trailing 15 min averaged < 200 KB/s after a 5 min
+    # grace, unless ≥ 90 % is already sent.  Healthy peers stream 1–2 GB
+    # full GPKGs at 0.7–3 MB/s; the pathological case was 60 KB/s for
+    # 8–12 h (then ``max retries``) — ~10 peer-hours per KG lost while
+    # the sibling PUTs landed in 20 min.  A re-PUT on a fresh connection
+    # usually lands on a healthy edge; the ladder still caps at 6 attempts.
+    _STALL_MIN_BPS = 200 * 1024
+    _STALL_WINDOW_S = 15 * 60
+    _STALL_GRACE_S = 5 * 60
+    _STALL_SKIP_FRAC = 0.90
     # Files at/above this size use the slower retry ladder in
     # _upload_to_bucket: 30/60/120/240/300 s (~12 min span) instead of
     # 4/8/16/32/64 s (~2 min). A 2-min ladder cannot outlast a Zenodo
@@ -974,11 +1037,17 @@ class Client:
             md5_hex = None
         max_attempts = 6
         for attempt in range(1, max_attempts + 1):
+            _stalled: ProgressFileWrapper | None = None
             try:
                 with open(local_path, "rb") as fh:
-                    data = (ProgressFileWrapper(
-                        fh, file_size, progress_callback)
-                        if progress_callback else fh)
+                    data = ProgressFileWrapper(
+                        fh, file_size, progress_callback,
+                        stall_min_bps=(self._STALL_MIN_BPS
+                                       if file_size >= self._LARGE_PUT_BYTES else 0),
+                        stall_window_s=self._STALL_WINDOW_S,
+                        stall_grace_s=self._STALL_GRACE_S,
+                        stall_skip_frac=self._STALL_SKIP_FRAC)
+                    _stalled = data
                     # max_retries=0 — the outer loop in this method
                     # owns retry policy. Without this we'd amplify
                     # every transient hiccup into 6 × 6 = 36 re-PUTs
@@ -1005,6 +1074,13 @@ class Client:
                 last_exc = ZenodoError(f"bucket verify failed: {why}")
             except requests.exceptions.RequestException as exc:
                 last_exc = exc
+                if _stalled is not None and _stalled.stalled_reason:
+                    # Watchdog abort (urllib3 may re-wrap it as a
+                    # ProtocolError/ConnectionError): say so explicitly —
+                    # this is the signal behind a re-PUT, not a Zenodo 5xx.
+                    log.warning("PUT %s aborted by throughput watchdog "
+                                "(attempt %d/%d): %s", filename, attempt,
+                                max_attempts, _stalled.stalled_reason)
                 # The 'write timeout' / SSLEOFError class of failures
                 # almost always means the upload completed on Zenodo's
                 # side but the response got dropped. Verify before

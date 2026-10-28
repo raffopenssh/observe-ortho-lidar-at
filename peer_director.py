@@ -14568,7 +14568,10 @@ class PeerDirector:
 
         # Hash check — skip if unchanged
         import hashlib
-        q_hash = hashlib.md5(json.dumps(queue).encode()).hexdigest()
+        # Key the hash on the recipient too: a new active peer must get
+        # the (unchanged) queue once, else it only ever sees the copy it
+        # got at start (cell-filtered, see austria_processor priority block).
+        q_hash = hashlib.md5(json.dumps([active_id, queue]).encode()).hexdigest()
         with self._lock:
             if self.state.get('_last_queue_hash') == q_hash:
                 return

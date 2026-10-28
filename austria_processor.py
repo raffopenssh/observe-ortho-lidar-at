@@ -13832,6 +13832,49 @@ def main():
             # Sub-sort blocks by index within parent
             return (base, k.get("_block_index", 0))
         priority_kgs.sort(key=_prio_key)
+        # Operator / director priority overrides cell pinning (2026-10-28).
+        # ``pending`` was already cut to this peer's KG_CELL_FILTER /
+        # lat strips, so a queued code outside them vanished here — and
+        # because it still landed in ``_known_queue_codes`` the mid-run
+        # injector never picked it up either: 6 queued blocks sat
+        # untouched for days while the active frontier got the queue
+        # re-synced (hash-gated) and ignored it.  Mid-run injection
+        # already runs regardless of cells, so make start-up agree.
+        # Cache-only peers keep the strict whitelist (their queue *is*
+        # the director's cell-aware slice).
+        if not args.cache_only:
+            _have = set()
+            for _k in priority_kgs:
+                _have.add(_k["kg_code"])
+                _have.add(_k.get("_parent_kg_code", _k["kg_code"]))
+            _by_code = {k["kg_code"]: k for k in kgs}
+            _extra = []
+            for pc in priority_codes:
+                if pc in _have or pc in peer_claimed:
+                    continue
+                _pp = parent_kg_code(pc) if is_block_code(pc) else pc
+                _pk = _by_code.get(_pp)
+                if not _pk or _pp in peer_claimed:
+                    continue
+                try:
+                    _blocks = maybe_split_kg(_pk)
+                except Exception:  # noqa: BLE001
+                    _blocks = [_pk]
+                for _b in _blocks:
+                    _bc = _b["kg_code"]
+                    if is_block_code(pc) and _bc != pc:
+                        continue
+                    if (_bc in completed_codes or _bc in failed_kgs
+                            or _bc in peer_claimed or _bc in _have):
+                        continue
+                    _extra.append(_b)
+                    _have.add(_bc)
+            if _extra:
+                log.info("Priority queue: %d queued code(s) lie outside this "
+                         "peer's cells — running them anyway: %s",
+                         len(_extra), [b["kg_code"] for b in _extra][:10])
+                priority_kgs.extend(_extra)
+                priority_kgs.sort(key=_prio_key)
     else:
         priority_kgs = []
         non_priority = pending
