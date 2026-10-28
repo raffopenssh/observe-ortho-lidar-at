@@ -890,14 +890,27 @@ def _dtm_nodata_mask(path: str, shape: tuple[int, int], transform) -> np.ndarray
     parcels (``91111-2912/1``, no elevation at all) whose water lies in
     shore tiles that are 3–52 % land — ``_nodata_tile_union_3035`` only
     drops *all-water* tiles, so both struck out at 18–25 % "hole" on every
-    peer (2026-09-23/26).  None when the layer is absent (pre-2.1 light)."""
+    peer (2026-09-23/26).  None when the layer is absent (pre-2.1 light).
+
+    The layer's nodata is ``v21_products.TERRAIN_COARSE_NODATA`` (−9999)
+    and is matched **explicitly**: GDAL's GPKG gridded-coverage writer
+    leaves ``gpkg_2d_gridded_coverage_ancillary.data_null`` empty for
+    Float32, so ``ds.nodata`` reads back as None and the −9999 lake fill
+    counted as valid DTM — the Bodensee KGs 91103/91108/91109/91110/
+    91111/91119 struck out again on 2026-10-18..25 with the exclusion
+    silently inactive ("no-DTM tiles excluded" but no "DTM-nodata px
+    excluded" in the verdict)."""
     try:
         import rasterio
         from rasterio.warp import reproject, Resampling
+        try:
+            from v21_products import TERRAIN_COARSE_NODATA as _TC_ND
+        except Exception:  # noqa: BLE001
+            _TC_ND = -9999.0
         with rasterio.open(f"GPKG:{path}:terrain_coarse_dtm") as ds:
             a = ds.read(1)
             nd = ds.nodata
-            valid = np.isfinite(a)
+            valid = np.isfinite(a) & (a != _TC_ND) & (a > -9000.0)
             if nd is not None:
                 valid &= a != nd
             dst = np.zeros(shape, np.uint8)

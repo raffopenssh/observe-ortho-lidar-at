@@ -895,6 +895,23 @@ def write_terrain_coarse(gpkg_path: str, coarse: dict) -> list[str]:
             dst.write(arr, 1)
             dst.set_band_description(1, f"{band} ({units[band]}), 5 m block mean of BEV ALS 1 m")
         written.append(name)
+    # GDAL (≤ 3.12) does not persist the Float32 nodata in
+    # ``gpkg_2d_gridded_coverage_ancillary.data_null`` — readers then see
+    # ``nodata=None`` and the −9999 fill as terrain (v2_verify's DTM-nodata
+    # hole exclusion went blind on the Bodensee KGs).  Record it ourselves.
+    if written:
+        try:
+            import sqlite3 as _sq
+            c = _sq.connect(gpkg_path)
+            try:
+                c.executemany("UPDATE gpkg_2d_gridded_coverage_ancillary SET data_null=? "
+                              "WHERE tile_matrix_set_name=? AND (data_null IS NULL OR data_null='')",
+                              [(float(TERRAIN_COARSE_NODATA), n) for n in written])
+                c.commit()
+            finally:
+                c.close()
+        except Exception as e:  # noqa: BLE001
+            log.debug("terrain_coarse data_null not recorded: %s", e)
     return written
 
 

@@ -120,17 +120,41 @@ def download(entry: dict, dest: Path, n_streams: int = N_STREAMS) -> dict:
     download with the real size (Oct 2026: 12213_full.gpkg deferred on 4
     peers in a row with the same "wrong" md5 — manifest said 794 226 688 B,
     Zenodo held 796 643 328 B)."""
-    rec = _download_once(entry, dest, n_streams)
-    want = str(entry.get("checksum") or "").replace("md5:", "").lower()
-    if want and rec.get("md5") != want:
+    def _fixed_entry():
         z_md5, z_size = stored_meta(entry)
         if z_size and z_size != int(entry["size"]):
             log.warning("manifest size stale for %s (%d vs Zenodo %d) — re-downloading",
                         entry.get("filename"), int(entry["size"]), z_size)
-            fixed = dict(entry, size=z_size, checksum=f"md5:{z_md5}" if z_md5 else entry.get("checksum"))
+            return dict(entry, size=z_size,
+                        checksum=f"md5:{z_md5}" if z_md5 else entry.get("checksum"))
+        return None
+
+    try:
+        rec = _download_once(entry, dest, n_streams)
+    except RangeNotSatisfiable:
+        # Manifest size LARGER than the file on Zenodo: the last range
+        # starts past EOF and Zenodo answers 416 for good (12174_full.gpkg:
+        # manifest 1 159 966 720 B, Zenodo 1 158 193 152 B = exactly
+        # page_count x page_size, i.e. the file is complete and the
+        # manifest record is what's wrong). Retrying the range cost 16
+        # peers x 40 min each and a "range 3 failed" deferral every time.
+        fixed = _fixed_entry()
+        if fixed is None:
+            raise
+        rec = _download_once(fixed, dest, n_streams)
+        rec["stale_size"] = int(entry["size"])
+        return rec
+    want = str(entry.get("checksum") or "").replace("md5:", "").lower()
+    if want and rec.get("md5") != want:
+        fixed = _fixed_entry()
+        if fixed is not None:
             rec = _download_once(fixed, dest, n_streams)
             rec["stale_size"] = int(entry["size"])
     return rec
+
+
+class RangeNotSatisfiable(RuntimeError):
+    """HTTP 416 on a range request — the manifest size overshoots the file."""
 
 
 def _download_once(entry: dict, dest: Path, n_streams: int = N_STREAMS) -> dict:
@@ -155,8 +179,17 @@ def _download_once(entry: dict, dest: Path, n_streams: int = N_STREAMS) -> dict:
                     # file gone from the bucket (e.g. 72321_full.gpkg: deposit 20492929
                     # has 0 files) — retrying for an hour won't bring it back
                     raise FileNotFoundError(f"HTTP {r.status_code}")
+                if r.status_code == 416:
+                    raise RangeNotSatisfiable(f"HTTP 416 for bytes={a}-{b}")
                 if r.status_code not in (200, 206):
                     raise RuntimeError(f"HTTP {r.status_code}")
+                _cr = r.headers.get("Content-Range", "")      # bytes a-b/total
+                try:
+                    _tot = int(_cr.rsplit("/", 1)[1]) if "/" in _cr else 0
+                except ValueError:
+                    _tot = 0
+                if _tot and _tot < size:
+                    raise RangeNotSatisfiable(f"Content-Range total {_tot} < manifest size {size}")
                 n = 0
                 with open(tmp, "r+b") as f:
                     f.seek(a)
@@ -166,7 +199,7 @@ def _download_once(entry: dict, dest: Path, n_streams: int = N_STREAMS) -> dict:
                 if n != b - a + 1:
                     raise RuntimeError(f"short range {n} != {b-a+1}")
                 return n
-            except FileNotFoundError:
+            except (FileNotFoundError, RangeNotSatisfiable):
                 raise
             except Exception as e:  # noqa: BLE001
                 log.warning("range %d attempt %d failed: %s", i, attempt, e)
