@@ -992,7 +992,22 @@ def status() -> dict:
     now = time.time()
     day = [k for k in done if k.get("done_at") and now - _ts(k["done_at"]) < 86400]
     rate = len(day) / 24.0
-    eta_h = (len(pend) / rate) if rate > 0 else None
+    # Scan backlog (2026-10-28): ``wait`` parents whose h3b is already on
+    # disk only move once ``scan`` spends an umfeld ``lu`` fetch on them
+    # (``sweep_lu_per_tick``, ~30/h) — with the sweepers mostly idle this
+    # upstream step, not the fleet, bounds the eta.  Count it explicitly so
+    # ``eta=0.0d`` with 3 000 parents still queued cannot happen again.
+    scan_backlog = sum(1 for c, k in kgs.items() if k.get("state") == "wait" and _parent_path(c).exists())
+    # rate = lu fetches/24h (the index-sourced parents scan for free and
+    # are long gone; what is left in the backlog is bevdirect-sourced).
+    scanned_day = sum(1 for k in kgs.values() if k.get("state") != "wait" and k.get("lu_cells_n")
+                      and k.get("scanned_at") and now - _ts(k["scanned_at"]) < 86400)
+    scan_rate = scanned_day / 24.0
+    eta_h = None
+    if rate > 0:
+        eta_h = len(pend) / rate
+        if scan_backlog:
+            eta_h += (scan_backlog / scan_rate) if scan_rate > 0 else 0.0
     # umfeld confirmation of integrated parents
     confirmed = 0
     try:
@@ -1020,6 +1035,7 @@ def status() -> dict:
             "unswept_parents": sum(1 for k in done if k.get("unswept")),
             "hold_units": hold_units, "hold_cells": hold_cells, "cache_miss_total": int((st.get("stats") or {}).get("cache_miss") or 0),
             "done_24h": len(day), "rate_per_h": round(rate, 2),
+            "scan_backlog": scan_backlog, "scan_rate_per_h": round(scan_rate, 2),
             "eta_h": round(eta_h, 1) if eta_h is not None else None, "peers": st.get("peers") or {},
             "contrib_confirmed": confirmed, "stats": st.get("stats"), "products": prod,
             "knobs": {"sweep_peers": _knob("sweep_peers", SWEEP_PEERS_DEFAULT),
@@ -1054,7 +1070,9 @@ def text_lines(v: dict | None = None) -> list[str]:
             f"· filled={v['cells_filled']:,} nodata={v['nodata_cells']:,}"
             + (f" unswept={v['unswept_cells']:,}({v['unswept_parents']}p)" if v.get("unswept_cells") else "")
             + (f" hold={v['hold_units']}u/{v['hold_cells']}cells→repair_cells" if v.get("hold_units") else "")
-            + f" · @{v['rate_per_h']}/h eta={eta} "
+            + f" · @{v['rate_per_h']}/h eta={eta}"
+            + (f" (scan backlog={v['scan_backlog']:,}p @{v['scan_rate_per_h']}/h)" if v.get("scan_backlog") else "")
+            + " "
             f"· contrib re-posted={v['contrib_confirmed']}/{by.get('done', 0)}")
     pr = v.get("products") or {}
     lines = [head,
