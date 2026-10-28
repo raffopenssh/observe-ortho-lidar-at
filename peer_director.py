@@ -259,6 +259,9 @@ DIRECTOR_KNOBS = {
     # workers sweep, parents per worker, umfeld bbox_changes min_delta.
     'sliver_sweep': bool, 'sweep_peers': int, 'sweep_per_peer': int, 'sweep_min_delta': float,
     'sweep_peers_auto': bool, 'sweep_peers_max': int,
+    # umfeld ``lu`` fetches per scan tick (~1.2 MB each, primary metered):
+    # the only throughput limit of the sweep once the sweepers idle.
+    'sweep_lu_per_tick': int,
     # Gradual ramp (docs/vct-pilot.md → Ramp): every 24h/N the director
     # moves ONE more eligible peer into vct_bev_peers (health-gated,
     # sticky) until the whole fleet builds its declared layer locally.

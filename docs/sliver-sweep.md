@@ -199,7 +199,10 @@ python3 sliver_sweep.py status | plan <kg> | refresh [--force] | scan [N] | inte
 
 Knobs (`director_config.json`): `sliver_sweep` (bool, default on),
 `sweep_peers` (4 — the **floor**), `sweep_per_peer` (3), `sweep_min_delta`
-(0.0002°), `sweep_peers_auto` (bool, default on), `sweep_peers_max` (24).
+(0.0002°), `sweep_peers_auto` (bool, default on), `sweep_peers_max` (24),
+`sweep_lu_per_tick` (3; umfeld `lu` fetches per 5-min scan tick ≈ 1.2 MB each —
+the sweep's throughput ceiling once the sweepers idle; the `sweep:` line shows
+`scan backlog=Np @x/h` and folds it into the eta. Set to 9 on 2026-10-28).
 
 **Auto-scale (2026-10-27)**: every sweep-capable cache-only worker the v2
 upgrade does not need this tick becomes a sweeper —

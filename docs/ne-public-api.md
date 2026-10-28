@@ -360,7 +360,7 @@ product or JSON is rewritten**:
 * **standing rule — resync by digest, never blindly**: `confirm_umfeld`
   compares `kgs[kg].obs.digest` with our fixed digest and re-POSTs only on
   mismatch (`replaced:true`; `unchanged:true` is free). Limits honoured:
-  ≥0.6 s between POSTs (`POST_MIN_GAP_S`), `ne_post_gib_per_day` (2 GiB,
+  ≥0.6 s between POSTs (`POST_MIN_GAP_S`), `ne_post_gib_per_day` (2 GiB default, 5 GiB set 2026-10-28,
   umfeld's token limit is 4 GiB/day) tracked in `index.json → stats.post_day`
   (`DAY-CAP-HOLD` on the `resync(by digest)` line). When our digest for a KG
   changes the retry ladder (`post_attempts`/`post_next`) resets.
