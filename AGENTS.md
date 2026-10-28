@@ -31,7 +31,7 @@ still shows ≥5 files / ≥1 GB committed in the last hour (retry ladder
 absorbing it); `ZENODO-DEGRADED` only when nothing lands. The
 `zenodo_uploads:` and `openeo:` lines are the evidence behind both verdicts
 — read them before touching timeouts/retry ladders (see
-`docs/copernicus-throttle.md → Correction (2026-09-23)`). `FLEET-DORMANT` =
+`docs/copernicus-throttle.md → Correction (2026-09-23)`). The `zenodo_uploads:` line ends with `watchdog: floor=… fleet_med=… (n=…) aborts_1h=N` — the fleet-relative PUT throughput watchdog (`docs/austria-processor.md → Zenodo PUT throughput watchdog`; floor = max(20 KB/s, 0.25 × fleet median), knobs `zenodo_put_floor_abs_kbps` / `zenodo_put_floor_frac`; `?q=watchdog` for aborts). `FLEET-DORMANT` =
 every remote peer unreachable ≥15 min — `docs/peer-director.md →
 Fleet-dormant hold mode`. **Counts come from the search index** (one row
 per parent KG, fresh `_json` completions only — split blocks and v2.x

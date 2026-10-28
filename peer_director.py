@@ -267,6 +267,10 @@ DIRECTOR_KNOBS = {
     # sticky) until the whole fleet builds its declared layer locally.
     # 0 = off.
     'vct_ramp_per_day': int,
+    # Zenodo PUT throughput watchdog (zenodo_client.ProgressFileWrapper):
+    # peer floor = max(abs_kbps, frac × fleet median PUT rate). Published
+    # to peers in the peer_status ack (``fleet_put_rate()``).
+    'zenodo_put_floor_abs_kbps': float, 'zenodo_put_floor_frac': float,
 }
 _knob_cache: dict = {'at': 0.0, 'd': {}}
 
@@ -2148,9 +2152,141 @@ def record_peer_push(peer_id: str, status: dict,
         pass
     if isinstance(_new_strikes, dict) and _new_strikes != _old_strikes:
         _v2_fleet_strikes_merge(peer_id, _new_strikes)
+    note_put_progress(peer_id, status, now=_ent['ts'])
     _gone = status.get('v2_gone')
     if isinstance(_gone, dict) and _gone and _gone != prev_status.get('v2_gone'):
         v2_regen_add_candidates(peer_id, _gone)
+
+
+# --- fleet Zenodo PUT rate (throughput-watchdog floor) -------------------
+# Every uploading peer already pushes ``current_kg.upload_progress``
+# ({file, sent, total}); the director turns consecutive pushes into a
+# per-upload span rate, takes the median over the uploads active in the
+# last 5 min, smooths it over a 15 min history and hands the result back
+# in the peer_status *ack* (~30 B — no new poll, no new push).  Cross-
+# worker via a small flock'd file next to the push mirror.  Consumed by
+# ``zenodo_client.fleet_put_floor()`` (peer-local mirror written by
+# ``app._peer_status_push_loop``; the primary mirrors it itself here).
+_FLEET_PUT_SAMPLES = _PEER_PUSH_DIR / '_put_rates.json'
+_FLEET_PUT_LOCK = _PEER_PUSH_DIR / '_put_rates.lock'
+_FLEET_PUT_LOCAL = DATA_DIR / 'zenodo_fleet_put.json'
+FLEET_PUT_ACTIVE_S = 300        # a sample counts while its last push is this fresh
+FLEET_PUT_MIN_SPAN_S = 60       # ≥ 2 pushes apart before a rate is trusted
+FLEET_PUT_HIST_S = 15 * 60      # rolling median of per-tick medians
+ZENODO_PUT_FLOOR_ABS_KBPS = 20.0
+ZENODO_PUT_FLOOR_FRAC = 0.25
+_fleet_put_cache: dict = {'at': 0.0, 'v': {}}
+
+
+def _fleet_put_rw(mutate):
+    """flock'd read-modify-write of the samples file; returns the dict."""
+    import fcntl
+    _PEER_PUSH_DIR.mkdir(parents=True, exist_ok=True)
+    with open(_FLEET_PUT_LOCK, 'a+') as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                d = json.loads(_FLEET_PUT_SAMPLES.read_text())
+                if not isinstance(d, dict):
+                    d = {}
+            except Exception:
+                d = {}
+            if mutate(d):
+                tmp = _FLEET_PUT_SAMPLES.with_suffix('.tmp')
+                tmp.write_text(json.dumps(d))
+                os.replace(tmp, _FLEET_PUT_SAMPLES)
+            return d
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def note_put_progress(peer_id: str, status: dict, now: float | None = None) -> None:
+    """Fold one pushed ``upload_progress`` into the per-peer span sample."""
+    try:
+        up = ((status or {}).get('current_kg') or {}).get('upload_progress')
+        if not isinstance(up, dict):
+            return
+        sent, total, fname = int(up.get('sent') or 0), int(up.get('total') or 0), str(up.get('file') or '')
+        if total <= 0 or not fname:
+            return
+        now = now if now is not None else time.time()
+
+        def _m(d):
+            e = (d.get('peers') or {}).get(peer_id)
+            if (isinstance(e, dict) and e.get('file') == fname and e.get('total') == total
+                    and sent >= int(e.get('s') or 0)):
+                e['t'], e['s'] = now, sent
+            else:
+                e = {'file': fname, 'total': total, 't0': now, 's0': sent, 't': now, 's': sent}
+            d.setdefault('peers', {})[peer_id] = e
+            return True
+        _fleet_put_rw(_m)
+    except Exception:
+        log.debug('note_put_progress failed', exc_info=True)
+
+
+def fleet_put_rate(ttl: float = 30.0) -> dict:
+    """``{ts, fleet_med_bps|None, n, floor_bps, abs_min_bps, frac, raw_med_bps}``
+    — cached *ttl* s; mirrors itself to ``zenodo_fleet_put.json`` for the
+    primary's own zenodo_client."""
+    import statistics
+    now = time.time()
+    if now - _fleet_put_cache['at'] < ttl and _fleet_put_cache['v']:
+        return _fleet_put_cache['v']
+    cfg = director_config()
+    abs_kbps = float(cfg.get('zenodo_put_floor_abs_kbps', ZENODO_PUT_FLOOR_ABS_KBPS) or 0)
+    frac = float(cfg.get('zenodo_put_floor_frac', ZENODO_PUT_FLOOR_FRAC) or 0)
+    out = {'raw': None, 'n': 0, 'hist_med': None}
+
+    def _m(d):
+        rates = []
+        for pid, e in list((d.get('peers') or {}).items()):
+            try:
+                if now - float(e['t']) > FLEET_PUT_ACTIVE_S:
+                    continue
+                span = float(e['t']) - float(e['t0'])
+                gain = int(e['s']) - int(e['s0'])
+                if span >= FLEET_PUT_MIN_SPAN_S and gain > 0:
+                    rates.append(gain / span)
+            except Exception:
+                continue
+        # prune dead samples (> 1 h) so the file stays tiny
+        d['peers'] = {k: v for k, v in (d.get('peers') or {}).items()
+                      if now - float((v or {}).get('t') or 0) <= 3600}
+        hist = [h for h in (d.get('hist') or []) if now - float(h[0]) <= FLEET_PUT_HIST_S]
+        if rates:
+            out['raw'] = statistics.median(rates)
+            out['n'] = len(rates)
+            hist.append([now, out['raw']])
+        d['hist'] = hist[-60:]
+        if hist:
+            out['hist_med'] = statistics.median(h[1] for h in hist)
+        return True
+    try:
+        _fleet_put_rw(_m)
+    except Exception:
+        log.debug('fleet_put_rate failed', exc_info=True)
+    med = out['hist_med']
+    abs_bps = abs_kbps * 1024.0
+    floor = max(abs_bps, frac * med) if med else abs_bps
+    v = {'ts': now, 'fleet_med_bps': (round(med) if med else None), 'n': out['n'],
+         'raw_med_bps': (round(out['raw']) if out['raw'] else None),
+         'floor_bps': round(floor), 'abs_min_bps': round(abs_bps), 'frac': frac}
+    _fleet_put_cache.update(at=now, v=v)
+    try:
+        tmp = _FLEET_PUT_LOCAL.with_suffix('.tmp')
+        tmp.write_text(json.dumps(v))
+        os.replace(tmp, _FLEET_PUT_LOCAL)
+    except Exception:
+        pass
+    return v
+
+
+def fleet_put_ack() -> dict:
+    """Slim ack payload for peers: ``{med, n, floor, abs, frac}`` (bytes/s)."""
+    v = fleet_put_rate()
+    return {'med': v.get('fleet_med_bps'), 'n': v.get('n'), 'floor': v.get('floor_bps'),
+            'abs': v.get('abs_min_bps'), 'frac': v.get('frac')}
 
 
 def get_pushed_status(peer_id: str) -> dict | None:

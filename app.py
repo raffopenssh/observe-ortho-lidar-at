@@ -2712,6 +2712,32 @@ def _acquire_single_flight(name: str, poll_s: float = 30.0):
             time.sleep(poll_s)
 
 
+_FLEET_PUT_LAST: dict = {}
+
+
+def _store_fleet_put(zp: dict) -> None:
+    """Mirror the director's fleet PUT floor (peer_status ack ``zput``)
+    into ``zenodo_client.FLEET_PUT_FILE`` for the processor's watchdog.
+    Rewritten only when a value changed or the file is > 5 min old."""
+    global _FLEET_PUT_LAST
+    try:
+        import zenodo_client as _zc
+        p = _zc.FLEET_PUT_FILE
+        same = {k: zp.get(k) for k in ('med', 'floor', 'abs', 'frac')} == \
+            {k: _FLEET_PUT_LAST.get(k) for k in ('med', 'floor', 'abs', 'frac')}
+        if same and p.exists() and time.time() - p.stat().st_mtime < 300:
+            return
+        v = {'ts': time.time(), 'fleet_med_bps': zp.get('med'), 'n': zp.get('n'),
+             'floor_bps': zp.get('floor'), 'abs_min_bps': zp.get('abs'), 'frac': zp.get('frac')}
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix('.tmp')
+        tmp.write_text(json.dumps(v))
+        os.replace(tmp, p)
+        _FLEET_PUT_LAST = dict(zp)
+    except Exception as e:
+        log.debug('fleet put mirror failed: %s', e)
+
+
 def _peer_status_push_loop():
     import requests as _req
     import director_ha as _dha
@@ -3072,6 +3098,9 @@ def _peer_status_push_loop():
                     _PEER_PUSH_ACK_LOG_WM = (_ack or {}).get('recent_log_wm') or None
                     if (_ack or {}).get('secrets_rev'):
                         _fs.note_rev(_ack.get('secrets_rev'))
+                    _zp = (_ack or {}).get('zput')
+                    if isinstance(_zp, dict) and 'floor' in _zp:
+                        _store_fleet_put(_zp)
                 except Exception:
                     _PEER_PUSH_ACK_LOG_WM = None
                 if not _resp.ok:
@@ -8585,7 +8614,10 @@ def director_peer_status():
     return jsonify({'ok': True, 'next_push_in_s': pd.PEER_PUSH_INTERVAL,
                     'recent_log_wm': pd.pushed_recent_log_wm(peer_id),
                     # ~12 B: peers re-lease provider secrets only when this changes
-                    'secrets_rev': _fs.store_rev()})
+                    'secrets_rev': _fs.store_rev(),
+                    # ~30 B: fleet-relative Zenodo PUT floor for the
+                    # throughput watchdog (zenodo_client.fleet_put_floor)
+                    'zput': pd.fleet_put_ack()})
 
 
 @app.route('/api/v1/director/proxy/status')
@@ -21027,7 +21059,7 @@ def _zenodo_upload_health(hours: float = 1.0, ttl: float = 60.0) -> dict:
         return _ZENODO_UPLOAD_HEALTH_CACHE['v']
     v = {'hours': hours, 'ok_files': 0, 'ok_bytes': 0, 'ok_files_24h': 0,
          'ok_bytes_24h': 0, 'put_fail': 0, 'put_final': 0, 'requeued': 0,
-         'lock_timeouts': 0, 'peers_fail': set(), 'peers_ok': set()}
+         'lock_timeouts': 0, 'wd_aborts': 0, 'peers_fail': set(), 'peers_ok': set()}
     cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=hours)
     cutoff_24 = datetime.now(timezone.utc) - timedelta(hours=24)
     cutoff = cutoff_dt.isoformat()
@@ -21064,7 +21096,9 @@ def _zenodo_upload_health(hours: float = 1.0, ttl: float = 60.0) -> dict:
                 peer = e.get('peer') or '?'
                 m = mult.search(msg)
                 n = int(m.group(1)) if m else 1
-                if 'zenodo_client: PUT' in msg and ('failed' in msg or 'error' in msg):
+                if 'aborted by throughput watchdog' in msg:
+                    v['wd_aborts'] += n
+                elif 'zenodo_client: PUT' in msg and ('failed' in msg or 'error' in msg):
                     v['put_fail'] += n; v['peers_fail'].add(peer)
                     a = att.search(msg)
                     if a and a.group(1) == a.group(2):
@@ -22890,6 +22924,14 @@ def process_txt():
             except Exception:
                 _zcfg = ''
             _gbh = _zu['ok_bytes'] / 1e9 / max(_zu['hours'], 1e-6)
+            try:
+                import peer_director as _pdw
+                _fp = _pdw.fleet_put_rate()
+                _wd = (f"watchdog: floor={_fp['floor_bps'] / 1024:.0f} KB/s "
+                       f"fleet_med={(_fp['fleet_med_bps'] or 0) / 1024:.0f} KB/s "
+                       f"(n={_fp['n']}) aborts_1h={_zu['wd_aborts']}")
+            except Exception:
+                _wd = f"watchdog: aborts_1h={_zu['wd_aborts']}"
             _zstate = ('STALLED — nothing committed' if not _zu['ok_files'] and _zu['put_fail']
                        else 'lossy — most PUT attempts fail' if _zu['put_fail'] > 2 * max(_zu['ok_files'], 1)
                        else 'ok')
@@ -22901,6 +22943,7 @@ def process_txt():
                 f"lock_timeouts={_zu['lock_timeouts']} · 24h: {_zu['ok_files_24h']} files "
                 f"{_zu['ok_bytes_24h']/1e9:.0f}GB"
                 + (f" · {_zcfg}" if _zcfg else '')
+                + f" · {_wd}"
                 + " · debug: ?q=zenodo_client&warn=1"
             )
         except Exception:

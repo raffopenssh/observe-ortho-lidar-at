@@ -449,12 +449,54 @@ def _md5_of_file(local_path: "Path") -> str:
 
 class UploadStalledError(requests.exceptions.ConnectionError):
     """Raised from ``ProgressFileWrapper.read`` when the Zenodo edge drains
-    the request body far below the normal rate for a long time (2026-10-28:
-    ~60 KB/s for 8–12 h on 1.9 GB full GPKGs while sibling peers streamed
-    the same size in 10–30 min; the 240 s socket timeout never fires because
-    bytes do trickle).  A ``ConnectionError`` so the single-PUT retry ladder
-    in ``_put_file_to_bucket`` handles it like a dropped socket: verify the
-    bucket, delete the partial, fresh TCP+TLS session, re-PUT."""
+    the request body far below what the *fleet* currently achieves, or
+    not at all (2026-10-28: ~60 KB/s for 8–12 h on 1.9 GB full GPKGs while
+    sibling peers streamed the same size in 10–30 min; the 240 s socket
+    timeout never fires because bytes do trickle).  A ``ConnectionError``
+    so the single-PUT retry ladder in ``_put_file_to_bucket`` handles it
+    like a dropped socket: verify the bucket, delete the partial, fresh
+    TCP+TLS session, re-PUT."""
+
+
+# --- fleet-relative PUT floor -------------------------------------------
+# The director derives a rolling fleet median PUT rate from the
+# ``upload_progress`` every uploading peer already pushes (no new poll:
+# it rides back in the ``peer_status`` ack, ~30 B) and the peer mirrors it
+# into this file (``app._peer_status_push_loop``).  Absent / stale file →
+# the absolute floor alone.  Knobs live in ``director_config.json``
+# (``zenodo_put_floor_abs_kbps`` / ``zenodo_put_floor_frac``); the peer
+# applies the *published* floor so one knob change reaches the fleet
+# within a push interval.
+FLEET_PUT_FILE = Path("data/austria_processor/zenodo_fleet_put.json")
+FLEET_PUT_MAX_AGE_S = 30 * 60
+STALL_ABS_MIN_BPS = 20 * 1024      # ABS_MIN default (knob zenodo_put_floor_abs_kbps)
+STALL_FLEET_FRAC = 0.25            # FRAC default (knob zenodo_put_floor_frac)
+_fleet_put_cache: dict = {"mtime": -1.0, "d": {}}
+
+
+def fleet_put_floor(now: float | None = None) -> dict:
+    """``{floor_bps, fleet_med_bps|None, n, abs_min_bps, age_s}``."""
+    now = now if now is not None else time.time()
+    d: dict = {}
+    try:
+        st = FLEET_PUT_FILE.stat()
+        mt = (st.st_mtime_ns, st.st_size)
+        if mt != _fleet_put_cache["mtime"]:
+            _fleet_put_cache["d"] = json.loads(FLEET_PUT_FILE.read_text()) or {}
+            _fleet_put_cache["mtime"] = mt
+        d = _fleet_put_cache["d"] if isinstance(_fleet_put_cache["d"], dict) else {}
+    except Exception:
+        d = {}
+    abs_min = float(d.get("abs_min_bps") or STALL_ABS_MIN_BPS)
+    age = now - float(d.get("ts") or 0.0)
+    med = d.get("fleet_med_bps")
+    if med is not None and age > FLEET_PUT_MAX_AGE_S:
+        med = None
+    frac = float(d.get("frac") if d.get("frac") is not None else STALL_FLEET_FRAC)
+    floor = max(abs_min, frac * float(med)) if med else abs_min
+    return {"floor_bps": floor, "fleet_med_bps": (float(med) if med else None),
+            "n": int(d.get("n") or 0), "abs_min_bps": abs_min, "frac": frac,
+            "age_s": (age if d else None)}
 
 
 class ProgressFileWrapper:
@@ -462,42 +504,99 @@ class ProgressFileWrapper:
 
     Also acts as a ``__len__``-able object so ``requests`` sets
     ``Content-Length`` without relying on ``fileno()``/``fstat``.
+
+    Throughput watchdog (``_check_stall``; see ``Client._STALL_*`` and
+    ``docs/austria-processor.md → Zenodo PUT throughput watchdog``):
+
+    * **dead** — ``stall_dead_s`` with zero bytes drained → abort, always
+      (after ``stall_grace_s``; independent of the floor / skip / steady
+      rules — that is a dead connection, not slowness).
+    * **slow** — trailing ``stall_window_s`` averaged below the fleet-
+      relative floor ``stall_min_bps`` → abort, *unless*: grace not over,
+      ≥ ``stall_skip_frac`` already sent, the window is *steady*
+      (every ~60 s bucket made progress and the window averaged ≥
+      ``stall_abs_min_bps``), or finishing at the current rate is quicker
+      than the time already sunk (a restart would cost more).
+    ``clock`` is injectable for tests.
     """
+
+    STEADY_BUCKET_S = 60.0
 
     def __init__(self, fh, total_size: int, callback=None, callback_interval: float = 0.5,
                  stall_min_bps: float = 0.0, stall_window_s: float = 0.0,
-                 stall_grace_s: float = 0.0, stall_skip_frac: float = 1.0):
+                 stall_grace_s: float = 0.0, stall_skip_frac: float = 1.0,
+                 stall_dead_s: float = 0.0, stall_abs_min_bps: float = 0.0,
+                 stall_fleet_bps: float | None = None, clock=None):
         self._fh = fh
         self._total = total_size
         self._sent = 0
         self._callback = callback
         self._interval = callback_interval
         self._last_cb = 0.0
-        # Throughput watchdog (see ``_put_file_to_bucket``): abort the PUT
-        # when the trailing ``stall_window_s`` averaged below
-        # ``stall_min_bps`` after ``stall_grace_s``, unless the body is
-        # already ≥ ``stall_skip_frac`` sent (finishing is cheaper).
+        self._clock = clock or time.time
         self._stall_min_bps = float(stall_min_bps or 0.0)
         self._stall_window_s = float(stall_window_s or 0.0)
         self._stall_grace_s = float(stall_grace_s or 0.0)
         self._stall_skip_frac = float(stall_skip_frac)
-        self._t0 = time.time()
+        self._stall_dead_s = float(stall_dead_s or 0.0)
+        self._stall_abs_min_bps = float(stall_abs_min_bps or 0.0)
+        self._stall_fleet_bps = stall_fleet_bps
+        self._t0 = self._clock()
         self._marks: list[tuple[float, int]] = []   # (ts, sent) ring, ~1/s
+        self._last_progress_ts = self._t0
         self.stalled_reason: str | None = None
+        self.stalled_kind: str | None = None        # 'dead' | 'slow'
 
     # --- size introspection for requests/urllib3 ---
     def __len__(self) -> int:
         return self._total
 
+    def _fmt_floor(self) -> str:
+        fm = (f"{self._stall_fleet_bps / 1024:.0f} KB/s" if self._stall_fleet_bps
+              else "n/a")
+        return (f"floor={self._stall_min_bps / 1024:.0f} KB/s "
+                f"fleet_med={fm} abs_min={self._stall_abs_min_bps / 1024:.0f} KB/s")
+
+    def _is_steady(self, now: float) -> bool:
+        """Monotone progress in every ~60 s bucket of the trailing window
+        and window average ≥ ABS_MIN."""
+        if self._stall_abs_min_bps <= 0:
+            return False
+        t_old, s_old = self._marks[0]
+        span = now - t_old
+        if span <= 0 or (self._sent - s_old) / span < self._stall_abs_min_bps:
+            return False
+        # Walk buckets: each bucket of STEADY_BUCKET_S must have gained bytes.
+        b_t, b_s = t_old, s_old
+        for ts, sent in self._marks[1:] + [(now, self._sent)]:
+            if ts - b_t >= self.STEADY_BUCKET_S:
+                if sent <= b_s:
+                    return False
+                b_t, b_s = ts, sent
+        return True
+
     def _check_stall(self, now: float) -> None:
-        if self._stall_min_bps <= 0 or self._stall_window_s <= 0:
+        active = self._stall_window_s > 0 and (self._stall_min_bps > 0 or self._stall_dead_s > 0)
+        if not active:
             return
+        prev_sent = self._marks[-1][1] if self._marks else 0
         if not self._marks or now - self._marks[-1][0] >= 1.0:
             self._marks.append((now, self._sent))
             cutoff = now - self._stall_window_s - 5.0
             while len(self._marks) > 2 and self._marks[0][0] < cutoff:
                 self._marks.pop(0)
+        if self._sent > prev_sent or not self._marks[:-1]:
+            self._last_progress_ts = now
         if now - self._t0 < self._stall_grace_s:
+            return
+        # 1) dead connection: nothing drained for stall_dead_s.
+        if self._stall_dead_s > 0 and now - self._last_progress_ts >= self._stall_dead_s:
+            self.stalled_kind = "dead"
+            self.stalled_reason = (
+                f"upload dead: 0 bytes for {(now - self._last_progress_ts) / 60:.0f} min "
+                f"({self._sent / 1e6:.0f}/{self._total / 1e6:.0f} MB sent); {self._fmt_floor()}")
+            raise UploadStalledError(self.stalled_reason)
+        if self._stall_min_bps <= 0:
             return
         if self._total and self._sent / self._total >= self._stall_skip_frac:
             return
@@ -506,14 +605,22 @@ class ProgressFileWrapper:
         if span < self._stall_window_s:
             return
         bps = (self._sent - s_old) / span
-        if bps < self._stall_min_bps:
-            remain = self._total - self._sent
-            eta_h = remain / bps / 3600.0 if bps > 0 else float("inf")
-            self.stalled_reason = (
-                f"upload stalled: {bps / 1024:.0f} KB/s over last {span / 60:.0f} min "
-                f"({self._sent / 1e6:.0f}/{self._total / 1e6:.0f} MB sent, "
-                f"eta {eta_h:.1f} h at this rate)")
-            raise UploadStalledError(self.stalled_reason)
+        if bps >= self._stall_min_bps:
+            return
+        # 2) slow — but protected when steady or when finishing is cheaper.
+        if self._is_steady(now):
+            return
+        remain = self._total - self._sent
+        sunk = now - self._t0
+        if bps > 0 and remain / bps < sunk:
+            return
+        eta_h = remain / bps / 3600.0 if bps > 0 else float("inf")
+        self.stalled_kind = "slow"
+        self.stalled_reason = (
+            f"upload stalled: {bps / 1024:.0f} KB/s over last {span / 60:.0f} min "
+            f"({self._sent / 1e6:.0f}/{self._total / 1e6:.0f} MB sent, "
+            f"eta {eta_h:.1f} h at this rate, {sunk / 3600:.1f} h sunk); {self._fmt_floor()}")
+        raise UploadStalledError(self.stalled_reason)
 
     def read(self, size=-1):
         # Force large reads even when http.client asks for 8 KB.
@@ -522,7 +629,7 @@ class ProgressFileWrapper:
         data = self._fh.read(size)
         if data:
             self._sent += len(data)
-            now = time.time()
+            now = self._clock()
             if self._callback and (now - self._last_cb >= self._interval):
                 self._callback(self._sent, self._total)
                 self._last_cb = now
@@ -532,7 +639,8 @@ class ProgressFileWrapper:
     def seek(self, *args, **kwargs):
         self._sent = 0
         self._marks = []
-        self._t0 = time.time()
+        self._t0 = self._clock()
+        self._last_progress_ts = self._t0
         return self._fh.seek(*args, **kwargs)
 
     def tell(self):
@@ -815,17 +923,22 @@ class Client:
     _MULTIPART_PART_SIZE = 256 * 1024 * 1024  # 256 MB
     # Socket timeout while *sending* a request body (see _do_request).
     _SEND_TIMEOUT_S = 240
-    # Throughput watchdog for single-PUT bodies (``UploadStalledError``):
-    # abort when the trailing 15 min averaged < 200 KB/s after a 5 min
-    # grace, unless ≥ 90 % is already sent.  Healthy peers stream 1–2 GB
-    # full GPKGs at 0.7–3 MB/s; the pathological case was 60 KB/s for
-    # 8–12 h (then ``max retries``) — ~10 peer-hours per KG lost while
-    # the sibling PUTs landed in 20 min.  A re-PUT on a fresh connection
-    # usually lands on a healthy edge; the ladder still caps at 6 attempts.
-    _STALL_MIN_BPS = 200 * 1024
-    _STALL_WINDOW_S = 15 * 60
+    # Throughput watchdog for single-PUT bodies (``UploadStalledError``,
+    # ``ProgressFileWrapper._check_stall``): the *slow* floor is fleet-
+    # relative — max(ABS_MIN, FRAC × fleet median PUT rate) from
+    # ``fleet_put_floor()`` (director-published; ABS_MIN alone when no
+    # fleet figure) — judged over a 30 min trailing window after a 5 min
+    # grace, skipped at ≥ 90 % sent, and never fired on a steady window
+    # or when finishing is cheaper than restarting.  A 0-byte stall of
+    # ≥ 10 min is always an abort.  At most ONE slow-abort per file:
+    # the next attempt runs with only the dead rule.  2026-10-27/28:
+    # Zenodo drained 50–150 KB/s for *every* peer for hours; a fixed
+    # 200 KB/s floor would have restarted 2 GB PUTs from byte 0 forever.
+    _STALL_WINDOW_S = 30 * 60
     _STALL_GRACE_S = 5 * 60
     _STALL_SKIP_FRAC = 0.90
+    _STALL_DEAD_S = 10 * 60
+    _STALL_MAX_SLOW_ABORTS = 1
     # Files at/above this size use the slower retry ladder in
     # _upload_to_bucket: 30/60/120/240/300 s (~12 min span) instead of
     # 4/8/16/32/64 s (~2 min). A 2-min ladder cannot outlast a Zenodo
@@ -1036,17 +1149,23 @@ class Client:
         except Exception:
             md5_hex = None
         max_attempts = 6
+        _slow_aborts = 0   # watchdog slow-aborts for this file (cap: 1)
         for attempt in range(1, max_attempts + 1):
             _stalled: ProgressFileWrapper | None = None
             try:
                 with open(local_path, "rb") as fh:
+                    _wd = file_size >= self._LARGE_PUT_BYTES
+                    _fl = fleet_put_floor() if _wd else {}
+                    _slow_on = _wd and _slow_aborts < self._STALL_MAX_SLOW_ABORTS
                     data = ProgressFileWrapper(
                         fh, file_size, progress_callback,
-                        stall_min_bps=(self._STALL_MIN_BPS
-                                       if file_size >= self._LARGE_PUT_BYTES else 0),
-                        stall_window_s=self._STALL_WINDOW_S,
+                        stall_min_bps=(_fl["floor_bps"] if _slow_on else 0),
+                        stall_abs_min_bps=(_fl.get("abs_min_bps", 0) if _slow_on else 0),
+                        stall_fleet_bps=_fl.get("fleet_med_bps") if _wd else None,
+                        stall_window_s=self._STALL_WINDOW_S if _wd else 0,
                         stall_grace_s=self._STALL_GRACE_S,
-                        stall_skip_frac=self._STALL_SKIP_FRAC)
+                        stall_skip_frac=self._STALL_SKIP_FRAC,
+                        stall_dead_s=self._STALL_DEAD_S if _wd else 0)
                     _stalled = data
                     # max_retries=0 — the outer loop in this method
                     # owns retry policy. Without this we'd amplify
@@ -1078,9 +1197,14 @@ class Client:
                     # Watchdog abort (urllib3 may re-wrap it as a
                     # ProtocolError/ConnectionError): say so explicitly —
                     # this is the signal behind a re-PUT, not a Zenodo 5xx.
+                    # The reason carries floor / fleet_med / abs_min.
+                    if _stalled.stalled_kind == "slow":
+                        _slow_aborts += 1
                     log.warning("PUT %s aborted by throughput watchdog "
-                                "(attempt %d/%d): %s", filename, attempt,
-                                max_attempts, _stalled.stalled_reason)
+                                "(attempt %d/%d, %s, slow_aborts=%d/%d): %s",
+                                filename, attempt, max_attempts,
+                                _stalled.stalled_kind, _slow_aborts,
+                                self._STALL_MAX_SLOW_ABORTS, _stalled.stalled_reason)
                 # The 'write timeout' / SSLEOFError class of failures
                 # almost always means the upload completed on Zenodo's
                 # side but the response got dropped. Verify before

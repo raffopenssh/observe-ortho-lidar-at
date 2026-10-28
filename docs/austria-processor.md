@@ -356,6 +356,53 @@ Manifest keys per product code (parent `61047` or block `04016-southwest`); deta
 
 Upload order: full → light_v2 → ne_h3b → json_v2 → json (`_v2_upload_and_finish`). Legacy `_light_gpkg` records survive with `status=removed` (size 0); v1 `_json` written before 2.4 is re-PUT `stripped`.
 
+### Zenodo PUT throughput watchdog (`zenodo_client.ProgressFileWrapper`)
+
+Added fb4b31b (2026-10-28) as a fixed 200 KB/s floor; made **fleet-relative**
+the same day after Zenodo drained 50–150 KB/s for *every* peer for hours
+(full-GPKG uploads median 5.2 h vs ~1 h) and a re-PUT landed at the same rate
+— a fixed floor would have restarted 2 GB PUTs from byte 0 forever. Zenodo is
+flaky; we work around it, we don't fight it. Only PUTs ≥ `_LARGE_PUT_BYTES`
+(32 MB) are watched.
+
+**Rules** (`_check_stall`, evaluated on every body read ~1/s):
+
+| rule | fires when | notes |
+|---|---|---|
+| grace | — | nothing fires in the first 5 min (`_STALL_GRACE_S`) |
+| **dead** | 0 bytes drained for ≥ 10 min (`_STALL_DEAD_S`) | always — ignores floor, 90 % skip, steady and the abort cap; that is a dead connection, not slowness |
+| **slow** | trailing 30 min (`_STALL_WINDOW_S`) averaged `< floor` | skipped at ≥ 90 % sent; **never** when the window is *steady* (every ~60 s bucket progressed and the window averaged ≥ ABS_MIN) or when `remaining / rate < time already sunk` (restart would cost more than finishing) |
+| cap | — | at most **one** slow-abort per file (`_STALL_MAX_SLOW_ABORTS`); the next ladder attempt runs with only the dead rule, so a file can't loop |
+
+`floor = max(ABS_MIN, FRAC × fleet_median)`; ABS_MIN 20 KB/s, FRAC 0.25 —
+director knobs `zenodo_put_floor_abs_kbps` / `zenodo_put_floor_frac`
+(`POST /api/v1/director/knobs`). No fleet figure → ABS_MIN only.
+
+**Fleet median, bandwidth-free**: every uploading peer already pushes
+`current_kg.upload_progress {file,sent,total}` on its 30 s status push.
+`peer_director.note_put_progress` turns consecutive pushes into a per-upload
+span rate (flock'd `/tmp/srtm_peer_push/_put_rates.json`, cross-worker);
+`fleet_put_rate()` takes the median over uploads active in the last 5 min
+(span ≥ 60 s), smooths it as the median of the last 15 min of per-tick
+medians, and the result rides back in the **peer_status ack** (`zput:
+{med,n,floor,abs,frac}`, ~30 B — no new poll, no new push). The peer
+mirrors it to `data/austria_processor/zenodo_fleet_put.json`
+(`app._store_fleet_put`, rewritten only on change / every 5 min); the
+primary writes its own mirror in `fleet_put_rate()`.
+`zenodo_client.fleet_put_floor()` reads it (stale > 30 min → ABS_MIN).
+
+**Surfacing**: `/process.txt` → `zenodo_uploads: … watchdog: floor=<KB/s>
+fleet_med=<KB/s> (n=<active uploads>) aborts_1h=N`; abort log line
+`PUT <file> aborted by throughput watchdog (attempt k/6, slow|dead,
+slow_aborts=1/1): … floor=… fleet_med=… abs_min=…` (grep `?q=watchdog`).
+Cross-check the fleet median against the committed GB/h on the same line.
+
+Trade-off to know: the steady protection means a monotone connection at
+≥ ABS_MIN is never cut even when it is an outlier against a fast fleet — the
+finishing-cheaper rule plus the 90 % skip are what bound the cost; raise
+`zenodo_put_floor_abs_kbps` if a slow-but-steady outlier class reappears.
+Tests: `python3 tests/test_put_watchdog.py` (synthetic timelines).
+
 ### API Endpoints (served by app.py, read processor state)
 
 | Method | Path | Purpose |
