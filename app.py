@@ -22928,7 +22928,7 @@ def process_txt():
                 import peer_director as _pdw
                 _fp = _pdw.fleet_put_rate()
                 _wd = (f"watchdog: floor={_fp['floor_bps'] / 1024:.0f} KB/s "
-                       f"fleet_med={(_fp['fleet_med_bps'] or 0) / 1024:.0f} KB/s "
+                       f"fleet_med={(f"{_fp['fleet_med_bps'] / 1024:.0f} KB/s" if _fp['fleet_med_bps'] else 'n/a')} "
                        f"(n={_fp['n']}) aborts_1h={_zu['wd_aborts']}")
             except Exception:
                 _wd = f"watchdog: aborts_1h={_zu['wd_aborts']}"
