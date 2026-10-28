@@ -397,6 +397,21 @@ fleet_med=<KB/s> (n=<active uploads>) aborts_1h=N`; abort log line
 slow_aborts=1/1): … floor=… fleet_med=… abs_min=…` (grep `?q=watchdog`).
 Cross-check the fleet median against the committed GB/h on the same line.
 
+**First-night result (2026-10-28 16:50Z, ~5 h after ca64f19)**: fleet_med
+56–60 KB/s (n=17, raw 63 KB/s) against 13.2 GB/h committed over ~30 active
+uploads (mean ≈120 KB/s/peer — skewed, so a median of half that is
+plausible); floor stayed at ABS_MIN 20 KB/s. **Zero aborts from peers on the
+new code** (no abort line carried `floor=`). All 35 aborts in 8 h came from
+the 9 peers still on the fixed 200 KB/s floor (fb4b31b/cfec838/e06cb25 —
+at123 at210 at217 at218 at220 at225 at229 at233 at236): with Zenodo at
+50–140 KB/s they re-PUT the same 400–750 MB file 6–10× (e.g. at220
+91110_light_v2.gpkg, 10 attempts since 11:28Z), never reach a KG boundary,
+so the director's *graceful* rollout could never catch them — the old
+watchdog blocked its own replacement. Resolved by operator stop + single-peer
+hard update, one peer at a time (20 s apart). Lesson: a change to the upload
+retry path should go out with an idle-only hard wave, since mid-upload peers
+are exactly the ones the old code keeps busy.
+
 Trade-off to know: the steady protection means a monotone connection at
 ≥ ABS_MIN is never cut even when it is an outlier against a fast fleet — the
 finishing-cheaper rule plus the 90 % skip are what bound the cost; raise
