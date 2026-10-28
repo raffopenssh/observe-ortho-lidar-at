@@ -53,6 +53,9 @@ def main():
     if not (a.checks or a.reason_re or a.codes):
         ap.error('one of --checks / --reason-re / --codes required')
     import requests
+    sys.path.insert(0, str(ROOT))
+    import peer_tokens
+    peer_tokens.install_outbound_hook()   # per-peer token per destination host
     tok = (ROOT / 'data' / 'admin_token').read_text().strip()
     hdr = {'X-Admin-Token': tok}
     rre = re.compile(a.reason_re) if a.reason_re else None
@@ -65,7 +68,11 @@ def main():
         except Exception as e:
             print(f'{pid:8s} GET ERR {str(e)[:70]}', file=sys.stderr)
             continue
-        if not isinstance(d, dict) or not d:
+        if isinstance(d, dict) and isinstance(d.get('strikes'), dict):
+            d = d['strikes']
+        if not isinstance(d, dict) or not d or 'error' in d:
+            if isinstance(d, dict) and d.get('error'):
+                print(f'{pid:8s} GET {d.get("error")}', file=sys.stderr)
             continue
         sel = set(a.codes) & set(d)
         for code, e in d.items():

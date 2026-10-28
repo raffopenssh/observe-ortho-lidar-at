@@ -308,3 +308,17 @@ re-upgrade keeps the v2 / v2.1 product live until the new one is committed.
   corpus; nothing is lost.
 * `CredentialRotatedError`-class rules from `docs/copernicus-throttle.md` are irrelevant to the
   upgrade path (no upstream fetches) but still apply to fresh v2 KGs.
+
+
+## 2026-10-28 — the "last 25 non-v2.4 parents" tail (what each class needed)
+
+| class | root cause | fix |
+|---|---|---|
+| Bodensee / border KGs struck out on `segment_type_no_holes` (91103/08/09/10/11/19, 56104-northwest) | `v2_verify._dtm_nodata_mask` read `terrain_coarse_dtm` with `ds.nodata=None` — GDAL never fills `gpkg_2d_gridded_coverage_ancillary.data_null` for Float32 coverages, so the -9999 lake pixels counted as valid DTM and the 8.5 km² lake parcel became a "hole" | mask matches `TERRAIN_COARSE_NODATA` explicitly; `write_terrain_coarse` sets `data_null`. `v2_verify.py` md5 changed → verify_rev amnesty releases the strikes fleet-wide |
+| `_full_gpkg download: range 3 failed` on 12174 / 18113-west (16 peers × 40 min each) | manifest `size` larger than the file on Zenodo (file itself complete: page_count × page_size == Zenodo size); last range → 416 / short, retried 12× | `gpkg_fetch.download` raises `RangeNotSatisfiable` at once and re-downloads with Zenodo's listed size + md5 |
+| 66326 / 72321 / 56314 / 80110 shown as v1 | superseded parent-level `_json` residue / 898-byte out-of-coverage blocks voted in `search_index._parent_product_version` | `_ignored_version_voter`: sweep units, ooc blocks and parent residue older than a block `_json` don't vote |
+| 12166, 90016-southeast, 91003-southeast `v2.3-partial` forever (`n_partial_wait`) | no `product_repair.json` record (ingested before the registry existed) → never `fixable` | one-shot `product_repair.observe()` from the `kg_v2_store` doc; they are now `fixable` and dispatched |
+| 44038 / 62241 `fast: md5 mismatch` | manifest md5 stale (file re-PUT in place); fixed by ffa54e5 on 10-09, strikes were older | cleared via `scripts/clear_v2_strikes_fleet.py --codes …` (script now installs the per-peer outbound token hook) |
+| 19704 `_json` really 404 on Zenodo | v2_regen only watches `_full_gpkg` gone | manual `POST /processing/queue {keep_products, gone_keys:[19704_json]}` → fresh v2.4 run |
+| 40008 `segmented_area_ge_v1` v2=26.5 vs v1=28.3 km² | **unexplained** — direct BEV reads show no coverage loss vs the v1 tiles; deterministic on 2 peers | left struck out; candidate for a fresh full run |
+| 65309 (no products, `65309-south` queued) | queued code outside the peers' cell filter was dropped at start | fb4b31b (priority overrides cell pinning) — waits for the rollout |
