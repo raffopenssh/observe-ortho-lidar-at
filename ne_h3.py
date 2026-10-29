@@ -1672,9 +1672,18 @@ def build_observed(declared: Section, seg_type_full: np.ndarray, ndsm_full: np.n
     common = dict(epoch=epoch, source=OBS_SOURCE, kg=kgz, h3_res=H3_RES, groups=list(GROUPS),
                   declared_digest=declared.digest, declared_epoch=declared.header.get("epoch"),
                   declared_source=declared.header.get("source"), declared_algo=declared.header.get("algo"))
+    # real ALS acquisition years (header only, digest-neutral — als_years.py;
+    # the row's flight_years bitmask is unchanged).  Centres already computed above.
+    try:
+        import als_years as _aly
+        als_hdr = _aly.header_block_for_ids(cids_all, ce_all, cn_all)
+    except Exception as _e:  # noqa: BLE001
+        log.debug("ne_h3: als_years header skipped: %s", _e)
+        als_hdr = None
     neo_hdr = dict(common, algo=ALGO_OBS, cells_n=n_cells, record=OBS_REC.format, record_bytes=OBS_REC.size,
                    fields=list(OBS_FIELDS), units=dict(OBS_UNITS), phenology=list(PHENOLOGY_CODES),
-                   verdicts=list(VERDICTS), cells_observed=int(observed.sum()))
+                   verdicts=list(VERDICTS), cells_observed=int(observed.sum()),
+                   **({"als_years": als_hdr} if als_hdr else {}))
     net_hdr = dict(common, algo=ALGO_TREES, rows_n=n_trees_total, record="u32: dx:5 dy:5 h:8(0.25m) crown:6(log2*5) species:4 vitality:3 flag:1",
                    species=list(SPECIES_CODES), vitality=list(VITALITY_CODES), min_h_m=3.0,
                    origin="metre-snapped EPSG:3035 cell centre; rows in NEO1 cell order, count = tree_n")
@@ -1710,6 +1719,7 @@ def build_observed(declared: Section, seg_type_full: np.ndarray, ndsm_full: np.n
                      "cells_observed": int(observed.sum()), "trees_n": n_trees_total,
                      "manmade_n": n_bld_total},
         "h3_res": H3_RES, "chunk_res": CHUNK_RES, "groups": list(GROUPS),
+        "als": als_hdr,
         "declared_ha": decl_ha, "observed_ha": obs_ha,
         "verdict_ha": verdict_ha, "verdict_n": verdict_n,
         "attribution": declared.header.get("attribution"), "notice": declared.header.get("notice"),
@@ -1923,7 +1933,31 @@ def neo1_section_from_h3b(path: str | Path, green_fix: bool = True) -> bytes:
         import ne_green_fix as _gf
         h["source"] = OBS_SOURCE_FIXED      # umfeld's manifest shows which KGs carry the corrected export
         h.update(_gf.header_note(n_fix, hdr["cells_n"]))
+    als = _als_header_for(hdr, obs)
+    if als:
+        h["als_years"] = als                # header only — digest covers the rows, no re-post needed
     return pack_section(MAGIC_OBS, h, obs)
+
+
+def _als_header_for(hdr: dict, obs: bytes) -> dict | None:
+    """``als_years`` header block for a re-POST: primary cache → product
+    header summary → compute from the row ids (last resort, ~1 µs/cell)."""
+    try:
+        import als_years as _aly
+        kg = str(hdr.get("kg", "")).zfill(5)
+        b = _aly.cached(kg)
+        if b and b.get("neo1_digest") == (hdr.get("neo1") or {}).get("digest"):
+            return {k: b.get(k) for k in ("newest", "oldest", "source", "coverage", "dominant", "years", "mosaics", "algo")} | {
+                "precision": b.get("precision")}
+        s_als = (hdr.get("summary") or {}).get("als")
+        if s_als:
+            return s_als
+        n = int(hdr["cells_n"])
+        ids = np.frombuffer(obs, dtype=np.uint8, count=n * OBS_REC.size).reshape(n, OBS_REC.size)[:, :8].copy().view("<u8").reshape(n)
+        return _aly.header_block_for_ids(ids)
+    except Exception as e:  # noqa: BLE001
+        log.debug("ne_h3: als_years header: %s", e)
+        return None
 
 
 # === SECTION: declared view (umfeld chunk-log view, 2026-10-27) ===

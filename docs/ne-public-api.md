@@ -169,6 +169,50 @@ burst 20 (no enforcement beyond the proxy's).
   `phenology`/`consistency` → mode + `consistency_hist[7]`; `als_years`
   union; `change.dh_m` mean; `forest_loss_year` max. Returns `n_children`.
   Implemented with `np.add.reduceat` on parent-sorted arrays — one pass.
+  `als_year_newest` max, `als_year_oldest` min (see below).
+
+### ALS acquisition year (`als_years.py`, 2026-10-29)
+
+The row's `als_years` (`flight_years` bitmask, bit i = ALS 2020+i) is
+frozen and is 0 wherever the last flight was ≤ 2019 (~60 % of KGs), which
+conflates "old flight" with "no data". umfeld-at needs the real year for
+the declared-vs-observed diff, so the BEV flight-block overlay
+(`data/als_acquisition/flight_blocks_<mosaic>.geojson`, `Flugjahr` per
+block, DSM year when DTM/DSM differ — the series record on data.gv.at is
+`5ce253fc-b7c5-4362-97af-6556c18a45d9`, file
+`Metadatenuebersicht_SHP_DTM_DSM_20240915.zip`) is evaluated **at read
+time, at the cell centre** — the 41 B row never changes, nothing is
+re-posted.
+
+What v2.4 uses: every observed value comes from the `20240915` mosaic
+(`tile_index.DEFAULT_DATASET`) → `als_year_newest`; `dh_m` / `dtm_m` are
+newest − oldest mosaic (`20220915`) → `als_year_oldest`. Equal years ⇒ not
+re-flown, `dh_m` is noise (`reflown_share` per KG). The vendored 20250915
+overlay is not used (no product was built from it).
+
+| surface | field | notes |
+|---|---|---|
+| `/api/v1/cells` json / csv | `change.als_year_newest`, `change.als_year_oldest` | int or null; roll-up max / min |
+| `/api/v1/cells?format=columns` | `als_year_newest`, `als_year_oldest` | u16 lists, **65535 = null** |
+| `format=bin`, `/chunk`, `/kg/<code>/cells?format=h3b` | — | frozen rows, unchanged |
+| `/api/v1/cells/dict` | `derived_fields`, `als{…}` | contract |
+| `/api/v1/kg/<code>` and `/kg/<code>/cells?format=json` | `als{years, newest, oldest, dominant, dominant_share, coverage, reflown_share, newest_hist, oldest_hist, cells_known, precision, source, source_url, mosaics}` | `coverage` = share of the KG's cells under `newest` |
+| `/api/v1/status` | `als{kgs_with_als_year, year_hist, year_hist_cells, newest_min/max, oldest_min, coverage_mean, precision, backfill}` | 5-min cached per worker |
+| `/landscape?include=cells` | `change.als_year_newest/oldest`, `als_source` | max / min over the bbox |
+| NEO1 header on `/obs` POST | `als_years{newest, oldest, dominant, coverage, years, source, mosaics}` | header only, digest-neutral (`ne_h3.build_observed`, `neo1_section_from_h3b`) |
+
+Cost model (disk / bandwidth): the two overlays are in-memory STRtrees
+(~450 polygons); per-cell years are computed once per inflated chunk
+(`Chunk.als()`) from the chunk's cached centres and ride the chunk LRU —
+no file reads per request. The per-KG block lives in `cells.sqlite`
+(`als_kg`, keyed on `neo1_digest`, `ALGO` bump = recompute). Two
+precisions: `chunk` (res-10 chunk centres weighted by cell count from the
+`chunk` table — the whole corpus in ~75 s with zero file reads, coverage
+within ±0.5 % of exact) for the backfill and on-demand misses; `exact`
+(every cell) at ingest time via `cells_api.index_file` while the new file
+is hot. Two u16 columns add ~0.1 B/cell gzipped. Progress / histogram:
+the `als_years:` line of `/process.txt`; CLI `python3 als_years.py
+--status|--backfill|--kg <code>`.
 
 ## 4. Performance / resource targets (measure before merging)
 

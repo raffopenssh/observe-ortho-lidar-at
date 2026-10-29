@@ -332,9 +332,28 @@ def status():
             st['cells'] = _cells.index_status()
         except Exception as e:  # noqa: BLE001
             st['cells'] = {'ready': False, 'error': str(e)}
+        try:
+            st['als'] = _als_status()
+        except Exception as e:  # noqa: BLE001
+            st['als'] = {'error': str(e)}
     if request.args.get('guard'):
         st['guard'] = _guard_dict()
     return _json(st, max_age=60)
+
+
+_als_cache: dict = {}
+
+
+def _als_status() -> dict:
+    """``als`` summary for /status (als_years.status_summary), 5-min cached per worker."""
+    now = time.time()
+    hit = _als_cache.get('v')
+    if hit and now - hit[0] < 300:
+        return hit[1]
+    import als_years
+    v = als_years.status_summary()
+    _als_cache['v'] = (now, v)
+    return v
 
 
 def _bbox_or_err():
@@ -530,6 +549,10 @@ def kg(code):
             d['cells'] = _cells.kg_cells_block(code)
         except Exception as e:  # noqa: BLE001
             d['cells'] = {'ready': False, 'error': str(e)}
+        try:
+            d['als'] = _cells.kg_als_block(code)     # real ALS flight years (als_years.py)
+        except Exception as e:  # noqa: BLE001
+            d['als'] = {'error': str(e)}
     return _json(d, max_age=600)
 
 

@@ -2644,6 +2644,21 @@ def _ne_ingest_thread():
 threading.Thread(target=_ne_ingest_thread, daemon=True, name='ne-ingest').start()
 
 
+# --- ALS acquisition years: per-KG block cache backfill (primary only, als_years.py) ---
+def _als_years_thread():
+    try:
+        import als_years as _aly
+        def _should_run():
+            try:
+                return _is_primary_self() and Path('data/ne/cells.sqlite').exists()
+            except Exception:
+                return False
+        _aly.start_backfill_thread(_should_run)
+    except Exception as _e:  # noqa: BLE001
+        log.debug('als_years thread: %s', _e)
+threading.Thread(target=_als_years_thread, daemon=True, name='als-years').start()
+
+
 def _v2_deps_startup_thread():
     """One-shot: make lightgbm importable on this VM. admin_update only
     pip-installs on the *next* rollout wave (the pip step is itself part
@@ -22459,6 +22474,13 @@ def process_txt():
             out.append(_nei.text_line())
         except Exception as _e:  # noqa: BLE001
             log.debug('process.txt ne_ingest line: %s', _e)
+        # Real ALS acquisition years per KG / cell (als_years.py): cache
+        # backfill progress + newest-year histogram.
+        try:
+            import als_years as _aly
+            out.append(_aly.text_line())
+        except Exception as _e:  # noqa: BLE001
+            log.debug('process.txt als_years line: %s', _e)
         # Sliver sweep (docs/sliver-sweep.md): umfeld bbox revision 2 strips
         # → scan / dispatch / integrate / re-post progress + sweep peers.
         try:

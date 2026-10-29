@@ -61,6 +61,16 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
   GET  /api/v1/kg/<code>/cells                    whole-KG container: format=h3b (default, downloadable) | json (summary)
   GET  /api/v1/landscape?…&include=cells          adds a per-bbox roll-up block (cover, heights, canopy, change, consistency)
   GET  /api/v1/status                             cells{kgs_ready, cells_total, index_rebuilt_at, epoch}
+                                                  als{kgs_with_als_year, year_hist, newest_min/max, oldest_min}
+
+  ALS acquisition year (real BEV Flugjahr, not the mosaic date): als_years in the row is a bitmask
+    (bit i = 2020+i) and is 0 for everything last flown ≤ 2019. The read-time fields als_year_newest /
+    als_year_oldest (u16, 65535 = null; json/columns/csv, not bin/h3b) carry the flight year of the
+    20240915 mosaic block (= the year every observed value was flown) and of the 20220915 block
+    (= the "oldest" side of dh_m / dtm_m; equal years ⇒ dh_m is noise). Roll-up: max / min.
+    Per KG: /api/v1/kg/<code> → als{{years, newest, oldest, dominant, coverage (share of cells under
+    newest), reflown_share, source "data.gv.at 5ce253fc-…", mosaics}}. Source: BEV flight-block
+    polygons ("Aktualität DGM - ALS", Flugjahr per block, DSM year), evaluated at the cell centre.
 
   params   layers=obs,trees,structures (default obs; trees/structures only at res 12; /cells/<h3> always all)
            res=12|11|10 (server-side roll-up: means for cover / ndvi / terrain / height, max for h_max, sums
@@ -83,7 +93,8 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
     "trees": {{"n": 14, "h_max": 27.5, "canopy": 0.58}},            (layer trees: trees = [{{dx, dy, lon, lat, h_m, crown_m2, species, vitality, ndsm_only}}, …])
     "structures": [{{dx, dy, lon, lat, type, h_max_m, h_robust_m, area_m2, conf, dh_m}}, …]   (layer structures)
     "ndvi": {{"mean": 0.71, "amp": 0.22}}, "phenology": "forest",
-    "change": {{"dh_m": -0.25, "dtm_m": 0.0, "forest_loss_year": null, "als_years": [2022, 2024]}},
+    "change": {{"dh_m": -0.25, "dtm_m": 0.0, "forest_loss_year": null, "als_years": [2022, 2024],
+               "als_year_newest": 2022, "als_year_oldest": 2010}},
     "terrain": {{"elev_m": 612, "slope": 14, "slope_p90": 23, "aspect": "SE", "roughness": 1.3, "tri": 0.8, "tpi": -0.5}},
     "consistency": "consistent"}}
   cover groups (shared codes with umfeld-at): geb=buildings, bau=construction & parking, acker=cropland,

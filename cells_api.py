@@ -41,6 +41,7 @@ except Exception:  # noqa: BLE001
     _orjson = None
 
 import ne_h3
+import als_years
 
 log = logging.getLogger('cells_api')
 
@@ -159,6 +160,17 @@ UNITS = {
 }
 
 _NEO1_REC_FIELDS = list(OBS_PUBLIC.keys())
+# read-time derived fields (NOT in the 41 B row; ``format=bin``/``h3b`` do not carry them):
+#   als_year_newest / als_year_oldest = real BEV Flugjahr of the newest (20240915) / oldest
+#   (20220915) mosaic block under the cell centre, u16, 65535 = null — als_years.py
+DERIVED_FIELDS = ('als_year_newest', 'als_year_oldest')
+JSON_GROUPS['als_year_newest'] = ('change', 'als_year_newest')
+JSON_GROUPS['als_year_oldest'] = ('change', 'als_year_oldest')
+UNITS['als_year_newest'] = ('real ALS flight year (BEV Flugjahr) of the newest mosaic (20240915) under the cell — '
+                            'the year every observed value was flown; u16, 65535 = null; derived at read time '
+                            'from data.gv.at flight blocks, not in the 41 B record')
+UNITS['als_year_oldest'] = ('real ALS flight year of the oldest mosaic (20220915) = the "oldest" of dh_m / dtm_m; '
+                            'u16, 65535 = null; equal to als_year_newest ⇒ not re-flown, dh_m is noise')
 
 # === SECTION: sqlite chunk index ===
 
@@ -246,6 +258,10 @@ def index_file(path: str | Path, *, conn: sqlite3.Connection | None = None) -> d
             raise
     _header_cache_drop(kg)
     _files_cache['t'] = 0.0
+    try:
+        als_years.index_file(p)      # per-KG ALS year block cache (keyed on neo1_digest)
+    except Exception as ex:  # noqa: BLE001
+        log.debug('als_years index %s: %s', kg, ex)
     return {'kg': kg, 'chunks': len(rows), 'cells_n': hdr['cells_n']}
 
 
@@ -257,6 +273,10 @@ def index_remove(kg: str) -> None:
         c.commit()
     _header_cache_drop(kg)
     _files_cache['t'] = 0.0
+    try:
+        als_years.remove(kg)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def rebuild_index() -> dict:
@@ -498,7 +518,7 @@ def public_summary(s: dict) -> dict:
 class Chunk:
     """One inflated res-10 chunk: NEO1 rows + NET1 / NEB1 rows + offsets."""
     __slots__ = ('kg', 'r10', 'ids', 'obs', 'trees', 'tree_off', 'bld', 'bld_off', 'cells', 'pub_z',
-                 'raw_pub', 'row', '_cen')
+                 'raw_pub', 'row', '_cen', '_als')
 
     def __init__(self, kg: str, row: dict, parts: dict):
         self.kg = kg
@@ -516,6 +536,17 @@ class Chunk:
         self.raw_pub = (parts['obs'], parts['trees'], parts['bld'])
         self.pub_z = None
         self._cen = None
+        self._als = None
+
+    def als(self) -> tuple[np.ndarray, np.ndarray]:
+        """(als_year_newest, als_year_oldest) u16 per row (65535 = null) from the
+        BEV flight-block overlay at the cell centre (``als_years.py``); computed
+        once per chunk — the 41 B row itself stays frozen."""
+        if self._als is None:
+            import als_years
+            cen = self.centres()
+            self._als = als_years.cell_years_3035(cen[:, 0], cen[:, 1])
+        return self._als
 
     def centres(self) -> np.ndarray:
         """(n, 2) metre-snapped EPSG:3035 centres, computed once per chunk."""
@@ -612,6 +643,17 @@ class Table:
 
     def kg_col(self) -> np.ndarray:
         return np.asarray(self.kgs, dtype=object)[self.kg_idx] if len(self.kgs) else np.zeros(0, object)
+
+    def als(self) -> tuple[np.ndarray, np.ndarray]:
+        """(als_year_newest, als_year_oldest) u16 for the selected rows (65535 = null)."""
+        n = len(self)
+        new = np.full(n, als_years.NULL, np.uint16); old = np.full(n, als_years.NULL, np.uint16)
+        for i, ch in enumerate(self.chunks):
+            m = self.src_chunk == i
+            if m.any():
+                cn, co = ch.als()
+                new[m] = cn[self.src_row[m]]; old[m] = co[self.src_row[m]]
+        return new, old
 
     def gather_trees(self):
         """→ (cell_row_index, u32 words) for all trees of the selected cells."""
@@ -720,6 +762,26 @@ def decode_obs(obs: np.ndarray, fields: list[str] | None = None) -> OrderedDict:
     return out
 
 
+def _add_derived(dec: OrderedDict, t: 'Table', fields: list[str] | None) -> OrderedDict:
+    """Append the read-time ALS year columns (float64, NaN = null) after
+    ``als_years`` so every renderer / roll-up sees them like row fields."""
+    want = [f for f in DERIVED_FIELDS if not fields or f in fields]
+    if not want or len(t) == 0 and not want:
+        return dec
+    new, old = t.als()
+    vals = {'als_year_newest': new, 'als_year_oldest': old}
+    out = OrderedDict()
+    for k, v in dec.items():
+        out[k] = v
+        if k == 'als_years':
+            for f in want:
+                out[f] = _nan_where(vals[f], vals[f] == als_years.NULL)
+    for f in want:
+        if f not in out:
+            out[f] = _nan_where(vals[f], vals[f] == als_years.NULL)
+    return out
+
+
 def _years_list(mask: int) -> list[int]:
     return [ne_h3.FLIGHT_YEAR0 + i for i in range(8) if mask & (1 << i)]
 
@@ -760,7 +822,7 @@ def _public_lists(dec: OrderedDict, *, cover_mean: bool = False) -> OrderedDict:
             out[name] = _cat(v, PHENOLOGY)
         elif name == 'aspect':
             out[name] = _cat(v, ASPECTS)
-        elif name == 'forest_loss_year':
+        elif name in ('forest_loss_year', 'als_year_newest', 'als_year_oldest'):
             o = v.astype(object); o[np.isnan(v)] = None
             out[name] = [int(x) if x is not None else None for x in o.tolist()]
         else:
@@ -857,7 +919,7 @@ def _reduce_mode(codes: np.ndarray, bounds: np.ndarray, k: int):
 def rollup(t: Table, res: int) -> tuple[np.ndarray, OrderedDict, dict]:
     """res-12 table → parent ids at ``res`` + aggregated public columns + extras
     (``n_children``, ``consistency_hist``).  One ``np.add.reduceat`` pass per field."""
-    dec = decode_obs(t.obs)
+    dec = _add_derived(decode_obs(t.obs), t, None)
     if len(t) == 0:
         return np.zeros(0, np.uint64), OrderedDict((k, v[:0]) for k, v in dec.items()), {'n_children': [], 'consistency_hist': []}
     parents = ne_h3.h3_parent_vec(t.ids, res)
@@ -873,8 +935,11 @@ def rollup(t: Table, res: int) -> tuple[np.ndarray, OrderedDict, dict]:
         elif name in ('structures_cover', 'canopy', 'ndvi_mean', 'ndvi_amp', 'h_mean', 'h_p90', 'dh_m', 'dtm_m',
                       'elev_m', 'slope', 'slope_p90', 'roughness', 'tri', 'tpi'):
             out[name] = _reduce_mean(v, bounds)
-        elif name in ('h_max', 'tree_h_max', 'forest_loss_year'):
+        elif name in ('h_max', 'tree_h_max', 'forest_loss_year', 'als_year_newest'):
             out[name] = np.maximum.reduceat(np.where(np.isnan(v), -np.inf, v), bounds)
+            out[name][~np.isfinite(out[name])] = np.nan
+        elif name == 'als_year_oldest':
+            out[name] = np.minimum.reduceat(np.where(np.isnan(v), np.inf, v), bounds)
             out[name][~np.isfinite(out[name])] = np.nan
         elif name in ('tree_n', 'structures_n'):
             out[name] = np.add.reduceat(v, bounds)
@@ -920,6 +985,8 @@ def aggregate_all(t: Table) -> dict:
     _, phist = _reduce_mode(np.where(dec['phenology'] == 255, len(PHENOLOGY), dec['phenology']), bounds, len(PHENOLOGY) + 1)
     ph_hist = {(PHENOLOGY[i] if i < len(PHENOLOGY) else 'null'): int(c) for i, c in enumerate(phist[0]) if c}
     fl = dec['forest_loss_year']
+    a_new, a_old = t.als()
+    kn = a_new != als_years.NULL; ko = a_old != als_years.NULL
     return {
         'n': n, 'res': RES, 'cover': cover,
         'structures_n': int(dec['structures_n'].sum()), 'structures_cover': mean('structures_cover', 3),
@@ -931,7 +998,10 @@ def aggregate_all(t: Table) -> dict:
         'consistency_hist': ch_hist, 'phenology_hist': ph_hist,
         'change': {'dh_m': mean('dh_m', 2), 'dtm_m': mean('dtm_m', 2),
                    'forest_loss_cells': int((~np.isnan(fl)).sum()),
-                   'als_years': _years_list(int(np.bitwise_or.reduce(dec['als_years'])))},
+                   'als_years': _years_list(int(np.bitwise_or.reduce(dec['als_years']))),
+                   'als_year_newest': int(a_new[kn].max()) if kn.any() else None,
+                   'als_year_oldest': int(a_old[ko].min()) if ko.any() else None,
+                   'als_source': als_years.SOURCE},
         'kgs': list(t.kgs), 'trees_truncated_cells': t.trees_truncated,
     }
 
@@ -1106,6 +1176,14 @@ def table_columns(t: Table, *, res: int = RES, dec: OrderedDict | None = None, i
             if fields and name not in fields:
                 continue
             out[name] = obs[f].tolist()
+            if name == 'als_years':
+                new, old = (None, None)
+                for dn, pos in (('als_year_newest', 0), ('als_year_oldest', 1)):
+                    if fields and dn not in fields:
+                        continue
+                    if new is None:
+                        new, old = t.als()
+                    out[dn] = (new if pos == 0 else old).tolist()       # u16, 65535 = null
     else:
         for name, v in (dec or {}).items():
             if fields and name not in fields:
@@ -1114,6 +1192,8 @@ def table_columns(t: Table, *, res: int = RES, dec: OrderedDict | None = None, i
                 out[name] = np.round(v, 3).tolist()
             elif name in ('als_years', 'consistency', 'phenology', 'aspect', 'tree_n', 'structures_n'):
                 out[name] = v.tolist()
+            elif name in DERIVED_FIELDS:
+                out[name] = np.where(np.isnan(v), als_years.NULL, v).astype(np.int64).tolist()   # 65535 = null
             else:
                 out[name] = _col_list(v, _ROUND.get(name, 2))
         if extras:
@@ -1344,9 +1424,9 @@ def _fields() -> list[str] | None:
     if not raw:
         return None
     fs = [x.strip() for x in raw.split(',') if x.strip()]
-    bad = [x for x in fs if x not in OBS_PUBLIC]
+    bad = [x for x in fs if x not in OBS_PUBLIC and x not in DERIVED_FIELDS]
     if bad:
-        raise CellsError(400, f'unknown fields {bad}', fields=list(OBS_PUBLIC))
+        raise CellsError(400, f'unknown fields {bad}', fields=list(OBS_PUBLIC) + list(DERIVED_FIELDS))
     return fs
 
 
@@ -1549,7 +1629,7 @@ def _render_inner(t: Table, hdrs: dict, meta: dict, *, fmt: str, res: int, layer
         hx['X-Cells-Kgs'] = ','.join(meta.get('kgs') or [])
         return _resp(body, mimetype='application/octet-stream', headers=hx, etag=etag, partial=partial)
     if res == RES:
-        ids = t.ids; dec = decode_obs(t.obs, fields); extras = None; kg_col = None
+        ids = t.ids; dec = _add_derived(decode_obs(t.obs, fields), t, fields); extras = None; kg_col = None
     else:
         ids, dec, extras = rollup(t, res)
         kg_col = extras.pop('kg')
@@ -1593,7 +1673,13 @@ def cells_dict():
         'res': RES, 'chunk_res': CHUNK_RES, 'cell_area_m2': '~307 (res 12)',
         'layers': {'obs': 'one 41 B record per cell (fields below)', 'trees': 'tree apices h ≥ 3 m, 4 B each (res 12 only)',
                    'structures': 'segmented man-made objects with LiDAR heights, 8 B each (res 12 only)'},
-        'fields': _NEO1_REC_FIELDS, 'units': UNITS,
+        'fields': _NEO1_REC_FIELDS, 'derived_fields': list(DERIVED_FIELDS), 'units': UNITS,
+        'als': {'fields': list(DERIVED_FIELDS), 'null': als_years.NULL, 'source': als_years.SOURCE,
+                'source_url': als_years.SOURCE_URL, 'mosaics': {'newest': als_years.NEWEST_DATASET, 'oldest': als_years.OLDEST_DATASET},
+                'note': 'als_years (row bitmask, bit i = 2020+i) is frozen and 0 for everything flown ≤ 2019; '
+                        'als_year_newest / als_year_oldest carry the real BEV Flugjahr of the two mosaics the '
+                        'product used, evaluated per cell centre at read time (json / columns / csv; not bin / h3b). '
+                        'Per-KG summary: /api/v1/kg/<code> → als{years,newest,oldest,coverage,source}.'},
         'groups': {g: GROUP_LABELS[g] for g in ne_h3.GROUPS},
         'consistency': {
             'codes': list(_CONSISTENCY_NAMES),
@@ -1614,7 +1700,8 @@ def cells_dict():
                   'larger chunk, then the lowest kg; meta.kgs lists the products touched',
         'rollup': {'res': [11, 10], 'mean': ['cover', 'structures_cover', 'canopy', 'ndvi.*', 'terrain.* (aspect → mode)',
                                             'height.mean', 'height.p90 (mean of p90s)', 'change.dh_m', 'change.dtm_m'],
-                   'max': ['height.max', 'trees.h_max', 'change.forest_loss_year'], 'sum': ['trees.n', 'structures_n'],
+                   'max': ['height.max', 'trees.h_max', 'change.forest_loss_year', 'change.als_year_newest'],
+                   'min': ['change.als_year_oldest'], 'sum': ['trees.n', 'structures_n'],
                    'mode': ['phenology', 'consistency (+ consistency_hist)'], 'union': ['change.als_years'],
                    'returns': 'n_children'},
     }
@@ -1692,6 +1779,7 @@ def kg_cells(code):
         d = {'kg': code, 'ready': True, 'cells_n': h['cells_n'], 'epoch': h['epoch'], 'product_version': h['product_version'],
              'partial': bool(h.get('partial_cells')), 'neo1_digest': h['neo1_digest'], 'summary': h['summary'],
              'created_at': h.get('created_at'),
+             'als': _als_block(code),
              'links': {'h3b': f'/api/v1/kg/{code}/cells?format=h3b', 'dict': '/api/v1/cells/dict'},
              'meta': _meta({'kgs': [code], 'epoch': h['epoch'], 'partial': bool(h.get('partial_cells'))}, h['cells_n'], RES, LAYERS)}
         return _resp(d, etag=etag, partial=bool(h.get('partial_cells')))
@@ -1712,6 +1800,20 @@ def kg_cells(code):
 
 
 # === SECTION: helpers for public_api integrations (§5) ===
+
+def _als_block(code: str) -> dict | None:
+    """``als{years,newest,oldest,coverage,source,…}`` for a KG (cached per
+    neo1_digest in cells.sqlite; first call after a new product computes it)."""
+    try:
+        return als_years.kg_block(code)
+    except Exception as e:  # noqa: BLE001
+        log.warning('als block %s: %s', code, e)
+        return {'error': str(e)}
+
+
+def kg_als_block(code: str) -> dict | None:
+    return _als_block(code)
+
 
 def kg_cells_block(code: str) -> dict:
     """``cells{ready, cells_n, epoch, summary}`` for ``/api/v1/kg/<code>``."""
