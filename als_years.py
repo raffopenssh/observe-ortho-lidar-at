@@ -438,6 +438,31 @@ def _public(b: dict) -> dict:
     return {k: v for k, v in b.items() if k not in _PUBLIC_DROP}
 
 
+_SLIM_KEYS = ("newest", "oldest", "dominant", "dominant_share", "precision", "reflown_share")
+
+
+def bulk_slim(kgs: list[str] | None = None) -> dict[str, dict]:
+    """Bulk ``als`` blocks for ``/api/v1/kgs?fields=codes,als`` (umfeld-at
+    saves one GET per KG per pass): one SELECT over the cache, no compute,
+    no histograms.  KGs without a cached block (no product yet / backfill
+    pending) are absent from the result."""
+    c = _conn()
+    if c is None:
+        return {}
+    out = {}
+    try:
+        rows = c.execute("SELECT kg, json FROM als_kg WHERE algo=?", (ALGO,)).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    want = set(str(k).zfill(5) for k in kgs) if kgs is not None else None
+    for kg, js in rows:
+        if want is not None and kg not in want:
+            continue
+        d = json.loads(js)
+        out[kg] = {k: d.get(k) for k in _SLIM_KEYS}
+    return out
+
+
 # === SECTION: status / summary ===
 
 def status_summary() -> dict:

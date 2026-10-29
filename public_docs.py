@@ -293,6 +293,9 @@ GET /api/v1/kgs?bbox=…                      KGs intersecting a bbox (processed
 GET /api/v1/kgs?limit=1000&offset=0         all processed KGs, paginated ({{kgs, total, …}})
 GET /api/v1/kgs?codes=63349,63332           specific codes
 GET /api/v1/kgs?fields=codes&processed_only=0 all 7 850 codes + universe_hash (see §KG universe)
+GET /api/v1/kgs?fields=codes,als&processed_only=0 bulk ALS flight years, one row per KG:
+    {{kg_code, als:{{newest, oldest, dominant, dominant_share, precision, reflown_share}}}} (als=null
+    where no cells product yet); no histograms — those stay on /api/v1/kg/<code>. ~400 KB gz, max-age 1800.
     rows: {{kg_code, kg_name, gemeinde_code, gemeinde_name, processed, product_version,
            product_version_registry, ne_ready, ne_status, ne_cells_published_at,
            generated_at, updated_at, quality_grade, bbox, centroid, url}}

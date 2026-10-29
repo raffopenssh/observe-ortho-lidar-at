@@ -482,7 +482,8 @@ def kgs():
     processed_only = request.args.get('processed_only', '1') not in ('0', 'false', 'no')
     codes = request.args.get('codes')
     st = lq.status()
-    if request.args.get('fields') == 'codes':
+    fields = {f.strip() for f in (request.args.get('fields') or '').split(',') if f.strip()}
+    if fields == {'codes'}:
         # Peer universe check (umfeld-at contract): codes only, enough to
         # recompute universe_hash. Hash is the ETag so If-None-Match → 304.
         try:
@@ -494,6 +495,24 @@ def kgs():
                       'universe_hash_recipe': st['universe_hash_recipe'],
                       'meta': _meta()}, max_age=3600,
                      etag=f'"{st["universe_hash"]}"' if not processed_only else None)
+    if fields == {'codes', 'als'}:
+        # Bulk ALS flight-year block (umfeld-at: one GET instead of 6 500):
+        # per KG {kg_code, als:{newest, oldest, dominant, dominant_share,
+        # precision, reflown_share}}; als=null where no cells product /
+        # backfill pending.  Served straight from the als_kg cache.
+        try:
+            import als_years
+            cl = lq.kg_codes(processed_only=processed_only)
+            blocks = als_years.bulk_slim(cl)
+        except Exception as e:  # noqa: BLE001
+            return _err(str(e), 500)
+        rows = [{'kg_code': c, 'als': blocks.get(c)} for c in cl]
+        return _json({'kgs': rows, 'count': len(rows), 'als_count': len(blocks),
+                      'kgs_total': st['kgs_total'], 'universe_hash': st['universe_hash'],
+                      'cells_generation': st.get('cells_generation'),
+                      'meta': _meta(note='slim als block, no histograms; full block with years/'
+                                         'coverage/newest_hist/oldest_hist at /api/v1/kg/<code>')},
+                     max_age=1800)
     try:
         if codes:
             want = [c.strip() for c in codes.split(',') if c.strip()][:200]
