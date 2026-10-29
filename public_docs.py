@@ -296,6 +296,10 @@ GET /api/v1/kgs?fields=codes&processed_only=0 all 7 850 codes + universe_hash (s
 GET /api/v1/kgs?fields=codes,als&processed_only=0 bulk ALS flight years, one row per KG:
     {{kg_code, als:{{newest, oldest, dominant, dominant_share, precision, reflown_share}}}} (als=null
     where no cells product yet); no histograms — those stay on /api/v1/kg/<code>. ~400 KB gz, max-age 1800.
+    Strong ETag + Last-Modified (moves only when a block is (re)computed or the universe changes):
+    send If-None-Match → 304 and skip the body. dominant = flight year covering the largest cell
+    share of the KG (dominant_share); newest = max year present and may be a sliver (its share =
+    coverage on /api/v1/kg/<code>). Label by dominant, treat dominant_share<0.9 as mixed.
     rows: {{kg_code, kg_name, gemeinde_code, gemeinde_name, processed, product_version,
            product_version_registry, ne_ready, ne_status, ne_cells_published_at,
            generated_at, updated_at, quality_grade, bbox, centroid, url}}

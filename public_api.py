@@ -500,19 +500,39 @@ def kgs():
         # per KG {kg_code, als:{newest, oldest, dominant, dominant_share,
         # precision, reflown_share}}; als=null where no cells product /
         # backfill pending.  Served straight from the als_kg cache.
+        # Strong ETag + Last-Modified from the als_kg cache fingerprint
+        # (row count / newest computed_at / content hash) x universe_hash,
+        # so a daily If-None-Match costs a COUNT() instead of 944 KB.
         try:
             import als_years
+            fp = als_years.bulk_fingerprint()
+        except Exception:  # noqa: BLE001
+            fp = None
+        etag = None
+        last_mod = None
+        if fp:
+            etag = f'"{hashlib.md5((fp[0] + "|" + str(st["universe_hash"]) + "|" + str(int(processed_only))).encode()).hexdigest()[:24]}"'
+            last_mod = fp[1]
+            if request.headers.get('If-None-Match') == etag:
+                return Response(status=304, headers=_als_hdrs(etag, last_mod))
+        try:
             cl = lq.kg_codes(processed_only=processed_only)
             blocks = als_years.bulk_slim(cl)
         except Exception as e:  # noqa: BLE001
             return _err(str(e), 500)
         rows = [{'kg_code': c, 'als': blocks.get(c)} for c in cl]
-        return _json({'kgs': rows, 'count': len(rows), 'als_count': len(blocks),
+        resp = _json({'kgs': rows, 'count': len(rows), 'als_count': len(blocks),
                       'kgs_total': st['kgs_total'], 'universe_hash': st['universe_hash'],
                       'cells_generation': st.get('cells_generation'),
                       'meta': _meta(note='slim als block, no histograms; full block with years/'
-                                         'coverage/newest_hist/oldest_hist at /api/v1/kg/<code>')},
-                     max_age=1800)
+                                         'coverage/newest_hist/oldest_hist at /api/v1/kg/<code>. '
+                                         'dominant = flight year covering the largest cell share '
+                                         '(dominant_share); newest = max year present, may be a sliver '
+                                         '(share in coverage at /api/v1/kg/<code>).')},
+                     max_age=1800, etag=etag)
+        if etag:
+            resp.headers.update(_als_hdrs(etag, last_mod))
+        return resp
     try:
         if codes:
             want = [c.strip() for c in codes.split(',') if c.strip()][:200]
@@ -573,6 +593,13 @@ def kg(code):
         except Exception as e:  # noqa: BLE001
             d['als'] = {'error': str(e)}
     return _json(d, max_age=600)
+
+
+def _als_hdrs(etag, last_mod):
+    h = {'ETag': etag, 'Cache-Control': 'public, max-age=1800'}
+    if last_mod:
+        h['Last-Modified'] = time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime(last_mod))
+    return h
 
 
 def _meta(**extra):

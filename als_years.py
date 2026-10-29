@@ -463,6 +463,24 @@ def bulk_slim(kgs: list[str] | None = None) -> dict[str, dict]:
     return out
 
 
+def bulk_fingerprint() -> tuple[str, float] | None:
+    """(etag, last_modified_epoch) of the ``bulk_slim`` payload: cache row
+    count + newest ``computed_at`` + sum of a cheap per-row hash, so the
+    ``/api/v1/kgs?fields=codes,als`` ETag only moves when a block is
+    (re)computed.  None when the cache is absent."""
+    c = _conn()
+    if c is None:
+        return None
+    try:
+        n, mx, h = c.execute(
+            "SELECT COUNT(*), COALESCE(MAX(computed_at),0), "
+            "COALESCE(SUM(length(json) + newest*7 + COALESCE(oldest,0)*3),0) FROM als_kg WHERE algo=?",
+            (ALGO,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return f"als-{ALGO}-{int(n)}-{int(mx)}-{int(h)}", float(mx or 0)
+
+
 # === SECTION: status / summary ===
 
 def status_summary() -> dict:
