@@ -182,6 +182,7 @@ CREATE TABLE IF NOT EXISTS file (kg TEXT PRIMARY KEY, body_offset INTEGER, cells
                     product_version TEXT, neo1_digest TEXT, partial INTEGER, mtime REAL,
                     w REAL, s REAL, e REAL, n REAL);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS summary (kg TEXT PRIMARY KEY, mtime REAL, js TEXT);
 """
 _local = threading.local()
 _idx_write_lock = threading.Lock()
@@ -252,6 +253,8 @@ def index_file(path: str | Path, *, conn: sqlite3.Connection | None = None) -> d
                        hdr.get('product_version'), (hdr.get('neo1') or {}).get('digest'),
                        1 if hdr.get('partial_cells') else 0, p.stat().st_mtime, *bb))
             c.execute("INSERT OR REPLACE INTO meta VALUES ('schema','1')")
+            c.execute('INSERT OR REPLACE INTO summary VALUES (?,?,?)',
+                      (kg, p.stat().st_mtime, json.dumps(public_summary(hdr.get('summary') or {}), separators=(',', ':'))))
             c.execute('COMMIT')
         except Exception:
             c.execute('ROLLBACK')
@@ -1794,6 +1797,200 @@ def kg_cells(code):
     r.headers['X-Cells-Epoch'] = str(h['epoch'])
     if h.get('partial_cells'):
         r.headers['X-Cells-Partial'] = '1'
+    return r
+
+
+# === SECTION: multi-KG summary (/api/v1/kgs/summary) ===
+
+KGS_SUMMARY_MAX_CODES = 500
+KGS_SUMMARY_MAX_AGE = 600
+_summary_mem: dict[str, tuple[float, dict]] = {}
+_summary_mem_lock = threading.Lock()
+_kgs_summary_resp: OrderedDict = OrderedDict()
+_SUM_INT = ('cells_observed', 'trees_n', 'structures_n')
+_SUM_DICT = ('cover_ha', 'consistency_n', 'consistency_ha')
+_TERRAIN_SUM = ('cells_with_terrain', 'hansen_loss_cells')
+
+
+def kg_summary(kg: str) -> dict | None:
+    """Public ``summary`` block of one KG's cells file, read once per file
+    mtime and persisted in ``cells.sqlite.summary`` (process-local dict in
+    front).  No raster / chunk access — header only."""
+    kg = str(kg).zfill(5)
+    f = _files().get(kg)
+    if f is None:
+        return None
+    mt = float(f.get('mtime') or 0)
+    hit = _summary_mem.get(kg)
+    if hit is not None and hit[0] == mt:
+        return hit[1]
+    c = _idx_conn()
+    if c is not None:
+        try:
+            row = c.execute('SELECT mtime, js FROM summary WHERE kg=?', (kg,)).fetchone()
+        except sqlite3.Error:
+            row = None
+        if row and float(row[0]) == mt:
+            s = json.loads(row[1])
+            with _summary_mem_lock:
+                _summary_mem[kg] = (mt, s)
+            return s
+    h = header(kg)
+    if h is None:
+        return None
+    s = h['summary']
+    with _summary_mem_lock:
+        _summary_mem[kg] = (mt, s)
+    try:
+        cw = _idx_conn(write=True)
+        with _idx_write_lock:
+            cw.execute('CREATE TABLE IF NOT EXISTS summary (kg TEXT PRIMARY KEY, mtime REAL, js TEXT)')
+            cw.execute('INSERT OR REPLACE INTO summary VALUES (?,?,?)', (kg, mt, json.dumps(s, separators=(',', ':'))))
+            cw.commit()
+    except sqlite3.Error as e:
+        log.debug('summary persist %s: %s', kg, e)
+    return s
+
+
+def merge_summaries(items: list[tuple[str, dict]]) -> dict:
+    """Merge per-KG public summaries: sums for ha / counts, min/max for the
+    terrain range, cell-weighted mean for ``slope_mean_deg``; same keys as
+    the per-KG block (+ ``epochs``)."""
+    out: dict = {k: 0 for k in _SUM_INT}
+    for k in _SUM_DICT:
+        out[k] = {}
+    terr = {'cells_with_terrain': 0, 'hansen_loss_cells': 0, 'elev_min_m': None, 'elev_max_m': None}
+    slope_w = 0.0; slope_n = 0
+    epochs = set(); sources = set(); groups = None; h3_res = None; chunk_res = None
+    for _kg, s in items:
+        for k in _SUM_INT:
+            out[k] += int(s.get(k) or 0)
+        for k in _SUM_DICT:
+            for g, v in (s.get(k) or {}).items():
+                out[k][g] = out[k].get(g, 0) + (v or 0)
+        t = s.get('terrain') or {}
+        for k in _TERRAIN_SUM:
+            terr[k] += int(t.get(k) or 0)
+        if t.get('elev_min_m') is not None:
+            terr['elev_min_m'] = t['elev_min_m'] if terr['elev_min_m'] is None else min(terr['elev_min_m'], t['elev_min_m'])
+        if t.get('elev_max_m') is not None:
+            terr['elev_max_m'] = t['elev_max_m'] if terr['elev_max_m'] is None else max(terr['elev_max_m'], t['elev_max_m'])
+        if t.get('slope_mean_deg') is not None:
+            w = int(t.get('cells_with_terrain') or 0) or 1
+            slope_w += float(t['slope_mean_deg']) * w; slope_n += w
+        if s.get('epoch'):
+            epochs.add(s['epoch'])
+        if s.get('source'):
+            sources.add(s['source'])
+        groups = groups or s.get('groups'); h3_res = h3_res or s.get('h3_res'); chunk_res = chunk_res or s.get('chunk_res')
+    for k in _SUM_DICT:
+        out[k] = {g: round(v, 2) for g, v in out[k].items()}
+    if groups:
+        cov = {g: out['cover_ha'].get(g, 0.0) for g in groups}
+        cov.update({g: v for g, v in out['cover_ha'].items() if g not in groups})
+        out['cover_ha'] = cov
+    terr['slope_mean_deg'] = round(slope_w / slope_n, 1) if slope_n else None
+    out['terrain'] = terr
+    out['epoch'] = max(epochs) if epochs else None
+    out['epochs'] = sorted(epochs)
+    out['source'] = sorted(sources)[-1] if sources else None
+    out['h3_res'] = h3_res; out['chunk_res'] = chunk_res; out['groups'] = groups
+    return out
+
+
+def _scope_codes(args) -> tuple[dict, list[str], list[str]]:
+    """(scope, codes, unknown) from ``codes=`` / ``gemeinde=`` / ``district=``
+    / ``state=``.  Raises CellsError 400 on bad / unsupported filters."""
+    keys = [k for k in ('codes', 'gemeinde', 'district', 'state') if args.get(k) is not None]
+    if len(keys) != 1:
+        raise CellsError(400, 'exactly one of codes=, gemeinde=, district=, state= is required')
+    key = keys[0]; raw = (args.get(key) or '').strip()
+    if key == 'codes':
+        codes = [c.strip().zfill(5) for c in raw.replace(';', ',').split(',') if c.strip()]
+        if not codes:
+            raise CellsError(400, 'codes= is empty')
+        bad = [c for c in codes if not (c.isdigit() and len(c) == 5)]
+        if bad:
+            raise CellsError(400, 'kg codes must be 5 digits', bad=bad[:10])
+        codes = sorted(set(codes))
+        if len(codes) > KGS_SUMMARY_MAX_CODES:
+            raise CellsError(400, f'more than {KGS_SUMMARY_MAX_CODES} codes', max_codes=KGS_SUMMARY_MAX_CODES, n=len(codes))
+        c = _search_conn()
+        known = set()
+        if c is not None:
+            for i in range(0, len(codes), 400):
+                part = codes[i:i + 400]
+                qm = ','.join('?' * len(part))
+                known.update(r[0] for r in c.execute(f'SELECT kg_code FROM kg WHERE kg_code IN ({qm})', part))
+        unknown = [k for k in codes if k not in known]
+        return {'type': 'codes', 'n': len(codes)}, [k for k in codes if k in known], unknown
+    want = {'gemeinde': 5, 'district': 3, 'state': 1}[key]
+    col = {'gemeinde': 'gemeinde_code', 'district': 'district_code', 'state': 'state_code'}[key]
+    if not (raw.isdigit() and len(raw) == want):
+        raise CellsError(400, 'bad_filter', detail=f'{key}= must be a {want}-digit Statistik Austria GKZ prefix')
+    # Wien: the KG list carries Wien as one Gemeinde (90001) in district 900;
+    # the Gemeindebezirke 901–923 (and 9xx01 pseudo-Gemeinden) are not mapped.
+    if raw.startswith('9') and ((key == 'district' and raw != '900') or (key == 'gemeinde' and raw != '90001')):
+        raise CellsError(400, 'unsupported_filter', detail='Wien Gemeindebezirke are not mapped to KGs here; use codes=',
+                         supported={'district': '900', 'gemeinde': '90001', 'state': '9'})
+    c = _search_conn()
+    if c is None:
+        raise CellsError(503, 'KG list unavailable')
+    rows = c.execute(f'SELECT kg_code FROM kg WHERE {col}=? ORDER BY kg_code', (raw,)).fetchall()
+    codes = [r[0] for r in rows]
+    if not codes:
+        raise CellsError(404, 'not_found', detail=f'no Katastralgemeinde with {key}={raw}')
+    return {'type': key, 'code': raw, 'n': len(codes)}, codes, []
+
+
+def kgs_summary(codes: list[str]) -> dict:
+    """Merged observed summary over a KG set (pure; used by the route)."""
+    fs = _files()
+    items = []; missing = []; partial = []
+    for k in codes:
+        s = kg_summary(k)
+        if s is None:
+            missing.append(k)
+            continue
+        if fs.get(k, {}).get('partial'):
+            partial.append(k)
+        items.append((k, s))
+    pend, notp = split_missing(missing)
+    d = {'kgs': len(codes), 'kgs_processed': len(items), 'summary': merge_summaries(items),
+         'incomplete': bool(missing or partial),
+         'kgs_pending_n': len(pend), 'kgs_not_processed_n': len(notp), 'kgs_partial_n': len(partial),
+         'kgs_pending': pend[:KGS_SUMMARY_MAX_CODES], 'kgs_not_processed': notp[:KGS_SUMMARY_MAX_CODES],
+         'kgs_partial': partial[:KGS_SUMMARY_MAX_CODES]}
+    return d
+
+
+@cells_bp.route('/api/v1/kgs/summary')
+def kgs_summary_route():
+    scope, codes, unknown = _scope_codes(_args())
+    gen = cells_generation()
+    key = json.dumps(scope, sort_keys=True) + '|' + ','.join(codes) + '|' + gen
+    etag = '"ks-' + hashlib.sha256(key.encode()).hexdigest()[:16] + '"'
+    inm = request.headers.get('If-None-Match') or ''
+    cc = f'public, max-age={KGS_SUMMARY_MAX_AGE}'
+    if etag in [x.strip() for x in inm.split(',')]:
+        return Response(status=304, headers={'ETag': etag, 'Cache-Control': cc})
+    body = _kgs_summary_resp.get(key)
+    if body is None:
+        d = kgs_summary(codes)
+        d = {'scope': scope, **d}
+        if unknown:
+            d['kgs_unknown'] = unknown
+        d['meta'] = _meta({'kgs': codes if scope['type'] == 'codes' else [], 'epoch': d['summary'].get('epoch'),
+                           'partial': d['incomplete']}, int(d['summary'].get('cells_observed') or 0), RES, ('obs',),
+                          generation=gen, per_kg='/api/v1/kg/<code>/cells?format=json', max_codes=KGS_SUMMARY_MAX_CODES)
+        body = _dumps(d, False)
+        _kgs_summary_resp[key] = body
+        while len(_kgs_summary_resp) > 256:
+            _kgs_summary_resp.popitem(last=False)
+    r = Response(body, status=200, mimetype='application/json')
+    r.headers['ETag'] = etag
+    r.headers['Cache-Control'] = cc
+    r.headers['X-Cells-Source'] = 'disk'
     return r
 
 

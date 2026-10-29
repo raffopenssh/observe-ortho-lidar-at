@@ -59,6 +59,20 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
   GET  /api/v1/cells/chunk/<h3>                   one res-10 (or res-9 = 7 chunks) chunk for bulk clients; format=h3b|bin|json
   GET  /api/v1/cells/dict                         fields, units, code tables, group labels, limits, epoch
   GET  /api/v1/kg/<code>/cells                    whole-KG container: format=h3b (default, downloadable) | json (summary)
+  GET  /api/v1/kgs/summary?codes=a,b,…             merged observed summary over a KG SET (≤ 500 codes, else 400);
+       …?gemeinde=61630 | district=616 | state=6    or by Statistik Austria GKZ prefix (5 / 3 / 1 digits).
+                                                  Wien Gemeindebezirke (901–923 / 9xx01) → 400 {{error:"unsupported_filter"}},
+                                                  fall back to codes= (Wien as a whole: district=900, gemeinde=90001).
+                                                  → {{scope{{type,code|n}}, kgs, kgs_processed, incomplete,
+                                                  kgs_pending[_n], kgs_not_processed[_n], kgs_partial[_n], kgs_unknown?,
+                                                  summary{{…same keys as /kg/<code>/cells?format=json summary…}}, meta}}.
+                                                  summary: cover_ha / consistency_n / consistency_ha / cells_observed /
+                                                  trees_n / structures_n / terrain.cells_with_terrain / hansen_loss_cells
+                                                  are SUMS over the processed KGs; terrain.elev_min_m / elev_max_m =
+                                                  min / max; terrain.slope_mean_deg = cell-weighted mean; epoch = newest
+                                                  (+ epochs[]). KGs without published cells are skipped and counted in
+                                                  kgs − kgs_processed; incomplete:true when any KG is missing or partial.
+                                                  Header-only read (no raster), ETag + max-age=600, CORS *.
   GET  /api/v1/landscape?…&include=cells          adds a per-bbox roll-up block (cover, heights, canopy, change, consistency)
   GET  /api/v1/status                             cells{kgs_ready, cells_total, index_rebuilt_at, epoch}
                                                   als{kgs_with_als_year, year_hist, newest_min/max, oldest_min}

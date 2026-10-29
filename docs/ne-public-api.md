@@ -79,6 +79,7 @@ POST /api/v1/cells {"ids":[…]}        ≤ 16 384 ids
 /api/v1/cells/chunk/<h3>              res 9 or 10 chunk(s) for bulk clients; format=h3b|bin|json
 /api/v1/cells/dict                    field layout, units, code tables, group labels, limits, epoch pin
 /api/v1/kg/<code>/cells               whole-KG container (public product file): format=h3b (default) | json summary
+/api/v1/kgs/summary?codes=|gemeinde=|district=|state=   merged observed summary over a KG set (see §11)
 /api/v1/landscape?…&include=cells     existing endpoint gains a per-bbox roll-up block (§5)
 /api/v1/status                        gains cells{kgs_ready, cells_total, index_rebuilt_at}
 ```
@@ -421,3 +422,38 @@ product or JSON is rewritten**:
 * `summary.observed_ha` in headers is still pre-fix (documented in the pub header).
 * test: `python3 tests/test_ne_green_fix.py`; audit one file:
   `python3 ne_green_fix.py data/ne/63330.h3b`.
+
+## 11. Multi-KG summary `/api/v1/kgs/summary` (2026-10-29)
+
+For umfeld-at's landing glyph (selection card over Gemeinde / Bezirk /
+Bundesland / Natura-2000 masks). Public, tokenless, CORS `*`, ETag +
+`Cache-Control: public, max-age=600`.
+
+Scope (exactly one): `codes=63330,63331,…` (≤ 500, else 400),
+`gemeinde=61630` (5-digit GKZ), `district=616` (3), `state=6` (1).
+Wien Gemeindebezirke (`district=901…923`, `gemeinde=9xx01` other than
+90001) → `400 {"error":"unsupported_filter", …supported}`; Wien as a whole
+is `district=900` / `gemeinde=90001`. Unknown filter value → 404
+`not_found`; malformed → 400 `bad_filter`. Unknown KG codes in `codes=`
+are listed in `kgs_unknown` and not counted in `kgs`.
+
+Response: `{scope{type, code|n}, kgs, kgs_processed, incomplete,
+kgs_pending_n/kgs_not_processed_n/kgs_partial_n (+ lists ≤ 500),
+kgs_unknown?, summary, meta{generation, per_kg, max_codes, …}}`.
+`summary` has exactly the keys of the per-KG
+`/kg/<code>/cells?format=json → summary` block (`cells_api.public_summary`)
+merged by `cells_api.merge_summaries`: sums for `cells_observed`,
+`trees_n`, `structures_n`, `cover_ha{group}`, `consistency_n{}`,
+`consistency_ha{}`, `terrain.cells_with_terrain`, `terrain.hansen_loss_cells`;
+min / max for `terrain.elev_min_m` / `elev_max_m`; `terrain.slope_mean_deg`
+weighted by `cells_with_terrain`; `epoch` = newest + `epochs[]`. KGs
+without a published cells file are skipped (`kgs - kgs_processed`),
+split into `kgs_pending` / `kgs_not_processed` like the cells routes;
+`incomplete:true` when any KG is missing or has `partial_cells`.
+
+Cost: header-only. Per-KG public summaries are persisted in
+`cells.sqlite.summary(kg, mtime, js)` (written by `index_file` on ingest,
+lazily back-filled by `kg_summary()` when the mtime differs), with a
+process-local dict in front and a 256-entry response cache keyed on
+`(scope, codes, cells_generation())`. `state=6` (1 596 KGs) is ~3 s on a
+cold sqlite, ~10 ms warm.
