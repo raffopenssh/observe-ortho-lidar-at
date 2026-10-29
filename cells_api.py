@@ -979,7 +979,6 @@ def aggregate_all(t: Table) -> dict:
     def mx(name, nd=1):
         v = dec[name]; v = v[~np.isnan(v)]
         return round(float(v.max()), nd) if v.size else None
-    ch = {}
     _, chist = _reduce_mode(np.minimum(dec['consistency'], 6), bounds, 7)
     ch_hist = {_CONSISTENCY_NAMES[i]: int(c) for i, c in enumerate(chist[0]) if c}
     _, phist = _reduce_mode(np.where(dec['phenology'] == 255, len(PHENOLOGY), dec['phenology']), bounds, len(PHENOLOGY) + 1)
@@ -1618,7 +1617,6 @@ def _render(t: Table, hdrs: dict, meta: dict, *, fmt: str, res: int, layers: tup
 
 
 def _render_inner(t: Table, hdrs: dict, meta: dict, *, fmt: str, res: int, layers: tuple, fields, centres: bool) -> Response:
-    n = len(t)
     etag = _etag(hdrs)
     partial = bool(meta.get('partial'))
     if fmt == 'bin':
