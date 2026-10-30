@@ -15,4 +15,7 @@ keepalive = 15
 max_requests = 20000
 max_requests_jitter = 2000
 chdir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# gunicorn >= 23 opens a control socket; the default path is shared by every
+# gunicorn of the same user, so give the public tier its own.
+control_socket = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.gunicorn"), "ortho-lidar-public.ctl")
 del os, sys, _cfg  # leave only gunicorn settings in the module namespace

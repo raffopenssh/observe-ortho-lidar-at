@@ -9,6 +9,9 @@ workers = _cfg.env_int("SRTM_APP_WORKERS", 2)
 threads = _cfg.env_int("SRTM_APP_THREADS", 4)
 timeout = 600
 chdir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# gunicorn >= 23 opens a control socket; the default path is shared by every
+# gunicorn of the same user, so give the app tier its own.
+control_socket = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.gunicorn"), "ortho-lidar-app.ctl")
 del os, sys, _cfg  # leave only gunicorn settings in the module namespace
 raw_env = [
     "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES=YES",
