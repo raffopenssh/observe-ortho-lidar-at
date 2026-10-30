@@ -11251,6 +11251,13 @@ def remove_legacy_products(kg_code: str, v1_doc: dict | None = None, manifest=No
                 done["json_strip"] = {"size": ent.size, "prev_uploaded_at": prev_ts}
                 log.info("KG %s: v1 _json stripped of cadastre data and re-PUT in place (%d B)", kg_code, ent.size)
             else:
+                # Clean already (written by a cadastre-free code path but
+                # never flagged) — record it, else the legacy audit keeps
+                # listing the code as suspect forever (62004, 2026-10-30).
+                ej.status = "cf"
+                manifest.set(f"{kg_code}_json", ej)
+                manifest.save()
+                _push_manifest_entry_to_director(f"{kg_code}_json", manifest)
                 done["json_strip"] = "already clean"
         if pend.get("light_remove"):
             rec = client.remove_deposition_keep_record(f"{kg_code}_light_gpkg", manifest, reason="v2.4 cadastre layers")
