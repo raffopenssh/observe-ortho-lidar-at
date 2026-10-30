@@ -20795,7 +20795,7 @@ _PTXT_GROUPS = (
                   'throttle:', 'versions:', 'rollout:', 'frontier plan',
                   'primary_net:')),
     ('progress', ('progress:', 'products:', 'zenodo:', 'zen_stall:', 'v2:',
-                  'v2_verify_fails', 'v2_regen:', 'label_mix:', 'json_heal:', 'repair:',
+                  'v2_verify_fails', 'v2_regen:', 'label_mix:', 'stale_blocks:', 'json_heal:', 'repair:',
                   'chkpt_registry:', 'zen_cache:', 'hansen_cover:', 'cache_reconcile:',
                   'priority queue', 'recent failures')),
     ('upstreams', ('warn_top', 'zenodo_circuit:', 'zenodo_uploads:',
@@ -22571,6 +22571,21 @@ def process_txt():
                 out.append(_lml)
         except Exception as _e:
             out.append(f'label_mix: unavailable ({_e})')
+        # stale_blocks: old-split-layout residue still carrying live
+        # products while the current layout covers the parent on its own
+        # (stale_blocks.py scan|apply); 5-min cache, manifest-only scan.
+        try:
+            import stale_blocks as _sbk
+            _sbs = _sbk.status()
+            if _sbs.get('error'):
+                out.append(f"stale_blocks: unavailable ({_sbs['error']})")
+            else:
+                out.append(f"stale_blocks: parents={_sbs['stale_parents']} codes={_sbs['stale_codes']} "
+                           f"(old layout residue overlapping the live layout; `python3 stale_blocks.py apply`) "
+                           f"· drift={_sbs['drift_parents']} (layout changed, old product is the coverage — kept)"
+                           + (f" · {' '.join(_sbs['sample'])}" if _sbs['sample'] else ''))
+        except Exception as _e:
+            out.append(f'stale_blocks: unavailable ({_e})')
         # json_heal: missing v1 _json completion markers rebuilt from
         # _json_v2 by the director (json_heal.py); grep `?q=json_heal`.
         try:

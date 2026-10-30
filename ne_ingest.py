@@ -957,6 +957,14 @@ def run_tick(max_n: int = MAX_PER_TICK) -> dict:
         import inbound_budget
         idx = _load_index()
         entries = load_manifest_entries()
+        try:
+            # retired old-layout blocks (stale_blocks.apply journal) — must
+            # run under this lock, on the live idx, before pending()/merge
+            import stale_blocks as _sb
+            if _sb.consume_ne_journal(idx, entries):
+                _save_index(idx)
+        except Exception as ex:  # noqa: BLE001
+            log.warning("ne_ingest stale-block journal: %s", ex)
         todo = pending(entries, idx)
         out["pending"] = len(todo)
         mb_h = float(_knob("ne_ingest_mb_per_h", MB_PER_H_DEFAULT))

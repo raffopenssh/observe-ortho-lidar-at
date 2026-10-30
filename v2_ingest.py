@@ -219,6 +219,46 @@ def _clear_failure(code: str) -> None:
         store.meta_set("ingest_failed", json.dumps(f, separators=(",", ":")))
 
 
+# Manifest entries reach the primary over two paths (unit/KG result POST
+# vs. the 5-min peer sync), so ``_json_v2`` can be visible minutes before
+# ``_light_gpkg_v2``. Oct 2026: 84012-sw2 / 84115-sw1 / 81111-center struck
+# out 3x in 10 min on ``manifest_light_gpkg_v2`` and sat in verify_fail
+# although the light entry landed shortly after.
+MANIFEST_SETTLE_S = 2 * 3600
+_MANIFEST_GATE = "manifest_light_gpkg_v2"
+
+
+def _upload_age_s(uploaded_at: str | None) -> float:
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(str(uploaded_at).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, time.time() - dt.timestamp())
+    except Exception:  # noqa: BLE001
+        return float("inf")
+
+
+def requalify_failed(entries: dict | None = None) -> list[str]:
+    """Drop strikes whose only cause was the manifest-settling race: the
+    recorded reason is the ``manifest_light_gpkg_v2`` gate and the manifest
+    now carries a committed ``_light_gpkg_v2`` for the same code."""
+    entries = entries if entries is not None else load_manifest_entries()
+    f = failed()
+    cleared = []
+    for code, rec in list(f.items()):
+        reason = str((rec or {}).get("reason") or "")
+        if _MANIFEST_GATE not in reason:
+            continue
+        if _committed(entries.get(f"{code}_light_gpkg_v2")):
+            f.pop(code, None)
+            cleared.append(code)
+    if cleared:
+        store.meta_set("ingest_failed", json.dumps(f, separators=(",", ":")))
+        log.info("v2_ingest: requalified %s (light_gpkg_v2 entry has settled)", ",".join(cleared))
+    return cleared
+
+
 def pending(entries: dict | None = None) -> list[str]:
     """Codes with a committed ``_json_v2`` not yet in the store (oldest
     upload first), excluding codes with >= MAX_FAILS strikes on the same
@@ -571,6 +611,13 @@ def ingest_one(code: str, entries: dict, *, delete_v1: bool = True,
                                     f"clipped/empty on BEV ({_ev[:120]})", code)
             except Exception:  # noqa: BLE001
                 pass
+        elif (list(rep.get("errors") or []) and
+              all(er.split(":", 1)[0] == _MANIFEST_GATE for er in rep["errors"]) and
+              _upload_age_s(up_at) < MANIFEST_SETTLE_S):
+            # manifest still settling (see MANIFEST_SETTLE_S) — defer, no strike
+            log.info("v2_ingest: %s deferred — _light_gpkg_v2 manifest entry not yet synced "
+                     "(json_v2 %.0f min old)", code, _upload_age_s(up_at) / 60)
+            return {"code": code, "ok": False, "deferred": True, "reason": rep.summary()}
         else:
             _record_failure(code, rep.summary(), up_at)
             log.warning("v2_ingest: %s verify FAILED: %s", code, rep.summary())
@@ -633,6 +680,12 @@ def run_tick(max_n: int = MAX_PER_TICK, *, harvest: bool = True) -> dict:
     out = {"ingested": 0, "failed": 0, "pending": 0, "codes": [], "freed": 0}
     try:
         entries = load_manifest_entries()
+        try:
+            rq = requalify_failed(entries)
+            if rq:
+                out["requalified"] = rq
+        except Exception as ex:  # noqa: BLE001
+            log.warning("v2_ingest: requalify: %s", ex)
         todo = pending(entries)
         out["pending"] = len(todo)
         try:
