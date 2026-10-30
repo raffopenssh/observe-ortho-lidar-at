@@ -40,8 +40,11 @@ scope. The threat model assumes `:8100` is reachable by anyone and
   GeoJSON / WKT / KML / GPX / GeoPackage / zipped Shapefile uploads are
   parsed with fiona / shapely only, size- and feature-capped, polygons
   repaired server-side, and validated against the Austrian bbox and the
-  area limits before any raster is touched. Shapefile ZIPs are extracted
-  with path checks into a temp dir.
+  area limits before any raster is touched. Request bodies are capped
+  (`SRTM_APP_MAX_BODY_MB`, 256 MiB on the operator port; 32 MiB through
+  the public relay); Shapefile ZIPs are extracted with Python's
+  `zipfile` (absolute and `..` members are stripped) into a private
+  temp dir that is deleted afterwards.
 * **Outbound fetchers** go through `http_pool.py` with the host
   allow-list `config.OUTBOUND_ALLOWED_HOSTS` (BEV, Copernicus Data
   Space, Zenodo, Hansen on `storage.googleapis.com`, Overpass) plus
@@ -49,11 +52,15 @@ scope. The threat model assumes `:8100` is reachable by anyone and
   fetched. GDAL `/vsicurl/` reads use the same hosts.
 * **Pickle / checkpoint loading**: tile checkpoints
   (`tile_checkpoints/<kg>/tile_N.pkl`), restored checkpoint archives
-  from the Zenodo cache deposit, and the RF / LightGBM model files are
-  loaded only through `safe_load.py`, a whitelist unpickler (numpy,
-  shapely, scikit-learn / lightgbm estimator classes, builtins); any
-  other global raises. `tests/test_safe_load.py` covers it. A tampered
-  Zenodo record can therefore break a run but not execute code.
+  from the Zenodo cache deposit and every other pickle the pipeline
+  reads go through `safe_load.py`, a whitelist unpickler (numpy, shapely,
+  a few own dataclasses, builtins) — any other global raises
+  `UnsafePickle`. Model files (scikit-learn / LightGBM joblib) cannot be
+  whitelisted, so `safe_load.load_model` only loads them from the repo's
+  `data/` tree after a checksum match against `data/models_manifest.json`
+  (`SRTM_REQUIRE_MODEL_CHECKSUM=1` makes a missing checksum fatal).
+  `tests/test_safe_load.py` covers both. A tampered Zenodo record can
+  therefore break a run but not execute code.
 * **Secrets** live outside the repo in `SRTM_SECRETS_DIR`
   (default `~/.config/srtm-lidar`, files `zenodo_token`,
   `operator_token`, `copernicus_credentials.json`) or in the service
