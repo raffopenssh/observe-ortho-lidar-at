@@ -49,8 +49,8 @@ import temporal_analysis as tca
 import geo_parse
 from zenodo_fetch import FetchInProgress
 import search_index as si
-import umfeld as _umfeld
-import git_auth as _git_auth  # read-only GitHub token for the private repo
+import config as _config
+import public_segmentation as _ps   # ROUTES allow-list shared with the public tier
 
 
 import feedback_db
@@ -60,12 +60,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname
 log = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder='static', static_url_path='')
-import api_tiers as _tiers  # /k prefix + token tier shared with public_api.py
-# ``…/k/<path>`` is served exactly like ``/<path>`` (see api_tiers.py): the
-# public app proxies the token-gated private tier here with the prefix
-# intact, and peers may hit :8000 with the prefix before the port switch.
-app.wsgi_app = _tiers.StripPrefixMiddleware(app.wsgi_app)
-import llm_api as _llm_api  # siedler sibling-service contract (prewarm, trees/bbox)
+# Body-size cap (geometry uploads, peer status pushes, manifest PUTs).
+app.config['MAX_CONTENT_LENGTH'] = _config.env_int('SRTM_APP_MAX_BODY_MB', 256) * 1024 * 1024
+import llm_api as _llm_api  # read-only sibling-service contract (prewarm, trees/bbox)
 app.register_blueprint(_llm_api.bp)
 import hillshade_tiles as _hs_tiles  # /tiles/hillshade|slope/z/x/y.png from grid25
 app.register_blueprint(_hs_tiles.bp)
@@ -130,7 +127,7 @@ def _inflate_gzip_request_body():
 def net_stats():
     """Per-endpoint bandwidth attribution for this VM (all gunicorn
     workers merged). ``?fmt=txt`` for a plain-text table, ``?top=N``.
-    Loopback / admin-token only (path is under /api/v1/ admin rules)."""
+    Operator-only (loopback / X-Operator-Token)."""
     if _net_meter is None:
         return jsonify({'error': 'net_meter unavailable'}), 503
     top = min(200, max(5, int(request.args.get('top', 40) or 40)))
@@ -138,143 +135,107 @@ def net_stats():
         return Response(_net_meter.snapshot_text(top), mimetype='text/plain')
     return jsonify(_net_meter.snapshot(top))
 
-# === Admin auth ===
-# Shared cluster-wide secret stored in data/admin_token. Required header
-# X-Admin-Token (or ?admin_token=) on every mutating admin/director/processing
-# /zenodo endpoint. Loopback requests (127.0.0.1) are exempt so the in-process
-# director and dashboard fetches via /admin/token bootstrap work without
-# plumbing the secret everywhere. The token is auto-generated on first start
-# and is replicated by deploy.sh + peer-sync to every peer.
+# === Operator gate ===
+# ONE rule for every state-mutating route (processing / director / admin /
+# credentials / zenodo lock / index rebuild / classifier training and any
+# POST, PUT, PATCH or DELETE that is not part of the public analysis
+# allow-list): allowed from loopback (127.0.0.1 / ::1 without
+# X-Forwarded-For) or with ``X-Operator-Token == config.operator_token()``
+# when that is configured; otherwise 403.  The public tier
+# (``public_api.py``) never relays these paths and always sets
+# X-Forwarded-For, so a relayed request can never pass as loopback.  Peers
+# in multi-VM mode authenticate with the same header
+# (``peer_director._admin_headers``).
 
-ADMIN_TOKEN_PATH = Path('data/admin_token')
-
-
-def _load_or_create_admin_token() -> str:
-    """Load shared admin token, creating one if missing.
-
-    Lives in data/admin_token (gitignored). deploy.sh copies the primary's
-    token to peers; the data sync thread keeps it consistent.
-    """
-    try:
-        if ADMIN_TOKEN_PATH.exists():
-            tok = ADMIN_TOKEN_PATH.read_text().strip()
-            if tok:
-                return tok
-    except Exception:
-        pass
-    import secrets
-    tok = secrets.token_urlsafe(32)
-    try:
-        ADMIN_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        ADMIN_TOKEN_PATH.write_text(tok)
-        ADMIN_TOKEN_PATH.chmod(0o600)
-    except Exception as e:
-        log.warning('admin_token: could not persist token: %s', e)
-    return tok
-
-
-ADMIN_TOKEN = _load_or_create_admin_token()
-
-
-def _current_admin_token() -> str:
-    """Read the admin token fresh each time.
-
-    Lets `/api/v1/admin/install_token` rotate the cluster secret without
-    a srv restart — the next request picks up the new value.
-    """
-    global ADMIN_TOKEN
-    try:
-        if ADMIN_TOKEN_PATH.exists():
-            tok = ADMIN_TOKEN_PATH.read_text().strip()
-            if tok:
-                ADMIN_TOKEN = tok
-                return tok
-    except Exception:
-        pass
-    return ADMIN_TOKEN
-
-# URL prefixes that require the admin token. GET-only inspection endpoints
-# (/director/status, /processing/queue, /processing/peers, /bandwidth, ...)
-# stay open so the dashboard remains usable from anywhere.
-_PROTECTED_PREFIXES = (
+_OPERATOR_PREFIXES = (
     '/api/v1/admin/',
-    '/api/v1/secrets/',              # fleet_secrets lease (peer token, PEER_SCOPE)
-    '/api/v1/ne/declared/',          # umfeld lu relay for bev-mode peers (director holds the umfeld token)
-    '/api/v1/director/vct_reported',  # fleet-wide /contrib dedupe for split blocks
-    '/api/v1/director/sweep',         # sliver sweep: peer results (POST), status (GET) — sliver_sweep.py
-    '/api/v1/processing/sweep_spec',  # director → peer sweep units
-    '/api/v1/director/mode',
-    '/api/v1/director/activate',
-    '/api/v1/director/stop',
-    '/api/v1/director/peers',  # POST/PUT/DELETE; GET also requires token (contains URLs)
-    '/api/v1/director/throttle',
-    '/api/v1/director/config',
-    '/api/v1/director/barren_cells/clear',
-    '/api/v1/director/update_peers',
-    '/api/v1/director/heal_peers_json',
-    '/api/v1/director/restart_peer',
-    '/api/v1/director/handover',
-    '/api/v1/director/takeover',
-    '/api/v1/director/step_down',
-    '/api/v1/director/announce',
-    '/api/v1/director/snapshot',
-    '/api/v1/director/log_archive',
-    '/api/v1/director/combined_log_delta',
-    '/api/v1/director/probe',
-    '/api/v1/processing/start',
-    '/api/v1/processing/stop',
-    '/api/v1/processing/pause',
-    '/api/v1/processing/resume',
-    '/api/v1/processing/single',
-    '/api/v1/processing/retry',
-    '/api/v1/processing/throttle',
-    '/api/v1/processing/queue',
-    '/api/v1/processing/partial_kgs',
-    '/api/v1/processing/cache_manifest',
-    '/api/v1/processing/kg_strikes',
-    '/api/v1/processing/product',
-    '/api/v1/zenodo/lock',
+    '/api/v1/director/',
+    '/api/v1/processing/',
     '/api/v1/credentials',
-    '/api/v1/processing/cache_misses',
-    '/api/v1/manifest/push',
-    '/api/v1/manifest/reconcile',
+    '/api/v1/zenodo/lock',
+    '/api/v1/manifest/',
     '/api/v1/bev_probe',
     '/api/v1/net_stats',
+    '/api/v1/index/rebuild',
+    '/api/v1/classifier/train',
+    '/api/v1/training/evaluate',
+    '/api/v1/ne/declared/',
+    '/api/v1/flags/rebuild',
+    '/api/v1/feedback/resolve',
 )
 
-
-# Endpoints that handle their own auth (before_request must let them through).
-_AUTH_SELF_HANDLED = ('/api/v1/admin/install_token',)
-
-
-# Paths where GET is read-only inspection (let through) but POST/PUT/DELETE
-# still require the admin token. The dashboard polls these without a token.
-_PROTECTED_GET_OPEN = (
-    '/api/v1/processing/queue',
-    '/api/v1/processing/cache_manifest',
+# Read-only inspection GETs under the operator prefixes that the dashboard
+# and the public tier (/api/v1/director/status, /process.txt) may read.
+_OPERATOR_GET_OPEN = (
+    '/api/v1/director/status',
+    '/api/v1/director/log/history',
+    '/api/v1/director/peers/status',
+    '/api/v1/director/barren_cells',
+    '/api/v1/director/throttle',
+    '/api/v1/director/config',
+    '/api/v1/director/v2/priority',
+    '/api/v1/director/proxy/',
+    '/api/v1/director/sweep',
+    '/api/v1/director/vct_reported',
+    '/api/v1/director/identity',
+    '/api/v1/processing/status',
+    '/api/v1/processing/throttle',
+    '/api/v1/processing/peers',
+    '/api/v1/processing/product',
     '/api/v1/processing/kg_strikes',
+    '/api/v1/processing/cache_manifest',
+    '/api/v1/processing/completed_recent',
+    '/api/v1/processing/queue',
+    '/api/v1/processing/partial_kgs',
+    '/api/v1/processing/log',
+    '/api/v1/processing/tiles',
+    '/api/v1/processing/manifest',
+    '/api/v1/processing/kg_outlines',
+    '/api/v1/processing/kg_search',
+    '/api/v1/processing/cache_misses',
+    '/api/v1/processing/sweep_spec',
+    '/api/v1/credentials',
 )
 
 
-# (The cadastre-relay routes — /lookup, /parcels/*, /query/nature|habitat_count,
-# /cadastre/*, /kg/<c>/profile — and their token gate were removed 2026-10-13,
-# Kataster purge; api_tiers.PRIVATE_ROUTES_LANDSCAPE keeps answering 410.)
+def _is_operator_path(path: str, method: str) -> bool:
+    if method in ('GET', 'HEAD', 'OPTIONS'):
+        if any(path.startswith(p) for p in _OPERATOR_GET_OPEN):
+            return False
+        return any(path.startswith(p) for p in _OPERATOR_PREFIXES)
+    # Every other method mutates: only the public analysis allow-list is open.
+    if _public_request() and _ps.route_kind(method, path) is not None:
+        return False
+    return True
 
 
-def _is_protected_path(path: str, method: str) -> bool:
-    if path in _AUTH_SELF_HANDLED:
-        return False
-    if method == 'GET' and any(path.startswith(p) for p in _PROTECTED_GET_OPEN):
-        return False
-    return any(path.startswith(p) for p in _PROTECTED_PREFIXES)
+def _operator_token_ok() -> bool:
+    tok = _config.operator_token()
+    sent = request.headers.get('X-Operator-Token') or ''
+    return bool(tok) and hmac.compare_digest(sent, tok)
+
+
+@app.before_request
+def _enforce_operator_gate():
+    path = request.path or ''
+    if request.method == 'OPTIONS':
+        return None
+    if not _is_operator_path(path, request.method):
+        return None
+    if _public_request():
+        return jsonify({'error': 'not_found'}), 404      # defence in depth: never via the relay
+    if _request_is_loopback() or _operator_token_ok():
+        return None
+    return jsonify({'error': 'forbidden',
+                    'hint': 'operator routes are loopback-only or need X-Operator-Token'}), 403
 
 
 def _request_is_loopback() -> bool:
     """True for requests originating on this host.
 
-    gunicorn behind exe.dev's proxy: remote_addr is 127.0.0.1 for proxied
-    traffic too, so we also require X-Forwarded-For to be absent for the
-    loopback bypass to apply.
+    Behind a reverse proxy (or the public tier's relay) remote_addr is
+    127.0.0.1 for forwarded traffic too, so X-Forwarded-For must be absent
+    for the loopback bypass to apply.
     """
     try:
         if request.remote_addr not in ('127.0.0.1', '::1'):
@@ -317,22 +278,25 @@ def _invalidate_zip_indices(entries: dict) -> int:
 #
 # ``public_api.py`` forwards a whitelisted set of analysis endpoints
 # (segment / overlays / exports / shares / parse-geometry) from the tokenless
-# public UI at https://example.invalid/segmentation.  Those requests
-# arrive on loopback *without* X-Forwarded-For (so the admin bypass applies —
-# the proxy whitelists the paths) and *with* ``X-Srtm-Public: 1``.  Everything
-# below treats them as untrusted: no cadastre context, ``source=auto`` (the
-# frozen v2.x products first, live BEV only as fallback), a smaller area cap,
-# a separate share namespace, and every admin path answers 404.
+# public UI at ``/segmentation``.  Those requests arrive from the public tier
+# on loopback *with* ``X-Srtm-Public: 1`` and the client's address in
+# X-Forwarded-For (so the loopback operator bypass never applies).
+# Everything below treats them as untrusted: no model-context layers,
+# ``source=auto`` (the frozen v2.x products first, live BEV only as fallback),
+# a smaller area cap, a separate share namespace, and every operator path
+# answers 404.
 PUBLIC_HDR = 'X-Srtm-Public'
-PUBLIC_MAX_AREA_SQM = int(float(os.environ.get('PUBLIC_MAX_AREA_KM2', '5')) * 1e6)
+PUBLIC_MAX_AREA_SQM = int(_config.PUBLIC_MAX_AREA_KM2 * 1e6)
 
 
 def _public_request() -> bool:
-    """True when this request was relayed by the public tier (loopback + header)."""
+    """True when this request was relayed by the public tier (header set by
+    ``public_segmentation.relay`` — clients cannot inject it through the relay,
+    and claiming it directly only *removes* rights)."""
     try:
         v = getattr(g, '_public_tier', None)
         if v is None:
-            v = bool(request.headers.get(PUBLIC_HDR) == '1' and _request_is_loopback())
+            v = request.headers.get(PUBLIC_HDR) == '1'
             g._public_tier = v
         return v
     except RuntimeError:          # outside a request context (async workers)
@@ -431,12 +395,6 @@ def _public_params(params: dict) -> dict:
     """Pin the public-tier constraints into a params dict (also consumed by
     the async workers, which run outside the request context)."""
     params['_public'] = True
-    # Run-time model context (footprints / parcel edges for segv2 + the v1
-    # building mask) is allowed, but ONLY from the local bevdirect-serve
-    # (public BEV vector tiles; live_cadastre.py) — never umfeld's /k tier.
-    # Nothing of it reaches the response (meta key dropped, evaluation
-    # omitted, scrub() on the relay).
-    params['cadastre_source'] = 'bevdirect'
     if str(params.get('source', '')).lower() not in ('auto', 'product', 'bev'):
         params['source'] = 'auto'
     return params
@@ -467,226 +425,13 @@ def _cors_public(resp):
     return resp
 
 
-@app.before_request
-def _enforce_private_only():
-    """``data/private_only`` present → this whole app is the hidden tier:
-    every non-loopback request must carry a valid tier token (admin token
-    or data/api_tokens), else the generic 404 (never 401 — the surface is
-    unadvertised). ``?token=`` on a page sets the ``srtm_k`` cookie so the
-    dashboards keep working in a browser."""
-    tok = request.args.get('token')
-    if tok and _tiers.token_valid(tok) and request.cookies.get(_tiers.COOKIE) != tok:
-        g._set_tier_cookie = tok          # ?token= once → cookie for the dashboards
-    if _request_is_loopback():
-        return None
-    on_peer = not _is_primary_self_cached()
-    if not on_peer and not _tiers.private_only():
-        return None
-    if request.method == 'OPTIONS':
-        return None
-    if not on_peer and _request_via_owner_port():
-        return None                       # primary dashboards: exe.dev login is the gate
-    tok = _tiers.request_token(request)
-    if _tiers.token_valid(tok):
-        return None
-    if not on_peer and _tiers.process_txt_pwd_ok(request):
-        return None                       # /k/process.txt?pwd= stop-gap (api_tiers)
-    if on_peer:
-        return _peer_gate_response()
-    return jsonify({'error': 'not_found', 'docs': _tiers.PUBLIC_BASE + '/api/v1/docs/llm.txt'}), 404
-
-
-_PRIMARY_SELF_CACHE = {'t': 0.0, 'v': None}
-
-
-def _is_primary_self_cached() -> bool:
-    """``_is_primary_self()`` with a 30 s TTL — it is consulted on every
-    request and ``director_ha.load_self`` reads ``self.json`` each time."""
-    now = time.time()
-    if _PRIMARY_SELF_CACHE['v'] is None or now - _PRIMARY_SELF_CACHE['t'] > 30:
-        _PRIMARY_SELF_CACHE['v'] = _is_primary_self()
-        _PRIMARY_SELF_CACHE['t'] = now
-    return _PRIMARY_SELF_CACHE['v']
-
-
-def _peer_gate_response():
-    """Unauthenticated request to a *non-primary* peer's ``:8000``.
-
-    Peers never serve the legacy app / docs / dashboards: the owner-port
-    bypass is primary-only. Browsers get a short note ("this VM is a
-    processing peer") that redirects to the public landing page on the
-    primary; everything else gets the unadvertised 404. ``/api/v1/ping``
-    stays open for liveness probes. Director → peer traffic is unaffected:
-    ``http_pool._inject_tier_auth`` puts the admin token on every call to a
-    ``srtm-lidar-*.exe.xyz`` host."""
-    path = request.path or ''
-    if request.method in ('GET', 'HEAD') and path in _tiers.PEER_OPEN_GET_PATHS:
-        return None
-    accept = request.headers.get('Accept') or ''
-    wants_html = (request.method in ('GET', 'HEAD')
-                  and ('text/html' in accept or path in ('/', '/index.html')
-                       or path.endswith('.html')))
-    if wants_html:
-        host = (request.headers.get('X-Forwarded-Host') or request.host or '').split(':')[0]
-        resp = Response(_tiers.peer_note_html(host), status=200, mimetype='text/html')
-        resp.headers['Cache-Control'] = 'no-store'
-        resp.headers['X-Robots-Tag'] = 'noindex'
-        return resp
-    return jsonify({'error': 'not_found',
-                    'note': 'processing peer of the srtm-lidar-at cluster; no public interface',
-                    'primary': _tiers.PUBLIC_BASE + '/',
-                    'docs': _tiers.PUBLIC_BASE + '/api/v1/docs/llm.txt'}), 404
-
-
-def _request_via_owner_port() -> bool:
-    """True when the request arrived on ``:8000`` through the exe.dev proxy
-    (``X-Forwarded-Host`` ends in ``:8000``) and not via the ``/k`` prefix.
-
-    Since the exe.dev default port moved to 8100 (public tier), ``:8000``
-    is an *alternate* port: the proxy only lets exe.dev-authenticated
-    users with access to the VM (and other exe.dev VMs — the peers) reach
-    it. So the dashboards (`/process.html`, `/process.txt`, …) are usable
-    there without a tier token; exe.dev's login is the gate. Mutating
-    endpoints keep their admin-token check, and the cadastre-relay routes
-    keep theirs (see ``_is_protected_path``)."""
-    try:
-        if request.environ.get('srtm.tier') == 'private':
-            return False
-        if request.headers.get('X-Srtm-Tier') == 'private':
-            return False
-        fh = request.headers.get('X-Forwarded-Host') or ''
-        return fh.rsplit(':', 1)[-1] == '8000' and ':' in fh
-    except Exception:
-        return False
-
-
-@app.after_request
-def _tier_cookie(resp):
-    tok = getattr(g, '_set_tier_cookie', None)
-    if tok:
-        resp.set_cookie(_tiers.COOKIE, tok, max_age=30 * 86400, secure=True,
-                        httponly=True, samesite='Lax')
-    return resp
-
-
-import peer_tokens as _pt
-_pt.install_outbound_hook()   # per-destination X-Admin-Token rewriting (docs/security-tokens.md)
 import safe_load as _safe_load
 _safe_load.install()          # whitelist unpickler for np.load(allow_pickle=True) (safe_load.py)
-import fleet_secrets as _fs   # provider secrets: leased from the primary, memory-only on peers
-_fs.set_event_hook(lambda kind, msg: pd._emit_director_event(f'{kind}: {msg}', peer='director',
-                                                             level='error' if 'denied' in kind else 'info'))
-
-OWNER_EMAILS_PATH = Path('data/owner_emails')
-_OWNER_EMAILS_CACHE = {'t': 0.0, 'v': frozenset()}
-
-
-def _owner_emails() -> frozenset:
-    """exe.dev identities allowed to wield the master token (one per line,
-    ``data/owner_emails``). Empty file / missing → master works from
-    loopback only."""
-    now = time.time()
-    if now - _OWNER_EMAILS_CACHE['t'] > 5:
-        v = set()
-        try:
-            for line in OWNER_EMAILS_PATH.read_text().splitlines():
-                line = line.strip().lower()
-                if line and not line.startswith('#'):
-                    v.add(line)
-        except Exception:
-            pass
-        _OWNER_EMAILS_CACHE['v'] = frozenset(v)
-        _OWNER_EMAILS_CACHE['t'] = now
-    return _OWNER_EMAILS_CACHE['v']
-
-
-def _request_is_owner_channel() -> bool:
-    """Where the **master** token may be used on the primary:
-
-    * loopback (on-box CLI, in-process director), or
-    * the private ``:8000`` exe.dev proxy port (only exe.dev logins with
-      access to this VM can reach it) **and** the proxy-asserted
-      ``X-ExeDev-Email`` is in ``data/owner_emails``.
-
-    Never via the public ``/k`` tier — that is the peers' channel, and a
-    master token seen there is treated as stolen (401 + security event).
-    """
-    if _request_is_loopback():
-        return True
-    try:
-        if request.environ.get('srtm.tier') == 'private' \
-                or request.headers.get('X-Srtm-Tier') == 'private':
-            return False
-        fh = request.headers.get('X-Forwarded-Host') or ''
-        if not (':' in fh and fh.rsplit(':', 1)[-1] == '8000'):
-            return False
-        email = (request.headers.get('X-ExeDev-Email') or '').strip().lower()
-        return bool(email) and email in _owner_emails()
-    except Exception:
-        return False
-
-
-_SEC_EVENT_TS: dict = {}
-
-
-def _security_event(kind: str, detail: str) -> None:
-    """Rate-limited (1/min per kind) director-log line, greppable via
-    ``/process.txt?q=security``."""
-    now = time.time()
-    if now - _SEC_EVENT_TS.get(kind, 0.0) < 60:
-        return
-    _SEC_EVENT_TS[kind] = now
-    try:
-        log.error('security: %s — %s', kind, detail)
-        pd._emit_director_event(f'security {kind}: {detail}', peer='director',
-                                level='error')
-    except Exception:
-        pass
 
 
 def _peer_of_request() -> str:
     xff = (request.headers.get('X-Forwarded-For') or '').split(',')[0].strip()
     return xff or request.remote_addr or '?'
-
-
-@app.before_request
-def _enforce_admin_token():
-    path = request.path or ''
-    if not _is_protected_path(path, request.method):
-        return None
-    if _public_request():
-        return jsonify({'error': 'not_found'}), 404
-    if _request_is_loopback():
-        return None
-    tok = (request.headers.get('X-Admin-Token')
-           or request.args.get('admin_token')
-           or request.cookies.get('admin_token')
-           or _tiers.request_token(request))   # Bearer / X-API-Key / ?token / srtm_k cookie
-    kind = _pt.classify(tok, _current_admin_token())
-    if kind == 'master':
-        # On the primary the master is owner-only (see _request_is_owner_channel).
-        # On a peer, its own token *is* the director's handle — full rights.
-        if _pt.is_primary_role() and not _request_is_owner_channel():
-            _security_event('master-token-off-channel',
-                            f'{request.method} {path} from {_peer_of_request()} '
-                            f'via {request.headers.get("X-Forwarded-Host") or "?"}'
-                            f'{"/k" if request.environ.get("srtm.tier") == "private" else ""}')
-            return jsonify({'error': 'admin token required',
-                            'hint': 'master token is only accepted on the owner channel'}), 401
-        return None
-    if kind == 'peer':
-        if _pt.peer_scope_allowed(path, request.method):
-            return None
-        _security_event('peer-scope-deny',
-                        f'{_pt.peer_for_token(tok) or "?"} {request.method} {path}')
-        return jsonify({'error': 'forbidden', 'scope': 'peer'}), 403
-    if kind == 'mesh':
-        if _pt.mesh_scope_allowed(path, request.method):
-            return None
-        _security_event('mesh-scope-deny', f'{request.method} {path} from {_peer_of_request()}')
-        return jsonify({'error': 'forbidden', 'scope': 'mesh'}), 403
-    return jsonify({'error': 'admin token required',
-                    'hint': 'set X-Admin-Token header'}), 401
 
 
 # === SECTION: response compression + conditional GET ===
@@ -744,21 +489,6 @@ def _compress_and_etag(resp):
         return resp
 
 
-@app.route('/api/v1/admin/token', methods=['GET'])
-def admin_token_bootstrap():
-    """Loopback-only endpoint: returns the admin token.
-
-    The dashboard fetches this on load so the operator's browser can call
-    protected endpoints. Public callers get 401 from the before_request hook
-    (this route is under /api/v1/admin/ so it is protected).
-    """
-    return jsonify({'token': _current_admin_token()})
-
-
-_UMFELD_PUSH_TS: dict = {}
-_UMFELD_PUSH_MIN_INTERVAL_S = 300
-
-
 _NE_STAGE_TS: dict[str, float] = {}
 _NE_STAGE_LAST = [0.0]
 _NE_STAGE_FLEET_INTERVAL_S = 600     # ≤1 peer / 10 min: binary is ~9 MB of metered primary egress
@@ -805,277 +535,10 @@ def _maybe_stage_ne_tooling(peer_id: str, nt) -> None:
         log.debug('_maybe_stage_ne_tooling %s: %s', peer_id, e)
 
 
-def _maybe_push_umfeld_token(peer_id: str, peer_sha) -> None:
-    if _fs.store_rev() and _fs.leases().get(peer_id):
-        return   # peer leases from fleet_secrets — no disk copies any more
-    """Director-side: push data/umfeld_token to a peer that reports a
-    different (or no) token. Fire-and-forget thread, ≤1 push / 5 min / peer.
-    The token never travels through git (public repo) — only this
-    admin-token-authenticated POST."""
-    try:
-        mine = _umfeld.token_sha()
-        if not mine or peer_sha == mine:
-            return
-        now = time.time()
-        if now - _UMFELD_PUSH_TS.get(peer_id, 0) < _UMFELD_PUSH_MIN_INTERVAL_S:
-            return
-        _UMFELD_PUSH_TS[peer_id] = now
-        url = None
-        try:
-            cfg = pd.load_peers_config()
-            for p in cfg.get('peers', []):
-                if p.get('id') == peer_id and p.get('url'):
-                    url = p['url'].rstrip('/')
-                    break
-        except Exception:
-            url = None
-        if not url:
-            return
-
-        def _push():
-            try:
-                import requests
-                r = requests.post(url + '/api/v1/admin/install_umfeld_token',
-                                  json={'token': _umfeld.token()},
-                                  headers=pd._admin_headers(), timeout=(3, 10))
-                if r.ok:
-                    log.info('umfeld token pushed to %s (%s)', peer_id, r.json().get('status'))
-                elif r.status_code != 404:   # 404 = peer still on old code
-                    log.warning('umfeld token push to %s: HTTP %s', peer_id, r.status_code)
-            except Exception as e:
-                log.debug('umfeld token push to %s failed: %s', peer_id, e)
-        threading.Thread(target=_push, daemon=True, name=f'umfeld-token-{peer_id}').start()
-    except Exception as e:
-        log.debug('_maybe_push_umfeld_token %s: %s', peer_id, e)
-
-
 _GIT_PUSH_TS: dict = {}
 
 
-def _maybe_push_git_token(peer_id: str, peer_sha) -> None:
-    """Director-side: push data/github_token (read-only PAT for the private
-    repo) to a peer reporting a different/no token. ≤1 push / 5 min / peer."""
-    try:
-        if _fs.store_rev() and _fs.leases().get(peer_id):
-            return   # peer already leases from fleet_secrets — no disk copies any more
-        mine = _git_auth.token_sha()
-        if not mine or peer_sha == mine:
-            return
-        now = time.time()
-        if now - _GIT_PUSH_TS.get(peer_id, 0) < _UMFELD_PUSH_MIN_INTERVAL_S:
-            return
-        _GIT_PUSH_TS[peer_id] = now
-        url = None
-        try:
-            cfg = pd.load_peers_config()
-            for p in cfg.get('peers', []):
-                if p.get('id') == peer_id and p.get('url'):
-                    url = p['url'].rstrip('/')
-                    break
-        except Exception:
-            url = None
-        if not url:
-            return
-
-        def _push():
-            try:
-                import requests
-                r = requests.post(url + '/api/v1/admin/install_git_token',
-                                  json={'token': _git_auth.token()},
-                                  headers=pd._admin_headers(), timeout=(3, 10))
-                if r.ok:
-                    log.info('git token pushed to %s (%s)', peer_id, r.json().get('status'))
-                elif r.status_code != 404:   # 404 = peer still on old code
-                    log.warning('git token push to %s: HTTP %s', peer_id, r.status_code)
-            except Exception as e:
-                log.debug('git token push to %s failed: %s', peer_id, e)
-        threading.Thread(target=_push, daemon=True, name=f'git-token-{peer_id}').start()
-    except Exception as e:
-        log.debug('_maybe_push_git_token %s: %s', peer_id, e)
-
-
-@app.route('/api/v1/admin/install_git_token', methods=['POST'])
-def admin_install_git_token():
-    """Install the read-only GitHub token used by ``git fetch origin`` on
-    this peer (repo is private). Admin-token protected. Body ``{"token"}``.
-    Also registers scripts/git_credential_helper.sh in the local git config."""
-    body = request.get_json(silent=True) or {}
-    try:
-        changed = _git_auth.install_token(body.get('token') or '')
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 400
-    except Exception as e:
-        return jsonify({'error': f'write failed: {e}'}), 500
-    return jsonify({'status': 'installed' if changed else 'unchanged',
-                    'git_token_sha': _git_auth.token_sha()})
-
-
 _PRIVATE_PUSH_TS: dict = {}
-
-
-def _maybe_push_private_only(peer_id: str, peer_flag) -> None:
-    """Director-side: every peer must carry the same ``data/private_only``
-    guard as the primary (its :8000 app.py serves the full dashboards +
-    docs, which name parcels/cadastre). A peer reporting ``private_only:
-    false`` while we have the flag gets ``POST /admin/set_private_only``.
-    ≤1 push / 5 min / peer; newly added peers are covered on their first
-    status push."""
-    try:
-        if not _tiers.private_only() or peer_flag is True:
-            return
-        now = time.time()
-        if now - _PRIVATE_PUSH_TS.get(peer_id, 0) < _UMFELD_PUSH_MIN_INTERVAL_S:
-            return
-        _PRIVATE_PUSH_TS[peer_id] = now
-        url = None
-        try:
-            cfg = pd.load_peers_config()
-            for p in cfg.get('peers', []):
-                if p.get('id') == peer_id and p.get('url'):
-                    url = p['url'].rstrip('/')
-                    break
-        except Exception:
-            url = None
-        if not url:
-            return
-
-        def _push():
-            try:
-                import requests
-                r = requests.post(url + '/api/v1/admin/set_private_only',
-                                  json={'enabled': True},
-                                  headers=pd._admin_headers(), timeout=(3, 10))
-                if r.ok:
-                    log.info('private_only guard pushed to %s (%s)', peer_id, r.json().get('status'))
-                elif r.status_code != 404:   # 404 = peer still on old code
-                    log.warning('private_only push to %s: HTTP %s', peer_id, r.status_code)
-            except Exception as e:
-                log.debug('private_only push to %s failed: %s', peer_id, e)
-        threading.Thread(target=_push, daemon=True, name=f'private-only-{peer_id}').start()
-    except Exception as e:
-        log.debug('_maybe_push_private_only %s: %s', peer_id, e)
-
-
-@app.route('/api/v1/admin/set_private_only', methods=['POST'])
-def admin_set_private_only():
-    """Create / remove ``data/private_only`` on this peer (admin-token
-    protected). Body ``{"enabled": true|false}``. Takes effect on the next
-    request — ``api_tiers.private_only()`` stats the flag file."""
-    body = request.get_json(silent=True) or {}
-    enabled = bool(body.get('enabled', True))
-    try:
-        flag = _tiers.PRIVATE_ONLY_FLAG
-        was = flag.exists()
-        if enabled and not was:
-            flag.parent.mkdir(parents=True, exist_ok=True)
-            flag.touch()
-        elif not enabled and was:
-            flag.unlink()
-    except Exception as e:
-        return jsonify({'error': f'flag write failed: {e}'}), 500
-    return jsonify({'status': 'unchanged' if was == enabled else ('enabled' if enabled else 'disabled'),
-                    'private_only': _tiers.private_only()})
-
-
-@app.route('/api/v1/secrets/lease')
-def secrets_lease():
-    """Provider secrets (Zenodo / umfeld / GitHub) for the calling peer —
-    ``fleet_secrets.py``. Peer-token gated (PEER_SCOPE); the bundle is
-    ~300 B and is fetched once per process + on ``secrets_rev`` change
-    (piggybacked on the status-push ack). Audit in
-    ``data/secret_leases.json``; ``data/secrets_deny`` refuses a peer."""
-    if not _pt.is_primary_role():
-        return jsonify({'error': 'not_primary'}), 404
-    tok = request.headers.get('X-Admin-Token') or _tiers.request_token(request)
-    peer_id = _pt.peer_for_token(tok) if tok else None
-    if not peer_id:
-        if _request_is_loopback() or (_pt.classify(tok, _current_admin_token()) == 'master'
-                                      and _request_is_owner_channel()):
-            peer_id = 'primary'
-        else:
-            return jsonify({'error': 'peer token required'}), 401
-    b = _fs.lease_for(peer_id, _peer_of_request())
-    if not b:
-        _security_event('secret-lease-refused', f'{peer_id} from {_peer_of_request()}')
-        return jsonify({'error': 'no lease'}), 403
-    resp = jsonify(b)
-    resp.headers['Cache-Control'] = 'no-store'
-    return resp
-
-
-@app.route('/api/v1/admin/install_umfeld_token', methods=['POST'])
-def admin_install_umfeld_token():
-    """Install the token for the cadastre upstream (example.invalid /k
-    tier). Admin-token protected (``/api/v1/admin/`` prefix). Body:
-    ``{"token": "..."}``. Read by ``umfeld.token()`` on the next request —
-    no processor restart needed."""
-    body = request.get_json(silent=True) or {}
-    try:
-        changed = _umfeld.install_token(body.get('token') or '')
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 400
-    except Exception as e:
-        return jsonify({'error': f'write failed: {e}'}), 500
-    return jsonify({'status': 'installed' if changed else 'unchanged',
-                    'umfeld_token_sha': _umfeld.token_sha()})
-
-
-@app.route('/api/v1/admin/install_token', methods=['POST'])
-def admin_install_token():
-    """Install/rotate the cluster admin token.
-
-    Authentication rules (the before_request hook lets this route through;
-    we authenticate here ourselves):
-      * If this peer currently has NO token (data/admin_token missing or
-        empty), accept any non-empty new token — first-write-wins
-        bootstrap. Used by the director to seed peers running pre-auth
-        code that have just been updated.
-      * Otherwise the request must present a valid X-Admin-Token (the
-        peer's current token) OR pass current_token in the body.
-
-    Body JSON: {"new_token": "...", "current_token": "<optional>"}
-    """
-    global ADMIN_TOKEN
-    body = request.get_json(silent=True) or {}
-    new_tok = (body.get('new_token') or '').strip()
-    if not new_tok or len(new_tok) < 16:
-        return jsonify({'error': 'new_token must be a non-empty string >=16 chars'}), 400
-
-    # Loopback always allowed (on-box CLI / in-process callers).
-    if not _request_is_loopback():
-        existing = ''
-        try:
-            if ADMIN_TOKEN_PATH.exists():
-                existing = ADMIN_TOKEN_PATH.read_text().strip()
-        except Exception:
-            existing = ''
-        if existing:
-            presented = (request.headers.get('X-Admin-Token')
-                         or request.args.get('admin_token')
-                         or body.get('current_token') or '')
-            if presented != existing:
-                return jsonify({
-                    'error': 'token already installed; current X-Admin-Token required to rotate',
-                }), 401
-        # else: bootstrap, allow.
-
-    try:
-        ADMIN_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        ADMIN_TOKEN_PATH.write_text(new_tok)
-        ADMIN_TOKEN_PATH.chmod(0o600)
-    except Exception as e:
-        return jsonify({'error': f'failed to write token: {e}'}), 500
-    ADMIN_TOKEN = new_tok
-    mesh_ok = False
-    mesh = (body.get('mesh_token') or '').strip()
-    if mesh and len(mesh) >= 16:
-        try:
-            _pt._write_secret(_pt.MESH_TOKEN_PATH, mesh)
-            mesh_ok = True
-        except Exception as e:
-            log.warning('admin_install_token: mesh token write failed: %s', e)
-    log.info('admin_install_token: token installed/rotated (len=%d, mesh=%s)', len(new_tok), mesh_ok)
-    return jsonify({'status': 'installed', 'mesh': mesh_ok})
 
 
 # === SECTION: Copernicus credentials API ===
@@ -1114,8 +577,7 @@ def _fanout_credentials(op: str, cid: str, csec: str | None = None,
     peer_urls = _get_peer_urls() or []
     if not peer_urls:
         return {'ok': 0, 'failed': [], 'skipped': 0, 'targets': 0}
-    tok = _current_admin_token()
-    headers = {_CRED_FANOUT_HEADER: '1', 'X-Admin-Token': tok}
+    headers = {_CRED_FANOUT_HEADER: '1', **pd._admin_headers()}
     body = {'client_id': cid}
     if op == 'add':
         body.update({'client_secret': csec, 'label': label,
@@ -1167,10 +629,7 @@ def _is_cred_fanout_request() -> bool:
 
 
 def _is_director_local() -> bool:
-    try:
-        return Path('data/austria_processor/is_director').exists()
-    except Exception:
-        return False
+    return _config.is_director()
 
 
 @app.route('/api/v1/credentials', methods=['POST'])
@@ -1255,211 +714,8 @@ def credentials_validate():
 
 
 # Initialize search index + watch for new KG JSON files
-class _GitBusy(RuntimeError):
-    """Raised when another git sync is already running on this VM."""
-    pass
 
 
-_GIT_SYNC_LOCK_PATH = '/tmp/srtm_git_sync.lock'
-
-
-def _ensure_v2_deps(sp, timeout: int = 600) -> str:
-    """Make sure runtime deps beyond requirements.txt are importable.
-
-    Currently: ``lightgbm`` (segv2 model) and ``h3`` (v2.4 NE cells).
-    Called from admin_update after the git pull (both immediate + deferred
-    paths). pip as the srv user (exedev) with --user; idempotent."""
-    import importlib
-    _DEPS = ['lightgbm', 'h3']  # keep in sync with requirements.txt
-    installed = []
-    for dep in _DEPS:
-        try:
-            importlib.import_module(dep)
-            continue  # already present
-        except Exception:
-            pass
-        try:
-            r = sp.run([sys.executable, '-m', 'pip', 'install', '--user', '-q',
-                        '--break-system-packages', dep],
-                       capture_output=True, text=True, timeout=timeout)
-            ok = r.returncode == 0
-            log.info('v2 deps: pip install %s rc=%s %s', dep, r.returncode,
-                     (r.stderr or '')[-300:] if not ok else '')
-            installed.append(dep if ok else f'{dep}:rc{r.returncode}')
-        except Exception as e:
-            log.warning('v2 deps: pip install %s failed: %s', dep, e)
-            installed.append(f'{dep}:err')
-    # ne_cells (v2.4 NE cells + VTC pilot): pinned package from the public
-    # vtcseamless-py repo.  Was a private-repo pip URL until Oct 2026, so
-    # 48/49 peers never got it and the pilot could not enrol anyone — now
-    # every peer installs it here on each srv start / rollout wave.
-    try:
-        import ne_h3 as _neh
-        rec = _neh.ensure_ne_cells_package()
-        if not rec.get('present'):
-            ok = (rec.get('ready') or {}).get('package')
-            log.info('v2 deps: ne_cells (vtcseamless-py@%s) %s %s', _neh.NE_CELLS_PIN,
-                     'ok' if ok else 'FAILED', '' if ok else (rec.get('pip_tail') or '')[-300:])
-            installed.append('ne_cells' if ok else f"ne_cells:rc{rec.get('pip_rc')}")
-    except Exception as e:
-        log.warning('v2 deps: ne_cells install failed: %s', e)
-        installed.append('ne_cells:err')
-    # bevdirect-serve binary: missing or not the pinned tag (e.g. after the
-    # v0.3.1 bump) → static release tarball from GitHub (un-metered; the
-    # primary-served copy is reserved for the paced director stager).  Also
-    # stops a stale running server and purges pre-v0.3.1 on-disk tile dirs.
-    try:
-        import ne_h3 as _neh
-        bd = _neh.bevdirect_ready(probe_server=False)
-        if not bd.get('binary'):
-            st = _neh.ensure_bevdirect_tooling(install=True, binary=True, primary_fallback=False)
-            log.info('v2 deps: bevdirect-serve %s -> %s', _neh.BEVDIRECT_TAG,
-                     'ok' if st.get('binary') else f"FAILED (have {st.get('binary_version')})")
-            installed.append('bevdirect-serve' if st.get('binary') else 'bevdirect-serve:err')
-    except Exception as e:
-        log.warning('v2 deps: bevdirect-serve install failed: %s', e)
-        installed.append('bevdirect-serve:err')
-    return f'installed={installed}' if installed else 'present'
-
-
-def _safe_git_sync(repo: str, sp):
-    """Robust git pull for `/admin/update` and the deferred-update path.
-
-    Failure modes seen in production rollouts (15+ peers, observed 2026-04-29):
-      * Stale .git/index.lock from crashed/concurrent git ops -> every
-        subsequent update fails until manual cleanup.
-      * Concurrent /admin/update calls racing on the same repo.
-      * `git pull` 30s timeout too tight on cold-cache / slow-network VMs.
-      * `git checkout -- .` 10s timeout too tight when the working tree is
-        large (data/* dir mtimes get stat-walked).
-
-    This helper:
-      1. Takes an exclusive non-blocking flock on /tmp/srtm_git_sync.lock
-         so concurrent calls fail fast (409) instead of corrupting state.
-      2. Removes any .git/index.lock older than 60s (left by crashed git).
-      3. Bumps timeouts: checkout 30s, fetch 60s, pull 120s.
-      4. Uses `git fetch` then `git reset --hard origin/<branch>` instead of
-         `pull --ff-only` -- robust against local commits/divergence and
-         deterministic across 150 peers.
-    Returns the CompletedProcess of the final reset (with stdout/stderr that
-    callers stuff into the JSON response).
-    """
-    import fcntl, os as _os, time as _t, functools as _ft
-    from pathlib import Path as _P
-    # Private repo: make sure the credential helper is registered and git
-    # never blocks on a terminal prompt (missing token → fast failure).
-    _git_auth.ensure_helper(repo)
-    _env = _git_auth.git_env()
-    _run = sp.run
-    sp = type('_SP', (), {'run': staticmethod(_ft.partial(_run, env=_env))})
-    lock_fd = _os.open(_GIT_SYNC_LOCK_PATH, _os.O_CREAT | _os.O_RDWR, 0o644)
-    try:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise _GitBusy('git sync already in progress on this VM')
-        # Stale .git/index.lock cleanup (60s grace).
-        idx_lock = _P(repo) / '.git' / 'index.lock'
-        try:
-            if idx_lock.exists() and (_t.time() - idx_lock.stat().st_mtime) > 60:
-                idx_lock.unlink()
-        except Exception:
-            pass
-        # Production invariant: every peer tracks origin/main. If a peer
-        # drifted onto a side-branch (e.g. an operator checked out
-        # `untested` for a one-off test), it would otherwise keep
-        # pulling that branch and the director would mark it
-        # NEEDS-MANUAL forever. Force-snap back to main first.
-        branch = 'main'
-        # Runtime state that used to be git-tracked (kg_strikes.json,
-        # failure_counts.json — untracked since Sep 2026). ``checkout -- .``
-        # / ``reset --hard`` reverted them to the committed snapshot on
-        # every rollout, silently undoing the fleet's adaptive-split
-        # strikes (operators had to re-run the strike-reset script after
-        # each update). Snapshot before, restore after, so the live values
-        # survive both the transition commit (which deletes them from the
-        # tree) and any future re-tracking mistake.
-        _preserve = {}
-        for _rel in ('data/austria_processor/kg_strikes.json',
-                     'data/austria_processor/failure_counts.json'):
-            try:
-                _fp = Path(repo) / _rel
-                if _fp.exists():
-                    _preserve[_rel] = _fp.read_bytes()
-            except Exception:
-                pass
-        # Reset any tracked file modifications.
-        sp.run(['git', 'checkout', '--', '.'], capture_output=True, text=True,
-               timeout=30, cwd=repo)
-        # Switch to main if we're on another branch. -B re-creates the
-        # local main branch from origin/main, discarding any divergence.
-        cur = sp.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-                     capture_output=True, text=True, timeout=10,
-                     cwd=repo).stdout.strip()
-        if cur and cur != branch:
-            # Need origin/main present locally before -B can use it.
-            sp.run(['git', 'fetch', 'origin', branch],
-                   capture_output=True, text=True, timeout=60, cwd=repo)
-            sp.run(['git', 'checkout', '-B', branch, f'origin/{branch}'],
-                   capture_output=True, text=True, timeout=30, cwd=repo)
-        # Fetch + hard-reset (robust against divergence; deterministic).
-        fetch = sp.run(['git', 'fetch', 'origin', branch],
-                       capture_output=True, text=True, timeout=60, cwd=repo)
-        # If we have local commits ahead of origin, push them first so the
-        # subsequent hard-reset doesn't discard them. Symptom of skipping
-        # this: an operator commits on the primary, peers' /admin/update
-        # via update_peers pushes from the calling node only — the primary
-        # itself runs through here and would silently lose its commit on
-        # `git reset --hard origin/main`. Auto-handback then refused
-        # because at55 (and origin) didn't know about the orphaned commit.
-        push_out = ''
-        try:
-            local = sp.run(['git', 'rev-parse', branch],
-                           capture_output=True, text=True, timeout=10,
-                           cwd=repo).stdout.strip()
-            remote = sp.run(['git', 'rev-parse', f'origin/{branch}'],
-                            capture_output=True, text=True, timeout=10,
-                            cwd=repo).stdout.strip()
-            if local and remote and local != remote:
-                ahead = sp.run(['git', 'rev-list', '--count',
-                                f'origin/{branch}..{branch}'],
-                               capture_output=True, text=True, timeout=10,
-                               cwd=repo).stdout.strip()
-                if ahead and ahead != '0':
-                    pr = sp.run(['git', 'push', 'origin', branch],
-                                capture_output=True, text=True,
-                                timeout=60, cwd=repo)
-                    push_out = (pr.stdout + pr.stderr).strip()
-                    if pr.returncode == 0:
-                        # Re-fetch so origin/<branch> includes our push.
-                        sp.run(['git', 'fetch', 'origin', branch],
-                               capture_output=True, text=True,
-                               timeout=60, cwd=repo)
-        except Exception as _pe:
-            push_out = f'push-if-ahead error: {_pe}'
-        reset = sp.run(['git', 'reset', '--hard', f'origin/{branch}'],
-                       capture_output=True, text=True, timeout=30, cwd=repo)
-        for _rel, _blob in _preserve.items():
-            try:
-                _fp = Path(repo) / _rel
-                _fp.parent.mkdir(parents=True, exist_ok=True)
-                _tmp = _fp.with_suffix('.tmp')
-                _tmp.write_bytes(_blob)
-                _tmp.replace(_fp)
-            except Exception as _re:
-                log.warning('git sync: could not restore %s: %s', _rel, _re)
-        if push_out:
-            reset.stdout = (push_out + '\n' + (reset.stdout or '')).strip()
-        # Synthesize a pull-like CompletedProcess for the response.
-        reset.stdout = (fetch.stdout + reset.stdout).strip()
-        reset.stderr = (fetch.stderr + reset.stderr).strip()
-        return reset
-    finally:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        except Exception:
-            pass
-        _os.close(lock_fd)
 
 
 _INDEX_WATCH_LOCK_PATH = '/tmp/srtm_index_watch.lock'
@@ -1632,32 +888,8 @@ threading.Thread(target=_init_search_index, daemon=True).start()
 
 
 def _get_peer_urls():
-    """Read peer URLs from peer_urls.txt or from systemd service --peers flag."""
-    pf = Path('data/austria_processor/peer_urls.txt')
-    if pf.exists():
-        return [u.strip() for u in pf.read_text().splitlines() if u.strip() and not u.startswith('#')]
-    # Fallback: parse from systemd service / drop-in configs
-    svc_paths = list(Path('/etc/systemd/system/austria_processor.service.d').glob('*.conf')) \
-        if Path('/etc/systemd/system/austria_processor.service.d').exists() else []
-    svc_paths.append(Path('/etc/systemd/system/austria_processor.service'))
-    for svc in svc_paths:
-        try:
-            if not svc.exists():
-                continue
-            for line in svc.read_text().splitlines():
-                if '--peers' in line:
-                    parts = line.split('--peers')[1].strip().split()
-                    urls = []
-                    for p in parts:
-                        if p.startswith('http'):
-                            urls.append(p)
-                        elif p.startswith('--'):
-                            break
-                    if urls:
-                        return urls
-        except PermissionError:
-            continue
-    return []
+    """Peer base URLs for multi-VM mode (``config.peers()``); ``[]`` single-VM."""
+    return list(_config.peers())
 
 
 # Manifest keys deleted intentionally — don't re-merge from peers
@@ -1876,7 +1108,7 @@ def _manifest_entry_newer(cur, entry) -> bool:
     when the stamps are equal and *entry* carries a ``status`` that *cur*
     lacks.  The 2.4 writers save the record once from ``upload_stream``
     (no status) and again a moment later with ``status=cf``
-    (``_mark_cadastre_free``) under the SAME ``uploaded_at``; a peer-sync
+    (``_mark_context_free``) under the SAME ``uploaded_at``; a peer-sync
     GET landing in that window pinned the flag-less copy on the primary
     for good (41 ``legacy: suspect`` files on clean v2.4 uploads,
     2026-10-30)."""
@@ -2583,12 +1815,11 @@ def _sync_peer_data():
                             # the header every push 401'd silently, the
                             # watermark never advanced and the full 44 KB
                             # body went to every peer each cycle (~20 MB/h).
-                            _tok = _current_admin_token()
                             rr = _gzip_put_json(
                                 req,
                                 peer_url.rstrip('/') + '/api/v1/processing/cache_manifest',
                                 _body, timeout=15,
-                                headers=({'X-Admin-Token': _tok} if _tok else None))
+                                headers=(pd._admin_headers() or None))
                             if not rr.ok:
                                 log.warning('Peer sync: cache manifest push to %s -> HTTP %s',
                                             peer_url, rr.status_code)
@@ -2644,7 +1875,7 @@ threading.Thread(target=_v2_ingest_thread, daemon=True, name='v2-ingest').start(
 
 # --- NE ingest: fleet <code>_ne.h3b products → data/ne/ (primary only) ---
 # Peer-first pulls under the primary inbound budget, split-parent merge +
-# NEO1 POST, umfeld confirmation.  Same single-flight pattern as v2_ingest.
+# NEO1 POST.  Same single-flight pattern as v2_ingest.
 def _ne_ingest_thread():
     import fcntl as _fcntl
     import ne_ingest as _nei
@@ -2679,22 +1910,6 @@ def _als_years_thread():
     except Exception as _e:  # noqa: BLE001
         log.debug('als_years thread: %s', _e)
 threading.Thread(target=_als_years_thread, daemon=True, name='als-years').start()
-
-
-def _v2_deps_startup_thread():
-    """One-shot: make lightgbm importable on this VM. admin_update only
-    pip-installs on the *next* rollout wave (the pip step is itself part
-    of the new code), so peers that just pulled the v2 commit would keep
-    producing v1 until another commit lands. ~20 s, once per srv start."""
-    time.sleep(45)
-    try:
-        import subprocess as _sp
-        res = _ensure_v2_deps(_sp)
-        if res != 'present':
-            log.info('v2 deps at startup: %s', res)
-    except Exception as e:
-        log.debug('v2 deps startup: %s', e)
-threading.Thread(target=_v2_deps_startup_thread, daemon=True, name='v2-deps').start()
 
 
 # === SECTION: Status push to director ===
@@ -2777,15 +1992,19 @@ def _store_fleet_put(zp: dict) -> None:
 
 def _peer_status_push_loop():
     import requests as _req
-    import director_ha as _dha
     import peer_director as _pd
     import gzip as _gz
     global _PEER_PUSH_LAST_FULL_TS, _PEER_PUSH_LAST_STATE, _PEER_PUSH_ACK_LOG_WM
     global _PEER_PUSH_LAST_CACHE_ONLY
+    # Workers only: the director itself (single-VM mode) never pushes.
+    if _config.is_director():
+        return
     # One pusher per VM (both gunicorn workers used to push → 2× the
     # director's inbound peer_status traffic for no extra freshness).
     _sf = _acquire_single_flight('peer_status_push')
     _last_push_ts = 0.0
+    self_info = {'id': _config.self_id(), 'director_url': _config.PRIMARY_URL}
+    director_url = _config.PRIMARY_URL
     while True:
         try:
             time.sleep(PEER_PUSH_INTERVAL_S)
@@ -2793,29 +2012,6 @@ def _peer_status_push_loop():
             if (_PEER_PUSH_LAST_STATE in ('running', 'processing')
                     and _PEER_PUSH_LAST_CACHE_ONLY
                     and (time.time() - _last_push_ts) < PEER_PUSH_INTERVAL_CACHE_S - 2):
-                continue
-            # Skip on the director itself.
-            try:
-                if _dha.IS_DIRECTOR_FLAG.exists():
-                    continue
-            except Exception:
-                pass
-            # Resolve target director URL.
-            try:
-                self_info = _dha.load_self() or {}
-                director_url = (self_info.get('director_url') or '').strip()
-            except Exception:
-                director_url = ''
-            if not director_url:
-                # Fallback: read zenodo_lock_url.txt (always points at
-                # the current director on a healthy peer).
-                try:
-                    p = Path('data/austria_processor/zenodo_lock_url.txt')
-                    if p.exists():
-                        director_url = p.read_text().strip()
-                except Exception:
-                    pass
-            if not director_url:
                 continue
             # Build payload from local progress.json + bandwidth.
             try:
@@ -2871,7 +2067,7 @@ def _peer_status_push_loop():
                     status['git_commit'] = _GIT_COMMIT
                 status.setdefault('region', _REGION)
                 status.setdefault('instance',
-                                  os.environ.get('INSTANCE_ID', _dha.self_id()))
+                                  os.environ.get('INSTANCE_ID', _config.self_id()))
             except Exception:
                 pass
             # Fresh host CPU/steal/iowait telemetry on every push. The
@@ -3023,11 +2219,7 @@ def _peer_status_push_loop():
                 peer_id = ''
             if not peer_id:
                 continue
-            try:
-                tok = Path('data/admin_token').read_text().strip()
-                hdrs = {'X-Admin-Token': tok} if tok else {}
-            except Exception:
-                hdrs = {}
+            hdrs = _pd._admin_headers()
             # Bandwidth-saver: if the peer is steady-state idle and
             # we sent a full push recently, skip this tick. A peer in
             # active processing always pushes (state churns every few
@@ -3087,10 +2279,7 @@ def _peer_status_push_loop():
                     },
                 }
                 payload = {'peer_id': peer_id, 'status': _slim,
-                           'bandwidth': bw,
-                           'umfeld_token_sha': _umfeld.token_sha(),
-                           'git_token_sha': _git_auth.token_sha(),
-                           'private_only': _tiers.private_only()}
+                           'bandwidth': bw}
             else:
                 # recent_log delta: only lines newer than what the
                 # director acked holding for us (~70 % of a full push
@@ -3105,10 +2294,7 @@ def _peer_status_push_loop():
                         status['recent_log'] = _new_rl
                         status['recent_log_delta'] = _wm
                 payload = {'peer_id': peer_id, 'status': status,
-                           'bandwidth': bw,
-                           'umfeld_token_sha': _umfeld.token_sha(),
-                           'git_token_sha': _git_auth.token_sha(),
-                           'private_only': _tiers.private_only()}
+                           'bandwidth': bw}
                 _PEER_PUSH_LAST_FULL_TS = _now
                 _PEER_PUSH_LAST_STATE = _state_now
             _PEER_PUSH_LAST_CACHE_ONLY = bool(status.get('cache_only'))
@@ -3133,8 +2319,6 @@ def _peer_status_push_loop():
                 try:
                     _ack = _resp.json() if _resp.ok else {}
                     _PEER_PUSH_ACK_LOG_WM = (_ack or {}).get('recent_log_wm') or None
-                    if (_ack or {}).get('secrets_rev'):
-                        _fs.note_rev(_ack.get('secrets_rev'))
                     _zp = (_ack or {}).get('zput')
                     if isinstance(_zp, dict) and 'floor' in _zp:
                         _store_fleet_put(_zp)
@@ -3210,12 +2394,11 @@ _ROLE_PROMOTED_AT_FILE = Path('data/austria_processor/role_promoted_at')
 
 
 def _is_primary_self() -> bool:
-    """Cheap check: are we the primary VM?"""
-    try:
-        import director_ha as _dha
-        return _dha.self_id() == 'primary'
-    except Exception:
-        return False
+    """Cheap check: are we the primary / director instance (``config``)?"""
+    return _config.is_director()
+
+
+_is_primary_self_cached = _is_primary_self
 
 
 def _record_promotion_if_needed() -> None:
@@ -3300,7 +2483,7 @@ def _is_keep_role_data() -> bool:
     disk-eviction death loop that stalled fleet progress for ~28 h
     (Jul 1–3 2026).
 
-    A shadow only needs the small snapshot state (director_ha.SNAPSHOT_FILES,
+    A shadow only needs the small snapshot state (director snapshot files,
     pushed every ~30 s independently of this function) plus the manifest
     merge (~370 KB, which _sync_peer_data does regardless of keep-role).
     On a REAL promotion the ex-shadow becomes director → keep-role here →
@@ -3310,11 +2493,9 @@ def _is_keep_role_data() -> bool:
     has an instantly-correct view of what's already on Zenodo.
     """
     try:
-        import director_ha as _dha
-        sid = _dha.self_id()
-        if sid == 'primary':
+        if _config.is_director():
             return True
-        if _dha.IS_DIRECTOR_FLAG.exists():
+        if False:
             # Interim director on a small disk (2026-09-30: at240, 24.5 GB,
             # died disk-full after pulling the 9-12 GB JSON corpus as
             # director). The corpus is only a *guard* input for the
@@ -4497,7 +3678,7 @@ def _processing_status_compute():
             'rate_kgs_per_hour': 0, 'avg_seconds_per_kg': 0,
             'elapsed_seconds': 0, 'eta_seconds': 0,
             'recent_log': [], 'failed_kgs': [],
-            'parcels_total': 0, 'buildings_total': 0, 'started_at': None,
+            'buildings_total': 0, 'started_at': None,
             'git_commit': _GIT_COMMIT,
             'region': _REGION,
             'instance': os.environ.get('INSTANCE_ID', 'primary'),
@@ -5228,18 +4409,16 @@ def processing_peers_combined():
 def processing_start():
     """Start the Austria processor as a background process."""
     global _processor_process
-    # Hard gate: the primary hosts the public dashboard / search index /
-    # Zenodo lock broker and must NEVER run the processor. The director
-    # enforces this via pinned_role=idle + not_before=2027, systemd
-    # autostart is disabled — this closes the last path (direct API
-    # call). Override only with explicit ?force_primary=1.
+    # Multi-VM only: the director host serves the dashboard / search index /
+    # Zenodo lock broker and should not also run the processor unless asked
+    # (?force_primary=1).  In single-VM mode the local processor is the
+    # only one, so the gate does not apply.
     try:
-        import director_ha as _dha
         _force = request.args.get('force_primary', '').lower() in ('1', 'true', 'yes')
-        if _dha.self_id() == 'primary' and not _force:
+        if _config.peers() and _config.is_director() and not _force:
             return jsonify({
-                'error': 'Refusing to start processor on the primary '
-                         '(dashboard host). Pass ?force_primary=1 to '
+                'error': 'Refusing to start processor on the director host '
+                         'while SRTM_PEERS is set. Pass ?force_primary=1 to '
                          'override deliberately.'}), 403
     except Exception:
         pass
@@ -5285,23 +4464,20 @@ def processing_start():
         request.args.get('v2_upgrade', '').lower() in ('1', 'true', 'yes')
         or bool(body.get('v2_upgrade'))
     )
-    # v2.4: NE declared-layer source, pushed by the director (``umfeld`` =
-    # GET /k/api/v1/ne/<kg> from umfeld-at; ``bevdirect`` = local
-    # bevdirect-serve + pinned ne_cells).  Sidecar read by ne_h3.ne_source()
-    # on every fetch, so a running processor follows a switch too.
+    # v2.4: NE declared-layer source, pushed by the director (``bevdirect``
+    # = local bevdirect-serve + pinned ne_cells; the only source in this
+    # build).  Sidecar read by ne_h3.ne_source() on every fetch.
     _ne_src = str(body.get('ne_source') or request.args.get('ne_source') or '').strip().lower()
     if _ne_src == 'bevdirect':
         # Gate: never point a running processor at bevdirect unless the
         # binary + ne_cells package are present — kick the installer in
-        # the background and stay on umfeld until the next start.
+        # the background and refuse the start until then.
         try:
             import ne_h3 as _neh
             _bd = _neh.bevdirect_ready(probe_server=False)
             if not (_bd.get('binary') and _bd.get('package')):
-                # Since the Kataster purge umfeld's /k cadastre routes answer
-                # 410: an "umfeld" start would 410 on every KG (cadastre-less
-                # products).  Refuse the start instead; the director retries
-                # next tick, by which time the install (minutes) is done.
+                # Refuse the start; the director retries next tick, by
+                # which time the install (minutes) is done.
                 _started = _ne_tooling_install_async()
                 app.logger.warning('ne_source=bevdirect requested but tooling not ready '
                                    '(%s) — refusing start, installing (started=%s)', _bd, _started)
@@ -5312,7 +4488,7 @@ def processing_start():
         except Exception as e:
             app.logger.warning('ne_source=bevdirect gate failed: %s — refusing start', e)
             return jsonify({'error': f'bevdirect tooling gate failed: {e}', 'retry': True}), 503
-    if _ne_src in ('umfeld', 'bevdirect'):
+    if _ne_src == 'bevdirect':
         try:
             Path('data/austria_processor/ne_source').write_text(_ne_src)
         except Exception:
@@ -5371,10 +4547,8 @@ def processing_start():
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_fd = open(log_file, 'a')
 
-    # Inject Zenodo upload mutex broker URL.  Primary serves the broker
-    # on its own gunicorn; peers point at the primary.  Reads from
-    # data/austria_processor/zenodo_lock_url.txt if present, else
-    # localhost when this instance is the director, else unset (no-op).
+    # Zenodo upload-mutex broker URL for the processor (config.ZENODO_LOCK_URL,
+    # else the local broker / app route on the director, else the primary).
     proc_env = os.environ.copy()
     if cred_indices:
         try:
@@ -5424,24 +4598,20 @@ def processing_start():
     except Exception as _ae:
         log.warning('proc_assignment sidecar write failed: %s', _ae)
     if 'ZENODO_LOCK_URL' not in proc_env:
-        lock_file = Path('data/austria_processor/zenodo_lock_url.txt')
-        is_director = Path('data/austria_processor/is_director').exists()
-        if lock_file.exists():
-            proc_env['ZENODO_LOCK_URL'] = lock_file.read_text().strip()
-        elif is_director:
-            # On the director, prefer the standalone broker on port
-            # 8001 when reachable. Insulates lock state from gunicorn
-            # slow paths. Fallback to in-gunicorn route on port 8000.
-            broker = 'http://127.0.0.1:8001'
+        if _config.ZENODO_LOCK_URL:
+            proc_env['ZENODO_LOCK_URL'] = _config.ZENODO_LOCK_URL
+        elif _config.is_director():
+            # Prefer the standalone broker (zenodo_lock_broker.py) when it
+            # is running; fall back to the in-app route on config.APP_URL.
+            broker = f'http://127.0.0.1:{_config.APP_PORT + 1}'
             try:
                 import requests as _req
                 _r = _req.get(broker + '/api/v1/zenodo/lock', timeout=1.0)
-                if _r.status_code == 200:
-                    proc_env['ZENODO_LOCK_URL'] = broker
-                else:
-                    proc_env['ZENODO_LOCK_URL'] = 'http://127.0.0.1:8000'
+                proc_env['ZENODO_LOCK_URL'] = broker if _r.status_code == 200 else _config.APP_URL
             except Exception:
-                proc_env['ZENODO_LOCK_URL'] = 'http://127.0.0.1:8000'
+                proc_env['ZENODO_LOCK_URL'] = _config.APP_URL
+        else:
+            proc_env['ZENODO_LOCK_URL'] = _config.PRIMARY_URL
 
     import subprocess
     # Launch inside a transient systemd scope so the processor lives in its
@@ -6020,7 +5190,7 @@ def processing_prioritize():
     """Prioritize KGs for processing — by bbox or explicit codes.
 
     Accepts JSON body with either:
-      - bbox: {west, south, east, north} — resolves to KG codes via cadastre API
+      - bbox: {west, south, east, north} — resolves to KG codes via the search index
       - kgs: ["63349", "63350", ...] — explicit KG codes
 
     Filters out already-processed KGs and writes remaining to retry_queue.json.
@@ -6046,8 +5216,7 @@ def processing_prioritize():
     if not bbox and not kgs:
         return jsonify({'error': 'Provide bbox (west/south/east/north) or kgs array'}), 400
 
-    # Resolve bbox to KG codes via the local search index (umfeld's
-    # ``/k/api/v1/spatial/kgs`` is gone — contributor token, 404 since 2026-10-23)
+    # Resolve bbox to KG codes via the local search index
     if bbox:
         try:
             import search_index as _si
@@ -7220,8 +6389,7 @@ def processing_queue_add():
 # ----------------------------------------------------------------------
 # Partial-KG registry — KGs that completed but had upstream-failed tiles.
 # Written by austria_processor._record_partial_kg() after each KG.
-# Lives at data/austria_processor/partial_kgs.json (replicated to shadow
-# via director_ha.SNAPSHOT_FILES so HA handover preserves it).
+# Lives at data/austria_processor/partial_kgs.json.
 # ----------------------------------------------------------------------
 PARTIAL_KGS_PATH = Path('data/austria_processor/partial_kgs.json')
 
@@ -7253,7 +6421,7 @@ def processing_partial_kgs_get():
 def processing_partial_kgs_delete():
     """Drop a KG from the partial registry (after manual review or re-queue).
 
-    Auth handled globally by `_enforce_admin_token` via `_PROTECTED_PREFIXES`.
+    Auth handled globally by `_enforce_operator_gate`.
     Supports `kg=ALL` (or `?all=1`) to clear the entire registry in one call —
     cheaper than N-round-trips from the dashboard's `dismiss all`.
     """
@@ -7657,13 +6825,7 @@ def api_manifest_reconcile():
     peer_urls = _get_peer_urls()
     if not peer_urls:
         return jsonify({'merged_new': 0, 'merged_updated': 0, 'peers': 0})
-    headers = {}
-    try:
-        tok = Path('data/admin_token').read_text().strip()
-        if tok:
-            headers['X-Admin-Token'] = tok
-    except Exception:
-        pass
+    headers = pd._admin_headers()
 
     def _fetch(url):
         try:
@@ -7983,46 +7145,18 @@ def director_peers_config():
     return jsonify({'status': 'updated', 'config': new_cfg})
 
 
-@app.route('/api/v1/director/peers/mint_token', methods=['POST'])
-def director_mint_peer_token():
-    """Mint (or return the already-minted) unique token for a future peer
-    so the dashboard's deploy command can bake it in — the master token
-    never leaves the primary. Owner-channel only (master token).
-
-    Body: ``{vm: 'srtm-lidar-at77'}`` or ``{host: 'example.invalid'}``.
-    Returns ``{host, admin_token, mesh_token}``.
-    """
-    if not _request_is_owner_channel():
-        return jsonify({'error': 'owner channel required'}), 403
-    data = request.get_json(silent=True) or {}
-    host = (data.get('host') or '').strip().lower()
-    if not host:
-        vm = (data.get('vm') or '').strip().lower()
-        if not re.match(r'^srtm-lidar-at\d+$', vm):
-            return jsonify({'error': 'vm must look like srtm-lidar-at<N>'}), 400
-        host = vm + '.exe.xyz'
-    if not _tiers.is_cluster_host(host):
-        return jsonify({'error': 'not a cluster host'}), 400
-    m = _pt.load_peer_tokens(force=True)
-    tok = m.get(host)
-    if not tok:
-        tok = _pt.generate()
-        m[host] = tok
-        _pt.save_peer_tokens(m)
-    if not _pt.MESH_TOKEN_PATH.exists():
-        _pt._write_secret(_pt.MESH_TOKEN_PATH, _pt.generate())
-    return jsonify({'host': host, 'admin_token': tok, 'mesh_token': _pt.mesh_token(),
-                    'director_url': 'https://' + __import__('director_ha').PRIMARY_HOST + '/k'})
-
-
 @app.route('/api/v1/director/peers/add', methods=['POST'])
 def director_add_peer():
     """Add a new peer dynamically.
 
     Body JSON:
-      id: peer identifier (e.g. 'at3')
-      url: peer URL (e.g. 'https://example.invalid:8000')
+      id: peer identifier
+      url: peer base URL (https://…)
       enabled: bool (default true)
+
+    The peer must be configured with ``SRTM_PRIMARY_URL`` pointing here and
+    the same ``SRTM_OPERATOR_TOKEN``; Copernicus credentials are configured
+    per instance (``config.COPERNICUS_CREDENTIALS_FILE``), never pushed.
     """
     import requests
     data = request.get_json(silent=True) or {}
@@ -8033,14 +7167,6 @@ def director_add_peer():
         return jsonify({'error': 'id and url are required'}), 400
     if not peer_url.startswith('https://'):
         return jsonify({'error': 'url must start with https://'}), 400
-
-    # Peer tokens may only register *themselves* (deploy.sh self-registration).
-    _tok_in = (request.headers.get('X-Admin-Token') or _tiers.request_token(request) or '')
-    if not _request_is_loopback() and _pt.classify(_tok_in, _current_admin_token()) == 'peer':
-        if _pt.peer_for_token(_tok_in) != _pt.host_of(peer_url):
-            _security_event('peer-scope-deny',
-                            f'{_pt.peer_for_token(_tok_in)} tried to register {peer_url}')
-            return jsonify({'error': 'forbidden', 'scope': 'peer'}), 403
 
     cfg = pd.load_peers_config()
     # Explicit re-add clears any removal tombstone (see
@@ -8075,48 +7201,6 @@ def director_add_peer():
             pass
         time.sleep(5)
 
-    # Unique per-peer token (docs/security-tokens.md). Mint (or reuse the
-    # token minted for the deploy command) and install it on the peer.
-    # Works when the peer has no token yet (deploy.sh without ADMIN_TOKEN:
-    # first-write-wins bootstrap) or already runs the minted one
-    # (idempotent). ``token`` in the body = whatever the peer currently
-    # holds, for peers deployed with a token the primary does not know.
-    token_result = {'status': 'offline'}
-    _host = _pt.host_of(peer_url)
-    _ptok = _pt.token_for_host(_host)
-    if not _ptok:
-        _ptok = _pt.generate()
-        _m = _pt.load_peer_tokens(force=True)
-        _m[_host] = _ptok
-        _pt.save_peer_tokens(_m)
-    if not _pt.MESH_TOKEN_PATH.exists():
-        _pt._write_secret(_pt.MESH_TOKEN_PATH, _pt.generate())
-    if online:
-        _cur = (data.get('token') or '').strip() or _ptok
-        token_result = _pt._install_on_peer(peer_url, _cur, _ptok, _pt.mesh_token())
-        if token_result.get('status') != 'installed':
-            log.warning('add_peer %s: token install %s', peer_id, token_result)
-
-    # Push self-identity to the new peer so it knows its own id, URL and
-    # who the current director is. This is the source-of-truth for
-    # director_ha (watchdog comparisons, takeover gating, announce flips).
-    try:
-        import director_ha as dha
-        my_url = dha.self_url() or request.host_url.rstrip('/')
-        admin_tok = ''
-        try:
-            admin_tok = Path('data/admin_token').read_text().strip()
-        except Exception:
-            pass
-        requests.post(
-            peer_url + '/api/v1/director/identity',
-            json={'id': peer_id, 'url': peer_url, 'director_url': my_url},
-            headers=({'X-Admin-Token': admin_tok} if admin_tok else {}),
-            timeout=10,
-        )
-    except Exception as _e:
-        log.warning('Could not push identity to new peer %s: %s', peer_id, _e)
-
     from datetime import datetime as _dtnow, timezone as _tznow
     cfg['peers'].append({
         'id': peer_id, 'url': peer_url, 'enabled': enabled,
@@ -8137,60 +7221,10 @@ def director_add_peer():
         current_urls.add(peer_url)
         peer_urls_path.write_text('\n'.join(sorted(current_urls)) + '\n')
 
-    # Bootstrap Copernicus credentials to the new peer. Without this a
-    # freshly-added peer comes up with an empty store and cannot run
-    # frontier work — director's regular fan-out only fires when a cred
-    # is *added/deleted*, never on peer-join. Reads the director's own
-    # store (no hardcoding) and pushes each entry with X-Cred-Fanout=1
-    # so the receiving peer skips re-validation and re-broadcast.
-    creds_pushed = 0
-    creds_failed = 0
-    if online:
-        try:
-            import copernicus as _cop
-            store = _cop.list_credentials_with_secrets()
-            tok = ''
-            try:
-                tok = Path('data/admin_token').read_text().strip()
-            except Exception:
-                pass
-            hdrs = {_CRED_FANOUT_HEADER: '1'}
-            if tok:
-                hdrs['X-Admin-Token'] = tok
-            for c in store or []:
-                cid = (c.get('client_id') or '').strip()
-                sec = (c.get('client_secret') or '').strip()
-                if not cid or not sec:
-                    continue
-                try:
-                    rr = requests.post(
-                        peer_url + '/api/v1/credentials',
-                        json={'client_id': cid, 'client_secret': sec,
-                              'label': c.get('label', ''),
-                              'notes': c.get('notes', ''),
-                              'validate': False},
-                        headers=hdrs, timeout=10,
-                    )
-                    if rr.ok:
-                        creds_pushed += 1
-                    else:
-                        creds_failed += 1
-                except Exception:
-                    creds_failed += 1
-            log.info('add_peer %s: bootstrapped %d/%d credentials',
-                     peer_id, creds_pushed,
-                     creds_pushed + creds_failed)
-        except Exception as _e:
-            log.warning('add_peer %s: credential bootstrap failed: %s',
-                        peer_id, _e)
-
     return jsonify({
         'status': 'added',
         'peer': {'id': peer_id, 'url': peer_url, 'enabled': enabled, 'online': online},
-        'token': token_result,
         'total_peers': len(cfg['peers']),
-        'creds_bootstrapped': creds_pushed,
-        'creds_failed': creds_failed,
     })
 
 
@@ -8302,29 +7336,6 @@ def director_cooldown_peer(peer_id):
                     'released_kg': released_kg})
 
 
-@app.route('/api/v1/director/peers/<peer_id>/update', methods=['POST'])
-def director_update_peer(peer_id):
-    """Trigger git pull + restart on a single peer.
-
-    Body JSON: {"graceful": true|false}. ``graceful=true`` (default)
-    defers the restart until the peer finishes the current KG.
-    ``graceful=false`` restarts immediately, killing any mid-KG work.
-    """
-    body = request.get_json(silent=True) or {}
-    graceful = body.get('graceful', True) is not False
-    cfg = pd.load_peers_config()
-    peer = pd.get_peer_by_id(cfg, peer_id)
-    if not peer:
-        return jsonify({'error': f'Peer {peer_id} not found'}), 404
-    url = peer.get('url')
-    if not url:
-        # Primary updates locally via /api/v1/admin/update — proxy in-process.
-        return admin_update()  # type: ignore[name-defined]
-    res = pd.trigger_peer_update(url, graceful=graceful)
-    return jsonify({'status': 'ok', 'peer_id': peer_id,
-                    'graceful': graceful, 'result': res})
-
-
 @app.route('/api/v1/director/peers/<peer_id>/release_hold', methods=['POST'])
 def director_release_hold(peer_id):
     """Release a peer's reserved KG hold.
@@ -8399,13 +7410,8 @@ def director_pin_peer(peer_id):
 def director_peer_cmd(peer_id, action):
     """Proxy pause/resume/stop/start to a remote peer's processor.
 
-    The dashboard talks to *this* primary (so X-Admin-Token + cookies
-    work normally); we forward the request to the peer with the
-    cluster admin token. Without this proxy, the dashboard's
-    cross-origin POST to ``https://srtm-lidar-atN.exe.xyz:8000/api/v1/processing/stop``
-    arrives without the X-Admin-Token (the JS fetch wrapper only
-    injects it for same-origin URLs) and returns 401, which is what
-    made "■ Stop" appear to do nothing.
+    The dashboard talks to *this* director; we forward the request to the
+    peer with the operator token (``peer_director._admin_headers``).
 
     Action whitelist matches the peer's processing endpoints. Query
     string and JSON body are forwarded verbatim so flags like
@@ -8432,7 +7438,7 @@ def director_peer_cmd(peer_id, action):
     target = url + '/api/v1/processing/' + action
     try:
         import requests as _req
-        headers = {'X-Admin-Token': _current_admin_token() or ''}
+        headers = pd._admin_headers()
         # Forward query string + JSON body verbatim.
         body = request.get_json(silent=True)
         r = _req.post(target,
@@ -8503,7 +7509,7 @@ def director_config_route():
     (``null`` deletes → default).  Keys: ``v24_fast_max_peers`` (concurrent
     v2.4 fast units fleet-wide; Zenodo shared-token budget),
     ``max_v2_upgrade_peers``, ``max_cache_only_peers``, ``v2_upgrade``,
-    ``ne_source`` (umfeld|bevdirect, sent in every start payload),
+    ``ne_source`` (bevdirect, sent in every start payload),
     ``v2_ingest_mb_per_h`` / ``ne_ingest_mb_per_h`` (primary inbound
     budgets), ``ne_ingest_enabled``, ``v2_upgrade_fill_below_ready``.
     Cross-worker safe (own file, not peers.json)."""
@@ -8511,7 +7517,7 @@ def director_config_route():
         'v24_fast_max_peers': pd.V24_FAST_MAX_PEERS,
         'max_v2_upgrade_peers': pd.MAX_V2_UPGRADE_PEERS,
         'max_cache_only_peers': pd.MAX_CACHE_ONLY_PEERS,
-        'v2_upgrade': True, 'ne_source': 'umfeld',
+        'v2_upgrade': True, 'ne_source': 'bevdirect',
         'v2_upgrade_fill_below_ready': pd.V2_UPGRADE_FILL_BELOW_READY,
     }
     try:
@@ -8631,32 +7637,12 @@ def director_peer_status():
         return jsonify({'error': 'peer_id required'}), 400
     status = body.get('status') or {}
     bw = body.get('bandwidth')
-    if 'umfeld_token_sha' in body and isinstance(status, dict):
-        # keep the contributor-token state in the push cache so the ne:
-        # line can count peers able to POST obs/reports to umfeld
-        status = dict(status)
-        status['umfeld_token_sha'] = body.get('umfeld_token_sha')
-    if 'git_token_sha' in body and isinstance(status, dict):
-        # kept so the `secrets:` line in /process.txt can prove peers run on
-        # the leased GitHub PAT (not a stale on-disk copy)
-        status = dict(status)
-        status['git_token_sha'] = body.get('git_token_sha')
     pd.record_peer_push(peer_id, status, bandwidth=bw)
-    # Fleet distribution of the umfeld (cadastre upstream) token: a peer
-    # whose reported sha differs from ours gets ours pushed (throttled).
-    if 'umfeld_token_sha' in body:
-        _maybe_push_umfeld_token(peer_id, body.get('umfeld_token_sha'))
     _maybe_stage_ne_tooling(peer_id, status.get('ne_tooling') if isinstance(status, dict) else None)
-    if 'git_token_sha' in body:
-        _maybe_push_git_token(peer_id, body.get('git_token_sha'))
-    if 'private_only' in body:
-        _maybe_push_private_only(peer_id, body.get('private_only'))
     # Ack carries the newest recent_log ts we now hold for this peer so
     # its next full push can be a delta (see _peer_status_push_loop).
     return jsonify({'ok': True, 'next_push_in_s': pd.PEER_PUSH_INTERVAL,
                     'recent_log_wm': pd.pushed_recent_log_wm(peer_id),
-                    # ~12 B: peers re-lease provider secrets only when this changes
-                    'secrets_rev': _fs.store_rev(),
                     # ~30 B: fleet-relative Zenodo PUT floor for the
                     # throughput watchdog (zenodo_client.fleet_put_floor)
                     'zput': pd.fleet_put_ack()})
@@ -9655,574 +8641,6 @@ def director_proxy_combined_log():
     return jsonify(_combined_log_compute())
 
 
-@app.route('/api/v1/director/update_peers', methods=['POST'])
-def director_update_peers():
-    """Tell all remote peers to git pull and restart their web servers.
-    Optional body: {"peer_id": "at3"} to update a single peer.
-    """
-    body = request.get_json(silent=True) or {}
-    target_id = body.get('peer_id')
-    skip_push = bool(body.get('skip_push'))
-    # Default: graceful update (let peers finish current KG first).
-    # Pass {"graceful": false} to force immediate restart.
-    graceful = body.get('graceful', True) is not False
-    cfg = pd.load_peers_config()
-
-    # Ensure local commits are on origin before peers pull. Otherwise peers
-    # report 'Already up to date.' against a stale remote and silently stay
-    # behind the primary.
-    push_info = {'attempted': False}
-    if not skip_push:
-        try:
-            import subprocess as sp
-            repo = str(Path(__file__).parent)
-            branch = sp.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-                            capture_output=True, text=True, timeout=5,
-                            cwd=repo).stdout.strip() or 'main'
-            local = sp.run(['git', 'rev-parse', branch],
-                           capture_output=True, text=True, timeout=5,
-                           cwd=repo).stdout.strip()
-            sp.run(['git', 'fetch', 'origin', branch],
-                   capture_output=True, text=True, timeout=20, cwd=repo)
-            remote = sp.run(['git', 'rev-parse', f'origin/{branch}'],
-                            capture_output=True, text=True, timeout=5,
-                            cwd=repo).stdout.strip()
-            push_info = {'attempted': True, 'branch': branch,
-                         'local': local[:7], 'remote_before': remote[:7]}
-            if local and remote and local != remote:
-                # Check whether local is ahead (fast-forwardable on remote)
-                ahead = sp.run(['git', 'rev-list', '--count',
-                                f'origin/{branch}..{branch}'],
-                               capture_output=True, text=True, timeout=5,
-                               cwd=repo).stdout.strip()
-                push_info['ahead'] = ahead
-                push = sp.run(['git', 'push', 'origin', branch],
-                              capture_output=True, text=True, timeout=60,
-                              cwd=repo)
-                push_info['push_rc'] = push.returncode
-                push_info['push_out'] = (push.stdout + push.stderr).strip()[-500:]
-                if push.returncode != 0:
-                    return jsonify({
-                        'error': 'git push failed; aborting peer update',
-                        'push': push_info,
-                        'hint': 'Resolve manually or pass {"skip_push": true} to force.',
-                    }), 409
-            else:
-                push_info['push_rc'] = 0
-                push_info['note'] = 'origin already up to date'
-        except Exception as e:
-            push_info['error'] = str(e)
-            return jsonify({
-                'error': f'pre-push check failed: {e}',
-                'push': push_info,
-                'hint': 'Pass {"skip_push": true} to update peers anyway.',
-            }), 500
-
-    # Token sync (2026-10-23): the master token NEVER leaves the primary.
-    # Peers hold their own per-host token (peer_tokens.py); re-pushing
-    # the mapped token is an idempotent no-op that only re-seeds a peer
-    # whose data/admin_token was wiped by a redeploy. Unmapped peers are
-    # left alone — mint them with `python3 peer_tokens.py --new-peer`.
-    token_results = {}
-    for peer in cfg.get('peers', []):
-        if not peer.get('url'):
-            continue
-        if target_id and peer['id'] != target_id:
-            continue
-        _ptok = _pt.token_for_host(_pt.host_of(peer['url']))
-        if not _ptok:
-            token_results[peer['id']] = {'status': 'skipped_no_peer_token'}
-            continue
-        token_results[peer['id']] = pd.install_token_on_peer(peer['url'], _ptok)
-
-    results = {}
-    # Update peers in stepwise waves to avoid the thundering-herd
-    # restart that hammered the cluster on 2026-05-06 (50 peers all
-    # restarting srv simultaneously → EMFILE on primary, 45 circuit
-    # breakers tripped, dashboard down for ~2 min). Cap concurrency
-    # at 5 in flight, with a 6 s gap between waves so the previous
-    # wave's restarts have time to settle. Total: ~50 peers in
-    # ~60 s instead of ~5 s.
-    targets = [p for p in cfg.get('peers', [])
-               if p.get('url') and (not target_id or p['id'] == target_id)]
-    # Include the LOCAL node if its peer entry has no url (primary's
-    # entry is typically url=null). Without this, /update_peers updates
-    # every peer except the host running the director, which is exactly
-    # the host that needs to pull new code so auto-handback (ancestry
-    # check) can succeed. Cause of the 2026-05-06 stuck-on-at40 incident.
-    try:
-        import director_ha as _dha
-        _self_id = _dha.self_id()
-    except Exception:
-        _self_id = None
-    local_entry = None
-    for p in cfg.get('peers', []):
-        if p.get('url'):
-            continue
-        if target_id and p['id'] != target_id:
-            continue
-        if _self_id and p['id'] == _self_id:
-            local_entry = p
-            break
-
-    # --- Director-aware ordering -------------------------------------
-    # If we are the running director, bouncing srv on the director box
-    # during a fleet-wide wave drops director_state.json freshness,
-    # peer watchdogs trip a takeover, and the cluster cascades (the
-    # 2026-05-10 incident). Two-phase recovery:
-    #   1. Hand over to the current healthy shadow BEFORE any update
-    #      kicks off, so the director box can be restarted safely.
-    #   2. Defer the (former) director's own self-update and the new
-    #      director's update to the tail of the wave with extra gap,
-    #      so the freshly-promoted director is stable while the rest
-    #      of the fleet is restarted.
-    # Skip both when this is a single-peer update (target_id set) and
-    # we're not the target.
-    handover_info: dict = {'attempted': False}
-    deferred_self_id = None      # was-director, update last via loopback
-    deferred_new_dir_id = None   # new director, update at very end
-    try:
-        is_director_local = _dha.IS_DIRECTOR_FLAG.exists()
-    except Exception:
-        is_director_local = False
-    if is_director_local and not target_id:
-        try:
-            d_state = pd.load_director_state()
-            shadow_id = d_state.get('shadow_peer')
-            last_push = d_state.get('shadow_last_push_ts') or 0.0
-            last_ok = d_state.get('shadow_last_push_ok')
-            shadow_peer = pd.get_peer_by_id(cfg, shadow_id) if shadow_id else None
-            shadow_age = (time.time() - float(last_push)) if last_push else 1e9
-        except Exception as _e:
-            shadow_peer = None
-            handover_info['error'] = f'shadow_lookup: {_e}'
-            shadow_age = 1e9
-            last_ok = None
-            shadow_id = None
-        # Only hand over if shadow is reachable, recently fresh, and
-        # not us. shadow_last_push_ok==True + push within 5 min ≈ healthy.
-        if (shadow_peer and shadow_peer.get('url')
-                and shadow_id != _self_id
-                and last_ok is True and shadow_age < 300):
-            handover_info = {
-                'attempted': True, 'target': shadow_id,
-                'shadow_age_s': round(shadow_age, 1),
-            }
-            try:
-                hres = _dha.do_handover(shadow_id, shadow_peer['url'])
-                handover_info['result'] = hres
-                if hres.get('status') == 'handed_over':
-                    # We are no longer the director. Defer our self-update
-                    # AND the new director's update to the tail.
-                    deferred_self_id = _self_id
-                    deferred_new_dir_id = shadow_id
-                    # Remove the new director from the main wave; we'll
-                    # update it at the very end with extra gap.
-                    targets = [p for p in targets
-                               if p['id'] != shadow_id]
-            except Exception as _e:
-                handover_info['error'] = str(_e)[:200]
-        else:
-            handover_info = {
-                'attempted': False,
-                'reason': ('no_healthy_shadow'
-                           if not shadow_peer
-                           else f'shadow_stale (age={int(shadow_age)}s ok={last_ok})'),
-                'shadow_id': shadow_id,
-            }
-
-    if local_entry is not None and deferred_self_id is None:
-        # Schedule the local update in a daemon thread so we can return
-        # a response before srv bounces. The thread calls /admin/update
-        # over loopback (auth-exempt) so we reuse the exact same code
-        # path peers go through, including the graceful/deferred logic.
-        import threading as _th_local, time as _t_local
-        def _local_update():
-            _t_local.sleep(2)
-            try:
-                import requests as _rq_local
-                _rq_local.post(
-                    'http://127.0.0.1:8000/api/v1/admin/update',
-                    json={'graceful': graceful},
-                    timeout=120,
-                )
-            except Exception as _e:
-                log.warning('local self-update via loopback failed: %s', _e)
-        _th_local.Thread(target=_local_update, daemon=True).start()
-        results[local_entry['id']] = {'status': 'scheduled_local_update',
-                                      'graceful': graceful}
-    WAVE = int(body.get('wave_size') or 5)
-    GAP_S = float(body.get('wave_gap_s') or 6.0)
-    # Extra delay before touching the new-director and old-director
-    # boxes. Lets the freshly-promoted director stabilise (heartbeat,
-    # shadow election, identity broadcast) and the bulk of the fleet
-    # finish restarting before the director box bounces.
-    DIR_TAIL_DELAY_S = float(body.get('director_tail_delay_s') or 30.0)
-    if targets:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import time as _t
-        for i in range(0, len(targets), WAVE):
-            batch = targets[i:i + WAVE]
-            with ThreadPoolExecutor(max_workers=min(WAVE, len(batch))) as ex:
-                futs = {ex.submit(pd.trigger_peer_update, p['url'], graceful):
-                        p['id'] for p in batch}
-                for f in as_completed(futs):
-                    pid = futs[f]
-                    try:
-                        results[pid] = f.result(timeout=60)
-                    except Exception as e:
-                        results[pid] = {'error': str(e)}
-            if i + WAVE < len(targets):
-                _t.sleep(GAP_S)
-
-    # Tail: update the new director FIRST (cross-process HTTP — survives
-    # our restart) and the (former) director box LAST. The previous order
-    # bounced ourselves before the cross-thread call to update the new
-    # director ran, killing the daemon thread mid-flight and leaving the
-    # new director stuck on the old commit (results[]'s placeholder is
-    # all that ever shipped). Bulk wave has already finished by now, so
-    # the cluster is on the new code; only these two boxes remain.
-    if deferred_new_dir_id:
-        new_dir_peer = pd.get_peer_by_id(cfg, deferred_new_dir_id)
-        if new_dir_peer and new_dir_peer.get('url'):
-            import threading as _th_nd, time as _t_nd
-            def _tail_new_dir_update():
-                # Short delay so the freshly-promoted director has a
-                # chance to take a tick and refresh director_state.json
-                # before its srv bounces. trigger_peer_update is a
-                # one-shot outbound POST to the peer; the peer schedules
-                # its own restart and returns immediately, so this call
-                # is unaffected by our subsequent self-restart.
-                _t_nd.sleep(DIR_TAIL_DELAY_S)
-                try:
-                    res = pd.trigger_peer_update(
-                        new_dir_peer['url'], graceful)
-                    results[deferred_new_dir_id] = res
-                except Exception as _e:
-                    results[deferred_new_dir_id] = {'error': str(_e)[:200]}
-            _th_nd.Thread(target=_tail_new_dir_update, daemon=True).start()
-            results[deferred_new_dir_id] = {
-                'status': 'scheduled_new_director_update',
-                'graceful': graceful,
-                'deferred_s': DIR_TAIL_DELAY_S,
-            }
-    if deferred_self_id and local_entry is not None:
-        import threading as _th_tail, time as _t_tail
-        def _tail_self_update():
-            # Sleep long enough that the new-director update kick has
-            # already left the building. DIR_TAIL_DELAY_S * 2 keeps a
-            # comfortable gap between the new director's HTTP call
-            # firing and our own loopback /admin/update bouncing srv.
-            _t_tail.sleep(DIR_TAIL_DELAY_S * 2)
-            try:
-                import requests as _rq_tail
-                _rq_tail.post(
-                    'http://127.0.0.1:8000/api/v1/admin/update',
-                    json={'graceful': graceful},
-                    timeout=120,
-                )
-            except Exception as _e:
-                log.warning('tail self-update via loopback failed: %s', _e)
-        _th_tail.Thread(target=_tail_self_update, daemon=True).start()
-        results[local_entry['id']] = {
-            'status': 'scheduled_local_update',
-            'graceful': graceful,
-            'deferred_s': DIR_TAIL_DELAY_S * 2,
-            'after_handover_to': deferred_new_dir_id,
-        }
-    # Surface a single high-level event in the merged 24h log so the
-    # dashboard shows the rollout. Per-peer results would be too noisy
-    # for a fleet-wide "Update Peers" wave — the per-peer update events
-    # in the stale-peer orchestrator already cover the auto path.
-    try:
-        _scope = ('peer ' + target_id) if target_id else \
-                 (str(len(targets)) + ' peers')
-        _ho = ''
-        if handover_info.get('attempted') and \
-           (handover_info.get('result') or {}).get('status') == 'handed_over':
-            _ho = f' [handover→{handover_info.get("target")}]'
-        director_event(
-            'update wave: ' + _scope
-            + (' (graceful)' if graceful else ' (immediate)')
-            + _ho
-            + ' → ' + str(_GIT_COMMIT))
-    except Exception:
-        pass
-    return jsonify({
-        'results': results,
-        'token_install': token_results,
-        'push': push_info,
-        'graceful': graceful,
-        'handover': handover_info,
-    })
-
-
-@app.route('/api/v1/director/heal_peers_json', methods=['POST'])
-def director_heal_peers_json():
-    """Run the peers.json sanitiser locally AND on every reachable peer.
-
-    Use after a suspected cascading-handover or split-brain incident.
-    Idempotent: peers with already-canonical URLs report no changes.
-    """
-    import director_ha as dha
-    import requests as _rq
-    results: dict = {}
-    # Local first.
-    try:
-        results['local'] = dha.sanitise_peers_json()
-    except Exception as e:
-        results['local'] = {'error': str(e)}
-    # Fan out to peers.
-    try:
-        cfg = pd.load_peers_config()
-    except Exception as e:
-        results['_fanout_error'] = str(e)
-        return jsonify(results)
-    tok = _current_admin_token()
-    headers = {'X-Admin-Token': tok} if tok else {}
-    for p in (cfg.get('peers') or []):
-        pid = p.get('id')
-        url = p.get('url')
-        if not pid or pid == dha.self_id() or not url:
-            continue
-        try:
-            r = _rq.post(
-                url.rstrip('/') + '/api/v1/admin/heal_peers_json',
-                headers=headers, timeout=10)
-            try:
-                results[pid] = r.json()
-            except Exception:
-                results[pid] = {'http': r.status_code,
-                                'body': r.text[:200]}
-        except Exception as e:
-            results[pid] = {'error': str(e)}
-    return jsonify(results)
-
-
-def _free_disk_for_update(min_free_gb: float = 0.5) -> dict:
-    """Evict stale tile_checkpoints to make room before a git-pull + restart.
-
-    A git pull on a near-full disk can fail mid-write (ENOSPC) and leave the
-    peer wedged: srv won't restart cleanly, the director keeps re-issuing the
-    update, and the peer never picks up new code. The cheapest safe reclaim is
-    the per-KG ``tile_checkpoints/<kg>`` dirs: they only matter for resuming a
-    KG that is *currently in flight* on THIS peer. Any other checkpoint dir is
-    either already-uploaded (the KG completed) or belongs to a KG some other
-    peer owns now -- safe to drop (cross-peer recovery still works via the
-    Zenodo chkpt registry). We keep only the in-progress KG's dir.
-
-    Only acts when free disk is below ``min_free_gb`` (default 0.5 GB) so it is
-    a no-op on healthy peers. Best-effort; never raises.
-    """
-    import shutil as _sh
-    out = {'ran': False, 'freed_mb': 0, 'dirs_removed': 0}
-    try:
-        free_gb = _sh.disk_usage('/').free / (1024 ** 3)
-        if free_gb >= min_free_gb:
-            return out
-        out['ran'] = True
-        out['free_gb_before'] = round(free_gb, 3)
-        data_dir = Path('data/austria_processor')
-        keep = set()
-        try:
-            ipf = data_dir / 'in_progress_kg.txt'
-            if ipf.exists():
-                cur = ipf.read_text().strip()
-                if cur:
-                    keep.add(cur)
-        except Exception:
-            pass
-        ckpt_root = data_dir / 'tile_checkpoints'
-        if ckpt_root.exists():
-            for d in ckpt_root.iterdir():
-                if not d.is_dir() or d.name in keep:
-                    continue
-                try:
-                    sz = sum(f.stat().st_size for f in d.rglob('*') if f.is_file())
-                    _sh.rmtree(d, ignore_errors=True)
-                    out['freed_mb'] += sz / 1e6
-                    out['dirs_removed'] += 1
-                except Exception:
-                    pass
-        out['freed_mb'] = round(out['freed_mb'], 1)
-        try:
-            out['free_gb_after'] = round(_sh.disk_usage('/').free / (1024 ** 3), 3)
-        except Exception:
-            pass
-        log.info('update disk-eviction: %.0f MB freed from %d stale checkpoint dir(s) '
-                 '(free %.2f -> %.2f GB; kept in-progress %s)',
-                 out['freed_mb'], out['dirs_removed'], out.get('free_gb_before', 0),
-                 out.get('free_gb_after', 0), sorted(keep) or 'none')
-    except Exception as _e:
-        log.warning('update disk-eviction failed: %s', _e)
-    return out
-
-
-@app.route('/api/v1/admin/update', methods=['POST'])
-def admin_update():
-    """Git pull and restart the web server (called by director on peers).
-
-    Optional body/query: graceful=1 → if a processor is running mid-KG,
-    send a graceful stop (SIGTERM, no escalation) and defer the actual
-    git-pull + srv restart until the processor has exited at the next KG
-    boundary. Director will start it again on the next tick.
-    """
-    body = request.get_json(silent=True) or {}
-    graceful = (request.args.get('graceful') in ('1', 'true', 'yes')
-                or body.get('graceful') is True
-                or body.get('after_kg') is True)
-    try:
-        import subprocess as sp
-        repo = str(Path(__file__).parent)
-        if graceful:
-            # Are we mid-KG?  If so, send graceful stop and defer the
-            # actual update to a background thread that polls until the
-            # processor exits, then runs the same code path as below.
-            try:
-                proc_running = sp.run(
-                    ['pgrep', '-f', 'austria_processor.py'],
-                    capture_output=True, timeout=3,
-                ).returncode == 0
-            except Exception:
-                proc_running = False
-            if proc_running:
-                # Ask the processor to stop after the current KG. Python
-                # PID only — see _processor_python_pids() for why a
-                # broad pkill -TERM here was a hard kill in disguise.
-                try:
-                    _signal_processor_graceful()
-                except Exception:
-                    pass
-                import threading as _th, time as _t
-                def _deferred_update():
-                    # Frontier KGs run 12-20 h; resetting the tree under a
-                    # live processor mixes module versions, so wait it out.
-                    deadline = _t.time() + 48 * 3600
-                    while _t.time() < deadline:
-                        try:
-                            still = sp.run(
-                                ['pgrep', '-f', 'austria_processor.py'],
-                                capture_output=True, timeout=3,
-                            ).returncode == 0
-                        except Exception:
-                            still = False
-                        if not still:
-                            break
-                        _t.sleep(15)
-                    # Free disk before the pull so a near-full peer doesn't
-                    # wedge mid-write (ENOSPC) and get stuck off the rollout.
-                    try:
-                        _free_disk_for_update()
-                    except Exception:
-                        pass
-                    # Now run the actual update + restart sequence.
-                    try:
-                        _safe_git_sync(repo, sp)
-                    except Exception:
-                        pass
-                    try:
-                        _ensure_v2_deps(sp)
-                    except Exception:
-                        pass
-                    sp.Popen(['sudo', 'systemctl', 'restart', 'srv'])
-                _th.Thread(target=_deferred_update, daemon=True).start()
-                return jsonify({
-                    'status': 'graceful_update_scheduled',
-                    'note': 'will git-pull + restart srv once processor exits at next KG boundary',
-                })
-            # No processor running → fall through to immediate path.
-        # Free disk before the pull so a near-full peer doesn't wedge mid-write
-        # (ENOSPC) and get stuck off the rollout. No-op above min_free_gb.
-        try:
-            _free_disk_for_update()
-        except Exception:
-            pass
-        # Reset any tracked files that have local modifications + pull, with
-        # stale-lock cleanup, serialization, and bumped timeouts. See
-        # _safe_git_sync() docstring.
-        try:
-            pull = _safe_git_sync(repo, sp)
-        except _GitBusy as _gb:
-            return jsonify({'error': 'another update in progress', 'detail': str(_gb)}), 409
-        except Exception as _ge:
-            return jsonify({'error': f'git sync failed: {_ge}'}), 500
-        # segv2 runtime dep (no-op when already importable)
-        try:
-            _ensure_v2_deps(sp)
-        except Exception:
-            pass
-        # Ensure traceroute is available (needed for region detection)
-        if sp.run(['which', 'traceroute'], capture_output=True).returncode != 0:
-            sp.run(['sudo', 'apt-get', 'install', '-y', '-q', 'traceroute'],
-                   capture_output=True, timeout=60)
-        # Fix ownership of data/ tree. Earlier processor runs (before the
-        # uid=exedev fix) wrote files as root, which the now-uid=exedev
-        # subprocess can't read or rewrite. Symptoms: "Permission denied:
-        # 'data/austria_processor/zenodo_manifest.json'", "Corrupt BEV
-        # cache <hash>.npz: Permission denied". Idempotent — only chowns
-        # files actually owned by another uid.
-        try:
-            for sub in ('data', 'rf_training_data'):
-                p = Path(repo) / sub
-                if p.exists():
-                    sp.run(['sudo', 'chown', '-R', 'exedev:exedev', str(p)],
-                           capture_output=True, timeout=120)
-        except Exception as _e:
-            log.warning('data/ chown failed: %s', _e)
-        # Install / refresh systemd watchdog units (idempotent).  These
-        # restart srv if /api/v1/ping stops answering — protects against
-        # the wedged-gunicorn failure mode.
-        try:
-            from pathlib import Path as _P
-            ws = _P(repo) / 'srv-watchdog.service'
-            wt = _P(repo) / 'srv-watchdog.timer'
-            wsh = _P(repo) / 'srv_watchdog.sh'
-            if ws.exists() and wt.exists() and wsh.exists():
-                sp.run(['chmod', '+x', str(wsh)], capture_output=True, timeout=5)
-                sp.run(['sudo', 'cp', str(ws), '/etc/systemd/system/srv-watchdog.service'],
-                       capture_output=True, timeout=10)
-                sp.run(['sudo', 'cp', str(wt), '/etc/systemd/system/srv-watchdog.timer'],
-                       capture_output=True, timeout=10)
-                sp.run(['sudo', 'systemctl', 'daemon-reload'],
-                       capture_output=True, timeout=10)
-                sp.run(['sudo', 'systemctl', 'enable', '--now', 'srv-watchdog.timer'],
-                       capture_output=True, timeout=10)
-        except Exception as _e:
-            log.warning('srv-watchdog install failed: %s', _e)
-        # Defer restart if processor is mid-upload (avoid broken manifest entries)
-        current_step = ''
-        try:
-            step_data = json.loads((Path(__file__).parent / 'data/austria_processor/current_step.json').read_text())
-            current_step = step_data.get('step', '')
-        except Exception:
-            pass
-        upload_steps = {'upload_full_gpkg', 'upload'}
-        if current_step in upload_steps:
-            # Schedule restart after a short delay to let upload finish
-            def _delayed_restart():
-                import time as _t
-                _t.sleep(90)
-                sp.Popen(['sudo', 'systemctl', 'restart', 'srv'])
-            import threading as _th
-            _th.Thread(target=_delayed_restart, daemon=True).start()
-            return jsonify({
-                'status': 'updated',
-                'git': pull.stdout.strip(),
-                'git_err': pull.stderr.strip(),
-                'restart': 'deferred_upload',
-            })
-        # Restart gunicorn in background so this response gets out first
-        sp.Popen(['sudo', 'systemctl', 'restart', 'srv'])
-        return jsonify({
-            'status': 'updated',
-            'git': pull.stdout.strip(),
-            'git_err': pull.stderr.strip(),
-            'restart': 'immediate',
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
 @app.route('/api/v1/director/restart_peer', methods=['POST'])
 def director_restart_peer():
     """Force-restart the processor on a specific peer (stop + start).
@@ -10340,7 +8758,7 @@ def _zenodo_lock_is_stale(now: float) -> bool:
 # which is much cheaper than holding the lock state itself.
 # Falls back to in-process state when the broker is unreachable.
 
-_BROKER_BASE = 'http://127.0.0.1:8001'
+_BROKER_BASE = f'http://127.0.0.1:{_config.APP_PORT + 1}'   # zenodo_lock_broker.py (optional)
 _BROKER_HEALTHY_AT = 0.0
 _BROKER_HEALTHY_TTL = 30.0   # re-probe at most every 30s
 _BROKER_HEALTHY = False
@@ -10376,11 +8794,7 @@ def _broker_proxy(method: str, path_suffix: str = '') -> tuple | None:
     try:
         import requests as _req
         url = _BROKER_BASE + '/api/v1/zenodo/lock' + path_suffix
-        # Forward auth header so the broker sees the same token check.
         hdrs = {}
-        tok = request.headers.get('X-Admin-Token')
-        if tok:
-            hdrs['X-Admin-Token'] = tok
         body = request.get_data() or None
         if body is not None:
             hdrs['Content-Type'] = request.headers.get(
@@ -10566,7 +8980,7 @@ def admin_drop_tombstones():
     Read-only w.r.t. Zenodo and the tile caches; touches nothing but
     tombstone state.
 
-    Auth: global ``_enforce_admin_token`` hook (``/api/v1/admin/*``).
+    Auth: global ``_enforce_operator_gate`` hook (``/api/v1/admin/*``).
     """
     body = (request.json or {}) if request.is_json else {}
     keys = list(body.get('keys') or [])
@@ -10614,7 +9028,7 @@ def admin_unfail_kgs():
     must clear every *peer* before the primary, else the verdict is
     re-imported on the next 5-min sync tick.
 
-    Auth: covered by the global ``_enforce_admin_token`` before_request
+    Auth: covered by the global ``_enforce_operator_gate`` before_request
     hook (``/api/v1/admin/*`` is a protected path; loopback exempt).
     """
     codes = []
@@ -10678,7 +9092,7 @@ def admin_ne_tooling():
     bevdirect-serve binary: primary's ``/api/v1/admin/bevdirect_binary``
     first, ``go install …/vtcseamless/cmd/bevdirect-serve@<tag>`` fallback).
     Does NOT switch ``ne_source`` — that stays a director config knob.
-    Auth: global ``_enforce_admin_token`` (``/api/v1/admin/`` prefix)."""
+    Auth: global ``_enforce_operator_gate`` (``/api/v1/admin/`` prefix)."""
     import ne_h3 as _neh
     out = {'started': False}
     if request.method == 'POST':
@@ -10691,84 +9105,16 @@ def admin_ne_tooling():
     return jsonify(out)
 
 
-# === SECTION: bev-mode relays (peers never call umfeld's /k tier) ===
-_LU_CACHE_DIR = Path('data/ne/lu_cache')
-_LU_CACHE_MAX_BYTES = 400 * 1024 * 1024
-_LU_CACHE_MAX_AGE_S = 30 * 86400
-_lu_relay_lock = threading.Lock()
-
-
-def _lu_cache_prune() -> None:
-    try:
-        files = sorted(_LU_CACHE_DIR.glob('*.nec'), key=lambda p: p.stat().st_mtime)
-        now = time.time()
-        total = sum(p.stat().st_size for p in files)
-        for p in files:
-            if now - p.stat().st_mtime > _LU_CACHE_MAX_AGE_S or total > _LU_CACHE_MAX_BYTES:
-                total -= p.stat().st_size
-                p.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-
-@app.route('/api/v1/ne/declared/<kg>', methods=['GET'])
-def ne_declared_relay(kg):
-    """umfeld's frozen ``lu`` NEC1 for a parent KG, relayed for bev-mode
-    peers (``ne_h3.fetch_declared_director``): a peer whose bevdirect build
-    would lose cells (own parcels clipped by the cell grid — alpine parents,
-    ``vct_pilot.DeclaredDeficient``) or failed gets the declared layer from
-    here instead of umfeld's token-gated ``/k`` tier.  Statistics only (no
-    parcel leaves umfeld); cached on disk 30 d / 400 MB (~265 KB median per
-    KG), so the metered link pays once per parent.  404 mirrors umfeld's
-    ``{status, retry_after_s}`` + ``Retry-After`` (→ ``NENotBuilt``).
-    Admin token (``_PROTECTED_PREFIXES``)."""
-    import ne_h3 as _neh
-    kg = str(kg).zfill(5)
-    if not kg.isdigit() or len(kg) != 5:
-        return jsonify({'error': 'bad kg'}), 400
-    fp = _LU_CACHE_DIR / f'{kg}.nec'
-    try:
-        if fp.exists() and fp.stat().st_size > 64:
-            blob = fp.read_bytes()
-            resp = Response(blob, mimetype='application/vnd.ne-cells')
-            resp.headers['X-NE-Relay'] = 'cache'
-            return resp
-    except Exception:
-        pass
-    with _lu_relay_lock:
-        try:
-            if fp.exists() and fp.stat().st_size > 64:
-                blob = fp.read_bytes()
-            else:
-                sec = _neh.fetch_declared_umfeld(kg)
-                blob = _neh.pack_section(_neh.MAGIC_LU, sec.header, sec.raw)
-                _LU_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                tmp = fp.with_suffix('.tmp')
-                tmp.write_bytes(blob)
-                tmp.replace(fp)
-                _lu_cache_prune()
-        except _neh.NENotBuilt as e:
-            body = {'status': e.status, 'retry_after_s': e.retry_after_s, 'kg': kg, 'relay': 'umfeld'}
-            resp = jsonify(body)
-            resp.status_code = 404
-            if e.retry_after_s:
-                resp.headers['Retry-After'] = str(int(e.retry_after_s))
-            return resp
-        except Exception as e:  # noqa: BLE001
-            return jsonify({'error': f'umfeld relay failed: {str(e)[:200]}', 'kg': kg}), 503
-    resp = Response(blob, mimetype='application/vnd.ne-cells')
-    resp.headers['X-NE-Relay'] = 'umfeld'
-    return resp
-
+# === SECTION: VTC pilot fleet dedupe ===
 
 @app.route('/api/v1/director/vct_reported', methods=['GET'])
 def director_vct_reported():
-    """Has any peer already reported parent ``?kg=`` to umfeld-at /contrib
-    with ``?source=`` (default: our bevdirect tag) within ``?max_age_s``
-    (default 30 d)?  Read from ``vct_fleet.json``'s ``reported`` map (folded
-    from the peers' status pushes by ``vct_fleet._collect_rows``).  Split
-    blocks use it (``vct_pilot.already_reported``) to skip the /contrib
-    POST a sibling block already made — formerly a ``/k`` GET per block."""
+    """Has any peer already reported parent ``?kg=`` to the optional NE
+    contrib endpoint with ``?source=`` (default: our bevdirect tag) within
+    ``?max_age_s`` (default 30 d)?  Read from ``vct_fleet.json``'s
+    ``reported`` map (folded from the peers' status pushes by
+    ``vct_fleet._collect_rows``).  Split blocks use it
+    (``vct_pilot.already_reported``) to skip a POST a sibling block made."""
     import vct_fleet as _vf
     import ne_h3 as _neh
     kg = str(request.args.get('kg') or '').zfill(5)
@@ -10827,7 +9173,7 @@ def director_sweep_result():
 @app.route('/api/v1/director/sweep', methods=['GET', 'POST'])
 def director_sweep():
     """GET → ``sliver_sweep.status()`` (+ ``?kg=`` plan of one parent).
-    POST ``{"refresh":true}`` re-pulls umfeld's bbox_changes; ``{"reset":
+    POST ``{"refresh":true}`` re-pulls the bbox_changes list; ``{"reset":
     [codes]}`` puts parents back to ``wait``; ``{"scan": N}`` scans now;
     ``{"rerun": [codes] | true}`` re-dispatches ok units lacking add-on
     products (``sliver_sweep.rerun_missing_products``)."""
@@ -10884,12 +9230,12 @@ def admin_vct_pilot():
     out: dict = {}
     if request.method == 'POST':
         body = request.get_json(silent=True) or {}
-        # ``ne_source`` (umfeld|bevdirect) = per-peer bev mode, live: the
-        # sidecar is read at every KG's NE step.  bevdirect implies the
-        # pilot (the declared build IS the pilot run).
+        # ``ne_source`` (bevdirect) = per-peer bev mode, live: the sidecar
+        # is read at every KG's NE step.  bevdirect implies the pilot (the
+        # declared build IS the pilot run).
         _src = str(body.get('ne_source') or '').strip().lower()
-        if _src and _src not in ('umfeld', 'bevdirect'):
-            return jsonify({'error': 'ne_source must be umfeld|bevdirect'}), 400
+        if _src and _src != 'bevdirect':
+            return jsonify({'error': 'ne_source must be bevdirect'}), 400
         want = str(body.get('on', '')).strip().lower() in ('1', 'true', 'yes', 'on') or _src == 'bevdirect'
         if want or _src == 'bevdirect':
             _bd = _neh.bevdirect_ready(probe_server=False)
@@ -10897,8 +9243,7 @@ def admin_vct_pilot():
                 out['started_install'] = _ne_tooling_install_async()
                 out['refused'] = 'tooling not ready'
                 want = False
-                if _src == 'bevdirect':
-                    _src = 'umfeld'
+                _src = ''
         if 'on' in body or _src == 'bevdirect':
             out['changed'] = _vct.set_enabled(want)
             if out['changed']:
@@ -11019,7 +9364,7 @@ def admin_v2_strikes_clear():
         # Fatal section = between "FAIL n/m checks | " and " | warn:" /
         # " | hint:".  Check names are the tokens followed by ": " at the
         # start of the section or after "; " / "| " — a plain split on ";"
-        # broke on details like "(parcels ≥300 m²; raw 82.8/87.9) | lost=…".
+        # broke on details like "(≥300 m²; raw 82.8/87.9) | lost=…".
         m = _re.search(r' FAIL \d+/\d+ checks \| (.*?)(?: \| (?:warn|hint):|$)', reason)
         if not m:
             continue
@@ -11457,7 +9802,7 @@ def admin_mem_top():
     out['top_by_count'] = cnt.most_common(15)
     out['top_by_size_mb'] = [(k, round(v / 1048576, 1)) for k, v in sz.most_common(15)]
     big = []
-    for modname in ('app', 'peer_director', 'director_ha', 'search_index',
+    for modname in ('app', 'peer_director', 'search_index',
                     'kg_v2_store', 'zenodo_fetch', 'ne_ingest', 'v2_ingest',
                     'vct_fleet', 'net_meter', 'http_pool', 'json_cache'):
         mod = sys.modules.get(modname)
@@ -11670,21 +10015,6 @@ def admin_disable_autostart():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/v1/admin/heal_peers_json', methods=['POST'])
-def admin_heal_peers_json():
-    """Run the peers.json sanitiser on this host and return the report.
-
-    Idempotent. Repairs canonical-URL drift (cascading-handover bug,
-    stale snapshot propagation, manual edit). Safe to call on any VM.
-    """
-    try:
-        import director_ha as dha
-        rep = dha.sanitise_peers_json()
-        return jsonify(rep)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
 @app.route('/api/v1/admin/combined_log/evict', methods=['POST'])
 def admin_combined_log_evict():
     """Evict entries from the persistent merged 24h log.
@@ -11775,443 +10105,35 @@ def admin_combined_log_evict():
                     'after_bytes': after_bytes})
 
 
-@app.route('/api/v1/admin/clear_stepped_down', methods=['POST'])
-def admin_clear_stepped_down():
-    """Clear the ``stepped_down`` flag so this peer is eligible to be
-    re-promoted to director (e.g. via auto-handback to primary).
-    """
-    try:
-        from director_ha import STEPPED_DOWN_FLAG
-        existed = STEPPED_DOWN_FLAG.exists()
-        try:
-            STEPPED_DOWN_FLAG.unlink()
-        except FileNotFoundError:
-            pass
-        return jsonify({'cleared': existed})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+# === SECTION: Director identity ===
 
-
-# === SECTION: Director high-availability (heartbeat / shadow / handover) ===
-
-@app.route('/api/v1/director/heartbeat', methods=['GET'])
-def director_heartbeat():
-    """Liveness ping. Public (no admin token) so peers can probe cheaply.
-
-    Returns 200 only when this VM holds ``is_director``. Otherwise 410 so
-    callers know to look elsewhere (peer watchdog will then check whom it
-    thinks the director is and re-evaluate).
-    """
-    import director_ha as dha
-    if not dha.IS_DIRECTOR_FLAG.exists():
-        return jsonify({'is_director': False, 'self': dha.load_self()}), 410
-    # Liveness check: the loop must actually be running. A dead loop with
-    # IS_DIRECTOR_FLAG still on disk means the cluster is unmanaged —
-    # report 410 so peers fail over to a healthier shadow instead of
-    # trusting our flag forever.
-    #
-    # Use ON-DISK signals ONLY — no Python-side singleton construction,
-    # no module imports beyond what's already loaded. Heartbeat must stay
-    # cheap because every peer hits it every 30 s, and a busy director
-    # cannot afford GIL contention here. With 2 gunicorn workers only 1
-    # holds the director loop (fcntl lock); whichever worker serves this
-    # request just stats the state file and returns. Loop saves state
-    # every ~30s; allow 5x slack (150 s) for slow ticks under load —
-    # tighter values produced false positives that triggered cascading
-    # takeovers during heavy GPKG uploads.
-    state_fresh = False
-    state_age = None
-    try:
-        st_path = pd.DIRECTOR_STATE
-        if st_path.exists():
-            state_age = time.time() - st_path.stat().st_mtime
-            state_fresh = state_age < 150.0
-    except Exception:
-        pass
-    running = state_fresh
-    if not running:
-        return jsonify({
-            'is_director': True,
-            'running': False,
-            'note': 'flag set but loop not running',
-            'state_age_s': state_age,
-            'self': dha.load_self(),
-        }), 410
-    state = {}
-    try:
-        state = pd.load_director_state_ro()
-    except Exception:
-        pass
-    return jsonify({
-        'is_director': True,
-        'running': running,
-        'self': dha.load_self(),
-        'shadow_peer': state.get('shadow_peer'),
-        'active_peer': state.get('active_peer'),
-        'mode': state.get('mode'),
-        'ts': time.time(),
-    })
-
-
-@app.route('/api/v1/director/snapshot', methods=['GET', 'PUT'])
-def director_snapshot():
-    """GET: build & return a snapshot (director only).
-    PUT: stage a snapshot from the director (shadow only).
-    """
-    import director_ha as dha
-    if request.method == 'GET':
-        if not dha.IS_DIRECTOR_FLAG.exists():
-            return jsonify({'error': 'not_director'}), 410
-        if not dha.ha_enabled() and not _request_is_loopback():
-            return jsonify({'error': 'ha_disabled'}), 403
-        return jsonify(dha.build_snapshot())
-    body = request.get_json(silent=True) or {}
-    if not dha.ha_enabled():
-        return jsonify({'error': 'ha_disabled'}), 403
-    if not isinstance(body, dict) or '_meta' not in body:
-        return jsonify({'error': 'invalid_snapshot'}), 400
-    dha.stage_snapshot(body)
-    return jsonify({'status': 'staged', 'self': dha.load_self()})
-
-
-@app.route('/api/v1/director/probe')
-def director_probe():
-    """Out-of-band reachability probe: "can *you* reach ``url``'s director
-    heartbeat?" Used by (1) a shadow before promoting itself (peer quorum),
-    (2) an interim director before handing back to primary, and (3) the
-    primary itself, asking a peer whether its public URL is reachable from
-    the fleet (edge/proxy blackout detection — 2026-09-30 incident).
-
-    SSRF guard: ``url`` must be a canonical fleet URL
-    (``https://srtm-lidar-at[N].exe.xyz:8000``)."""
-    import director_ha as dha, re as _re
-    url = (request.args.get('url') or '').strip().rstrip('/')
-    if not _re.match(r'^https://srtm-lidar-at(\d+\.exe\.xyz:8000|\.exe\.xyz(:8000|/k))$', url):
-        return jsonify({'error': 'url must be a canonical fleet peer URL'}), 400
-    return jsonify(dha.probe_url_from_here(url))
-
-
-@app.route('/api/v1/director/combined_log_delta', methods=['PUT'])
-def director_combined_log_delta_put():
-    """Shadow-only: import a gzipped JSONL delta of the director's live
-    merged 24 h log ring (director_ha.push_combined_log_delta_to_shadow).
-    Written straight into ``data/combined_log_24h.jsonl`` (per-entry
-    dedup) so a promoted shadow already holds the fleet's log history.
-    Bounded: 16 MB compressed."""
-    import gzip as _gz
-    import director_ha as _dha
-    if not _dha.ha_enabled():
-        return jsonify({'error': 'ha_disabled'}), 403
-    raw = request.get_data(cache=False) or b''
-    if len(raw) > 16 * 1024 * 1024:
-        return jsonify({'error': 'too_large'}), 413
-    try:
-        if (request.headers.get('Content-Encoding') or '').lower() == 'gzip' \
-                or raw[:2] == b'\x1f\x8b':
-            raw = _gz.decompress(raw)
-        entries = []
-        for line in raw.decode('utf-8', 'replace').splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except Exception:
-                continue
-            if isinstance(e, dict):
-                entries.append(e)
-    except Exception as e:
-        return jsonify({'error': f'decode: {e}'}), 400
-    n = _combined_log_import_entries(entries)
-    return jsonify({'ok': True, 'received': len(entries), 'imported': n})
-
-
-@app.route('/api/v1/director/log_archive', methods=['GET', 'PUT'])
-def director_log_archive_put():
-    """Shadow-only: stage a per-day gzipped log archive blob from the
-    director. Body: ``{day:'YYYY-MM-DD', gz_b64, size, sha256}``.
-
-    The shadow keeps a copy in ``data/log_archive/`` directly (NOT under
-    ``shadow/``) so when this peer is later promoted to director the
-    long-term forensic record is already in place. Idempotent: skips
-    write if the local file already matches ``size`` and ``sha256``
-    (so the hourly heartbeat is essentially free in steady state).
-
-    Best-effort and bounded — callers MUST cap blob size; the endpoint
-    rejects payloads >32 MB to keep traffic tame.
-    """
-    import director_ha as _dha
-    if request.method == 'PUT' and not _dha.ha_enabled():
-        return jsonify({'error': 'ha_disabled'}), 403
-    import base64 as _b64, hashlib as _hl
-    import director_ha as _dha
-    if request.method == 'GET':
-        # Inventory for the director's sha cache (see
-        # director_ha.push_log_archive_to_shadow).
-        return jsonify(_dha.log_archive_inventory())
-    body = request.get_json(silent=True) or {}
-    day = (body.get('day') or '').strip()
-    if not (len(day) == 10 and day[4] == '-' and day[7] == '-'):
-        return jsonify({'error': 'bad day'}), 400
-    blob_b64 = body.get('gz_b64') or ''
-    if not isinstance(blob_b64, str) or len(blob_b64) > 45 * 1024 * 1024:
-        return jsonify({'error': 'too_large'}), 413
-    try:
-        blob = _b64.b64decode(blob_b64)
-    except Exception as e:
-        return jsonify({'error': f'b64: {e}'}), 400
-    arch_dir = Path('data/log_archive')
-    arch_dir.mkdir(parents=True, exist_ok=True)
-    out = arch_dir / f'{day}.jsonl.gz'
-    # Append delta (director_ha._push_one_archive_day): ``blob`` is only
-    # the tail past ``base_size``; the local file must match the base
-    # exactly, else 409 and the director re-sends the whole day.
-    _base_size = body.get('base_size')
-    if _base_size is not None:
-        try:
-            _base_size = int(_base_size)
-            if not (out.exists() and out.stat().st_size == _base_size):
-                return jsonify({'error': 'base_mismatch', 'reason': 'size'}), 409
-            _prefix = out.read_bytes()
-            if _hl.sha256(_prefix).hexdigest() != (body.get('base_sha256') or ''):
-                return jsonify({'error': 'base_mismatch', 'reason': 'sha'}), 409
-            blob = _prefix + blob
-        except Exception as e:
-            return jsonify({'error': f'base: {e}'}), 409
-    sha = _hl.sha256(blob).hexdigest()
-    if body.get('sha256') and body['sha256'] != sha:
-        return jsonify({'error': 'sha mismatch'}), 400
-    # Idempotent skip: same size + sha as the on-disk file.
-    try:
-        if out.exists() and out.stat().st_size == len(blob):
-            existing = _hl.sha256(out.read_bytes()).hexdigest()
-            if existing == sha:
-                return jsonify({'status': 'unchanged', 'size': len(blob)})
-    except Exception:
-        pass
-    tmp = out.with_suffix('.gz.tmp')
-    tmp.write_bytes(blob)
-    os.replace(tmp, out)
-    return jsonify({'status': 'staged', 'size': len(blob), 'sha256': sha})
-
-
-@app.route('/api/v1/director/announce', methods=['POST'])
-def director_announce():
-    """Inbound announce — a new director claims authority."""
-    import director_ha as dha
-    body = request.get_json(silent=True) or {}
-    return jsonify(dha.accept_announce(body))
-
-
-@app.route('/api/v1/director/step_down', methods=['POST'])
-def director_step_down():
-    """Old director is asked to step down (idempotent)."""
-    import director_ha as dha
-    body = request.get_json(silent=True) or {}
-    return jsonify(dha.step_down(body))
-
-
-@app.route('/api/v1/director/takeover', methods=['POST'])
-def director_takeover():
-    """Inbound takeover (manual handover or shadow promotion).
-
-    Body: ``{snapshot, prev_director_url, reason}``. If snapshot provided,
-    install it inline; otherwise promote the staged shadow snapshot.
-    """
-    import director_ha as dha
-    body = request.get_json(silent=True) or {}
-    snap = body.get('snapshot')
-    return jsonify(dha._do_takeover(
-        reason=body.get('reason', 'inbound_takeover'),
-        prev_director_url=body.get('prev_director_url'),
-        snapshot_inline=snap if isinstance(snap, dict) else None,
-    ))
-
-
-@app.route('/api/v1/director/handover', methods=['POST'])
-def director_handover():
-    """Manual handover initiated by the current director.
-
-    Body: ``{to: <peer_id>}`` (or ?to=<peer_id>).
-    """
-    import director_ha as dha
-    if not dha.IS_DIRECTOR_FLAG.exists():
-        return jsonify({'error': 'not_director'}), 409
-    target = (request.args.get('to') or
-              (request.get_json(silent=True) or {}).get('to', '')).strip()
-    if not target:
-        return jsonify({'error': 'to=<peer_id> required'}), 400
-    cfg = pd.load_peers_config()
-    peer = pd.get_peer_by_id(cfg, target)
-    if not peer or not peer.get('url'):
-        return jsonify({'error': f'unknown peer: {target}'}), 404
-    return jsonify(dha.do_handover(target, peer['url']))
-
-
-@app.route('/api/v1/director/identity', methods=['GET', 'POST'])
+@app.route('/api/v1/director/identity', methods=['GET'])
 def director_identity():
-    """GET/POST self identity (id, url, director_url)."""
-    import director_ha as dha
-    if request.method == 'GET':
-        return jsonify({**dha.load_self(),
-                        'peer_urls': sorted(_get_peer_urls() or []),
-                        'is_director': dha.IS_DIRECTOR_FLAG.exists(),
-                        'stepped_down': dha.STEPPED_DOWN_FLAG.exists(),
-                        'watchdog': dha.watchdog_state()})
-    body = request.get_json(silent=True) or {}
-    cur = dha.load_self()
-    # SECURITY/SANITY: only the receiver itself can authoritatively know its
-    # own id and url. We therefore NEVER override `id`/`url` from a remote
-    # POST: the director may have stale peers.json mappings that point an
-    # id at a different host, and accepting them would corrupt our self.json
-    # (which has happened during cascaded director handovers). The receiver
-    # derives id from hostname via dha.load_self() and trusts that.
-    # Only `director_url` is accepted from a remote POST — that's the whole
-    # point of the identity broadcast: tell the peer who its director is.
-    incoming_id = body.get('id')
-    incoming_url = body.get('url')
-    rejected = {}
-    if incoming_id and incoming_id != cur.get('id'):
-        rejected['id'] = {'incoming': incoming_id, 'self': cur.get('id')}
-    if incoming_url and incoming_url != cur.get('url'):
-        rejected['url'] = {'incoming': incoming_url, 'self': cur.get('url')}
-    if rejected:
-        log.warning('director_identity: refusing to override self id/url '
-                    'from remote POST: %s', rejected)
-    # Local writes (loopback / same-process) are still permitted to set
-    # id/url so the on-box bootstrap can fix things up.
-    # NOTE: must use _request_is_loopback() — exe.dev's HTTPS proxy makes
-    # remote_addr=127.0.0.1 for *every* request, so a naive check would let
-    # any peer overwrite our id/url. _request_is_loopback() also requires
-    # X-Forwarded-For to be absent, which the proxy always sets for remote
-    # callers. Without this guard, cascading takeovers on at26 corrupted
-    # the primary's self.json (id flipped primary→at8→at3).
-    if _request_is_loopback():
-        for k in ('id', 'url'):
-            if k in body and body[k] is not None:
-                cur[k] = body[k]
-    prev_dir_url = (cur.get('director_url') or '').strip()
-    if 'director_url' in body and not dha.director_url_allowed(body.get('director_url')):
-        log.error('director_identity: refusing director_url=%r (HA disabled, '
-                  'pinned to %s)', body.get('director_url'), dha.PRIMARY_HOST)
-        return jsonify({'error': 'ha_disabled',
-                        'note': f'director pinned to {dha.PRIMARY_HOST}'}), 403
-    if 'director_url' in body:
-        cur['director_url'] = body['director_url']
-    dha.save_self(cur)
-    if 'director_url' in body:
-        dha.set_director_url(body['director_url'])
-        # On director failover, the new director's push cache starts
-        # empty. Sticky fields (host fingerprint) are only shipped once
-        # per process — force a re-send on the next push so the new
-        # director sees them too.
-        try:
-            new_url = (body.get('director_url') or '').strip()
-            if new_url and new_url != prev_dir_url:
-                import host_telemetry as _ht
-                _ht.mark_host_profile_unsent()
-        except Exception:
-            pass
-    # Fleet roster push: the director ships the current peer URL list so
-    # this peer's ``peer_urls.txt`` (consumed by the processor's
-    # ``--peers`` claim check and the data-sync thread) doesn't rot.
-    # Stale lists (decommissioned at10/at13/at14 on at11, Sep 2026) cost a
-    # 10 s timeout per dead URL on every claim poll.
-    pu = body.get('peer_urls')
-    if isinstance(pu, list):
-        urls = sorted({str(u).strip().rstrip('/') for u in pu
-                       if isinstance(u, str) and u.strip().startswith('http')})
-        try:
-            pf = Path('data/austria_processor/peer_urls.txt')
-            cur_urls = sorted(_get_peer_urls() or [])
-            if urls != cur_urls:
-                pf.parent.mkdir(parents=True, exist_ok=True)
-                tmp = pf.with_suffix('.tmp')
-                tmp.write_text('\n'.join(urls) + ('\n' if urls else ''))
-                tmp.replace(pf)
-                log.info('director_identity: peer_urls.txt updated (%d → %d urls)',
-                         len(cur_urls), len(urls))
-        except Exception as e:
-            log.warning('director_identity: peer_urls.txt write failed: %s', e)
-    out = dict(cur)
-    if rejected:
-        out['_rejected'] = rejected
-    return jsonify(out)
+    """Self identity (id, director_url, peers) derived from ``config``."""
+    return jsonify({'id': _config.self_id(),
+                    'url': _config.SELF_URL or None,
+                    'director_url': _config.PRIMARY_URL or None,
+                    'peer_urls': sorted(_get_peer_urls() or []),
+                    'is_director': _config.is_director(),
+                    'single_vm': _config.single_vm()})
 
 
-# Start the director background thread — only on the primary instance.
-# The director loop actively starts/stops processors on peers, so only one
-# instance should run it. Enabled by the flag file data/austria_processor/is_director.
+# Start the director background thread — on the director instance only
+# (``config.is_director()``: always in single-VM mode; a worker pointed at
+# ``SRTM_PRIMARY_URL`` never runs it).
 def _start_director():
     time.sleep(3)  # let Flask boot first
     if os.environ.get('SRTM_APP_IMPORT_ONLY'):
         # CLI tools (sliver_sweep.py, ne_ingest.py …) import app for
         # helpers such as _kg_coverage_complete — never run a second
-        # director (+ identity broadcast) from a shell.
+        # director from a shell.
         return
-    flag = Path('data/austria_processor/is_director')
-    stepped_down = Path('data/austria_processor/stepped_down')
-    if stepped_down.exists() and flag.exists():
-        # Conflict: both flags set. stepped_down wins (safer). The peer
-        # was demoted; don't re-promote it on cold restart.
-        try:
-            flag.unlink()
-            log.warning('Both is_director and stepped_down present; honouring '
-                        'stepped_down and removing is_director.')
-        except Exception:
-            pass
-    if not flag.exists():
-        log.info('Not a director instance (no %s) — director loop disabled', flag)
+    if not _config.is_director():
+        log.info('Worker instance (SRTM_PRIMARY_URL set) — director loop disabled')
         return
     d = pd.get_director()
     d.start()
-    # Best-effort bulk identity broadcast — tells every peer who the
-    # current director is (and what their own peer_id is) so their
-    # watchdog can start probing /director/heartbeat. Self-healed each
-    # tick, but a one-shot at startup gets the cluster aware faster.
-    try:
-        d._broadcast_identity_to_all_peers()  # noqa: SLF001
-    except Exception as _e:
-        log.warning('startup identity broadcast failed: %s', _e)
 threading.Thread(target=_start_director, daemon=True).start()
-
-# Start the director high-availability watchdog on every VM. On the
-# director it's mostly a no-op; on peers it pings the director every 30s
-# and if the shadow misses 3 in a row, the shadow promotes itself.
-try:
-    import director_ha as dha
-    import socket as _sock
-    # ALWAYS heal self.json on startup from the local hostname — it is
-    # the only authoritative source of identity for this VM. Past
-    # cascading handovers corrupted self.json with the wrong id/url
-    # (e.g. at37 ended up with id='at44'). The hostname does not lie.
-    _self = dha.load_self()
-    _hn = _sock.gethostname().split('.')[0]
-    if _hn.startswith('srtm-lidar-'):
-        _suffix = _hn[len('srtm-lidar-'):]
-        _correct_id = 'primary' if _suffix == 'at' else _suffix
-        # primary → /k canonical (director_ha.canonical_peer_url); peers → :8000
-        _correct_url = dha.canonical_peer_url(_correct_id) or f'https://{_hn}.exe.xyz:8000'
-        _changed = False
-        if _self.get('id') != _correct_id:
-            log.warning('self.json id mismatch: was %r, healing to %r',
-                        _self.get('id'), _correct_id)
-            _self['id'] = _correct_id
-            _changed = True
-        if _self.get('url') != _correct_url:
-            log.warning('self.json url mismatch: was %r, healing to %r',
-                        _self.get('url'), _correct_url)
-            _self['url'] = _correct_url
-            _changed = True
-        if dha.IS_DIRECTOR_FLAG.exists() and _self.get('director_url'):
-            # The director should not have a director_url pointer.
-            _self['director_url'] = None
-            _changed = True
-        if _changed:
-            dha.save_self(_self)
-    dha.start_watchdog()
-except Exception as _e:
-    log.warning('director_ha watchdog disabled: %s', _e)
 
 
 # === SECTION: Search index API endpoints ===
@@ -12299,7 +10221,6 @@ def _compute_insights():
     green = sum(r['area_km2'] for r in out['lc'] if r['type'] in ('tree','grass','crop','shrub','hedge','orchard','vineyard','garden'))
     out['green_pct'] = round(green/lc_total*100, 0)
 
-    # ── 3./4. parcel auto-class + frav spread: removed 2026-10-13 (Kataster purge)
     out['auto'] = []; out['dominant'] = []; out['frav'] = {}
 
     # ── 5. Tall trees / giant atlas ────────────────────────────────
@@ -12325,7 +10246,7 @@ def _compute_insights():
         'SELECT CAST(elevation_mean_m/250 AS INT)*250 b,COUNT(*),AVG(shannon_diversity),AVG(tree_count),AVG(ndvi_mean) '
         'FROM kg WHERE processed=1 AND elevation_mean_m IS NOT NULL GROUP BY b ORDER BY b')]
 
-    # ── 8. Aspect compass (KG-level since the Kataster purge) ──────
+    # ── 8. Aspect compass (KG-level) ──────
     out['aspect'] = [{'a': a, 'n': int(n)} for a, n in
         rows('SELECT aspect_dominant,COUNT(*) FROM kg WHERE processed=1 AND aspect_dominant IS NOT NULL '
              'AND aspect_dominant!="" GROUP BY aspect_dominant')]
@@ -12380,10 +10301,7 @@ def api_insights():
     if force:
         # Forcing a recompute is admin/loopback-only — the public must
         # never be able to stampede the director's DB on demand.
-        _tok = (request.headers.get('X-Admin-Token')
-                or request.args.get('admin_token')
-                or request.cookies.get('admin_token'))
-        if not (_request_is_loopback() or (_tok and _tok == _current_admin_token())):
+        if not (_request_is_loopback() or _operator_token_ok()):
             force = False  # silently ignore
 
     cached = _insights_fresh(now)
@@ -12474,7 +10392,7 @@ def api_processing_kg_search():
     search / prioritize boxes).  ``?q=<text>&limit=N`` → FTS over KG /
     Gemeinde / district / state names (``search_index.query_text``), slim
     rows {kg_code, kg_name, gemeinde_name, district_name, processed}.
-    Replaces the retired ``/api/v1/query?q=`` (Kataster purge 2026-10-13)."""
+    Replaces the retired ``/api/v1/query?q=``."""
     q = (request.args.get('q') or '').strip()
     if not q:
         return jsonify({'total': 0, 'results': []})
@@ -12516,7 +10434,7 @@ def api_kg(kg_code):
     Otherwise returns index data with Zenodo download links."""
     # If full JSON exists locally, serve it directly (backwards-compatible).
     # For split / maybe-split KGs we synthesize a merged JSON-shape view so
-    # callers see complete parcels/buildings/landscape stats instead of the
+    # callers see complete buildings/landscape stats instead of the
     # flat index row that only carries one block's data.
     json_path = Path(f'data/austria_processor/json/{kg_code}.json')
     use_idx = bool(request.args.get('index_only'))
@@ -12834,7 +10752,7 @@ def api_kg_landcover(kg_code):
     cls:[[int]], cover_frac:[[0..1]]}]}``; 404 when the KG has no 2.1
     product yet (``?fallback`` is deliberately absent — use
     ``/heightfield?landcover=1`` for a lon/lat grid).  Data: BEV ALS/DOP
-    (CC BY 4.0, bearbeitet) + Copernicus + cadastre via the v2 segmenter."""
+    (CC BY 4.0, bearbeitet) + Copernicus via the v2 segmenter."""
     try:
         grids = _grid25_for_kg(kg_code)
         grids = [g for g in grids if g.get('landcover')]
@@ -12913,7 +10831,6 @@ def api_kg_heightfield(kg_code):
                 _HEIGHTFIELD_CACHE.pop(next(iter(_HEIGHTFIELD_CACHE)))
             _HEIGHTFIELD_CACHE[ck] = (time.time(), payload)
             return jsonify(payload)
-        # (kg_parcels centroid samples dropped 2026-10-13 — Kataster purge)
         pts = c.execute('SELECT centroid_lon,centroid_lat,centroid_dtm_m FROM kg_buildings '
                          'WHERE kg_code=? AND centroid_dtm_m IS NOT NULL', (kg_code,)).fetchall()
         if len(pts) < 3:
@@ -13038,7 +10955,6 @@ def _get_geometry():
     # Repair invalid input polygons (self-intersections, mis-ordered ring sets
     # where a hole is emitted as the exterior, etc.). Without this a caller can
     # get a confident answer computed on the wrong footprint — see the Jun 2026
-    # cadastre parcel 63334-235 report (0.04 ha vs 17.53 ha, no warning).
     features = _repair_invalid_geometries(features)
 
     # Validate each feature is within Austria
@@ -13222,7 +11138,7 @@ def _get_params():
                 'min_height', 'max_height', 'min_area', 'min_change',
                 'object_types', 'resolution', 'format',
                 'include_ortho', 'include_temporal',
-                'include_copernicus', 'include_cadastre',
+                'include_copernicus',
                 'include_hansen', 'include_infra', 'mark_uncertain', 'color_mode', 'types',
                 'ortho_year', 'min_object_size',
                 'felz_scale', 'rag_threshold', 'groups',
@@ -13470,30 +11386,6 @@ def _try_copernicus_cached(bbox_dict: dict, *, ndvi=True, landcover=True,
         return result if result else None
     except Exception as e:
         log.debug("Copernicus cache read failed: %s", e)
-        return None
-
-
-def _try_cadastre(geom_wgs84, transform, shape) -> np.ndarray | None:
-    """Building mask for the live request path (primary-only UI) from the
-    local bevdirect-serve (``live_cadastre.py``).  umfeld's ``/k`` cadastre
-    routes are gone (404) — there is no remote fallback; ``cadastre.
-    get_building_mask`` is the same bevdirect source behind the legacy
-    signature.  Peers never call this."""
-    try:
-        import live_cadastre as _lc
-        if _is_primary_self_cached() and _lc.available(probe_server=False):
-            return _lc.building_mask(_lc.fetch(geom_wgs84.bounds), transform, shape)
-    except Exception as e:
-        log.warning("live cadastre (bevdirect) failed: %s — trying cadastre.get_building_mask", e)
-    try:
-        import cadastre
-        bbox = geom_wgs84.bounds
-        return cadastre.get_building_mask(bbox, transform, shape)
-    except ImportError:
-        log.info("Cadastre module not available")
-        return None
-    except Exception as e:
-        log.warning("Cadastre fetch failed: %s", e)
         return None
 
 
@@ -13802,7 +11694,6 @@ def _auto_save_share(task_id: str, result: dict, geometry_text: str, params: dic
             'ortho': str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes'),
             'temporal': str(params.get('include_temporal', 'false')).lower() in ('true', '1', 'yes'),
             'copernicus': str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes'),
-            'cadastre': str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes'),
             'source': str(params.get('source', 'bev')),
             'hansen': str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes'),
             'mark_uncertain': str(params.get('mark_uncertain', 'false')).lower() in ('true', '1', 'yes'),
@@ -13824,8 +11715,6 @@ def _auto_save_share(task_id: str, result: dict, geometry_text: str, params: dic
                 state['center'] = [round(sum(lats)/len(lats), 6), round(sum(lngs)/len(lngs), 6)]
                 state['zoom'] = 15
 
-        if public:
-            state.pop('cadastre', None)
         name = custom_name if custom_name and _valid_share_id(custom_name) else f"Auto-save {time.strftime('%Y-%m-%d %H:%M')}"
         payload = {'state': state, 'result': result, 'name': name}
 
@@ -13881,13 +11770,6 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
     include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
     include_temporal = str(params.get('include_temporal', 'false')).lower() in ('true', '1', 'yes')
     include_copernicus = str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes')
-    include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
-    # 'bevdirect' (default; local vtcseamless bevdirect-serve, public BEV
-    # vector tiles — what bev-mode peers use) | 'umfeld' (legacy /k fast
-    # paths; 404 since the Kataster purge, kept for the owner UI only)
-    cadastre_source = str(params.get('cadastre_source', 'bevdirect')).lower()
-    if cadastre_source not in ('bevdirect', 'umfeld'):
-        cadastre_source = 'bevdirect'
     include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
     include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
     mark_uncertain = str(params.get('mark_uncertain', 'false')).lower() in ('true', '1', 'yes')
@@ -13905,7 +11787,6 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
     all_objects = []
     all_stats = None
     all_evaluation = None
-    ctx_meta = None  # live cadastre context provenance (meta.context_layer)
     all_labels = None
     all_transform = None
     all_shape = None
@@ -13994,40 +11875,10 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
               _prog('Loading Copernicus', 'NDVI + landcover + SAR + harmonics')
               copernicus_data = _try_copernicus(geom, sar=True, harmonics=True, year=ti.dataset_to_year(dataset))
 
+          # Building-footprint / vector model context is not part of the
+          # live request path in the public build (products carry it).
           building_footprints = None
           v2_context = None
-          if include_cadastre:
-              _prog('Loading cadastre', 'building footprints')
-              live_ctx = None
-              if cadastre_source == 'bevdirect' and _is_primary_self_cached():
-                  try:
-                      import live_cadastre as _lc
-                      live_ctx = _lc.fetch(geom.bounds)
-                      building_footprints = _lc.building_mask(live_ctx, data['transform'], data['shape'])
-                      ctx_meta = {'source': live_ctx['source'], 'cells': live_ctx['cells'],
-                                  'footprints': len(live_ctx['footprints']), 'parcels': len(live_ctx['parcels'])}
-                  except Exception as _ce:
-                      log.warning('live cadastre context (bevdirect) failed: %s', _ce)
-                      product_warnings.append(f'Context layer (BEV vector tiles) unavailable: {str(_ce)[:120]}')
-                      live_ctx = None
-              elif not params.get('_public'):
-                  building_footprints = _try_cadastre(
-                      geom, data['transform'], data['shape'],
-                  )
-              if seg_model == 'v2' and live_ctx is not None:
-                  # same inputs the processor gives segv2 (parcels + footprints
-                  # from cadastre_data; OSM + INVEKOS fetched by Context itself)
-                  try:
-                      import sys as _sys
-                      _sv2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'segv2')
-                      if _sv2 not in _sys.path:
-                          _sys.path.insert(0, _sv2)
-                      import inference as _v2inf
-                      v2_context = _v2inf.Context(geom_3035.bounds, parcels=live_ctx['parcels'],
-                                                  footprints=live_ctx['footprints'])
-                  except Exception as _ce:
-                      log.warning('segv2 Context from live cadastre failed: %s', _ce)
-                      v2_context = None
 
           hansen_data = None
           if include_hansen:
@@ -14089,7 +11940,7 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
 
         # Populate seg_cache so overlay/gpkg endpoints can reuse results
         seg_cache_key = _seg_cache_key(geom_3035, dataset, include_ortho, include_copernicus,
-                                       include_cadastre, include_hansen, include_infra, mark_uncertain,
+                                       include_hansen, include_infra, mark_uncertain,
                                        product=prod is not None)
         _seg_cache.update({
             "labels": labels, "objects": objects,
@@ -14242,24 +12093,17 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
             "include_ortho": include_ortho,
             "include_temporal": include_temporal,
             "include_copernicus": include_copernicus,
-            "include_cadastre": include_cadastre,
             "include_hansen": include_hansen,
             "include_infra": include_infra,
             "mark_uncertain": mark_uncertain,
-            "context_layer": ctx_meta,
             "processing_time_s": round(time.time() - t0, 2),
             **_rf_model_meta(load=product_meta.get('source') != 'product'),
             **(params.get('_geometry_meta') or {}),
             **product_meta,
         },
     }
-    if params.get('_public'):
-        for k in ('include_cadastre',):
-            resp['meta'].pop(k, None)
     if product_warnings:
         resp.setdefault('warnings', []).extend(product_warnings)
-    if all_evaluation and not params.get('_public'):
-        resp["cadastre_evaluation"] = all_evaluation
     if hansen_evaluation:
         resp["hansen_evaluation"] = hansen_evaluation
     if include_copernicus and copernicus_missing and _is_processor_running():
@@ -14271,12 +12115,12 @@ def _segment_core(task_id: str, features: list, params: dict) -> dict:
 
 # === SECTION: /api/v1/segment/overlay + raster rendering ===
 
-def _seg_cache_key(geom_3035, dataset, include_ortho, include_copernicus, include_cadastre,
+def _seg_cache_key(geom_3035, dataset, include_ortho, include_copernicus,
                    include_hansen, include_infra, mark_uncertain, product=False) -> str:
     """Key shared by ``_segment_core`` and ``/segment/overlay`` (+ exports via the
     ``{bounds}_{dataset}`` prefix scan).  Product-backed results get their own
     suffix so a live render never reuses frozen labels and vice versa."""
-    k = (f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}_{include_cadastre}"
+    k = (f"{geom_3035.bounds}_{dataset}_{include_ortho}_{include_copernicus}"
          f"_{include_hansen}_{include_infra}_{mark_uncertain}_temporal")
     return k + '_product' if product else k
 
@@ -14652,7 +12496,6 @@ def segment_overlay():
         dataset = params.get('dataset', ti.DEFAULT_DATASET)
         include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
         include_copernicus = str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes')
-        include_cadastre = str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes')
         include_hansen = str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes')
         include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
         mark_uncertain = str(params.get('mark_uncertain', 'false')).lower() in ('true', '1', 'yes')
@@ -14683,7 +12526,7 @@ def segment_overlay():
         _validate_area(geom_3035)
 
         # Build a cache key from geometry bounds + dataset + analysis options
-        cache_key = _seg_cache_key(geom_3035, dataset, include_ortho, include_copernicus, include_cadastre,
+        cache_key = _seg_cache_key(geom_3035, dataset, include_ortho, include_copernicus,
                                    include_hansen, include_infra, mark_uncertain)
         source = str(params.get('source', 'bev')).lower()
         if source not in ('bev', 'auto', 'product'):
@@ -14829,8 +12672,6 @@ def segment_overlay():
             copernicus_data = _try_copernicus(geom, sar=True, harmonics=True, year=ti.dataset_to_year(dataset))
 
         building_footprints = None
-        if include_cadastre:
-            building_footprints = _try_cadastre(geom, data['transform'], data['shape'])
 
         hansen_data = None
         if include_hansen:
@@ -16280,7 +14121,6 @@ def _changes_trees_core(task_id, features, params):
     crown_geometry = str(params.get('crown_geometry', 'point')).lower()
     min_tree_height = float(params.get('min_tree_height', 3.0))
     reject_nonforest = str(params.get('reject_nonforest', 'true')).lower() in ('true', '1', 'yes')
-    include_cadastre = str(params.get('include_cadastre', 'true')).lower() in ('true', '1', 'yes')
     min_tree_likelihood = float(params.get('min_tree_likelihood', tv.MIN_TREE_LIKELIHOOD))
 
     geom_3035 = _tree_geom_prepare(features)
@@ -16298,16 +14138,7 @@ def _changes_trees_core(task_id, features, params):
     if reject_nonforest and tree_changes:
         _progress_set(task_id, 'surface', 'Checking surfaces (buildings/crops)…')
         bmask_a = bmask_b = None
-        if include_cadastre:
-            # cadastre is a single current snapshot; the same mask applies to
-            # both epochs (grids are co-registered by raster_io)
-            bmask_b, bm_meta = _tree_v2_building_mask(rasters['data_b'], task_id)
-            bmask_a = (bmask_b if (bmask_b is not None
-                                   and bmask_b.shape == rasters['ndsm_a'].shape)
-                       else None)
-            surf_meta.update(bm_meta)
-        else:
-            surf_meta['building_mask'] = 'skipped (include_cadastre=false)'
+        surf_meta['building_mask'] = 'unavailable'
         vb = tv.surface_filter_labels(
             rasters['labels_b'], rasters['ndsm_b'], rasters['transform_b'],
             {tc.label_b for tc in tree_changes if tc.label_b},
@@ -16389,7 +14220,6 @@ def _trees_core(task_id, features, params):
     crown_min_area = int(params.get('crown_min_area', 4))
     include_ortho = str(params.get('include_ortho', 'true')).lower() in ('true', '1', 'yes')
     reject_nonforest = str(params.get('reject_nonforest', 'true')).lower() in ('true', '1', 'yes')
-    include_cadastre = str(params.get('include_cadastre', 'true')).lower() in ('true', '1', 'yes')
     min_tree_likelihood = float(params.get('min_tree_likelihood', tv.MIN_TREE_LIKELIHOOD))
 
     geom_3035 = _tree_geom_prepare(features)
@@ -16422,17 +14252,13 @@ def _trees_core(task_id, features, params):
     # v2.3 non-forest suppression, shared with /api/v2/trees. The v1
     # detector has its own building pixel class, but it is geometry+spectral
     # only and demonstrably leaks: on a Waldviertel farmyard AOI it reported
-    # 175 "trees", 85 of them sitting on cadastre building footprints.
+    # 175 "trees", 85 of them sitting on building footprints.
     # Running the same evidence engine here means both API versions get the
-    # cadastre-authoritative verdict instead of two different qualities.
+    # same verdict instead of two different qualities.
     surf_meta = {'nonforest_rejection': reject_nonforest}
     if reject_nonforest and trees:
         bmask = None
-        if include_cadastre:
-            bmask, bm_meta = _tree_v2_building_mask(data, task_id)
-            surf_meta.update(bm_meta)
-        else:
-            surf_meta['building_mask'] = 'skipped (include_cadastre=false)'
+        surf_meta['building_mask'] = 'unavailable'
         _progress_set(task_id, 'surface', 'Checking surfaces (buildings/crops)…')
         verdicts = tv.surface_filter_labels(
             labels, data['ndsm'], data['transform'],
@@ -16649,8 +14475,6 @@ def _tree_v2_params(params):
         # v2.3: non-forest suppression (buildings / crops / hard surfaces)
         'reject_nonforest': str(params.get('reject_nonforest', 'true')).lower()
                             in ('true', '1', 'yes'),
-        'include_cadastre': str(params.get('include_cadastre', 'true')).lower()
-                            in ('true', '1', 'yes'),
         'min_tree_likelihood': float(params.get('min_tree_likelihood',
                                                 tv.MIN_TREE_LIKELIHOOD)),
     }
@@ -16746,33 +14570,6 @@ def _tree_v2_det_meta(det_meta, nir_used):
     out['nir_used_for'] = used_for
     return out
 
-def _tree_v2_building_mask(data, task_id):
-    """Cadastre building footprints rasterised on the ALS grid (v2.3).
-
-    Authoritative non-tree evidence: BEV cadastre outlines. Dilated inside
-    ``tree_inventory.classify_surfaces`` (wall line vs. eaves). Returns
-    (mask, meta) — mask is None when the cadastre is unavailable, and the
-    inventory then falls back to spectral + geometric gates only.
-    """
-    try:
-        import pyproj
-        tf = data['transform']; h, w = data['shape']; res = abs(tf.a)
-        min_e, max_n = tf.c, tf.f
-        max_e, min_n = min_e + w * res, max_n - h * res
-        tx = pyproj.Transformer.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
-        lon_min, lat_min = tx.transform(min_e, min_n)
-        lon_max, lat_max = tx.transform(max_e, max_n)
-        _progress_set(task_id, 'cadastre', 'Reading cadastre building footprints…')
-        import cadastre
-        m = cadastre.get_building_mask((lon_min, lat_min, lon_max, lat_max),
-                                       tf, (h, w))
-        if m is None:
-            return None, {'building_mask': 'unavailable'}
-        return m, {'building_mask': 'cadastre',
-                   'building_mask_px': int(m.sum())}
-    except Exception as e:
-        log.warning("trees v2: cadastre building mask unavailable (%s)", e)
-        return None, {'building_mask': f'error: {e}'}
 
 
 def _tree_v2_inventory(data, eff, include_ortho, task_id):
@@ -16809,13 +14606,9 @@ def _tree_v2_inventory(data, eff, include_ortho, task_id):
     elif want_fused and not include_ortho:
         det_meta['detection_fallback_reason'] = 'include_ortho=false'
 
-    # v2.3: cadastre building footprints (authoritative non-tree evidence)
     building_mask = None
-    if eff.get('reject_nonforest', True) and eff.get('include_cadastre', True):
-        building_mask, bm_meta = _tree_v2_building_mask(data, task_id)
-        det_meta.update(bm_meta)
-    elif eff.get('reject_nonforest', True):
-        det_meta['building_mask'] = 'skipped (include_cadastre=false)'
+    if eff.get('reject_nonforest', True):
+        det_meta['building_mask'] = 'unavailable'
 
     _progress_set(task_id, 'trees', 'Detecting tree apices + crowns…')
     det_info = {}
@@ -17832,7 +15625,7 @@ def _tree_v3_meta(eff, meta, t0):
         'product_version': v21_products.PRODUCT_VERSION,
         'product_versions_readable': list(v21_products.READABLE_MANIFEST_VERSIONS),
         'detection_mode': eff.get('detection_mode', 'ndsm_only'),
-        'algorithm': 'product tree_apices (ndsm_only marker watershed, cadastre '
+        'algorithm': 'product tree_apices (ndsm_only marker watershed, footprint '
                      'building mask, 2.2: per-crown ortho RGBI spectra + crown outlines) + '
                      'landcover.grid25 denominators (2.2: area-weighted canopy_frac); live v2 '
                      'fallback for uncovered parts; detection_mode=fused = whole-AOI live '
@@ -18767,173 +16560,6 @@ def ortho_geotiff():
 
 # === SECTION: RF classifier training endpoints ===
 
-@app.route('/api/v1/classifier/train', methods=['POST'])
-def train_classifier():
-    """Retired (410, 2026-10-30). Online RF training keyed on cadastre parcel
-    land-use codes needs umfeld's parcel-keyed routes (``/export/geojson``,
-    ``/spatial/parcels``), which are gone (404) — and
-    ``cadastre.fetch_parcel_land_use`` no longer exists.  Training lives in
-    the offline ``train_rf_4000kg.py`` job (``docs/rf-training.md``)."""
-    return jsonify({'error': 'retired',
-                    'detail': 'online classifier training (parcel-keyed) is gone; '
-                              'see docs/rf-training.md / train_rf_4000kg.py'}), 410
-
-
-def _train_classifier_retired_body():  # pragma: no cover — kept for reference only
-    """Train RF classifier from cadastre ground truth over a bbox.
-
-    Params: geometry (bbox/geojson), dataset, include_ortho, include_copernicus,
-            include_temporal, include_hansen.
-    Fetches segment features + cadastre parcel codes, trains RF model.
-    All data sources (ortho, copernicus, hansen, temporal) are included by
-    default so the RF sees the same features it will use at inference time.
-    """
-    try:
-        import learned_classifier as lc
-        import object_segmentation as oc
-        import cadastre
-
-        params = _get_params()
-        features = _get_geometry()
-        geom = features[0]['geometry']
-        if len(features) > 1:
-            from shapely.ops import unary_union as _uu
-            geom = _uu([f['geometry'] for f in features]).convex_hull
-        geom_3035 = ti.geometry_to_3035(geom)
-        dataset = params.get('dataset', ti.DEFAULT_DATASET)
-        obs_year = ti.dataset_to_year(dataset)
-
-        include_temporal = str(params.get('include_temporal', 'true')).lower() in ('true', '1', 'yes')
-        include_hansen = str(params.get('include_hansen', 'true')).lower() in ('true', '1', 'yes')
-
-        # Read LIDAR
-        data = raster_io.read_dtm_dsm(geom_3035, dataset)
-
-        # Multi-temporal DTM/DSM
-        dtm_dates, dsm_dates = None, None
-        if include_temporal:
-            try:
-                multi = raster_io.read_multi_date_ndsm(geom_3035)
-                dtm_dates, dsm_dates = {}, {}
-                for d in multi['dates_loaded']:
-                    try:
-                        dd = raster_io.read_dtm_dsm(geom_3035, dataset=d)
-                        mh = min(dd['shape'][0], data['shape'][0])
-                        mw = min(dd['shape'][1], data['shape'][1])
-                        dtm_dates[d] = dd['dtm'][:mh, :mw]
-                        dsm_dates[d] = dd['dsm'][:mh, :mw]
-                    except Exception as e:
-                        log.warning("Train: date %s load failed: %s", d, e)
-            except Exception as e:
-                log.warning("Train: multi-temporal failed: %s", e)
-
-        # Read ortho
-        rgb, spectral = _try_read_ortho(data)
-
-        # Copernicus (NDVI, land cover, SAR, harmonics)
-        copernicus_data = None
-        if not _is_processor_running():
-            copernicus_data = _try_copernicus(geom, sar=True, harmonics=True, year=ti.dataset_to_year(dataset))
-
-        # Hansen forest prior
-        hansen_data = None
-        if include_hansen:
-            hansen_data = _try_hansen(geom, data['transform'], data['shape'])
-
-        # Building footprints from cadastre (for calibration features)
-        building_footprints = _try_cadastre(geom, data['transform'], data['shape'])
-
-        # Infrastructure lookup
-        _il3 = None
-        include_infra = str(params.get('include_infra', 'true')).lower() in ('true', '1', 'yes')
-        if include_infra:
-            try:
-                from infrastructure_lookup import InfrastructureLookup
-                from pyproj import Transformer as _Tx4
-                _tx4 = _Tx4.from_crs('EPSG:3035', 'EPSG:4326', always_xy=True)
-                _b3 = geom.bounds
-                _w43, _s43 = _tx4.transform(_b3[0], _b3[1])
-                _e43, _n43 = _tx4.transform(_b3[2], _b3[3])
-                _il3 = InfrastructureLookup.for_bbox(_w43, _s43, _e43, _n43)
-            except Exception:
-                pass
-
-        # Segment (feature extraction) — pass ALL data sources
-        result = oc.segment_and_classify(
-            data['dtm'], data['dsm'], data['mask'], data['transform'],
-            dtm_dates=dtm_dates,
-            dsm_dates=dsm_dates,
-            spectral=spectral,
-            copernicus=copernicus_data,
-            building_footprints=building_footprints,
-            hansen=hansen_data,
-            ortho_year=obs_year,
-            observation_year=obs_year,
-            infra_lookup=_il3,
-        )
-        objects = result['objects']
-        labels_arr = result['labels']
-
-        # Hansen tree-loss calibration
-        if include_hansen and hansen_data:
-            try:
-                objects = hansen.calibrate_tree_loss(
-                    objects, labels_arr, hansen_data,
-                    observation_year=obs_year,
-                )
-            except Exception as e:
-                log.warning("Train: Hansen calibration failed: %s", e)
-
-        features = [obj.features for obj in objects]
-
-        # Fetch cadastre parcel codes
-        bbox_wgs = geom.bounds
-        try:
-            parcels = cadastre.fetch_parcel_land_use(
-                (bbox_wgs[0], bbox_wgs[1], bbox_wgs[2], bbox_wgs[3]))
-        except Exception:
-            parcels = None
-
-        if parcels is None:
-            return _error("Could not fetch cadastre parcel codes")
-
-        # Match segments to cadastre labels
-        train_features = []
-        train_labels = []
-        for feat in features:
-            code = _dominant_cadastre_code(feat, parcels)
-            if code and code in lc.CADASTRE_TO_TYPE:
-                train_features.append(feat)
-                train_labels.append(lc.CADASTRE_TO_TYPE[code])
-
-        if len(train_features) < 20:
-            return _error(f"Only {len(train_features)} labelled segments, need >= 20")
-
-        clf = lc.LearnedClassifier()
-        stats = clf.train(train_features, train_labels)
-
-        # Clear cached raster data to reclaim memory
-        _clear_raster_caches()
-
-        return jsonify({
-            "status": "trained",
-            "training_stats": stats,
-            "n_segments_total": len(features),
-            "n_segments_labelled": len(train_features),
-            "dataset": dataset,
-            "observation_year": obs_year,
-            "data_sources": {
-                "temporal": dtm_dates is not None and len(dtm_dates) >= 2,
-                "ortho": spectral is not None,
-                "copernicus": copernicus_data is not None,
-                "hansen": hansen_data is not None,
-                "building_footprints": building_footprints is not None,
-            },
-        })
-
-    except Exception as e:
-        log.error("classifier train: %s", traceback.format_exc())
-        return _error(str(e))
 
 
 @app.route('/api/v1/classifier/status', methods=['GET'])
@@ -18965,28 +16591,6 @@ def classifier_status():
         })
     except Exception as e:
         return _error(str(e))
-
-
-def _dominant_cadastre_code(feat, parcels):
-    """Find the most common cadastre code overlapping a segment."""
-    # parcels is expected to be a list of {geometry, code} or similar
-    # For now, find parcels whose centroid falls within segment bbox
-    ce = feat.get("centroid_e", 0)
-    cn = feat.get("centroid_n", 0)
-    if not parcels:
-        return None
-    # Simple: find nearest parcel
-    best = None
-    best_dist = float('inf')
-    for p in parcels:
-        pc = p.get("centroid")
-        code = p.get("code")
-        if pc and code:
-            d = ((pc[0] - ce)**2 + (pc[1] - cn)**2)**0.5
-            if d < best_dist:
-                best_dist = d
-                best = code
-    return best
 
 
 # === SECTION: /api/v1/docs + share endpoints ===
@@ -19028,7 +16632,7 @@ def info():
     return jsonify({
         "name": "Austrian LIDAR & Orthophoto Analysis API",
         "version": "3.0.0",
-        "description": "Landscape transformation analysis: LIDAR DTM/DSM time series + Sentinel-2 + cadastre",
+        "description": "Landscape transformation analysis: LIDAR DTM/DSM time series + Sentinel-2",
         "classifier": "landscape_v2 — 10 types focused on human transformation of terrain",
         "source": "data.bev.gv.at",
         "resolution_lidar": "1m",
@@ -19041,7 +16645,7 @@ def info():
                                  "only cover parts of Austria per year)."),
         "tiles": len(ti.TILE_COORDS),
         "git_commit": getattr(__import__('peer_director'), '_LOCAL_GIT_COMMIT', ''),
-        # Runtime deps beyond requirements.txt (installed by _ensure_v2_deps):
+        # Runtime deps beyond the core (lightgbm / h3 — see requirements.txt):
         # lets the operator confirm a peer can build segv2 / v2.4 NE cells
         # without shell access.
         "deps": {m: __import__('importlib.util').util.find_spec(m) is not None
@@ -19053,7 +16657,6 @@ def info():
             "copernicus_sentinel2": "10m NDVI growing-season composite (via openEO)",
             "copernicus_worldcover": "10m ESA land cover classification",
             "copernicus_sentinel1_sar": "SAR backscatter (VV+VH)",
-            "cadastre_footprints": "mm-precision building polygons (ground truth)",
         },
         "change_event_types": tca.EVENT_TYPES,
         # Licence + attribution obligations for every source we redistribute
@@ -19264,7 +16867,6 @@ def onestop():
       include_ortho=true                     Include orthophoto (default: true)
       include_temporal=false                 Include temporal analysis
       include_copernicus=false               Include Sentinel-2/SAR
-      include_cadastre=false                 Include cadastre
       include_hansen=false                   Include Hansen forest change
       include_infra=true                     Include infrastructure spatial match
       types=tree,road                        Object type filter
@@ -19322,7 +16924,7 @@ def onestop():
         # Build params
         params = {}
         for key in ('dataset', 'min_object_size', 'include_ortho', 'include_temporal',
-                    'include_copernicus', 'include_cadastre', 'include_hansen', 'include_infra',
+                    'include_copernicus', 'include_hansen', 'include_infra',
                     'types', 'groups', 'felz_scale', 'rag_threshold',
                     'height_min', 'height_max', 'height_op',
                     'top_n_classes', 'top_n_objects', 'min_height_m'):
@@ -19405,8 +17007,6 @@ def _estimate_time(geom_3035, params: dict) -> int:
         base += 15 + area_ha * 0.4
     if str(params.get('include_copernicus', 'false')).lower() in ('true', '1', 'yes'):
         base += 20
-    if str(params.get('include_cadastre', 'false')).lower() in ('true', '1', 'yes'):
-        base += 5
     if str(params.get('include_hansen', 'false')).lower() in ('true', '1', 'yes'):
         base += 10
     return int(base)
@@ -20063,7 +17663,6 @@ def api_flags_rebuild():
 
 def _feedback_user(req):
     """Resolve user from header/body. Anonymous fallback."""
-    tok = req.headers.get('X-Feedback-Token') or (req.get_json(silent=True) or {}).get('token')
     user_id = (req.get_json(silent=True) or {}).get('user') or req.args.get('user') or 'anon'
     role = 'student'
     # Trivial role mapping; tighten later via data/feedback_users.json if needed
@@ -20294,7 +17893,7 @@ def _share_page() -> str:
 def _share_dir(public: bool | None = None) -> Path:
     """Share store for this request: public-tier relays (``X-Srtm-Public``)
     get their own namespace so the tokenless UI can neither list nor load the
-    owner's shares (which may carry cadastre evaluations), and vice versa.
+    owner's shares, and vice versa.
     Async workers pass ``params['_public']`` explicitly."""
     if public is None:
         public = _public_request()
@@ -20826,7 +18425,7 @@ _PTXT_GROUPS = (
                   'chkpt_registry:', 'zen_cache:', 'hansen_cover:', 'cache_reconcile:',
                   'priority queue', 'recent failures')),
     ('upstreams', ('warn_top', 'zenodo_circuit:', 'zenodo_uploads:',
-                   'zenodo_lock:', 'zenodo_fetch:', 'openeo:', 'cadastre:',
+                   'zenodo_lock:', 'zenodo_fetch:', 'openeo:',
                    'bev_pause', 'ip_pools', 'copernicus credentials',
                    'fleet_proxy:')),
     ('fleet', ('fleet_cpu:', 'fleet_pools:', 'fleet_load:', 'fleet_bw:',
@@ -21298,7 +18897,7 @@ def process_txt():
             '(default: noise hidden, msgs capped at 220 chars, consecutive '
             'duplicates collapsed as \xd7N)\n'
             'sweep=N    sliver-sweep drill-down: one row per swept parent '
-            '(done -> umfeld confirmed/posted/queued, unswept/held units + '
+            '(done -> confirmed/posted/queued, unswept/held units + '
             'the openEO cells they wait for); implies roster=0&log=0\n'
             'greenfix=N green-fix override drill-down: fixed/confirmed/queued '
             'parents, budget, oldest unconfirmed rows; implies roster=0&log=0\n'
@@ -21359,7 +18958,7 @@ def process_txt():
         hours_back = 24.0
     # Focus views (token-cheap subsystem drill-downs, docs/sliver-sweep.md /
     # docs/ne-public-api.md → Green-ground override):
-    #   sweep=N    per-parent sliver-sweep rows (done → umfeld round-trip,
+    #   sweep=N    per-parent sliver-sweep rows (done → contrib round-trip,
     #              held/failed units + the cells they wait for); N rows
     #   greenfix=N green-fix override: fixed/confirmed/queued parents + rows
     # Either implies roster=0 and log=0 unless given explicitly.
@@ -21542,19 +19141,6 @@ def process_txt():
             _line += (f' UNREACHABLE since {_ep["unreachable_since"]} '
                       f'consec_fail={_ep.get("consecutive_fail", 0)}')
         out.append(_line)
-    try:
-        import director_ha as _dha_ha
-        _fl = _dha_ha.flap_count()
-        if _fl:
-            _lock = _dha_ha.flap_lockout_remaining_s()
-            out.append(f'ha:       takeovers_6h={_fl}'
-                       + (f' FLAP-LOCKOUT {_hms(int(_lock))} left' if _lock > 0 else '')
-                       + (' (dampened: miss threshold ×3)'
-                          if _fl >= _dha_ha.FLAP_MAX_TAKEOVERS else ''))
-            if _fl >= _dha_ha.FLAP_MAX_TAKEOVERS:
-                _health['ha_flapping'] = _fl
-    except Exception:
-        pass
 
     # --- Cache conveyor (frontier → cache-only pipeline) ---------
     # cache_ready=0 with many eligible peers idle = frontier-starved
@@ -22350,48 +19936,6 @@ def process_txt():
     except Exception:
         log.exception('process.txt fleet_proxy line failed')
 
-    # secrets: provider-secret lease convergence (fleet_secrets.py). A peer
-    # whose reported token sha matches the primary's store runs on the
-    # leased value; a mismatch means a stale legacy disk copy / old code.
-    try:
-        import fleet_secrets as _fsec
-        if _pt.is_primary_role() and _fsec.store_rev():
-            import hashlib as _hl
-            _sv = _fsec._load_store()
-            _want = {k: _hl.sha256(_sv[k].encode()).hexdigest()[:16]
-                     for k in ('github', 'umfeld') if _sv.get(k)}
-            _ls = _fsec.leases()
-            _rev = _fsec.store_rev()
-            _at_rev = sum(1 for v in _ls.values() if int((v or {}).get('rev') or 0) == _rev)
-            _ok = {k: 0 for k in _want}
-            _bad: dict = {}
-            _n = 0
-            for _pc in (pd.load_peers_config().get('peers') or []):
-                _pid = _pc.get('id')
-                _ps = pd.get_pushed_status(_pid) if _pid else None
-                if not _ps:
-                    continue
-                _st = _ps.get('status') or {}
-                _n += 1
-                for k, _key in (('github', 'git_token_sha'), ('umfeld', 'umfeld_token_sha')):
-                    if k not in _want:
-                        continue
-                    if _st.get(_key) == _want[k]:
-                        _ok[k] += 1
-                    elif _key in _st:
-                        _bad.setdefault(k, []).append(_pid)
-            _deny = sorted(_fsec.denied())
-            _bad_s = ''.join(f' {k}_stale={",".join(sorted(v)[:8])}{"…" if len(v) > 8 else ""}'
-                             for k, v in _bad.items())
-            out.append(
-                f'secrets:  rev={_rev} leases_at_rev={_at_rev}/{len(_ls)}'
-                + ''.join(f' {k}_sha_ok={_ok[k]}/{_n}' for k in _ok)
-                + f' denied={len(_deny)}{_bad_s}'
-                + f' legacy_file={"yes" if (_fsec.LEGACY_FILES["github"].exists() or _fsec.LEGACY_FILES["umfeld"].exists()) else "no"}'
-            )
-    except Exception:
-        log.exception('process.txt secrets line failed')
-
     # zenodo_lock line: the :8001 broker's lease table (kg_upload pool +
     # cache-class leases). Since 340f616 kg_upload leases are tracked but
     # unbounded by default (shared_slots=None); a long-idle lease here
@@ -22423,49 +19967,7 @@ def process_txt():
             f'{_cache_s}'
         )
     except Exception:
-        out.append('zenodo_lock: broker unreachable (:8001)')
-
-    # cadastre line: upstream health of the cadastre API in the last 1h,
-    # mined from the merged log (326fd60 / 19144bc — 202 warming +
-    # 5xx/timeout backoff). Only rendered when there is something to say.
-    try:
-        _cad = _health.get('cadastre_counts')
-        if _cad is None and _COMBINED_LOG_PATH.exists():
-            _cad = {'202': 0, 'transient': 0, 'peers': set()}
-            _c_since = (datetime.now(timezone.utc)
-                        - timedelta(hours=1)).isoformat()
-            with open(_COMBINED_LOG_PATH, 'r', encoding='utf-8') as fh:
-                fh.seek(0, 2)
-                _sz = fh.tell()
-                fh.seek(max(0, _sz - 512 * 1024))
-                for line in fh.read().split('\n'):
-                    if 'cadastre ' not in line or '"ts": "' not in line:
-                        continue
-                    try:
-                        e = json.loads(line)
-                    except Exception:
-                        continue
-                    if (e.get('ts') or '') < _c_since:
-                        continue
-                    m = e.get('msg') or ''
-                    if 'pending (202)' in m:
-                        _cad['202'] += 1
-                        _cad['peers'].add(e.get('peer'))
-                    elif 'cadastre' in m and 'transient (' in m:
-                        _cad['transient'] += 1
-                        _cad['peers'].add(e.get('peer'))
-        if _cad and (_cad['202'] or _cad['transient']):
-            _verdict = ('DEGRADED' if _cad['transient'] >= 10
-                        else 'warming' if _cad['202'] else 'flaky')
-            out.append(
-                f'cadastre: {_verdict} · 1h: 202_pending={_cad["202"]} '
-                f'transient_5xx_timeout={_cad["transient"]} '
-                f'peers={len(_cad["peers"])} · debug: ?q=cadastre'
-            )
-            if _cad['transient'] >= 10:
-                _health['cadastre_degraded'] = _cad['transient']
-    except Exception:
-        log.exception('process.txt cadastre line failed')
+        out.append(f'zenodo_lock: broker unreachable (:{_config.APP_PORT + 1})')
 
     # zenodo_fetch line: in-flight product downloads (both workers) +
     # recent-hour throughput / ZENODO-SLOW verdict. Structured twin at
@@ -22494,7 +19996,7 @@ def process_txt():
                          f" fast_running={_fg.get('running', 0)}/{_fg.get('max')}"
                          f" (+{_fg.get('new', 0)} new)")
             if _dsp.get('ne_wait'):
-                _v2l += f" · ne_wait={_dsp.get('ne_wait')} (umfeld built={_dsp.get('ne_built')})"
+                _v2l += f" · ne_wait={_dsp.get('ne_wait')} (built={_dsp.get('ne_built')})"
             _pri = _dsp.get('priority') or []
             if _pri:
                 _v2l += (f" · priority_pinned={len(_pri)}"
@@ -22505,7 +20007,7 @@ def process_txt():
                 _v2l += (f" · strikes_fleet={_fs.get('codes')}codes"
                          f" struck_out={_fs.get('struck_out')} peers={_fs.get('peers')}")
         out.append(_v2l)
-        # v2.4 rollout: legacy (cadastre-shaped files) audit + NE cells lines
+        # v2.4 rollout: legacy-file audit + NE cells lines
         # + primary h3b ingest (docs/v2.4-rollout.md, docs/ne-primary-api.md).
         try:
             import ne_rollout as _ner
@@ -22524,7 +20026,7 @@ def process_txt():
             out.append(_aly.text_line())
         except Exception as _e:  # noqa: BLE001
             log.debug('process.txt als_years line: %s', _e)
-        # Sliver sweep (docs/sliver-sweep.md): umfeld bbox revision 2 strips
+        # Sliver sweep (docs/sliver-sweep.md): bbox revision 2 strips
         # → scan / dispatch / integrate / re-post progress + sweep peers.
         try:
             import sliver_sweep as _sls
@@ -22542,7 +20044,7 @@ def process_txt():
             except Exception as _e:  # noqa: BLE001
                 out.append(f'green_fix detail: unavailable ({_e})')
         # VTC pilot (docs/vct-pilot.md): which peers, bevdirect bandwidth,
-        # agreement vs umfeld, /contrib report outcomes, obs round-trip and
+        # agreement vs declared, /contrib report outcomes, obs round-trip and
         # split-parent assembly for every pilot KG.
         try:
             import vct_fleet as _vf
@@ -23847,10 +21349,6 @@ def process_txt():
             _pn = _health['primary_net']
             _flags.append(
                 f'PRIMARY-NET-HIGH({_pn["out"]:.0f}+{_pn["in"]:.0f}MB/h)')
-        if _health.get('cadastre_degraded'):
-            _flags.append(
-                f'CADASTRE-DEGRADED({_health["cadastre_degraded"]} '
-                f'transient/1h)')
         if _health.get('hansen_gaps'):
             _flags.append(_health['hansen_gaps'])
         kgf = _health.get('kg_fail')
@@ -23901,36 +21399,13 @@ def process_txt():
 
 @app.route('/process.html')
 def process_html():
-    """Serve the processor dashboard with the admin token pre-injected.
-
-    The dashboard exercises every cluster admin endpoint (queue add/delete,
-    tombstones, bbox add, reshuffle, peers add/update, throttle, ...).  We
-    inject the current admin token as an inline script before the page's own
-    fetch interceptor so all those calls succeed without prompting the
-    operator. Anyone who can load /process.html therefore obtains the token;
-    that's by design — the dashboard is the admin UI.
-    """
-    try:
-        html = (Path('static') / 'process.html').read_text(encoding='utf-8')
-    except Exception as e:
-        return _error(f'process.html missing: {e}', 500)
-    tok = _current_admin_token() or ''
-    # JSON-encode so quotes/backslashes survive embedding.
-    inject = (
-        '<script>(function(){try{'
-        f'var t={json.dumps(tok)};'
-        'if(t){localStorage.setItem("srtm_admin_token",t);}'
-        '}catch(e){}})();</script>\n'
-    )
-    # Insert right after <head> so it runs before the existing interceptor.
-    lower = html.lower()
-    idx = lower.find('<head>')
-    if idx >= 0:
-        cut = idx + len('<head>')
-        html = html[:cut] + '\n' + inject + html[cut:]
-    else:
-        html = inject + html
-    return Response(html, mimetype='text/html; charset=utf-8')
+    """Processor / director dashboard.  Served from the operator tier only
+    (loopback by default — ssh-tunnel to ``config.APP_PORT`` or set
+    ``SRTM_APP_BIND``); the mutating calls it makes are gated by
+    ``_enforce_operator_gate``.  The public tier never relays it."""
+    if _public_request():
+        return jsonify({'error': 'not_found'}), 404
+    return app.send_static_file('process.html')
 
 
 @app.route('/')
