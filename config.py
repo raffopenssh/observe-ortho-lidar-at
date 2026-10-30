@@ -151,6 +151,12 @@ def uploads_enabled() -> bool:
 # Where products land when uploads are disabled / dry-run.
 OUT_DIR = Path(env("SRTM_OUT_DIR") or (ROOT / "out"))
 
+# Per-instance scratch state shared between gunicorn workers (async task
+# progress / results, heavy-request slots, locks).  Scoped by uid and port so
+# two instances on one host never see each other's files.
+RUNTIME_DIR = Path(env("SRTM_RUNTIME_DIR")
+                   or f"/tmp/srtm-lidar-{os.getuid()}-{APP_PORT}")
+
 # --- Copernicus / openEO credentials ----------------------------------------
 # Path to a JSON list of credential entries.  Default lives outside the repo.
 COPERNICUS_CREDENTIALS_FILE = Path(

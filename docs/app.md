@@ -33,8 +33,8 @@ need no secret at all: `curl localhost:8000/...`.
 ## Async tasks
 
 `/api/v1/segment`, `/onestop`, `/export/geopackage|mbtiles` return a
-`task_id` immediately; progress lives in `/tmp/segment_progress/<id>.json`
-and results in `/tmp/segment_results/<id>.json.gz` (gzip, 4 h TTL),
+`task_id` immediately; progress lives in `$SRTM_RUNTIME_DIR/segment_progress/<id>.json` (default `/tmp/srtm-lidar-<uid>-<port>/`)
+and results in `…/segment_results/<id>.json.gz` (gzip, 4 h TTL),
 polled via `/segment/progress?task_id=` / `/segment/result?task_id=`,
 aborted via `/segment/abort`. Every finished segmentation is also saved
 as the auto-share `auto-<task8>` (`/api/v1/share/<id>`). At most

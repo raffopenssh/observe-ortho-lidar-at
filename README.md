@@ -88,6 +88,7 @@ products are labelled partial). Register at
 | `SRTM_DATA_DIR` | `./data` | corpus, caches, state |
 | `SRTM_SECRETS_DIR` | `~/.config/srtm-lidar` | `zenodo_token`, `operator_token`, `copernicus_credentials.json` |
 | `SRTM_OUT_DIR` | `./out` | products when uploads are disabled |
+| `SRTM_RUNTIME_DIR` | `/tmp/srtm-lidar-<uid>-<port>` | per-instance scratch state (async task progress/results, request slots, locks) |
 | `SRTM_PRIMARY_URL`, `SRTM_PEERS`, `SRTM_PEER_ID` | empty | multi-machine mode (`docs/peer-director.md`); empty = single machine |
 | `SRTM_OPERATOR_TOKEN` | empty | `X-Operator-Token` for mutating routes from non-loopback clients |
 | `ZENODO_TOKEN` | empty | enables uploads; empty → products to `SRTM_OUT_DIR` |

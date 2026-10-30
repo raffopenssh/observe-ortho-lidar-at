@@ -308,7 +308,7 @@ def _public_request() -> bool:
 # files are shared by every gunicorn worker: sync heavy relays take one for the
 # request (503 after a short wait), async public workers hold one for the build.
 PUBLIC_MAX_HEAVY = max(1, int(os.environ.get('PUBLIC_MAX_HEAVY', '2')))
-_PUBLIC_SLOT_DIR = Path('/tmp/srtm_public_slots')
+_PUBLIC_SLOT_DIR = _config.RUNTIME_DIR / 'public_slots'
 _PUBLIC_HEAVY_RE = re.compile(
     r'^/api/v1/(segment|elevation|terrain|segment/overlay|(dtm|lidar|ortho|cir|hansen)/overlay'
     r'|export/(geopackage|kml|mbtiles)|share/[A-Za-z0-9_\-]+/download\.gpkg)$')
@@ -715,7 +715,8 @@ def credentials_validate():
 
 
 
-_INDEX_WATCH_LOCK_PATH = '/tmp/srtm_index_watch.lock'
+_config.RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+_INDEX_WATCH_LOCK_PATH = str(_config.RUNTIME_DIR / 'index_watch.lock')
 
 
 def _init_search_index():
@@ -1515,17 +1516,17 @@ def _sync_peer_data():
                         continue
 
                     # Construct download URL – prefer explicit link, then draft API, then bucket
-                    from zenodo_client import auth_headers as _zc_auth
+                    from zenodo_client import auth_headers as _zc_auth, is_zenodo_url as _zc_is_zenodo
                     link = entry.get('link', '')
                     if not link and entry.get('depo_id') and entry.get('filename'):
                         link = f"https://zenodo.org/api/records/{entry['depo_id']}/draft/files/{entry['filename']}/content"
                     if not link and entry.get('bucket_url') and entry.get('filename'):
                         link = f"{entry['bucket_url']}/{entry['filename']}"
-                    if not link:
+                    if not link or not _zc_is_zenodo(link):   # manifest is peer-supplied: Zenodo only
                         continue
 
                     try:
-                        jr = req.get(link, timeout=120, stream=True, headers=_zc_auth())
+                        jr = req.get(link, timeout=120, stream=True, headers=_zc_auth(link))
                         jr.raise_for_status()
                         # Atomic write: temp file then rename
                         tmp_path = local_path.with_suffix('.tmp')
@@ -2657,6 +2658,8 @@ threading.Thread(target=_role_data_eviction_loop, daemon=True,
 
 
 MAX_AREA_SQM = 25_000_000  # 25 km²
+MAX_INPUT_FEATURES = 5_000        # features per request geometry (before union)
+MAX_INPUT_VERTICES = 500_000      # total vertices per request geometry
 
 # === SECTION: Processing queue (semaphore for concurrent heavy tasks) ===
 _TASK_SEMAPHORE = threading.Semaphore(2)   # max 2 concurrent heavy tasks
@@ -2755,9 +2758,9 @@ def _apply_height_filter_objects(objects: list, params: dict) -> list:
 
 
 # === SECTION: Async task system (file-backed progress + result storage) ===
-_PROGRESS_DIR = Path('/tmp/segment_progress')
+_PROGRESS_DIR = _config.RUNTIME_DIR / 'segment_progress'
 _PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
-_RESULTS_DIR = Path('/tmp/segment_results')
+_RESULTS_DIR = _config.RUNTIME_DIR / 'segment_results'
 _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -7400,7 +7403,7 @@ def director_proxy_log():
 _ALL_STATUS_CACHE = {'ts': 0.0, 'data': None, 'refreshing': False}
 _ALL_STATUS_TTL = 8.0       # serve cached if newer
 _ALL_STATUS_STALE = 60.0    # serve stale + bg refresh if newer
-_ALL_STATUS_CACHE_FILE = Path('/tmp/srtm_all_status_cache.json')
+_ALL_STATUS_CACHE_FILE = _config.RUNTIME_DIR / 'all_status_cache.json'
 
 def _all_status_load_disk():
     try:
@@ -9137,13 +9140,13 @@ def admin_backfill_jsons_from_manifest():
                     f"/draft/files/{entry['filename']}/content")
         if not link and entry.get('bucket_url') and entry.get('filename'):
             link = f"{entry['bucket_url']}/{entry['filename']}"
-        if not link:
-            failed.append({'code': code, 'reason': 'no link'})
+        if not link or not _zc.is_zenodo_url(link):
+            failed.append({'code': code, 'reason': 'no link' if not link else 'link not on zenodo'})
             continue
         target = json_dir / f'{code}.json'
         tmp = target.with_suffix('.tmp')
         try:
-            with _req.get(link, timeout=120, stream=True, headers=_zc.auth_headers()) as r:
+            with _req.get(link, timeout=120, stream=True, headers=_zc.auth_headers(link)) as r:
                 r.raise_for_status()
                 with open(tmp, 'wb') as f:
                     for chunk in r.iter_content(65536):
@@ -9501,7 +9504,7 @@ def admin_diskstat():
         'hansen_cache': 'data/austria_processor/hansen_tiles',
         'bev_cache': 'data/austria_processor/bev_tile_cache',
         'ortho_cache': 'data/austria_processor/ortho_tile_cache',
-        'segment_results': '/tmp/segment_results',
+        'segment_results': str(_RESULTS_DIR),
     }
     sizes = {}
     for k, p in paths.items():
@@ -10602,6 +10605,17 @@ def _get_geometry():
             features = geo_parse.parse_input(data)
         else:
             raise ValueError("No geometry provided. Send GeoJSON, KML, or coordinates.")
+
+    # Complexity cap before any O(n log n) repair / union work on untrusted input.
+    if len(features) > MAX_INPUT_FEATURES:
+        raise ValueError(f"Too many features ({len(features)}); the maximum is {MAX_INPUT_FEATURES}.")
+    try:
+        import shapely as _shp_mod
+        n_coords = sum(int(_shp_mod.get_num_coordinates(f['geometry'])) for f in features)
+    except Exception:  # noqa: BLE001
+        n_coords = 0
+    if n_coords > MAX_INPUT_VERTICES:
+        raise ValueError(f"Geometry too complex ({n_coords} vertices); the maximum is {MAX_INPUT_VERTICES}.")
 
     # Repair invalid input polygons (self-intersections, mis-ordered ring sets
     # where a hole is emitted as the exterior, etc.). Without this a caller can
@@ -11781,7 +11795,7 @@ _seg_cache = {"labels": None, "objects": None, "mask": None,
               "transform": None, "shape": None, "ndsm": None, "key": None}
 
 # File-backed seg cache so all gunicorn workers share segmentation results
-_SEG_CACHE_DIR = Path('/tmp/seg_cache')
+_SEG_CACHE_DIR = _config.RUNTIME_DIR / 'seg_cache'
 _SEG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 def _seg_cache_path(cache_key: str) -> Path:
@@ -17383,6 +17397,9 @@ def llm_docs():
 
 # === SECTION: /api/v1/parse-geometry endpoint ===
 
+_UPLOAD_INFLATE_CAP = app.config['MAX_CONTENT_LENGTH']   # inflated upload bytes (gzip / zip) — same as the body cap
+
+
 @app.route('/api/v1/parse-geometry', methods=['POST'])
 def parse_geometry_file():
     """Parse an uploaded geometry file (Shapefile ZIP, GeoPackage, GeoJSON, KML, GPX, WKT, etc).
@@ -17406,7 +17423,12 @@ def parse_geometry_file():
         if fname.endswith('.gz') or (len(raw) >= 2 and raw[:2] == b'\x1f\x8b'):
             import gzip as _gzip
             try:
-                raw = _gzip.decompress(raw)
+                # bounded inflate: a gzip bomb must not exceed the upload cap
+                with _gzip.GzipFile(fileobj=io.BytesIO(raw)) as _gz:
+                    inflated = _gz.read(_UPLOAD_INFLATE_CAP + 1)
+                if len(inflated) > _UPLOAD_INFLATE_CAP:
+                    return _error('Uploaded file too large after decompression', 413)
+                raw = inflated
                 if fname.endswith('.gz'):
                     fname = fname[:-3]
             except Exception:
@@ -17467,8 +17489,15 @@ def parse_geometry_file():
                 zpath = os.path.join(tmp_dir, 'upload.zip')
                 with open(zpath, 'wb') as wf:
                     wf.write(raw)
-                # Find .shp inside zip
+                # Find .shp inside zip.  ``extractall`` already strips absolute
+                # paths and ``..`` members; cap member count and inflated size
+                # so a zip bomb cannot fill the disk.
                 with zipfile.ZipFile(zpath) as zf:
+                    _members = zf.infolist()
+                    if len(_members) > 200:
+                        return _error('ZIP has too many members', 400)
+                    if sum(int(m.file_size) for m in _members) > _UPLOAD_INFLATE_CAP:
+                        return _error('ZIP too large after decompression', 413)
                     zf.extractall(tmp_dir)
                 # Find shp file
                 shp_files = []
