@@ -12,6 +12,15 @@ CODE = '60001'
 kg = next(k for k in json.load(open('data/austria_processor/kg_list.json')) if k['kg_code'] == PARENT)
 bb = kg['bbox']
 bbox_wgs = (bb['min_lon'], bb['min_lat'], bb['max_lon'], bb['max_lat'])
+# needs the KG row in the search index (data/search_index.db is built on the
+# operator VM, not shipped): skip cleanly on a fresh checkout
+if not trees_v3.parents_for_bbox_wgs(*bbox_wgs):
+    msg = 'search index has no row for KG 60001 — run the indexer first (skipped)'
+    try:
+        import pytest
+        pytest.skip(msg, allow_module_level=True)
+    except ImportError:
+        print('SKIP:', msg); sys.exit(0)
 bbox_3035 = ti.geometry_to_3035(box(*bbox_wgs)).envelope
 minx, miny, maxx, maxy = bbox_3035.bounds
 
