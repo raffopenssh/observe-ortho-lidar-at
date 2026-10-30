@@ -1,12 +1,13 @@
-"""sliver_sweep — close the bbox slivers umfeld's KG-bbox revision 2 opened.
+"""sliver_sweep — close the bbox slivers the KG-bbox revision 2 opened.
 
-Background (2026-10-27, docs/sliver-sweep.md): umfeld's ``/api/v1/kgs``
-bbox used to be parcel-derived and narrower than the BEV VGD KG polygon
+Background (2026-10-27, docs/sliver-sweep.md): the NE server's
+``/api/v1/kgs`` bbox used to be narrower than the BEV VGD KG polygon
 envelope; our products were rasterised on that bbox, so the NEC1 cells in
 the strip between the two envelopes were never observed (``unseen``, all
-nodata).  umfeld now serves ``bbox_new = old ∪ VGD envelope + pad``
+nodata).  The NE server now serves ``bbox_new = old ∪ VGD envelope + pad``
 (``bbox_revision: 2``) and lists the per-KG ``slivers`` at
-``GET /api/v1/kgs/bbox_changes?min_delta=``.
+``GET /api/v1/kgs/bbox_changes?min_delta=``.  Everything here needs
+``config.UMFELD_URL``; without it ``refresh`` is a no-op.
 
 This module, instead of re-running whole KGs:
 
@@ -22,7 +23,7 @@ This module, instead of re-running whole KGs:
   parent is in, ``integrate`` merges them into the parent's file
   (``ne_ingest.merge_blocks`` — per cell the best-observed source wins, so
   interior cells are untouched) and refreshes the ingest index rows so
-  ``ne_ingest.confirm_umfeld`` re-POSTs the parent to umfeld ``/contrib``
+  ``ne_ingest.confirm_umfeld`` re-POSTs the parent to the NE server ``/contrib``
   (digest mismatch → fresh retry ladder).  KGs outside BEV coverage
   (border, no LiDAR) resolve as ``nodata`` — never a failure, never
   re-dispatched.
@@ -148,14 +149,16 @@ def enabled() -> bool:
     return bool(_knob("sliver_sweep", True))
 
 
-# === SECTION: umfeld change list ===
+# === SECTION: NE-server change list ===
 
 def refresh(force: bool = False) -> dict:
     """Pull ``/api/v1/kgs/bbox_changes`` (public tier, ETag-conditional) and
     register every changed KG.  New codes start in ``wait``; a KG whose
     bbox moved again (new revision) goes back to ``wait`` for a re-scan."""
     import requests
-    import umfeld
+    import config as _config
+    if not _config.UMFELD_URL:
+        return {"disabled": "config.UMFELD_URL empty"}
     with _Locked() as st:
         age = time.time() - (st.get("fetched_ts") or 0)
         if not force and st["kgs"] and age < REFRESH_S:
@@ -164,7 +167,7 @@ def refresh(force: bool = False) -> dict:
         hdrs = {"Accept-Encoding": "gzip"}
         if st.get("etag") and not force:
             hdrs["If-None-Match"] = st["etag"]
-        r = requests.get(f"{umfeld.PUBLIC_BASE}/kgs/bbox_changes", params={"min_delta": md},
+        r = requests.get(f"{_config.UMFELD_URL}/api/v1/kgs/bbox_changes", params={"min_delta": md},
                          headers=hdrs, timeout=120)
         st["fetched_ts"] = time.time(); st["fetched_at"] = _now()
         if r.status_code == 304:
@@ -301,17 +304,17 @@ def _nec1_source(parent: str, idx: dict | None) -> str:
         return ""
 
 
-LU_PER_TICK_DEFAULT = 3   # umfeld ``lu`` fetches per scan tick (~1.2 MB each; primary is metered)
+LU_PER_TICK_DEFAULT = 3   # NE-server ``lu`` fetches per scan tick (~1.2 MB each; primary is metered)
 
 
 def missing_outside(path: Path, lu_ids: np.ndarray, bbox_old: list) -> tuple[np.ndarray, np.ndarray, int]:
-    """Like :func:`unseen_outside`, but against umfeld's frozen ``lu`` cell
+    """Like :func:`unseen_outside`, but against the NE server's frozen ``lu`` cell
     set (``ne_h3.fetch_declared_umfeld(kg, layer="lu")``, which covers the
     whole VGD polygon): a cell counts when it is in ``lu_ids`` and NOT
     observed in *path* — i.e. unseen there OR absent altogether.  Needed for
     parents whose declared layer was built by bevdirect on the OLD viewport:
     the strip's cells are then missing from our file, not merely unseen, so
-    :func:`unseen_outside` cannot see them (and sweeping umfeld's whole
+    :func:`unseen_outside` cannot see them (and sweeping the NE server's whole
     sliver rects blind — 4 full-length edge strips per parent, 94 % of them
     without a single cell — cost 5 min of tile work per empty 1.5 km tile)."""
     import h3.api.numpy_int as h3n
@@ -372,8 +375,8 @@ def scan(max_n: int = SCAN_PER_TICK, entries: dict | None = None, idx: dict | No
     """Advance ``wait`` KGs: complete + h3b on disk → ``clean`` (no unseen
     cell outside the old bbox) or ``pending`` (units planned).
 
-    Parents with an ``index-*`` (umfeld lu) declared layer are scanned from
-    the local file alone; bevdirect-declared parents need umfeld's ``lu``
+    Parents with an ``index-*`` (NE-server lu) declared layer are scanned from
+    the local file alone; bevdirect-declared parents need the NE server's ``lu``
     cell set (one ~1.2 MB GET each, :func:`missing_outside`) — at most
     ``lu_budget`` (knob ``sweep_lu_per_tick``) of those per call, the rest
     stay ``wait`` for the next tick."""
@@ -396,7 +399,7 @@ def scan(max_n: int = SCAN_PER_TICK, entries: dict | None = None, idx: dict | No
         t0 = time.time()
         n_done = 0
         for code in todo:
-            # time cap scales with the lu budget (~3 s per umfeld ``lu``
+            # time cap scales with the lu budget (~3 s per NE-server ``lu``
             # GET): at 27/tick the old flat 40 s cut the scan short.
             if n_done >= max_n or time.time() - t0 > max(40, 5 * lu_budget):
                 break
@@ -431,7 +434,7 @@ def scan(max_n: int = SCAN_PER_TICK, entries: dict | None = None, idx: dict | No
                 if need_lu:
                     # bevdirect (or unknown) declared layer = clipped to the
                     # old viewport → strip cells are missing, not unseen:
-                    # diff against umfeld's lu (whole VGD polygon) instead.
+                    # diff against the NE server's lu (whole VGD polygon) instead.
                     import ne_h3
                     sec = ne_h3.fetch_declared_umfeld(code, layer="lu")
                     out["lu_fetched"] += 1
@@ -837,7 +840,7 @@ def _restore_from_archive(unit: str, dest: Path, entries: dict | None = None) ->
 
 def integrate(idx: dict, entries: dict | None = None, max_n: int = INTEGRATE_PER_TICK) -> list[dict]:
     """Merge received sweeps into their parent h3b (``ne_ingest.merge_blocks``)
-    and update the ingest index so umfeld gets a re-POST.  Also re-merges a
+    and update the ingest index so the NE server gets a re-POST.  Also re-merges a
     ``done`` parent whose file was replaced since (digest drift).  Runs in
     the ne_ingest tick; *idx* is the caller's live index (saved by it)."""
     import ne_ingest
@@ -1011,7 +1014,7 @@ def status() -> dict:
     day = [k for k in done if k.get("done_at") and now - _ts(k["done_at"]) < 86400]
     rate = len(day) / 24.0
     # Scan backlog (2026-10-28): ``wait`` parents whose h3b is already on
-    # disk only move once ``scan`` spends an umfeld ``lu`` fetch on them
+    # disk only move once ``scan`` spends an NE-server ``lu`` fetch on them
     # (``sweep_lu_per_tick``, ~30/h) — with the sweepers mostly idle this
     # upstream step, not the fleet, bounds the eta.  Count it explicitly so
     # ``eta=0.0d`` with 3 000 parents still queued cannot happen again.
@@ -1026,7 +1029,7 @@ def status() -> dict:
         eta_h = len(pend) / rate
         if scan_backlog:
             eta_h += (scan_backlog / scan_rate) if scan_rate > 0 else 0.0
-    # umfeld confirmation of integrated parents
+    # NE-server confirmation of integrated parents
     confirmed = 0
     try:
         import ne_ingest
@@ -1094,7 +1097,7 @@ def text_lines(v: dict | None = None) -> list[str]:
             f"· contrib re-posted={v['contrib_confirmed']}/{by.get('done', 0)}")
     pr = v.get("products") or {}
     lines = [head,
-             f"    scan: umfeld lu fetched={v.get('lu_fetched', 0)} (bevdirect parents, {_knob('sweep_lu_per_tick', LU_PER_TICK_DEFAULT)}/tick) "
+             f"    scan: NE lu fetched={v.get('lu_fetched', 0)} (bevdirect parents, {_knob('sweep_lu_per_tick', LU_PER_TICK_DEFAULT)}/tick) "
              f"· cells skipped as observed by a neighbour={v.get('seen_elsewhere', 0):,} "
              f"· add-on products (light_v2+json_v2): ok={pr.get('ok', 0)} missing={pr.get('missing', 0)} pre-products={pr.get('unknown', 0)}"]
     peers = v.get("peers") or {}
@@ -1127,16 +1130,16 @@ def text_lines(v: dict | None = None) -> list[str]:
     bad = [(c, k) for c, k in st["kgs"].items() if k.get("state") == "failed"][:5]
     if bad:
         lines.append("    failed: " + " ".join(f"{c}({(k.get('error') or '')[:60]})" for c, k in bad))
-    lines.append("    debug: ?sweep=1 (per-parent umfeld round-trip) · ?q=sweep · python3 sliver_sweep.py status|plan <kg> · docs/sliver-sweep.md")
+    lines.append("    debug: ?sweep=1 (per-parent NE-server round-trip) · ?q=sweep · python3 sliver_sweep.py status|plan <kg> · docs/sliver-sweep.md")
     return lines
 
 
 def detail_lines(limit: int = 30) -> list[str]:
     """``/process.txt?sweep=1`` — one row per swept parent (done first, then
     received / dispatched / pending-with-attempts), answering "did the
-    sweep land AND did umfeld get the merged cells?" without reading the
+    sweep land AND did the NE server get the merged cells?" without reading the
     state file.  Columns: parent, unseen→after (nodata / unswept), units
-    ok/total, umfeld round-trip (``confirmed`` = umfeld holds our post-sweep
+    ok/total, NE-server round-trip (``confirmed`` = the NE server holds our post-sweep
     digest; ``posted`` = sent, awaiting manifest; ``queued`` = re-POST
     pending in the ne_ingest ladder; ``parked`` = needs_bevdirect / day cap /
     strike-out), add-on products."""
@@ -1175,15 +1178,15 @@ def detail_lines(limit: int = 30) -> list[str]:
                 pass
             swept_at = (parents.get(c) or {}).get("swept_at") or k.get("done_at") or ""
             if want and cu.get("confirmed_digest") == want and str(cu.get("confirmed_at") or "") >= str(swept_at):
-                rt = f"umfeld=confirmed {_age(cu.get('confirmed_at'))} ago"; n_conf += 1
+                rt = f"ne=confirmed {_age(cu.get('confirmed_at'))} ago"; n_conf += 1
             elif want and cu.get("posted_digest") == want:
-                rt = f"umfeld=posted {_age(cu.get('posted_at'))} ago (awaiting manifest)"; n_wait += 1
+                rt = f"ne=posted {_age(cu.get('posted_at'))} ago (awaiting manifest)"; n_wait += 1
             elif cu.get("needs_bevdirect"):
-                rt = "umfeld=parked(needs_bevdirect)"; n_wait += 1
+                rt = "ne=parked(needs_bevdirect)"; n_wait += 1
             elif int(cu.get("post_attempts") or 0) >= ne_ingest.POST_MAX_ATTEMPTS:
-                rt = f"umfeld=struck-out({cu.get('post_attempts')} attempts)"; n_wait += 1
+                rt = f"ne=struck-out({cu.get('post_attempts')} attempts)"; n_wait += 1
             else:
-                rt = "umfeld=queued (re-POST pending, sweep-priority)"; n_wait += 1
+                rt = "ne=queued (re-POST pending, sweep-priority)"; n_wait += 1
             tail = f"{k.get('unseen_out')}→{k.get('unseen_after')} nodata={k.get('nodata') or 0}"
             if k.get("unswept"):
                 ra = float(k.get("resweep_after") or 0)
@@ -1198,8 +1201,8 @@ def detail_lines(limit: int = 30) -> list[str]:
                        f"· units {n_ok}/{len(us)}{' fail=' + str(n_fail) if n_fail else ''}{hold_s} attempts={k.get('attempts', 0)}"
                        + (f" · {fails or err}" if (fails or err) else ""))
     head = (f"sweep detail: parents={len(rows)} done={sum(1 for _, k in rows if k['state'] == 'done')} "
-            f"umfeld confirmed={n_conf} pending={n_wait} · rows capped at {limit} (?sweep=N) · "
-            "confirmed = umfeld manifest obs.digest == our post-sweep (green-fixed) digest")
+            f"NE confirmed={n_conf} pending={n_wait} · rows capped at {limit} (?sweep=N) · "
+            "confirmed = NE manifest obs.digest == our post-sweep (green-fixed) digest")
     return [head] + out[:limit]
 
 
@@ -1267,14 +1270,9 @@ def peer_report(kg: dict, result: dict | None, seconds: float | None = None) -> 
         # tiles outside BEV coverage are no failure; a LiDAR gap at the border reads the same
         if result.get("lidar_failed") and "No tiles cover" in err:
             status, err = "nodata", None
-    director = (os.environ.get("ZENODO_LOCK_URL", "").strip() or "http://127.0.0.1:8000").rstrip("/")
-    hdrs = {"Content-Type": "application/octet-stream"}
-    try:
-        tok = (_HERE / "data/admin_token").read_text().strip()
-        if tok:
-            hdrs["X-Admin-Token"] = tok
-    except Exception:
-        pass
+    import config as _config
+    director = _config.director_url().rstrip("/")
+    hdrs = {"Content-Type": "application/octet-stream", **_config.operator_headers()}
     try:
         me = json.loads((DATA_DIR / "self.json").read_text()).get("id") or ""
     except Exception:
