@@ -35,9 +35,7 @@ eMudhra history is dropped because it contains that token live in
 `git filter-repo --force --replace-text secrets.txt --mailmap authors.txt`
 → verify `git log --oneline | wc -l` ≈ 86 and
 `git log -p --all | grep -c 2dnLSA` = 0.
-`paxl` must keep working against the public tree: <FILL IN what paxl is / how
-to test it> — treat its interface as frozen. Never
-touch the live repo or services. Read `AGENTS.md` and `docs/api-tiers.md`,
+Never touch the live repo or services. Read `AGENTS.md` and `docs/api-tiers.md`,
 `docs/vct-pilot.md`, `docs/security-tokens.md` first; load other `docs/*.md`
 only when editing that subsystem.
 
@@ -142,7 +140,7 @@ Hard requirements:
    owner channel, bandwidth-wall parks for 50 VMs; keep architecture,
    product spec (v2.4 layout), algorithms, data sources + licences, single-VM
    ops. AGENTS.md ≤ 150 lines, pointing only at docs that exist.
-   Grep gate (docs): `grep -rniE 'exe\.xyz|/k/|/k\b|token|umfeld|parcel|cadastre|kataster|paxl|@gmail|exedev' --include=*.md --include=*.txt --include=*.html .` → 0 hits except the vtcseamless paragraph in `docs/vct-pilot.md` and licence text in README.
+   Grep gate (docs): `grep -rniE 'exe\.xyz|/k/|/k\b|token|umfeld|parcel|cadastre|kataster|@gmail|exedev' --include=*.md --include=*.txt --include=*.html .` → 0 hits except the vtcseamless paragraph in `docs/vct-pilot.md` and licence text in README.
 
 8. Austria-processor dependency closure. `austria_processor.py` imports these
    local modules — each must exist after the cuts or be stubbed with the same
