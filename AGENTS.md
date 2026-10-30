@@ -15,7 +15,7 @@ and setup: `README.md`. Security model: `SECURITY.md`.
 | director (single machine / `SRTM_PEERS`) | `docs/peer-director.md` | `peer_director.py` |
 | product layout v2.4, upgrades, ingest | `docs/v2.1-product-spec.md` | `v21_products.py`, `v2_verify.py`, `v2_ingest.py`, `v24_fast.py`, `kg_v2_store.py`, `kg_docs.py` |
 | tree inventory (v2 live, v3 product-backed) | `docs/tree-inventory-v3.md` | `tree_inventory.py`, `trees_v3.py` |
-| classifier v1 (RF) / v2 (LightGBM) | `docs/rf-training.md`, `segv2/README.md` | `learned_classifier.py`, `train_rf_4000kg.py`, `segv2/` |
+| classifier v1 (RF) / v2 (LightGBM) | `docs/rf-training.md`, `segv2/README.md` | `learned_classifier.py`, `segv2/`, `safe_load.py` |
 | search index | `docs/search-index.md` | `search_index.py` |
 | Zenodo tile cache / products / lock | `docs/zenodo-cache.md` | `zenodo_cache.py`, `zenodo_tiles.py`, `zenodo_client.py`, `zenodo_lock.py`, `tile_cache.py` |
 | Copernicus throttle + credentials | `docs/copernicus-throttle.md` | `copernicus.py` |
@@ -72,7 +72,7 @@ curl -s localhost:8000/api/v1/processing/status | python3 -m json.tool | head
 tail -f data/austria_processor/logs/processor.log
 curl -s -XPOST -H 'Content-Type: application/json' localhost:8000/api/v1/processing/queue \
   -d '{"kgs":["63330"],"position":0}'                         # queue a KG (re-run trap: docs/app.md)
-python3 austria_processor.py --kg 63330 --no-upload          # one KG by hand into ./out/
+python3 austria_processor.py --kg 63330 --no-upload          # one KG by hand → config.OUT_DIR/<kg>/ (also when ZENODO_TOKEN unset; --dry-run = no writes to Zenodo)
 python3 v2_ingest.py status; python3 ne_ingest.py status     # serving-side ingest
 ```
 
@@ -96,11 +96,11 @@ layers. Details: `docs/v2.1-product-spec.md`.
 | `object_segmentation.py`, `learned_classifier.py`, `segv2/`, `texture_features.py`, `ndvi_harmonics.py`, `terrain_analysis.py`, `temporal_analysis.py`, `tree_inventory.py`, `trees_v3.py`, `infrastructure_lookup.py`, `power_infrastructure.py`, `osm_features.py` | pipeline |
 | `raster_io.py`, `ortho_io.py`, `copernicus.py`, `hansen.py`, `hansen_coverage.py`, `bev_retry.py`, `bev_proxy.py` (direct-only stub), `http_pool.py`, `tile_cache.py`, `tile_index.py`, `zenodo_cache.py`, `zenodo_tiles.py`, `zenodo_client.py`, `zenodo_fetch.py`, `zenodo_lock.py`, `zenodo_meta_refresh.py` | data access, caches, Zenodo |
 | `austria_processor.py`, `peer_director.py`, `kg_splitter.py`, `kg_universe.py`, `tile_checkpoint_registry.py`, `tile_raster_sidecar.py`, `gpkg_streamed.py`, `v21_products.py`, `v2_source.py`, `v2_verify.py`, `v2_ingest.py`, `v24_fast.py`, `kg_json_v2.py`, `kg_v2_store.py`, `kg_docs.py`, `kg_log_harvest.py`, `ne_h3.py`, `ne_ingest.py`, `ne_rollout.py`, `ne_green_fix.py`, `ne_build_tiled.py`, `vct_pilot.py`, `als_acquisition.py`, `als_years.py`, `product_repair.py`, `product_origin.py`, `label_mix.py`, `sliver_sweep.py`, `stale_blocks.py`, `json_heal.py`, `json_cache.py`, `quality_flags.py`, `feedback_db.py`, `search_index.py`, `grid25_sample.py` | processor, products, serving-side stores |
-| `safe_load.py`, `service_guard.py`, `mem_lru.py`, `net_meter.py`, `host_telemetry.py`, `inbound_budget.py`, `geo_parse.py`, `attributions.py`, `calibrate.py`, `train_rf_4000kg.py` | safety, limits, helpers, training |
-| `static/index.html`, `process.html`, `training.html`, `docs.html`, `flag.js` | UI and dashboards |
-| `systemd/` (`srv`, `srv_public`, `austria_processor`, `rf_train`, `srv-watchdog`, `cells-national`) <!-- VERIFY: unit location --> | service templates |
+| `safe_load.py`, `service_guard.py`, `mem_lru.py`, `net_meter.py`, `host_telemetry.py`, `inbound_budget.py`, `geo_parse.py`, `attributions.py` | safety, limits, helpers |
+| `static/index.html`, `process.html`, `docs.html`, `flag.js` | UI and dashboards |
+| `systemd/` (`srv`, `srv_public`, `austria_processor`, `srv-watchdog`, `cells-national`, gunicorn confs) | service templates |
 | `tests/`, `tools/` (`fetch_models.py`, `bench_cells_api.py`, `scan_partial_kgs.py`, `ca_check.sh`) | tests and scripts |
-| `data/` shipped: `austria_processor/kg_list.json`, `best_model/rf_meta.json`, `segv2/models/model_G.meta.json`, `als_acquisition/*.geojson`, `models_manifest.json`; root `kg_bbox_r1.json`. Fetched: `best_model/rf_model.joblib(.xz)`, `segv2/models/model_G.joblib`. Generated: `austria_processor/*` state, `search_index.db`, `kg_v2_store.db`, `ne/`, `tile_cache/`, `shares/`, `feedback.sqlite`, `public_flags.sqlite` | data |
+| `data/` shipped: `austria_processor/kg_list.json` (the only processor runtime file in git), `best_model/rf_meta.json`, `segv2/models/model_G.meta.json`, `als_acquisition/*.geojson`, `models_manifest.json`; root `kg_bbox_r1.json`. Fetched: `best_model/rf_model.joblib(.xz)`, `segv2/models/model_G.joblib`. Generated: `austria_processor/*` state, `search_index.db`, `kg_v2_store.db`, `ne/`, `tile_cache/`, `shares/`, `feedback.sqlite`, `public_flags.sqlite` | data |
 
 Runtime state files of the processor are listed in
 `docs/austria-processor.md` → *Runtime files*.

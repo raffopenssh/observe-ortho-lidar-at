@@ -26,7 +26,8 @@ Hansen GFC                 ─┘ → GeoJSON / GPKG / KML / MBTiles, overlays, 
 ```
 
 * `object_segmentation.py` — the pipeline; `learned_classifier.py` (RF
-  v1), `segv2/` (LightGBM v2); `tree_inventory.py`, `trees_v3.py` —
+  v1), `segv2/` (LightGBM v2) — fitted models ship, retraining tooling
+  does not (`docs/rf-training.md`); `tree_inventory.py`, `trees_v3.py` —
   apex / crown inventory; `terrain_analysis.py`, `temporal_analysis.py`.
 * `app.py` — operator API + analysis engine (`:8000`, loopback);
   `public_api.py` — public read tier (`:8100`); `austria_processor.py`
@@ -55,14 +56,13 @@ Run it by hand:
 ```bash
 gunicorn -w 2 --threads 4 -b 127.0.0.1:8000 --timeout 600 app:app      # operator API + UI  → http://localhost:8000/
 gunicorn -w 2 --threads 24 -b 0.0.0.0:8100 public_api:app              # public API         → http://localhost:8100/
-python3 austria_processor.py --kg 63330 --no-upload                     # one KG into ./out/
+python3 austria_processor.py --kg 63330 --no-upload                     # one KG → $SRTM_OUT_DIR/<kg>/ (same when ZENODO_TOKEN is unset; --dry-run never touches Zenodo)
 ```
 
 Or install the systemd templates in `systemd/` (`srv.service`,
 `srv_public.service`, `austria_processor.service`, `srv-watchdog.timer`,
-`cells-national.timer`, `rf_train.service`; they reference `${HOME}` and
+`cells-national.timer`, gunicorn config files; they reference `${HOME}` and
 the repo directory — adjust `User=` / `WorkingDirectory=`):
-<!-- VERIFY: units moved to systemd/ and parametrised -->
 
 ```bash
 sudo cp systemd/*.service systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload
@@ -148,7 +148,7 @@ curl -s 'localhost:8100/api/v1/cells?bbox=15.40,47.07,15.41,47.08' | head -c 400
 | `search_index.py`, `kg_v2_store.py`, `kg_docs.py`, `cells_api.py`, `landscape_query.py`, `hillshade_tiles.py`, `public_flags.py`, `quality_flags.py` | serving-side stores and query modules |
 | `safe_load.py`, `service_guard.py`, `mem_lru.py`, `config.py` | safety and limits |
 | `static/` | UI (`index.html`), dashboards, `docs.html` |
-| `data/` | shipped: `austria_processor/kg_list.json`, `kg_bbox_r1.json` (root), `best_model/rf_meta.json`, `segv2/models/*.meta.json`, `als_acquisition/*.geojson`, `models_manifest.json`; fetched: model weights; generated: everything else |
+| `data/` | shipped: `austria_processor/kg_list.json` (only processor runtime file), `kg_bbox_r1.json` (root), `best_model/rf_meta.json`, `segv2/models/*.meta.json`, `als_acquisition/*.geojson`, `models_manifest.json`; fetched: model weights; generated: everything else |
 | `tests/`, `tools/`, `systemd/`, `docs/` | tests, scripts, unit templates, documentation |
 
 ## Limits

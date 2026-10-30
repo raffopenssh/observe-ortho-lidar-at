@@ -84,7 +84,8 @@ Strikes per code live in `kg_strikes.json`.
 | `--v2-upgrade` | process upgrade units from existing full GPKGs (`docs/v2.1-product-spec.md` § 6) |
 | `--no-copernicus` | skip Copernicus layers entirely (features nullable, product labelled partial) |
 | `SRTM_BEV_VECTOR_CONTEXT=1` | build NE declared layer + footprint context from BEV vector tiles (`docs/vct-pilot.md`) |
-| `--dry-run` / `SRTM_DRY_RUN=1` | no uploads, products under `SRTM_OUT_DIR` |
+| `--no-upload` | write products to `config.OUT_DIR/<kg>/` (default `out/`); automatic when no `ZENODO_TOKEN` is configured |
+| `--dry-run` / `SRTM_DRY_RUN=1` | never touch Zenodo (no uploads, no manifest edits); products under `config.OUT_DIR/<kg>/` |
 
 Upstream hosts are limited to `config.OUTBOUND_ALLOWED_HOSTS`
 (`http_pool.py`); there are no proxies (`bev_proxy.py` is a direct-only

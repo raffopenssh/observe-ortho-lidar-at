@@ -30,8 +30,13 @@ exempt. Rule-only types (`wind_turbine`, `substation`, `solar_panel`,
    come from a priority stack of open sources (`segv2/labels.py`): OSM
    road / rail centrelines buffered by class, OSM water areas and lines,
    INVEKOS field polygons with crop type (AMA, CC BY-AT 4.0 — optional,
-   `INVEKOS_API_URL`), building footprints for `roof` (needs nDSM ≥ 2 m),
-   and a land-use remainder for verge / riparian classes.
+   `config.INVEKOS_API_URL`), and building footprints for `roof` (needs
+   nDSM ≥ 2 m). In the public release `LabelContext` paints **no**
+   land-use layer: the OSM geometry comes from the optional OSM geometry
+   service (`/api/v1/osm/geometry`, see `.env.example`) or Overpass, the
+   INVEKOS polygons from `config.INVEKOS_API_URL`; both optional — with
+   neither configured, only footprint / raster-derived labels remain and
+   the fitted `model_G` is what you use.
 2. **Flight dates vary.** DSM mosaics are stitched from flights of
    different years; v2 features carry the effective DSM year gap,
    per-year-normalised height change and the ortho ↔ LiDAR year gap

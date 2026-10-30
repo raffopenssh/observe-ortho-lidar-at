@@ -122,26 +122,24 @@ Adjacent compatible segments merge into 11 group types:
 - cropland (crop+grass), pasture (grass+garden), orchard_grove (orchard+vineyard)
 - quarry (excavation+fill), construction_site (construction+excavation+fill+tree_loss)
 
-## Methods — RF Training Pipeline
+## Methods — Classifier Models
+Two trained models ship (fetched by `python3 tools/fetch_models.py` from data/models_manifest.json, loaded through
+safe_load.load_model with a checksum fence): the v1 Random Forest (data/best_model/) and the v2 LightGBM model
+(data/segv2/models/model_G.joblib, 117 features, 14 classes — used when lightgbm and the file are present).
+Without any model the rule-based classifier applies.
 
-### Ground Truth Sources
-1. Land-use polygons (open BEV vector data) → type mapping (roof/crop/tree/road …)
-2. OSM: roads/paths buffered to width → road/path labels; landuse/natural polygons → forest/farmland/water/quarry labels
-3. Hansen tree_loss: synthetically labelled where hansen_recent_loss_frac≥0.15 + treecover2000≥20% + (height<5m or h_change<-2m)
-   - Label circularity fix: hansen_recent_loss_frac and hansen_treecover2000 features zeroed for tree_loss samples
+### Training provenance (tooling not shipped)
+Segments were labelled from land-use polygons, building footprints and OSM (roads/paths buffered to width;
+landuse/natural polygons → forest/farmland/water/quarry), with height/NDVI sanity checks per label, plus
+synthetic tree_loss labels where hansen_recent_loss_frac≥0.15 + treecover2000≥20% + (height<5m or h_change<-2m)
+(circular Hansen features zeroed for those samples). Dominant classes downsampled to 5× the median class count.
+Model selection: composite score 0.4×OOB + 0.35×mean_per_class_accuracy + 0.25×worst_class_accuracy over a
+learning curve. The labelling/retraining tooling needs non-public reference data and is not part of this release.
 
-### Training Process
-Runs as systemd service (rf_train.service). Iterates ~300 random KGs (seed 42, >5 buildings each) + infrastructure KGs:
-1. For each KG: fetch OSM + land-use ground truth, read all raster data, segment, extract 57 features, match to labels
-2. Each KG checkpointed to rf_training_data/checkpoints/kg_XXXXX.npz (skipped on restart)
-3. Every 10 KGs: retrain RF on all accumulated samples, save to /tmp/learned_classifier/
-4. Dominant classes downsampled to 5× median class count to reduce imbalance
-
-### Model Selection
-- Learning-curve evaluation (training/evaluate route, not shipped as a script) trains RF at every 5-KG increment, multiple seeds <!-- VERIFY: evaluate_checkpoints.py not in repo -->
-- Composite score: 0.4×OOB + 0.35×mean_per_class_accuracy + 0.25×worst_class_accuracy
-- Best checkpoint+seed saved to data/best_model/ — API prefers this over live model
-- Training Monitor dashboard: /training.html (live OOB curve, per-class accuracy, convergence)
+### Feature contract
+learned_classifier.FEATURE_KEYS (v1) / model .meta.json feature_keys (v2) fix the column order emitted by
+object_segmentation.extract_object_features — never reorder. dist_parcel_edge has no source in the public
+release and is fed as a constant 500 m cap (small documented degradation on crop/orchard/vineyard/garden).
 
 ### Deployed Model (data/best_model/)
 Selected at peak composite score from learning curve:
