@@ -7,8 +7,7 @@ Two call sites, two gates:
    the same code (downloaded from Zenodo, ~MB).  Checks the codec round
    trip, structural completeness, **tile stitching** (every LiDAR-bearing
    tile segmented, segmented area ≥ v1, no all-zero holes in the
-   ``segment_type`` raster inside the parcel union), parcel/building
-   counts vs. cadastre + v1, coverage percentages ≥ v1 (−tolerance),
+   ``segment_type`` raster inside the AOI), coverage percentages ≥ v1 (−tolerance),
    unclassified share ≤ v1 (+tolerance), light GPKG ``integrity_check``
    + layer inventory + feature counts consistent with the JSON.
    A failed gate means **nothing is uploaded** and the KG is reported
@@ -42,14 +41,14 @@ import kg_json_v2
 
 log = logging.getLogger("austria_processor.v2verify")
 
-# 2.4: no cadastre-shaped sections / layers any more (parcels, building_footprints,
-# parcel_outline_z are FORBIDDEN — check_cadastre_free is fatal).
+# Products are property-free: no legacy property-level sections / layers
+# (FORBIDDEN_* — check_property_free_document is fatal).
 REQUIRED_SECTIONS = ("version", "kg_code", "bbox", "area_summary", "landscape", "terrain",
                      "coverage", "data_quality", "model")
 LIGHT_LAYERS_REQUIRED = ("segments", "segment_points", "segment_type", "segment_height")
 LIGHT_LAYERS_V2 = ()
-FORBIDDEN_SECTIONS = ("parcels", "building_footprints")
-FORBIDDEN_LIGHT_LAYERS = ("parcels", "buildings", "parcel_outline_z")
+FORBIDDEN_SECTIONS = ("parcels", "building_footprints")          # legacy section names
+FORBIDDEN_LIGHT_LAYERS = ("parcels", "buildings", "parcel_outline_z")  # legacy layer names
 # product 2.1 (docs/v2.1-product-spec.md) — checked by check_v21_document /
 # check_v21_light_gpkg; product_version is fatal, the 5 m / apex layers are
 # fatal only when the JSON claims them.
@@ -60,30 +59,16 @@ except Exception:  # noqa: BLE001
 LIGHT_LAYERS_V21 = ("terrain_coarse_dtm", "terrain_coarse_slope")
 
 TOL = {
-    "parcel_count_rel": 0.01,      # cadastre may change a little between runs
     "coverage_pp": 1.0,            # percentage points (elevation; fatal)
     "seg_coverage_pp_warn": 1.0,   # segmentation coverage: 1–2.5 pp drop = non-fatal drift
-    "seg_coverage_pp": 2.5,        # … drift past 2.5 pp is reported loudly (segv2 drops
-                                   # path/earthwork objects, so a few single-object
-                                   # parcels lose their area_summary — a class-set
-                                   # consequence, not a bug; 2026-09-21: 28 upgrades
-                                   # struck at −1.1…−1.7 pp)
-    "seg_coverage_pp_fatal": 8.0,  # … fatal only when BOTH the raw figure and the
-                                   # ≥300 m² figure drop past this (a tile that came
-                                   # back empty).  2026-09-22: 217 strike events / 35
-                                   # parents struck out at −2.5…−7.5 pp (≥300 m²) with
-                                   # raw drops of 0…−5.4 pp — every one deterministic
-                                   # (identical figures on two peers), i.e. a segv2 vs
-                                   # v1 class-set difference on 3–7 % of parcels, not a
-                                   # data hole.  Empty tiles are caught by
-                                   # segment_type_no_holes / lidar_tiles_ge_v1 /
-                                   # segmented_area_ge_v1 independently.
-    "parcel_count_abs": 2,         # … or ±2 parcels, whichever is larger (tiny blocks)
-    "building_cov_pp": 2.0,
+    "seg_coverage_pp": 2.5,        # … drift past 2.5 pp is reported loudly
+    "seg_coverage_pp_fatal": 8.0,  # … fatal past this (a tile that came back empty);
+                                   # empty tiles are also caught by segment_type_no_holes /
+                                   # lidar_tiles_ge_v1 / segmented_area_ge_v1
     "seg_area_rel": 0.02,          # v2 segmented area ≥ 0.98 × v1
     "unclassified_pp": 2.0,        # v2 unclassified share ≤ v1 + 2 pp
     "segments_rel_min": 0.5,       # sanity — v2 segments ≥ half of v1's
-    "raster_hole_frac": 0.005,     # zero segment_type inside parcel union
+    "raster_hole_frac": 0.005,     # zero segment_type inside the AOI
     "label_mix_frac": 0.005,       # segments rows whose polygon part is > 2× the object's
                                    # own area_sqm (+50 m²).  A healthy KG measures exactly
                                    # 0 (11117: p99.9 ratio 1.00); a KG stitched from tile
@@ -92,7 +77,6 @@ TOL = {
                                    # ids — polygons + segment_type pixels of unrelated
                                    # objects glued together.
     "label_mix_sample": 20000,
-    "outline_z_min_frac": 0.5,     # ≥ 50 % of parcels with geometry carry outline_z
 }
 
 
@@ -102,11 +86,8 @@ TOL = {
 HINTS = {
     "unclassified_le_v1": "few huge 'unclassified' objs = cross-tile anchor-weak merge demotion → "
                           "grep peer log 'Anchor-weak' (v2 skips those merges since 2026-09-21)",
-    "parcel_segmentation_coverage_pct_ge_v1": "raw AND ≥300 m² coverage both dropped >8 pp → a tile was not "
-                                              "segmented; check data_quality.tiles (smaller gaps are _drift warnings)",
-    "segment_type_no_holes": "segment_type==0 inside parcel union → unsegmented tile / BEV read hole; "
+    "segment_type_no_holes": "segment_type==0 inside the AOI → unsegmented tile / BEV read hole; "
                              "grep 'gpkg_full' + 'deferred' for that KG",
-    "parcels_vs_v1": "cadastre changed between runs (±1–2 is normal for old v1) — compare parcels_vs_cadastre",
     "segmented_area_ge_v1": "v2 covers less LiDAR area than v1 on the same grid → missing DTM tile / BEV outage",
     "lidar_tiles_ge_v1": "a DTM tile v1 had is missing now → BEV read failure, see bev_pause / Anchor",
     "bbox_covers_v1": "v2 AOI shrunk vs v1 → KG split/definition changed; compare kg_splitter output",
@@ -179,69 +160,6 @@ def _unclassified_pct(doc) -> float:
     return 100.0 * unc / tot if tot > 0 else 0.0
 
 
-SEG_COV_MIN_AREA_SQM = 300.0   # sliver parcels below this are excluded from the fatal coverage gate
-SEG_COV_MIN_PARCELS = 20       # … need this many big parcels for the filtered figure to mean anything
-
-
-def _seg_coverage_min_area(doc, min_area: float = SEG_COV_MIN_AREA_SQM) -> float | None:
-    """``parcel_segmentation_coverage_pct`` recomputed over parcels ≥ *min_area*
-    (needs ``parcels.details``); None when unavailable / too few parcels."""
-    det = _g(doc, "parcels", "details", default=None)
-    if not isinstance(det, list):
-        return None
-    big = [p for p in det if isinstance(p, dict) and (_num(p.get("area_sqm"), 0) or 0) >= min_area]
-    if len(big) < SEG_COV_MIN_PARCELS:
-        return None
-    return 100.0 * sum(1 for p in big if p.get("area_summary")) / len(big)
-
-
-def _lost_parcels_diag(v2, v1, min_area: float = SEG_COV_MIN_AREA_SQM) -> str:
-    """Forensic tail for a failed ``parcel_segmentation_coverage_pct_ge_v1``:
-    which parcels ≥ *min_area* had an ``area_summary`` in v1 but none in v2
-    (and the reverse), summarised by v1 dominant type, area and whether the
-    v2 doc has *any* segmentation on the parcel's tile.  The failing v2 JSON
-    is not uploaded, so this line is the only evidence that survives — it
-    tells apart "v2 class-set drops a type v1 had" (fix: map that type) from
-    "a tile came back empty" (fix: BEV/tile) without reprocessing."""
-    try:
-        d1 = _g(v1, "parcels", "details", default=None) or []
-        d2 = _g(v2, "parcels", "details", default=None) or []
-        if not isinstance(d1, list) or not isinstance(d2, list):
-            return ""
-        def _key(p):
-            return p.get("parcel_id") or p.get("gst_nr") or p.get("id") or p.get("kg_gst")
-        m2 = {_key(p): p for p in d2 if isinstance(p, dict) and _key(p) is not None}
-        lost, gained = [], 0
-        for p in d1:
-            if not isinstance(p, dict) or (_num(p.get("area_sqm"), 0) or 0) < min_area:
-                continue
-            q = m2.get(_key(p))
-            if q is None:
-                continue
-            if p.get("area_summary") and not q.get("area_summary"):
-                lost.append((p, q))
-            elif q.get("area_summary") and not p.get("area_summary"):
-                gained += 1
-        if not lost:
-            return f" | lost=0 gained={gained} (key mismatch? v1={len(d1)} v2={len(d2)} details)"
-        from collections import Counter
-        types = Counter()
-        for p, _q in lost:
-            as_ = p.get("area_summary") or {}
-            types[p.get("dominant_type") or (next(iter(as_)) if as_ else "?")] += 1
-        areas = sorted((_num(p.get("area_sqm"), 0) or 0) for p, _ in lost)
-        med = areas[len(areas) // 2]
-        # v2-side signal: does the lost parcel still carry elevation (tile
-        # was read) and what does the light seg raster say?
-        elev = sum(1 for _p, q in lost if q.get("elevation_m") is not None)
-        types_s = ",".join(f"{t}={n}" for t, n in types.most_common(4))
-        ex = ",".join(str(_key(p)) for p, _ in lost[:3])
-        return (f" | lost={len(lost)} gained={gained} v1_types[{types_s}] "
-                f"area_med={med:.0f}m² max={areas[-1]:.0f}m² v2_has_elev={elev}/{len(lost)} e.g. {ex}")
-    except Exception as exc:  # noqa: BLE001
-        return f" | lost-diag failed: {exc}"
-
-
 def _active_tiles(doc) -> tuple[int, int, list]:
     """(n_tiles_with_lidar, n_tiles_segmented, unsegmented_tile_idx)."""
     tiles = _g(doc, "data_quality", "tiles", default=[]) or []
@@ -263,9 +181,8 @@ def _active_tiles(doc) -> tuple[int, int, list]:
 def _nodata_tile_union_3035(doc):
     """Union (EPSG:3035) of tile bboxes that have **no DTM at all**
     (``dtm=False`` / ``valid_pixels=0``): open water (Bodensee, Rhine) or
-    outside BEV ALS coverage.  The cadastral parcel union routinely
-    extends over such areas (91109 Gaissau: tiles 1/11/12 on Lake
-    Constance, ``parcel_segmentation_coverage_pct=80.4``), so a hole
+    outside BEV ALS coverage.  The KG bbox routinely extends over such
+    areas (91109 Gaissau: tiles 1/11/12 on Lake Constance), so a hole
     there is permanent and not a stitching defect.  None if no such tile."""
     tiles = _g(doc, "data_quality", "tiles", default=[]) or []
     boxes = []
@@ -317,8 +234,8 @@ def _declared_dtm_nodata_px(doc) -> int | None:
 # document-level checks (shared by both gates)
 # --------------------------------------------------------------------------
 
-def check_cadastre_free_document(v2: dict, rep: Report) -> None:
-    """2.4: a product must not carry anything cadastre-shaped (fatal)."""
+def check_property_free_document(v2: dict, rep: Report) -> None:
+    """A product must not carry any property-level section (fatal)."""
     pv = str(v2.get("product_version") or "")
     try:
         is_24 = float(pv.split("-")[0]) >= 2.4
@@ -327,22 +244,23 @@ def check_cadastre_free_document(v2: dict, rep: Report) -> None:
     if not is_24:
         return
     present = [k for k in FORBIDDEN_SECTIONS if k in v2]
-    rep.check("cadastre_free_sections", not present, "forbidden sections: " + ",".join(present))
-    rep.check("cadastre_free_flag", bool(v2.get("cadastre_free")), "cadastre_free flag missing")
-    # no parcel ids / addresses anywhere in the (compact) document text
+    rep.check("property_free_sections", not present, "forbidden sections: " + ",".join(present))
+    rep.check("property_free_flag", bool(v2.get("property_free") or v2.get("cadastre_free")),
+              "property_free flag missing")
+    # no property ids / addresses anywhere in the (compact) document text
     try:
         import json as _j
         txt = _j.dumps({k: v for k, v in v2.items() if k not in ("terrain", "landcover")}, default=str)
         bad = [w for w in ("parcel_id", "building_id", "footprint_id", "vertex_heights", "outline_z",
                            "\"address", "gst_nr", "\"ez\"") if w in txt]
-        rep.check("cadastre_free_text", not bad, "cadastre-shaped keys in document: " + ",".join(bad))
+        rep.check("property_free_text", not bad, "property-level keys in document: " + ",".join(bad))
     except Exception as e:  # noqa: BLE001
-        rep.check("cadastre_free_text", False, f"scan failed: {e}", fatal=False)
+        rep.check("property_free_text", False, f"scan failed: {e}", fatal=False)
 
 
 def check_ne(v2: dict, rep: Report, h3b_path: str | None, ne_declared_digest: str | None) -> None:
     """2.4 NE cells: JSON ``ne`` section consistent with the ``.h3b`` product.
-    Missing NE (declared layer not built at umfeld yet) is a non-fatal
+    Missing NE (declared layer not available) is a non-fatal
     '-partial' defect; an INVALID h3b is fatal (never upload broken cells)."""
     pv = str(v2.get("product_version") or "")
     try:
@@ -377,17 +295,13 @@ def check_ne(v2: dict, rep: Report, h3b_path: str | None, ne_declared_digest: st
         n_obs = int((ne.get("observed") or {}).get("cells_observed") or 0)
         n_all = int(r.get("cells_n") or 0)
         is_block = bool(hdr.get("partial_cells"))
-        # A split block whose bbox corner lies outside Austria (border KGs:
-        # 32002-northwest-2, 73008-southwest-1, 74404-northeast, 80002-
-        # northeast-2 … 2026-10-07/08) has *no parcels* and therefore no
-        # declared cells inside its extent — 0 observed is correct there,
-        # not a product defect.  Fatal only when the block does carry
-        # parcels (a real observed-layer failure).
-        _n_parcels = int(_num(_g(v2, "parcels", "count"), 0) or 0)
-        _empty_block = is_block and _n_parcels == 0
+        # A split block whose bbox corner lies outside Austria (border KGs)
+        # has no declared cells inside its extent — 0 observed is correct
+        # there, not a product defect.
+        _empty_block = is_block and n_all == 0
         rep.check("ne_cells_observed", n_obs > 0 and (is_block or n_obs >= 0.5 * n_all),
                   f"{n_obs}/{n_all} cells observed" + (" (block)" if is_block else "")
-                  + (" (block has no parcels — outside AT / no declared cells)" if _empty_block else ""),
+                  + (" (block has no declared cells — outside AT)" if _empty_block else ""),
                   fatal=n_obs == 0 and not _empty_block)
         rep.check("ne_algo", (hdr.get("nec1") or {}).get("algo") == ne_h3.ALGO_DECLARED
                   and (hdr.get("neo1") or {}).get("algo") == ne_h3.ALGO_OBS,
@@ -396,8 +310,7 @@ def check_ne(v2: dict, rep: Report, h3b_path: str | None, ne_declared_digest: st
         rep.check("ne_h3b_valid", False, f"verify_h3b raised: {e}")
 
 
-def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None = None,
-                   expected_parcels: int | None = None) -> None:
+def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None = None) -> None:
     rep.check("sections", all(k in v2 for k in REQUIRED_SECTIONS),
               "missing: " + ",".join(k for k in REQUIRED_SECTIONS if k not in v2))
     rep.check("version", str(v2.get("version")) == "v2", f"version={v2.get('version')}")
@@ -433,115 +346,18 @@ def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None =
               f"{n_up} upstream-failed tile(s)" + (f" (v1: {n_up1})" if v1 else ""),
               fatal=(v1 is not None and n_up > n_up1))
 
-    # 2.4: cadastre-free gate (fatal) + NE section
-    check_cadastre_free_document(v2, rep)
-    has_parcels = "parcels" in v2          # legacy (< 2.4) documents only
-    # parcels (legacy documents only — 2.4 has none)
-    pd = (_g(v2, "parcels", "details", default=[]) or []) if has_parcels else []
-    pc = int(_num(_g(v2, "parcels", "count"), 0) or 0) if has_parcels else 0
-    if has_parcels:
-        rep.check("parcels_count_matches_details", pc == len(pd), f"count={pc} details={len(pd)}")
-    if has_parcels and expected_parcels is not None and expected_parcels > 0:
-        rel = abs(pc - expected_parcels) / expected_parcels
-        rep.check("parcels_vs_cadastre", rel <= TOL["parcel_count_rel"],
-                  f"{pc} vs cadastre {expected_parcels}")
-    if pd:
-        with_geom = sum(1 for p in pd if p.get("vertex_heights"))
-        with_oz = sum(1 for p in pd if p.get("outline_z"))
-        rep.check("parcel_outline_z", with_geom == 0 or with_oz >= TOL["outline_z_min_frac"] * with_geom,
-                  f"{with_oz}/{with_geom} parcels carry outline_z", fatal=False)
-        n_elev = sum(1 for p in pd if _num(p.get("elevation_m")) is not None)
-        pd1 = (_g(v1, "parcels", "details", default=[]) or []) if v1 else []
-        n_elev1 = sum(1 for p in pd1 if isinstance(p, dict) and _num(p.get("elevation_m")) is not None)
-        _elev_ok = n_elev >= 0.9 * len(pd)
-        # fatal: below half, or regressed vs a v1 baseline that had them
-        _elev_fatal = n_elev < 0.5 * len(pd) or (pd1 and n_elev < 0.9 * n_elev1)
-        rep.check("parcel_elevations", _elev_ok,
-                  f"{n_elev}/{len(pd)} parcels with elevation" + (f" (v1: {n_elev1}/{len(pd1)})" if pd1 else ""),
-                  fatal=bool(_elev_fatal))
+    # property-free gate (fatal)
+    check_property_free_document(v2, rep)
 
     check_v21_document(v2, rep)
     check_v23_top_ranking(v2, rep)
 
     cov = _g(v2, "coverage", default={}) or {}
-    cov1 = (_g(v1, "coverage", default={}) or {}) if v1 else {}
-    for k in (("parcel_elevation_coverage_pct", "parcel_segmentation_coverage_pct") if has_parcels else ()):
-        v = _num(cov.get(k))
-        v1v = _num(cov1.get(k)) if v1 else None
-        # a baseline that had 0 / no coverage figure cannot be regressed;
-        # a parcel-less block (57210-southeast: alpine quadrant whose huge
-        # parcels all have their centroid in a sibling block, 0 parcels /
-        # 0 buildings) has nothing to cover — 0.0 is the correct figure.
-        rep.check(f"coverage.{k}", v is not None and v > 0,
-                  f"{k}={v}" + (" (no parcels in KG)" if pc == 0 else ""),
-                  fatal=pc > 0 and not (v1 is not None and not v1v))
 
     if v1 is None:
         return
     # ---- improvement / non-regression vs v1 --------------------------------
-    pc1 = int(_num(_g(v1, "parcels", "count"), 0) or 0) if has_parcels else 0
-    if pc1 > 0:
-        _d = abs(pc - pc1)
-        rep.check("parcels_vs_v1", _d <= max(TOL["parcel_count_abs"], TOL["parcel_count_rel"] * pc1),
-                  f"v2={pc} v1={pc1}")
     cov1 = _g(v1, "coverage", default={}) or {}
-    for k, tol in (("parcel_elevation_coverage_pct", TOL["coverage_pp"]),
-                   ("parcel_segmentation_coverage_pct", TOL["seg_coverage_pp"]),
-                   ("building_height_coverage_pct", TOL["building_cov_pp"])):
-        a, b = _num(cov.get(k)), _num(cov1.get(k))
-        if a is None or b is None or not has_parcels:
-            continue
-        if k == "parcel_segmentation_coverage_pct":
-            # Small KGs (19423: 164 parcels, 19732: 38) flip a handful of
-            # sliver parcels (70–250 m², smaller than the object covering
-            # them) between runs — 1–6 parcels = 2.6–3.6 pp, past the 2.5 pp
-            # gate although nothing is wrong (2026-09-21, 5 parents struck
-            # after 0d4f717).  Judge the fatal gate on parcels ≥ 300 m² where
-            # both docs carry details; the raw figure stays a drift warning.
-            # The ≥300 m² figure has a small denominator on medium KGs (50–200
-            # parcels): losing 3–6 parcels = 3–7 pp although the raw figure
-            # moved 0–2 pp.  Fatal only when *both* figures drop past
-            # seg_coverage_pp_fatal — that is what a lost tile looks like;
-            # anything smaller is reported as non-fatal drift with the
-            # lost-parcel forensic tail so the class-set gap stays visible.
-            fatal_tol = TOL["seg_coverage_pp_fatal"]
-            fa, fb = _seg_coverage_min_area(v2), _seg_coverage_min_area(v1)
-            if fa is not None and fb is not None:
-                _det = f"v2={fa:.1f} v1={fb:.1f} (parcels ≥{SEG_COV_MIN_AREA_SQM:.0f} m²; raw {a:.1f}/{b:.1f})"
-                big_drop = fa < fb - fatal_tol and a < b - fatal_tol
-                if fa < fb - tol or big_drop:
-                    _det += _lost_parcels_diag(v2, v1)
-                rep.check(f"{k}_ge_v1", not big_drop, _det)
-                if not big_drop and (fa < fb - tol or a < b - TOL["seg_coverage_pp_warn"]):
-                    rep.check(f"{k}_drift", False,
-                              f"v2={a:.1f} v1={b:.1f} ({a - b:+.1f} pp raw; "
-                              f"{fa - fb:+.1f} pp ≥{SEG_COV_MIN_AREA_SQM:.0f} m²)", fatal=False)
-                continue
-            # no per-parcel details on one side: judge the raw figure alone
-            rep.check(f"{k}_ge_v1", a >= b - fatal_tol, f"v2={a:.1f} v1={b:.1f}")
-            if b - fatal_tol <= a < b - TOL["seg_coverage_pp_warn"]:
-                rep.check(f"{k}_drift", False, f"v2={a:.1f} v1={b:.1f} ({a - b:+.1f} pp)", fatal=False)
-            continue
-        if k == "building_height_coverage_pct":
-            # Percentage over a *small* denominator: 40114-northeast-1 has
-            # 4 buildings (75.0 vs 100.0 = one building), 63323-south 17
-            # (70.6 vs 75.0 = one), 90014-northwest-2 ~22 (76.7 vs 81.8 =
-            # one) — all struck on a 2 pp gate on 2026-09-23 although a
-            # single edge building flipping its nDSM sample is run-to-run
-            # noise, not a lost tile.  Fatal only when ≥3 buildings (or
-            # 5 %) lost height; the pp figure stays a drift warning.
-            nb = int(_num(_g(v2, "building_footprints", "count"), 0) or 0)
-            nb1 = int(_num(_g(v1, "building_footprints", "count"), 0) or 0)
-            n = max(nb, nb1, 1)
-            lost = max(0.0, (b - a) * n / 100.0)
-            fatal_lost = max(3.0, 0.05 * n)
-            rep.check(f"{k}_ge_v1", lost <= fatal_lost,
-                      f"v2={a:.1f} v1={b:.1f} (≈{lost:.1f} of {n} buildings lost height; fatal >{fatal_lost:.0f})")
-            if lost <= fatal_lost and a < b - tol:
-                rep.check(f"{k}_drift", False, f"v2={a:.1f} v1={b:.1f} ({a - b:+.1f} pp, ≈{lost:.0f} buildings)",
-                          fatal=False)
-            continue
-        rep.check(f"{k}_ge_v1", a >= b - tol, f"v2={a:.1f} v1={b:.1f}")
     # Tile-grid comparisons.  ``total_segmented_area_sqm`` is the SUM of
     # per-tile valid px over the overlapping 1.5 km grid and ``n_tiles``
     # depends on how the bbox happened to fall on the grid when the v1 ran
@@ -886,9 +702,8 @@ def _dtm_nodata_mask(path: str, shape: tuple[int, int], transform) -> np.ndarray
     −9999, v2.1+) has **no DTM**, resampled (nearest) onto the segment_type
     grid.  Where BEV ALS has no ground there is nothing to segment, so a
     hole there is a property of the terrain, not of the stitcher: the
-    Bodensee KGs 91109 Gaissau / 91111 Hard carry 1.8 / 7.0 km² lake
-    parcels (``91111-2912/1``, no elevation at all) whose water lies in
-    shore tiles that are 3–52 % land — ``_nodata_tile_union_3035`` only
+    Bodensee KGs 91109 Gaissau / 91111 Hard carry 1.8 / 7.0 km² of lake
+    (no elevation at all) whose water lies in shore tiles that are 3–52 % land — ``_nodata_tile_union_3035`` only
     drops *all-water* tiles, so both struck out at 18–25 % "hole" on every
     peer (2026-09-23/26).  None when the layer is absent (pre-2.1 light).
 
@@ -1043,10 +858,10 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
         _optional = set()
         missing = [l for l in LIGHT_LAYERS_REQUIRED if l not in layers]
         rep.check("light_gpkg_layers", not missing, "missing: " + ",".join(missing))
-        # 2.4: cadastre-shaped layers are forbidden (fatal) — also as bare tables
+        # property-level layers are forbidden (fatal) — also as bare tables
         all_tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         forbidden = [l for l in FORBIDDEN_LIGHT_LAYERS if l in layers or l in all_tables]
-        rep.check("light_gpkg_cadastre_free", not forbidden, "forbidden layers/tables: " + ",".join(forbidden))
+        rep.check("light_gpkg_property_free", not forbidden, "forbidden layers/tables: " + ",".join(forbidden))
 
         def _count(t):
             try:
@@ -1089,14 +904,6 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
                       "label ids of restored tiles collided in the stitcher")
         except Exception as e:  # noqa: BLE001
             rep.check("segments_label_consistency", False, str(e)[:160], fatal=False)
-        pc = int(_num(_g(v2, "parcels", "count"), 0) or 0)
-        npar = _count("parcels")
-        rep.check("parcels_layer_count", pc == 0 or abs(npar - pc) <= max(2, 0.01 * pc),
-                  f"layer={npar} json={pc}")
-        nb = int(_num(_g(v2, "building_footprints", "count"), 0) or 0)
-        nbl = _count("buildings")
-        rep.check("buildings_layer_count", nb == 0 or abs(nbl - nb) <= max(2, 0.01 * nb),
-                  f"layer={nbl} json={nb}")
         try:
             check_v21_light_gpkg(c, layers, v2, rep)
         except Exception as e:  # noqa: BLE001
@@ -1142,10 +949,9 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
             # large irregular KG it is wrong in *both* directions:
             # ``total_segmented_area_sqm`` counts every valid DTM px in
             # the tile bboxes, while the stitched raster only keeps px of
-            # *kept* objects — segments <50 % inside the parcel union are
-            # dropped by the KG-mask filter and the centroid dedup drops
-            # overlap duplicates.  A KG whose parcel union fills only part
-            # of its 15-tile bbox therefore legitimately reads 0.75–0.83
+            # *kept* objects — segments <50 % inside the AOI are dropped
+            # and the centroid dedup drops overlap duplicates.  A KG whose
+            # AOI fills only part of its 15-tile bbox legitimately reads 0.75–0.83
             # (47106 → 0.827 vs floor 0.828, 57210-south → 0.745/0.780,
             # 2026-09-23: both struck, v2 products dropped for a healthy
             # raster).  Real stitching loss is what ``segment_type_no_holes``
@@ -1153,14 +959,10 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
             # the area ratio is only a drift warning.  Fatal only when no
             # union is available (legacy callers) or the raster is empty.
             _shape_aware = hole is not None
-            # A parcel-less block has no union to measure holes in and no
-            # KG-mask to explain the ratio; the raster only has to exist.
-            _no_parcels = int(_num(_g(v2, "parcels", "count"), 0) or 0) == 0
-            _ok = nz > 0 and (_shape_aware or _no_parcels or _r >= _floor)
+            _ok = nz > 0 and (_shape_aware or _r >= _floor)
             rep.check("segment_type_raster_area", _ok,
                       f"nonzero px={nz} json segmented m²={sa:.0f} ratio={_r:.3f} floor={_floor:.3f} tiles={_nt}"
-                      + (" (hole check authoritative)" if _shape_aware
-                         else " (no parcels in KG — ratio advisory)" if _no_parcels else ""))
+                      + (" (hole check authoritative)" if _shape_aware else ""))
             if _ok and _r < 0.95:
                 rep.check("segment_type_raster_area_drift", False,
                           f"ratio={_r:.3f} (tile-overlap double count / KG-mask filter, {_nt} tiles)",
@@ -1173,7 +975,7 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
             _nup = int(_num(_g(v2, "data_quality", "n_upstream_failed_tiles"), 0) or 0)
             _declared_gap = (_s < _l) or _nup > 0
             rep.check("segment_type_no_holes", hole <= TOL["raster_hole_frac"],
-                      f"{100*hole:.2f}% of parcel union has no segment class"
+                      f"{100*hole:.2f}% of the AOI has no segment class"
                       + (" (declared tile gap)" if _declared_gap else "")
                       + (" (no-DTM tiles excluded from union)" if _nd is not None else "")
                       + (f" (DTM-nodata px excluded: {100*_nd_frac:.1f}% of union)" if _nd_px else ""),
@@ -1198,8 +1000,7 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
 # --------------------------------------------------------------------------
 
 def verify_before_upload(code: str, json_v2_path: str, light_gpkg_path: str | None,
-                         v1_doc: dict | None, *, expected_parcels: int | None = None,
-                         union_geom_3035=None, h3b_path: str | None = None,
+                         v1_doc: dict | None, *, union_geom_3035=None, h3b_path: str | None = None,
                          ne_declared_digest: str | None = None) -> Report:
     rep = Report()
     p = Path(json_v2_path)
@@ -1216,7 +1017,7 @@ def verify_before_upload(code: str, json_v2_path: str, light_gpkg_path: str | No
     rep.check("json_v2_decodes", True)
     ok, why = kg_json_v2.roundtrip_ok(v2)
     rep.check("codec_roundtrip", ok, why)
-    check_document(v2, v1_doc, rep, code=code, expected_parcels=expected_parcels)
+    check_document(v2, v1_doc, rep, code=code)
     if light_gpkg_path is not None:
         check_light_gpkg(light_gpkg_path, v2, rep, union_geom_3035)
     check_ne(v2, rep, h3b_path, ne_declared_digest)
@@ -1249,8 +1050,7 @@ def verify_for_ingest(code: str, blob: bytes, v1_doc: dict | None, manifest_entr
         # the block CODE survived a re-split but now names a different
         # rectangle. The stored v1 doc describes the old rectangle, so every
         # "v2 >= v1" improvement check would compare unrelated AOIs
-        # (57306-southeast-1: 20 tiles/13 parcels -> 12 tiles/0 parcels,
-        # struck out 3x on parcels_vs_v1). Verify without a baseline.
+        # (57306-southeast-1: 20 tiles -> 12 tiles). Verify without a baseline.
         bb2, bb1 = v2.get("bbox") or {}, v1_doc.get("bbox") or {}
         rep.check("baseline_layout_stale", False,
                   f"v1 bbox lon[{_num(bb1.get('min_lon'), 0):.4f},{_num(bb1.get('max_lon'), 0):.4f}] "
@@ -1263,15 +1063,6 @@ def verify_for_ingest(code: str, blob: bytes, v1_doc: dict | None, manifest_entr
     check_document(v2, v1_doc, rep, code=code)
     if v1_doc is None and v1_row:
         # Fall back to the flat index row for the few comparable numbers.
-        # 2.4+ documents are cadastre-free (no ``parcels`` section) — the
-        # index row's parcel_count is a v1 figure, so the comparison is
-        # meaningless there (Oct 2026: 03032/11040/12015/12044/20140 struck
-        # out 3x on ``parcels_vs_v1_row: v2=0 v1=N``).
-        pc = int(_num(_g(v2, "parcels", "count"), 0) or 0)
-        pc1 = int(_num(v1_row.get("n_parcels"), 0) or 0)
-        if pc1 > 0 and "parcels" in v2 and not v2.get("cadastre_free"):
-            rep.check("parcels_vs_v1_row", abs(pc - pc1) / pc1 <= TOL["parcel_count_rel"],
-                      f"v2={pc} v1={pc1}")
         n1 = int(_num(v1_row.get("n_segments"), 0) or 0)
         n2 = int(_num(_g(v2, "landscape", "n_segments"), 0) or 0)
         if n1 > 0:
