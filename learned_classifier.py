@@ -253,7 +253,7 @@ class LearnedClassifier:
         # ------------------------------------------------------------------
         # Break label circularity for tree_loss samples.
         #
-        # tree_loss labels are created in train_rf_4000kg.py using
+        # tree_loss labels were created by the (removed) RF training harness using
         # hansen_recent_loss_frac and hansen_treecover2000 as the labelling
         # criteria.  If the RF sees these same features alongside the label
         # it just learns "hansen_recent_loss_frac > 0.15 → tree_loss" —
