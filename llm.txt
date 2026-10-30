@@ -1,5 +1,6 @@
-# Austrian Landscape Analysis API — v5.4
-# Base: https://example.invalid:8000
+# Austrian Landscape Analysis — operator API reference (app.py)
+# Base: http://localhost:8000 (loopback; mutating routes need loopback or the operator header — see SECURITY.md)
+# Public read tier: http://localhost:8100 → GET /api/v1/docs/llm.txt (its own contract)
 # Geometry: WGS84 (lon/lat). Processing: EPSG:3035. Max area: 25 km². Austria only.
 
 ## Overview
@@ -8,7 +9,7 @@ Watershed segmentation + Random Forest classifier over 6 remote sensing layers.
 Classifies landscape into 25 object types + 11 group types.
 Focused on distinguishing man-made vs natural and detecting terrain modification.
 
-## Data Sources (8)
+## Data Sources (7)
 
 | # | Source | Resolution | Access | Role |
 |---|--------|-----------|--------|------|
@@ -18,8 +19,7 @@ Focused on distinguishing man-made vs natural and detecting terrain modification
 | 4 | ESA WorldCover v200 | 10m | AWS COG (esa-worldcover.s3.eu-central-1.amazonaws.com) | Land cover prior (built/tree/crop/grass/water fractions) |
 | 5 | Sentinel-1 SAR | 10m | openEO | VV+VH backscatter (cloud-proof ground classification) |
 | 6 | Hansen GFC-2024-v1.12 | 30m | HTTP range (storage.googleapis.com) | Forest cover 2000, annual loss/gain 2001–2024 |
-| 7 | Austrian Cadastre | mm | umfeld-at `/k` REST API | Run-time model context only (footprint/land-use priors); never written to a product since 2.4 |
-| 8 | OpenStreetMap | varies | Overpass API | Roads, paths, waterways, landcover (supplementary ground truth) |
+| 7 | OpenStreetMap | varies | Overpass API | Roads, paths, waterways, landcover (supplementary ground truth) |
 
 BEV LiDAR URLs: data.bev.gv.at/download/ALS/{DTM,DSM}/{20220915,20230915,20240915}/
 BEV Ortho URLs: data.bev.gv.at/download/DOP/{20220128,20221027,20240625,20250415}/
@@ -39,7 +39,7 @@ re-use them you must carry forward these credits:
 
 | Source | Licence | Required credit |
 |---|---|---|
-| BEV ALS DTM/DSM, DOP orthophoto, Kataster | CC BY 4.0 (Open Government Data) | "Datenquelle: BEV – Bundesamt für Eich- und Vermessungswesen, <product>, Stichtag <date>, CC BY 4.0, bearbeitet" |
+| BEV ALS DTM/DSM, DOP orthophoto | CC BY 4.0 (Open Government Data) | "Datenquelle: BEV – Bundesamt für Eich- und Vermessungswesen, <product>, Stichtag <date>, CC BY 4.0, bearbeitet" |
 | Copernicus Sentinel-1 / Sentinel-2 | Free, full & open (EU Reg. 377/2014; Del. Reg. 1159/2013) | "Contains modified Copernicus Sentinel data <year>" |
 | ESA WorldCover 2021 v200 | CC BY 4.0 | "© ESA WorldCover project 2021" + Zanaga et al. 2022, doi:10.5281/zenodo.7254221 |
 | Hansen GFC-2024-v1.12 | CC BY 4.0 | "Hansen/UMD/Google/USGS/NASA" + Hansen et al. 2013, Science 342:850–853 |
@@ -56,8 +56,8 @@ real flight years per block in meta.acquisition. DOP series
 OSM caveat: the `infrastructure` layer / JSON key contains OSM-derived
 (ODbL) data and is kept separate. Merging it into a redistributed database
 triggers ODbL share-alike for that database. Everything else is CC BY 4.0.
-No personal data: cadastre owner data is not in the open datasets nor in
-this API; EZ numbers are public cadastre attributes.
+No personal data: nothing in the products or this API is keyed by any
+property or ownership unit; building footprints are never written out.
 
 ## Methods — Segmentation Pipeline
 
@@ -125,14 +125,14 @@ Adjacent compatible segments merge into 11 group types:
 ## Methods — RF Training Pipeline
 
 ### Ground Truth Sources
-1. Cadastre land-use codes (Benützungsart): 50-entry BA→type mapping (42→roof, 51→crop, 56→tree, 48→road, etc.)
+1. Land-use polygons (open BEV vector data) → type mapping (roof/crop/tree/road …)
 2. OSM: roads/paths buffered to width → road/path labels; landuse/natural polygons → forest/farmland/water/quarry labels
 3. Hansen tree_loss: synthetically labelled where hansen_recent_loss_frac≥0.15 + treecover2000≥20% + (height<5m or h_change<-2m)
    - Label circularity fix: hansen_recent_loss_frac and hansen_treecover2000 features zeroed for tree_loss samples
 
 ### Training Process
 Runs as systemd service (rf_train.service). Iterates ~300 random KGs (seed 42, >5 buildings each) + infrastructure KGs:
-1. For each KG: fetch cadastre + OSM ground truth, read all raster data, segment, extract 57 features, match to labels
+1. For each KG: fetch OSM + land-use ground truth, read all raster data, segment, extract 57 features, match to labels
 2. Each KG checkpointed to rf_training_data/checkpoints/kg_XXXXX.npz (skipped on restart)
 3. Every 10 KGs: retrain RF on all accumulated samples, save to /tmp/learned_classifier/
 4. Dominant classes downsampled to 5× median class count to reduce imbalance
@@ -163,14 +163,14 @@ Top 10 feature importances:
   temporal_h_std 2.3%, h_p90 2.3%, h_p10 2.2%
 
 Learning curve: composite peaks at 55 KGs then declines (additional data introduces label noise
-from cadastre/OSM misalignment faster than new signal). OOB and composite both trend down after 60 KGs.
+from label/OSM misalignment faster than new signal). OOB and composite both trend down after 60 KGs.
 
 ## Austria-Wide Processing (Austria Processor)
 
-Background processor (austria_processor.py, ~5100 lines) applies the full pipeline to all ~8,440 Austrian Katastralgemeinden (KGs), uploading results to Zenodo as open-access datasets.
+Background processor (austria_processor.py) applies the full pipeline to all ~8,440 Austrian Katastralgemeinden (KGs), uploading results to Zenodo as open-access datasets.
 
 ### Architecture
-- Runs as systemd service (austria_processor.service, MemoryMax=4G)
+- Runs as systemd service (austria_processor.service, MemoryMax=8G)
 - Each KG processed in isolated subprocess (multiprocessing.Pool(1)) — full memory reclaim between KGs
 - Large KGs tiled into 1.5km overlapping strips (100m overlap), centroid-ownership deduplication
 - Tile checkpoints: completed tiles pickled to disk; on crash only interrupted tile re-processed
@@ -179,11 +179,11 @@ Background processor (austria_processor.py, ~5100 lines) applies the full pipeli
 
 ### Per-KG Outputs (uploaded to Zenodo)
 - {kg}_full.gpkg (~400MB): all raster layers (DTM/DSM/nDSM/ortho/segment_type) + vector segment polygons
-- {kg}_light_v2.gpkg (~100-400MB): segment raster+vector, new buildings, infrastructure, tree apices/crowns, terrain_coarse (no cadastre layers since 2.4)
-- {kg}.json / {kg}_v2.json.gz / {kg}_ne.h3b: cadastre-stripped summary (completion marker), kgjson/2 blob, NE H3 cells — area statistics, height distributions, landscape characterisation, top objects, terrain, NDVI, Hansen loss, new buildings, infrastructure, data quality score
+- {kg}_light_v2.gpkg (~100-400MB): segment raster+vector, new buildings, infrastructure, tree apices/crowns, terrain_coarse
+- {kg}.json / {kg}_v2.json.gz / {kg}_ne.h3b: summary (completion marker), kgjson/2 blob, NE H3 cells — area statistics, height distributions, landscape characterisation, top objects, terrain, NDVI, Hansen loss, new buildings, infrastructure, data quality score
 
 #### GPKG segments layer — full per-object attribute schema (55 props)
-Present in {kg}_full.gpkg and {kg}_light.gpkg (layer 'segments',
+Present in {kg}_full.gpkg and {kg}_light_v2.gpkg (layer 'segments',
 MultiPolygon EPSG:3035) and in app GPKG exports (onestop, /export/geopackage,
 share download). A companion 'segment_points' layer (Point EPSG:4326, 54
 props) carries the same attributes on object centroids.
@@ -205,9 +205,8 @@ props) carries the same attributes on object centroids.
   Observation:    obs_year
 A QGIS layer_styles table auto-renders both layers (colour by type).
 
-#### Retired layers (product 2.4, Oct 2026)
-`parcels` / `buildings` layers are no longer written (cadastre-free products;
-the Austrian cadastre is run-time model context only). The light GPKG is
+#### Light GPKG layers (product 2.4)
+No footprint-shaped layers are ever written. The light GPKG is
 `{kg}_light_v2.gpkg` (segments, segment_points, new_buildings, infrastructure,
 segment_type, segment_height, tree_apices, tree_crowns, terrain_coarse);
 per-cell observed data lives in `{kg}_ne.h3b` (public /api/v1/cells).
@@ -245,27 +244,27 @@ the new position. Response includes resolved KG names, gemeinde, and final posit
 
 Examples:
   # Read the queue
-  curl https://example.invalid:8000/api/v1/processing/queue
+  curl http://localhost:8000/api/v1/processing/queue
   # → {"queue": [{"code":"12105","name":"Dürnstein",...}, ...], "count": 28, "permanently_failed": [...]}
 
   # Add Gesäuse + Kalkalpen national park KGs starting at position 2 (3rd place)
-  curl -X POST https://example.invalid:8000/api/v1/processing/queue \
+  curl -X POST http://localhost:8000/api/v1/processing/queue \
     -H 'Content-Type: application/json' \
     -d '{"kgs":["49006","49013","49106","49311","49313","49321","49405","49406","49407","49409","49412","60102","60106","60107","67106","67107","67109","67111","67404","67405","67412","67501"],"position":2}'
   # → {"status":"added","added_count":22,"queue_length":50,"added":[{"code":"49006","name":"Innerbreitenau","position":2},...]}
 
   # Move a KG to the front of the queue
-  curl -X POST https://example.invalid:8000/api/v1/processing/queue \
+  curl -X POST http://localhost:8000/api/v1/processing/queue \
     -H 'Content-Type: application/json' \
     -d '{"kgs":["91109"],"position":0}'
 
   # Replace entire queue
-  curl -X PUT https://example.invalid:8000/api/v1/processing/queue \
+  curl -X PUT http://localhost:8000/api/v1/processing/queue \
     -H 'Content-Type: application/json' \
     -d '{"queue":["49006","49013","60102"]}'
 
   # Remove a KG from the queue
-  curl -X DELETE 'https://example.invalid:8000/api/v1/processing/queue?kg=49006'
+  curl -X DELETE 'http://localhost:8000/api/v1/processing/queue?kg=49006'
 
 ## Geometry Input (all POST endpoints)
 
@@ -291,7 +290,6 @@ Query/body params:
   include_ortho      true → BEV RGBI (NDVI, NIR, brightness, GLCM texture)
   include_temporal   true → 3-date DTM comparison (2022/2023/2024)
   include_copernicus true → Sentinel-2 NDVI + ESA WorldCover + SAR + NDVI harmonics
-  include_cadastre   true → cadastre building footprint ground truth
   include_hansen     true → Hansen Global Forest Change calibration
   types              Comma-separated type filter (e.g. "roof,tree,road")
   groups             Comma-separated group filter (e.g. "building,forest")
@@ -344,7 +342,7 @@ Enrich features with DSM/DTM elevation.
 #### POST /api/v1/terrain
 Terrain characterisation: slope, aspect, TRI, TPI, curvature.
 Invalid input polygons (self-intersections, ring sets where a hole is emitted
-as the exterior — common with raw cadastre geometry) are repaired server-side
+as the exterior — common with raw survey geometry) are repaired server-side
 with make_valid() before rasterising. When that happens the response carries
 meta.geometry_repaired=true and meta.warnings[]. Applies to all
 geometry-driven endpoints (/terrain, /elevation, /segment, /changes*).
@@ -372,7 +370,7 @@ Per-tree properties: tree_id, status, height_before_m, height_after_m,
 height_change_m, crown_area_before_sqm, crown_area_after_sqm.
 Summary: total_trees, by_status{count, height_change_mean_m}.
 v2.3: NON-FOREST SUPPRESSION also runs here (params reject_nonforest /
-include_cadastre / min_tree_likelihood, defaults as in /api/v1/trees).
+min_tree_likelihood, defaults as in /api/v1/trees).
 Load-bearing for change detection: without it a demolished barn is
 reported as 'felled' timber and a new shed as a 'new' tree. Objects are
 judged on the epoch where they exist (after-date crown if present, else
@@ -392,13 +390,9 @@ Params:
   reject_nonforest   true (default) | false — v2.3 NON-FOREST SUPPRESSION,
                      the SAME engine as /api/v2/trees (see there for the
                      full evidence chain). v1's own building pixel class is
-                     geometry+spectral only and leaks badly: on a Waldviertel
-                     farmyard AOI it reported 175 trees, 85 of them standing
-                     on cadastre building footprints. With suppression on:
-                     69 trees, 2 on footprints (both genuine crowns
-                     overhanging a roof).
-  include_cadastre   true (default) | false — fetch BEV building footprints
-                     as authoritative non-tree evidence
+                     geometry+spectral only and leaks badly on farmyards
+                     (roofs reported as trees). With suppression on, only
+                     genuine crowns survive.
   min_tree_likelihood 0..1 (default 0.35) — reporting threshold
   async              true → 202 {task_id, poll, result} (same task framework
                      as /segment). Recommended for areas > ~50 ha.
@@ -432,8 +426,9 @@ Roof ridges, silos, containers, hay stacks, maize/rape plateaus, rock
 and road furniture all raise the DSM above terrain and used to be
 reported as trees with full DBH/volume (bogus crowns over farmyards and
 fields). Every crown is now judged on evidence, in order of authority:
-  1. CADASTRE — crown apex on, or >=50% of crown inside, a BEV building
-     footprint (dilated 1 m: outlines are wall lines, the DSM sees eaves)
+  1. BUILDING MASK (optional, SRTM_BEV_VECTOR_CONTEXT=1 on the
+     processor; the live API reports building_mask='unavailable') —
+     crown apex on, or >=50% of crown inside, a footprint (dilated 1 m)
      => surface_class='building'.
   2. NDVI (0.2 m BEV RGBI) — mean crown NDVI <= 0.10 means no live
      foliage => 'hard_surface'. The one legitimate NDVI-poor tree, a
@@ -458,12 +453,10 @@ surface_building_frac / surface_roughness_m / surface_planarity_m /
 surface_relief_m, so a client can re-threshold or audit the verdict.
 Set reject_nonforest=false to receive ALL apices, classified but
 unfiltered (useful to see what was removed and why).
-Measured on a Waldviertel farmyard AOI (0.008° x 0.005°, 47 cadastre
-buildings, 5.8% of grid): 650 → 206 stems, apices on building
-footprints 317 → 4. On a forest-dominated hamlet AOI the filter is
-nearly a no-op (4829 → 4734, 95 rejected), i.e. it costs almost no
-recall where there is nothing to reject. Cost is ~0.1 s + one cached
-cadastre call.
+Measured on a farmyard AOI (0.008° x 0.005°): 650 → 206 stems. On a
+forest-dominated hamlet AOI the filter is nearly a no-op (4829 → 4734,
+95 rejected), i.e. it costs almost no recall where there is nothing to
+reject. Cost is ~0.1 s.
 
 Seeding is two-source: (1) variable-window local maxima on nDSM
 (smoothed sigma=smooth_sigma), window radius r(h) = crown_radius_a +
@@ -479,12 +472,6 @@ Params:
   min_tree_height    m (default 3.0)
   reject_nonforest   true (default) | false — drop buildings/crops/hard
                      surfaces (see NON-FOREST SUPPRESSION above)
-  include_cadastre   true (default) | false — fetch BEV building
-                     footprints as authoritative non-tree evidence.
-                     false skips the cadastre round-trip (faster, and
-                     the only option outside cadastre coverage); the
-                     NDVI + geometry gates still run. meta.building_mask
-                     reports what was actually used.
   min_tree_likelihood 0..1 (default 0.35) — reporting threshold on the
                      surface score. Raise to be stricter (0.6 keeps only
                      crowns with no non-tree evidence at all), lower to
@@ -567,7 +554,7 @@ detection_mode is what actually ran),
 rejected_by_surface (count of apices dropped as non-forest) +
 rejected_by_surface_class ({building: N, crop: N, hard_surface: N, …}) +
 nonforest_rejection (bool, whether suppression was active) +
-building_mask (cadastre | unavailable | skipped… | error: …) +
+building_mask (bev_vector | unavailable | skipped… | error: …) +
 building_mask_px (footprint pixels on the AOI grid),
 nir_used_for (list: classification / detection / detection_luminance —
 replaces the ambiguous nir_used flag, which is kept for compatibility),
@@ -674,27 +661,27 @@ meta}.
 v3 answers from the FROZEN products instead of re-running the detector:
 every `_light_v2.gpkg` (product_version ≥ 2.1) carries a `tree_apices`
 point layer (EPSG:3035, R-tree) — the v2 ndsm_only apex inventory run
-once on the stitched 1 m nDSM with the cadastre building mask — and the
-JSON carries a 25 m `landcover.grid25` index. Product 2.2 (2026-09-20,
-tree_algo_version 3.1.0) adds per-crown BEV ortho RGBI spectra +
+once on the stitched 1 m nDSM (building mask when available) — and the
+JSON carries a 25 m `landcover.grid25` index. Product 2.2+
+(tree_algo_version 3.1.0) adds per-crown BEV ortho RGBI spectra +
 vitality + species_hint on every apex, a `tree_crowns` polygon layer,
 area-weighted canopy fractions, and anchors the raster grid to the BEV
 grid so tree_id is identical between product and live calls. 2.1
 products stay readable (meta.product_versions per code tells you which
-fields you get); the fleet re-upgrades them in the background.
+fields you get); the processor re-upgrades them in the background.
 
 GRID ANCHOR / tree_id (meta.grid_anchor, meta.tree_id_note):
   * All 1 m grids (product AND live, v2 AND v3) are the integer-metre
     EPSG:3035 BEV ALS grid; an apex is the pixel centre (x.5). tree_id =
     `t_<E_dm>_<N_dm>` of that centre — AOI-independent, epoch-stable
-    while the tree keeps its apex pixel. Before 2026-09-20 the live grid
+    while the tree keeps its apex pixel. In older releases the live grid
     origin was the fractional AOI corner, so v2 ids were shifted per AOI
     and never equalled product ids.
   * 2.1 products are re-anchored on read (constant per-product δ); the
     id stored in the 2.1 file is returned as `tree_id_product` when it
     differs — use it to migrate ids captured from v3.0.
   * `legacy_ids=1` adds `tree_id_v2` per feature (v2 AND v3): the id a
-    pre-2026-09-20 /api/v2/trees call over THIS SAME AOI reported. Submit
+    pre-grid-anchor /api/v2/trees call over THIS SAME AOI reported. Submit
     the AOI you used then, join on tree_id_v2, store tree_id.
   * Products built by the v2-upgrade path (from v1 full GPKGs) can carry
     ≤1 px tile misregistration; fresh products are exact.
@@ -723,7 +710,7 @@ Coverage rules (meta.coverage / meta.source_mix):
     inside footprint ∩ AOI; duplicates across overlapping products are
     collapsed by tree_id.
   * live part = AOI minus all footprints. With fallback_live=true
-    (default) the live v2 detector (ndsm_only, cadastre mask) runs ONCE
+    (default) the live v2 detector (ndsm_only) runs ONCE
     on that part; live trees within 1.5 m of a product apex are dropped
     (meta.coverage.live_deduped). fallback_live=false → product only.
   * meta.product_codes_failed / _reasons: products whose GPKG could not
@@ -978,7 +965,7 @@ Parse uploaded geometry file (Shapefile ZIP, GeoPackage, GeoJSON, KML, GPX, WKT)
 Multipart upload with field "file". Returns GeoJSON FeatureCollection.
 
 #### POST /api/v1/classifier/train
-Train RF classifier on cadastre ground truth for a bbox.
+Train RF classifier on open ground-truth labels for a bbox (docs/rf-training.md).
 Params: bbox (lon_min,lat_min,lon_max,lat_max), n_estimators, max_depth
 
 #### GET /api/v1/classifier/status
@@ -995,8 +982,8 @@ classifications, and tree-vs-mast/hedge-vs-tree mistakes. Flags carry a
 `severity` (low|medium|high|critical) and a numeric `weight` so multiple
 rules firing on the same object accumulate ("agreement").
 
-Empirical thresholds (re-tuned Apr-2026 against ~36k indexed parcels with
-top_objs/top_trees data):
+Empirical thresholds (tuned against ~36k indexed KG top_objs/top_trees
+rows):
   tree height        warn 50m  high 60m  critical 80m   (real Austria max ~57m)
   shrub height       warn  8m  high 12m  critical 20m   (was 4/6/15 — too noisy)
   hedge height       warn  8m  high 15m  critical 25m
@@ -1015,7 +1002,6 @@ All flags + aggregates for one object. obj_ref examples:
   KGCODE:top_obj:N            top_10_objects rank N
   KGCODE:top_manmade:N        top_manmade_objects rank N (product 2.3+)
   KGCODE:top_by_type:tree:0   per-type top entry
-  KGCODE:building:<id>        cadastre-matched building
   KGCODE:new_building:N       vectorised unmatched roof
   KGCODE:infra:road:N         vectorised infrastructure feature
 
@@ -1161,13 +1147,10 @@ Recipe — everything a 2.5D renderer needs for one KG, all <100 ms each:
 AVOID for interactive use: /kg/<kg>/segments (GPKG fetch) and every POST
 raster endpoint (10–60 s).
 
-#### Sibling-service contract (siedler / kohlschwarz)
-  POST /api/v1/prewarm?kgs=   warm-up hint (200 all warm / 202 pending)
+#### Index-backed fast routes (also on the public tier :8100)
   GET /api/v1/trees/bbox      sampled tree apices in a bbox (index, <10 ms)
-  GET /tiles/{hillshade|slope}/{z}/{x}/{y}.png   z10-17 WebMercator, from the 25 m grid25 DTM; 204 = no data
+  GET /tiles/{hillshade|slope|ndsm}/{z}/{x}/{y}.png   z10-17 WebMercator, from the 25 m grid25 DTM; 204 = no data
   All CORS *, ETag, gzip, index-backed (never a KG JSON / GPKG read).
-  (The per-KG dossiers /llm/kg/<kg>, /llm/kgs, /llm/manifest.json and the
-  parcel / buildings query endpoints were retired 2026-10-13 — Kataster purge.)
 
 #### GET /api/v1/kg/<kg_code>/segments
 Segment polygons with classification (from light GPKG).
@@ -1242,7 +1225,6 @@ Query params:
   include_ortho=true       Orthophoto features (default: true)
   include_temporal=false    Multi-date comparison
   include_copernicus=false  Sentinel-2/SAR
-  include_cadastre=false    Cadastre ground truth
   include_hansen=false      Hansen forest change
   types=tree,road           Object type filter
   height_min=X              Height filter: >= X metres
@@ -1297,7 +1279,7 @@ Processing queue: max 2 concurrent tasks, 4 in queue. Returns 503 if full.
 |---------------------------|-----------|----------------------------------|
 | ortho only (default)       | ~30-60s   | DTM+DSM+ortho, fast              |
 | ortho + temporal           | ~60-90s   | +3-date comparison               |
-| ortho + temporal + all     | ~90-120s  | +Copernicus+cadastre+Hansen      |
+| ortho + temporal + all     | ~90-120s  | +Copernicus+Hansen               |
 | GPKG/KML export            | +5-10s    | Added on top of analysis time    |
 | Auto-save (always happens) | +1-2s     | Gzip-compressed share saved      |
 
@@ -1308,27 +1290,27 @@ On mobile connections, GPKG download (1-5 MB) may add 5-30s depending on speed.
 
 ```bash
 # 1. Trees >30m in a forest area near Graz (~0.3 km², ~35s, JSON)
-curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&height_min=30&format=json'
+curl 'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&height_min=30&format=json'
 # → {"task_id":"...","status":"running","poll_url":"...","estimated_seconds":35}
 
 # 2. Same area, download as GeoPackage with vector polygons (~40s + 5s export)
-curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&height_min=30&format=gpkg'
+curl 'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&height_min=30&format=gpkg'
 # Poll the poll_url until done, then the final request returns the .gpkg file
 
 # 3. All objects in a small village (~0.2 km², ortho+temporal, KML, ~50s)
-curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.35,47.15,15.355,47.154&include_temporal=true&format=kml'
+curl 'http://localhost:8000/api/v1/onestop?bbox=15.35,47.15,15.355,47.154&include_temporal=true&format=kml'
 
 # 4. Buildings only, height 5-15m, as GPKG (~30s)
-curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=roof&height_min=5&height_max=15&format=gpkg'
+curl 'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=roof&height_min=5&height_max=15&format=gpkg'
 
 # 5. Poll a running task (same URL with task_id)
-curl 'https://example.invalid:8000/api/v1/onestop?task_id=<TASK_ID>&format=gpkg'
+curl 'http://localhost:8000/api/v1/onestop?task_id=<TASK_ID>&format=gpkg'
 # → 202 while running, then file download when done
 
 # 6. Full pipeline in a shell script:
-TASK=$(curl -s 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&height_min=30&format=gpkg' | jq -r .task_id)
+TASK=$(curl -s 'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&height_min=30&format=gpkg' | jq -r .task_id)
 while true; do
-  RESP=$(curl -s -w '%{http_code}' -o /tmp/result.gpkg "https://example.invalid:8000/api/v1/onestop?task_id=$TASK&format=gpkg")
+  RESP=$(curl -s -w '%{http_code}' -o /tmp/result.gpkg "http://localhost:8000/api/v1/onestop?task_id=$TASK&format=gpkg")
   [ "$RESP" = "200" ] && echo "Downloaded!" && break
   sleep 5
 done
@@ -1338,35 +1320,35 @@ done
 
 ```bash
 # KML with polygon outlines coloured by height (viridis ramp)
-curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&format=kml&segment_geometry=polygon&segment_geometry_style=height&group_by=height_class'
+curl 'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&format=kml&segment_geometry=polygon&segment_geometry_style=height&group_by=height_class'
 
 # KML with polygons coloured by object type (default style)
-curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&format=kml&segment_geometry=polygon'
+curl 'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&format=kml&segment_geometry=polygon'
 
 # KML with point centroids only (default, fast — no vectorisation)
-curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&format=kml'
+curl 'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&format=kml'
 
 # GPKG with height-coloured polygons (segment_geometry defaults to polygon for GPKG)
-curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&format=gpkg&segment_geometry_style=height'
+curl 'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&format=gpkg&segment_geometry_style=height'
 
 # GPKG with points only (skip vectorisation, smaller file)
-curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&format=gpkg&segment_geometry=point'
+curl 'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&format=gpkg&segment_geometry=point'
 ```
 
 ### Height Filter Examples (work on GPKG, KML, and one-stop)
 
 ```bash
 # Trees taller than 30m (height_min=30, operator inferred as >=)
-curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&height_min=30&format=gpkg'
+curl 'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&types=tree&height_min=30&format=gpkg'
 
 # Objects shorter than 5m
-curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&height_max=5&format=kml'
+curl 'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&height_max=5&format=kml'
 
 # Objects between 10m and 25m
-curl 'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&height_min=10&height_max=25&format=gpkg'
+curl 'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&height_min=10&height_max=25&format=gpkg'
 
 # Height filter on share GPKG download
-curl -o filtered.gpkg 'https://example.invalid:8000/api/v1/share/Kohlschwarz80/download.gpkg?types=tree&height_min=20'
+curl -o filtered.gpkg 'http://localhost:8000/api/v1/share/Kohlschwarz80/download.gpkg?types=tree&height_min=20'
 ```
 
 ---
@@ -1375,48 +1357,48 @@ curl -o filtered.gpkg 'https://example.invalid:8000/api/v1/share/Kohlschwarz80/d
 
 ```bash
 # Async segmentation with all sources
-curl -X POST 'https://example.invalid:8000/api/v1/segment?async=true&include_ortho=true&include_temporal=true&include_copernicus=true&include_cadastre=true' \
+curl -X POST 'http://localhost:8000/api/v1/segment?async=true&include_ortho=true&include_temporal=true&include_copernicus=true' \
   -H 'Content-Type: application/json' \
   -d '{"geometry":{"type":"Polygon","coordinates":[[[15.4,47.07],[15.403,47.07],[15.403,47.073],[15.4,47.073],[15.4,47.07]]]}}'
 # → {"task_id":"...","status":"running"}
 
 # Poll progress
-curl 'https://example.invalid:8000/api/v1/segment/progress?task_id=...'
+curl 'http://localhost:8000/api/v1/segment/progress?task_id=...'
 
 # Get result
-curl 'https://example.invalid:8000/api/v1/segment/result?task_id=...'
+curl 'http://localhost:8000/api/v1/segment/result?task_id=...'
 
 # Layer availability
-curl 'https://example.invalid:8000/api/v1/layers?bbox=15.1,47.1,15.2,47.2'
+curl 'http://localhost:8000/api/v1/layers?bbox=15.1,47.1,15.2,47.2'
 
 # Change detection
-curl -X POST 'https://example.invalid:8000/api/v1/changes' \
+curl -X POST 'http://localhost:8000/api/v1/changes' \
   -H 'Content-Type: application/json' \
   -d '{"date_a":"20220915","date_b":"20240915","geometry":{"type":"Polygon","coordinates":[[[15.4,47.07],[15.41,47.07],[15.41,47.08],[15.4,47.08],[15.4,47.07]]]}}'
 
 # List shares
-curl 'https://example.invalid:8000/api/v1/shares?limit=10'
+curl 'http://localhost:8000/api/v1/shares?limit=10'
 
 # Load share (follows rename redirects)
-curl 'https://example.invalid:8000/api/v1/share/Kohlschwarz80'
+curl 'http://localhost:8000/api/v1/share/Kohlschwarz80'
 
 # Direct GPKG download from share
-curl -o analysis.gpkg 'https://example.invalid:8000/api/v1/share/Kohlschwarz80/download.gpkg'
+curl -o analysis.gpkg 'http://localhost:8000/api/v1/share/Kohlschwarz80/download.gpkg'
 
 # --- Search Index (index status / KG detail / rebuild) ---
 # Index status
-curl 'https://example.invalid:8000/api/v1/index/status'
+curl 'http://localhost:8000/api/v1/index/status'
 
 # Specific KG detail (landcover + hansen + zenodo download links)
-curl 'https://example.invalid:8000/api/v1/kg/91109'
-curl 'https://example.invalid:8000/api/v1/kg/91109?index_only=true'
+curl 'http://localhost:8000/api/v1/kg/91109'
+curl 'http://localhost:8000/api/v1/kg/91109?index_only=true'
 # → includes zenodo_json_url, zenodo_light_gpkg_url, zenodo_full_gpkg_url
 #   and _links.zenodo_json, _links.zenodo_light_gpkg, _links.zenodo_full_gpkg
 #   (direct Zenodo download URLs when available)
 
 # Rebuild index (picks up new processor results + Zenodo manifest)
-curl -X POST 'https://example.invalid:8000/api/v1/index/rebuild'
+curl -X POST 'http://localhost:8000/api/v1/index/rebuild'
 
 # Sampled tallest trees in a bbox (index, <10 ms)
-curl 'https://example.invalid:8000/api/v1/trees/bbox?west=15.4&south=47.0&east=15.5&north=47.1&min_height=25'
+curl 'http://localhost:8000/api/v1/trees/bbox?west=15.4&south=47.0&east=15.5&north=47.1&min_height=25'
 ```
