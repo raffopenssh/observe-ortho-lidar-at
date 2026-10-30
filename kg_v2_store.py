@@ -14,7 +14,7 @@ Schema
 ------
 kg_v2(code TEXT PK, parent TEXT, blob BLOB, size INT, sha256 TEXT,
       version TEXT, model TEXT, uploaded_at TEXT, ingested_at TEXT,
-      v1_bytes_freed INT, n_parcels INT, source TEXT)
+      v1_bytes_freed INT, source TEXT)
 meta(key TEXT PK, value TEXT)
 
 ``v1_bytes_freed`` records the on-disk size of the v1 JSON file(s) deleted
@@ -53,7 +53,6 @@ _SCHEMA = [
         uploaded_at TEXT,
         ingested_at TEXT,
         v1_bytes_freed INTEGER DEFAULT 0,
-        n_parcels INTEGER,
         source TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS kg_v2_parent ON kg_v2(parent)",
@@ -265,7 +264,7 @@ def get_meta(code: str) -> dict | None:
     c = _conn()
     c.row_factory = sqlite3.Row
     r = c.execute("SELECT code,parent,size,sha256,version,model,uploaded_at,"
-                  "ingested_at,v1_bytes_freed,n_parcels,source,bbox,generated_at,"
+                  "ingested_at,v1_bytes_freed,source,bbox,generated_at,"
                   "product_version,LENGTH(grid25) AS grid25_bytes "
                   "FROM kg_v2 WHERE code=?",
                   (code,)).fetchone()
@@ -274,7 +273,7 @@ def get_meta(code: str) -> dict | None:
 
 
 def put(code: str, blob: bytes, *, uploaded_at: str = "", model: str = "",
-        version: str = "v2", n_parcels: int | None = None,
+        version: str = "v2",
         v1_bytes_freed: int = 0, source: str = "zenodo", doc: dict | None = None) -> dict:
     """Persist a verified blob.  Idempotent (REPLACE); keeps the larger of
     the stored / supplied ``v1_bytes_freed`` so a re-ingest never zeroes
@@ -312,11 +311,6 @@ def put(code: str, blob: bytes, *, uploaded_at: str = "", model: str = "",
         except Exception:
             bbox_s = None
         gen_at = doc.get("generated_at") or None
-        if n_parcels is None:
-            try:
-                n_parcels = int((doc.get("parcels") or {}).get("count") or 0)
-            except Exception:
-                pass
         if not model:
             model = str(((doc.get("model") or {}).get("classifier")) or "")
     with _lock:
@@ -325,11 +319,11 @@ def put(code: str, blob: bytes, *, uploaded_at: str = "", model: str = "",
         freed = max(int(v1_bytes_freed or 0), int(prev[0]) if prev else 0)
         c.execute(
             "INSERT OR REPLACE INTO kg_v2(code,parent,blob,size,sha256,version,model,"
-            "uploaded_at,ingested_at,v1_bytes_freed,n_parcels,source,bbox,generated_at,"
+            "uploaded_at,ingested_at,v1_bytes_freed,source,bbox,generated_at,"
             "product_version,grid25) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (code, parent_of(code), sqlite3.Binary(blob), len(blob), sha, version, model,
-             uploaded_at, now, freed, n_parcels, source, bbox_s, gen_at, prod_ver,
+             uploaded_at, now, freed, source, bbox_s, gen_at, prod_ver,
              sqlite3.Binary(grid25_payload) if grid25_payload else None))
         c.commit()
         _stats_invalidate()

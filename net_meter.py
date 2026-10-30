@@ -105,7 +105,7 @@ def install_requests_meter() -> None:
                 # Chunked + gzip: requests hands back the *decoded* body
                 # and urllib3 2.x exposes no wire counter for chunked
                 # reads, so len(content) overstates the metered bytes
-                # ~7x (umfeld /ne/manifest: 2.1 MB decoded vs 260 KB on
+                # ~7x (NE /ne/manifest: 2.1 MB decoded vs 260 KB on
                 # the wire). Re-compress at level 1 for a close estimate.
                 if (r.headers.get('Content-Encoding') or '').lower() in ('gzip', 'deflate') \
                         and resp_b <= 16 * 1024 * 1024:

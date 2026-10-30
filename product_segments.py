@@ -28,7 +28,7 @@ the Zenodo tile caches.  :func:`download_budget` grants *at most*
 (products already in ``GpkgCache`` / processor output / a resumable
 ``.tmp`` partial are free); beyond that ``auto`` returns ``None`` and the
 caller segments live.  Mode ``product`` always downloads what is needed,
-answers whatever is covered and raises when nothing is.  Nothing cadastre-derived exists in the 2.4 light
+answers whatever is covered and raises when nothing is.  Nothing property-level exists in the 2.4 light
 product (``v2_verify.FORBIDDEN_LIGHT_LAYERS``), so the result is clean by
 construction; ``_PROP_MAP`` is an explicit allow-list anyway.
 """

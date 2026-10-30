@@ -5,7 +5,7 @@ The bug: ``austria_processor`` renumbered the *objects* of a tile restored
 from a checkpoint but left the tile's *label raster* with the ids of the
 original run.  The stitchers resolve pixels through one global obj_map, so
 pixels of tile A took the type / polygon of an unrelated object of tile B:
-flat pasture rendered as ``roof`` (umfeld's glyph showed 27 ha of it on
+flat pasture rendered as ``roof`` (the NE glyph showed 27 ha of it on
 Kohlschwarz 63330), polygons glued across the KG, NE cells with
 ``geb`` at ``h_max = 0``.  Fix: ``_remap_restored_tile_ids`` (restore path),
 ``v2_verify.segments_label_consistency`` (pre-upload gate, fatal) and the
@@ -274,7 +274,7 @@ def _fetch_block_h3b(block: str, ent: dict) -> Path | None:
         import requests
         import zenodo_client
         url = f"{e['bucket_url'].rstrip('/')}/{e['filename']}"
-        r = requests.get(url, headers={"Authorization": f"Bearer {zenodo_client.DEFAULT_TOKEN}"},
+        r = requests.get(url, headers=zenodo_client.auth_headers(),
                          stream=True, timeout=(10, 120))
         r.raise_for_status()
         tmp = dest.with_suffix(".part")

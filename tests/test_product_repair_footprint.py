@@ -1,7 +1,7 @@
 """product_repair: missing_cells must judge the tile footprint, not the bbox.
 
 Edge tiles overshoot the KG bbox (``_compute_tile_grid``) and parents
-grow their bbox from the cadastre union, so a KG whose bbox ends at
+grew their bbox beyond the list bbox (legacy), so a KG whose bbox ends at
 13.778 can need the 13.8 cell (58032, 2026-10-19 → ``stuck``).
 """
 import sys

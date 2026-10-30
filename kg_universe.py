@@ -1,11 +1,12 @@
 """Canonical KG universe — single source of truth for "how many KGs exist".
 
-The authority is umfeld-at (cadastre upstream): 7850 Katastralgemeinden
-across 94 districts / 9 states (``/api/v1/stats → totals.kg_count``).
+The authority is the shipped ``data/austria_processor/kg_list.json``
+(7850 Katastralgemeinden across 94 districts / 9 states, from the BEV
+KG register).
 
 History (2026-10-04): we carried ``8440`` for ~200 days.  That number was
-an artefact of ``get_all_kgs()`` querying ``/search/kg?district=<name>``:
-umfeld's ``district`` filter is ``LIKE '%name%'`` ("Wien" also matched
+an artefact of ``get_all_kgs()`` querying an upstream ``/search/kg?district=<name>``
+whose ``district`` filter was ``LIKE '%name%'`` ("Wien" also matched
 Wiener Neustadt, "Feldkirch" matched Feldkirchen), the merged district
 "Waidhofen an der Thaya" appears twice in ``/search/district`` (codes
 322 + 325), and ``limit=500`` without ``offset`` truncated that merged
@@ -22,10 +23,10 @@ import json
 import os
 from pathlib import Path
 
-#: Authoritative count from umfeld-at (``totals.kg_count``), 2026-10-04.
+#: Authoritative count (BEV KG register), 2026-10-04.
 KG_TOTAL = 7850
 
-#: Shared fingerprint contract with umfeld-at (``/llm.txt §"KG universe"``):
+#: Fingerprint contract (shared with the NE server, ``/llm.txt §"KG universe"``):
 #: ``sha256("\n".join(sorted(kg_code)))`` hex.  Both services expose it as
 #: ``universe_hash`` + header ``X-KG-Universe-Hash``; equal hash ⇒ same set.
 #: If either side changes the set, bump this AND tell the other side first.

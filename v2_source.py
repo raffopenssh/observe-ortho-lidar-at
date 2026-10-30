@@ -13,7 +13,7 @@ Why health checks: some v1 GPKGs have holes — DTM tiles lost in
 (be7d155), ortho operates that returned black, Copernicus quadrants that
 never stitched.  A v2 product built on a holed input would bake the hole
 into the new segmentation.  So every window read is scored against the
-KG's cadastre union (the area we actually care about) and, if the invalid
+KG's AOI (the area we actually care about) and, if the invalid
 fraction inside the union exceeds a per-layer threshold, we fall back to
 the original reader for that tile (BEV for LiDAR/ortho, the local+Zenodo
 tile cache for Copernicus/Hansen — never openEO, upgrade peers hold no
@@ -45,7 +45,7 @@ log = logging.getLogger("austria_processor.v2src")
 
 NODATA = -9999.0
 
-# Per-layer invalid-fraction thresholds (inside the cadastre union) above
+# Per-layer invalid-fraction thresholds (inside the AOI) above
 # which we distrust the GPKG window and fall back to the real source.
 THRESH = {
     "lidar": 0.005,      # DTM/DSM NaN inside union (BEV is ~100 %% inside AT)
@@ -140,7 +140,7 @@ class _Gpkg:
 
 
 def _union_mask(shape, transform):
-    """Boolean mask of the cadastre union on the window grid (True inside)."""
+    """Boolean mask of the AOI on the window grid (True inside)."""
     u = _STATE.get("union")
     if u is None or u.is_empty:
         return np.ones(shape, bool)

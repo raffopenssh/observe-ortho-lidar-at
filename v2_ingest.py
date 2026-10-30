@@ -285,15 +285,16 @@ def pending(entries: dict | None = None) -> list[str]:
 
 
 def _link(entry: dict) -> tuple[str, dict]:
-    from zenodo_client import DEFAULT_TOKEN
+    import zenodo_client as _zc
     hdr = {}
     link = entry.get("link", "") or ""
     if not link and entry.get("bucket_url") and entry.get("filename"):
         link = f"{entry['bucket_url']}/{entry['filename']}"
-        hdr = {"Authorization": f"Bearer {DEFAULT_TOKEN}"}
+        hdr = _zc.auth_headers()
     if not link and entry.get("depo_id") and entry.get("filename"):
         link = (f"https://zenodo.org/api/records/{entry['depo_id']}/draft/files/"
-                f"{entry['filename']}/content?access_token={DEFAULT_TOKEN}")
+                f"{entry['filename']}/content")
+        hdr = _zc.auth_headers()
     return link, hdr
 
 
@@ -319,13 +320,8 @@ def _peer_pull(entry: dict) -> bytes | None:
         url = (p or {}).get("url")
         if not url:
             return None
-        hdr = {}
-        try:
-            tok = Path("data/admin_token").read_text().strip()
-            if tok:
-                hdr["X-Admin-Token"] = tok
-        except Exception:
-            pass
+        import config as _config
+        hdr = _config.operator_headers()
         r = requests.get(f"{url.rstrip('/')}/api/v1/processing/product", params={"key": key},
                          headers=hdr, timeout=30)
         if r.status_code != 200:
@@ -391,9 +387,9 @@ def _probe_deposit(depo_id) -> str | None:
         return None
     try:
         import requests
-        from zenodo_client import DEFAULT_TOKEN
+        import zenodo_client as _zc
         r = requests.get(f"https://zenodo.org/api/deposit/depositions/{depo_id}",
-                         headers={"Authorization": f"Bearer {DEFAULT_TOKEN}"}, timeout=30)
+                         headers=_zc.auth_headers(), timeout=30)
         if r.status_code in (404, 410):
             return "gone"
         if r.status_code == 200:
@@ -439,9 +435,9 @@ def _zenodo_control_ok() -> bool:
             return False
     try:
         import requests
-        from zenodo_client import DEFAULT_TOKEN
+        import zenodo_client as _zc
         r = requests.get("https://zenodo.org/api/deposit/depositions", params={"size": 1},
-                         headers={"Authorization": f"Bearer {DEFAULT_TOKEN}"}, timeout=30)
+                         headers=_zc.auth_headers(), timeout=30)
         return r.status_code == 200
     except Exception:  # noqa: BLE001
         return False
@@ -549,15 +545,13 @@ def _v1_row(code: str) -> dict | None:
         from kg_splitter import parent_kg_code
         if parent_kg_code(code) != code:
             # The index row is the *parent* aggregate (sum over sibling
-            # blocks).  Comparing a single block's parcel/segment count
-            # against it is meaningless — 45306-south struck out on
-            # `parcels_vs_v1_row: v2=1906 v1=975` (the row then held only
-            # the -southwest sibling).  Blocks have no v1 baseline.
+            # blocks).  Comparing a single block's segment count against
+            # it is meaningless.  Blocks have no v1 baseline.
             return None
         r = si.get_index()._conn().execute(
-            "SELECT parcel_count, n_segments FROM kg WHERE kg_code=?",
+            "SELECT n_segments FROM kg WHERE kg_code=?",
             (parent_kg_code(code),)).fetchone()
-        return {"n_parcels": r[0], "n_segments": r[1]} if r else None
+        return {"n_segments": r[0]} if r else None
     except Exception:  # noqa: BLE001
         return None
 

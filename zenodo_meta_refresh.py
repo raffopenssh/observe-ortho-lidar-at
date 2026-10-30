@@ -1,6 +1,6 @@
 """zenodo_meta_refresh — re-PUT deposition *metadata* (title / description /
 keywords) on every committed product so the whole archive reads with the
-current cadastre-free wording (``zenodo_client.landscape_metadata``,
+current property-free wording (``zenodo_client.landscape_metadata``,
 ``META_REV``) without re-uploading a single file or bumping the product
 version.
 
@@ -13,7 +13,7 @@ Rules
   ``restricted`` (asserted).
 * **Preserves** the per-product *Data Quality* line (grade, available /
   missing layers) by parsing it out of the old description; run-time-only
-  context layers (``cadastre_buildings``) are dropped by
+  context layers (building context) are dropped by
   ``landscape_metadata`` itself.
 * **Does not touch** ``uploaded_at`` (progress counters) — the sweep state
   lives in ``data/austria_processor/meta_refresh.json`` (``done[key] =
@@ -58,6 +58,7 @@ _names: dict | None = None
 _Q_RE = re.compile(r"Data Quality:</b>\s*(\d+)%\s*\(Grade\s+([A-F])\)", re.I)
 _AV_RE = re.compile(r"Available layers:\s*([^.<\n]+)\.", re.I)
 _MI_RE = re.compile(r"Missing layers:\s*([^.<\n]+)\.", re.I)
+# legacy wording to detect in old deposition descriptions
 STALE_RE = re.compile(r"cadastr(e|al) (parcel|unit)|BEV cadastre|\"cadastre\"", re.I)
 
 
@@ -173,7 +174,7 @@ def refresh_one(key: str, entry: dict, session, token: str, timeout: float = 30.
     """GET + PUT metadata for one deposition.  Verdict: ``ok`` / ``gone`` /
     ``published`` / ``retry`` (caller stops the tick) / ``error:…``."""
     depo = int(entry.get("depo_id") or 0)
-    hdr = {"Authorization": f"Bearer {token}"}
+    hdr = {"Authorization": f"Bearer {token}"} if token else {}
     r = session.get(f"{ZENODO}/{depo}", headers=hdr, timeout=timeout)
     if r.status_code in (404, 410):
         return "gone"
@@ -266,12 +267,12 @@ def text_line() -> str:
 def show(code: str) -> list:
     """Print + return the live Zenodo metadata of every committed file of *code*."""
     import requests
-    from zenodo_client import DEFAULT_TOKEN
+    import zenodo_client as _zc
     rows = []
     for k, e in sorted(_entries().items()):
         if product_code(k) != code or not e.get("depo_id") or int(e.get("size") or 0) <= 0:
             continue
-        r = requests.get(f"{ZENODO}/{e['depo_id']}", headers={"Authorization": f"Bearer {DEFAULT_TOKEN}"}, timeout=30)
+        r = requests.get(f"{ZENODO}/{e['depo_id']}", headers=_zc.auth_headers(), timeout=30)
         d = r.json() if r.status_code == 200 else {}
         md = d.get("metadata") or {}
         desc = re.sub(r"<[^>]+>", "", md.get("description") or "")

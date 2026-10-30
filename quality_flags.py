@@ -2,7 +2,7 @@
 
 Each rule is a small function (kg_data, obj) -> Optional[Flag].
 Flags are produced for individual extracted objects (trees, buildings,
-top_by_type segments, new buildings, infrastructure, parcels).
+top_by_type segments, new buildings, infrastructure).
 
 Thresholds are tuned against the empirical distribution of all currently
 processed KGs (see scripts/inspect_distributions.py output baked into
@@ -62,7 +62,7 @@ JSON_DIR = Path('data/austria_processor/json')
 
 THRESHOLDS = {
     # ---- Vegetation height ----
-    # Distributions across 36k indexed parcels (top_objs) Apr-2026:
+    # Distributions across 36k indexed objects (top_objs) Apr-2026:
     #   tree   p95=37.7  p99=43.1  max=84.3   (real Austria max ~57m)
     #   shrub  p95=13.3  p99=18.5  max=51.7   → raised warn 4→8
     #   hedge  p95=17.0  p99=21.3  max=41.1
@@ -238,22 +238,7 @@ def iter_objects(data: dict, kg_code: Optional[str] = None) -> Iterator[dict]:
                 'attrs': e,
             }
 
-    # 4) building_footprints.details (matched cadastre buildings)
-    for i, b in enumerate(data.get('building_footprints', {}).get('details') or []):
-        bid = b.get('building_id') or f'#{i}'
-        coord = b.get('centroid') or {}
-        yield {
-            'obj_ref': f'{kg}:building:{bid}',
-            'kg_code': kg, 'kind': 'building',
-            'obj_type': 'roof',
-            'centroid_lon': coord.get('lon'), 'centroid_lat': coord.get('lat'),
-            'area_sqm': b.get('footprint_area_sqm'),
-            'height_max_m': b.get('max_height_m'),
-            'height_mean_m': b.get('mean_height_m'),
-            'rf_confidence': None,
-            'confidence': None,
-            'attrs': b,
-        }
+    # 4) (legacy building_footprints.details — property-level, no longer produced)
 
     # 5) new_buildings.features (vectorised unmatched roofs)
     for i, f in enumerate(data.get('new_buildings', {}).get('features') or []):
@@ -286,8 +271,7 @@ def iter_objects(data: dict, kg_code: Optional[str] = None) -> Iterator[dict]:
                 'attrs': f,
             }
 
-    # 7) parcels.details — removed 2026-10-13 (Kataster purge, docs/kataster-purge.md):
-    #    2.4 products carry no cadastre; parcel-keyed flags are no longer emitted.
+    # 7) (legacy per-property flags — property-level, no longer emitted)
 
 
 # ----------------------------------------------------------------------

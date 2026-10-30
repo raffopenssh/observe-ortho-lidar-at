@@ -4,7 +4,7 @@ When a peer aborts a KG mid-flight (BEV throttle, Copernicus rotation,
 bandwidth wall, role eviction, …) the partially-completed tile pickles
 (``data/austria_processor/tile_checkpoints/<kg>/tile_*.pkl``) carry
 the full per-tile result (segmentation, classified objects, vector
-cadastre data, NDVI/SAR/Hansen extracts — *everything except the raw
+building context, NDVI/SAR/Hansen extracts — *everything except the raw
 DTM/DSM/ortho rasters*). They are small (KB–MB) and reusable by any
 other peer picking up the same KG. Today they live only on the
 aborting peer's local disk and are lost when it moves on.

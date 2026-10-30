@@ -254,8 +254,8 @@ def _auth_headers(url: str, headers: Optional[dict]) -> dict:
     # (/api/records/<id>/draft/files/../content) are owner-only → Bearer.
     if url.startswith('https://zenodo.org/api/') and 'access_token=' not in url:
         try:
-            from zenodo_client import DEFAULT_TOKEN
-            hdr['Authorization'] = f'Bearer {DEFAULT_TOKEN}'
+            import zenodo_client as _zc
+            hdr.update(_zc.auth_headers())
         except Exception:  # noqa: BLE001
             pass
     if headers:

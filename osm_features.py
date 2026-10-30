@@ -2,7 +2,7 @@
 
 Fetches road/path, waterway, and land-cover data from the Overpass API,
 reprojects to EPSG:3035, and rasterises onto a 1m LIDAR grid for use as
-training labels alongside cadastre building footprints.
+training labels alongside building footprints.
 
 Key design choices:
 - Uses `out geom;` format (inline coordinates) to avoid expensive node recursion

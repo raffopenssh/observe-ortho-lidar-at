@@ -1,13 +1,13 @@
 """KG Block Splitter — split large Katastralgemeinden into contiguous blocks.
 
 Large KGs (>MAX_TILES_PER_BLOCK tiles) are split into multiple blocks,
-each containing a contiguous group of parcels.  Blocks are named with
+each a rectangle of the KG bbox.  Blocks are named with
 a directional suffix based on their centroid position within the KG:
 
     49006-north-1, 49006-south-1, 49006-center-1, etc.
 
-Splitting respects parcel boundaries: every parcel belongs to exactly
-one block, so users can stitch blocks together in QGIS without overlap.
+Blocks tile the bbox without overlap, so users can stitch blocks together
+in QGIS.
 
 Usage:
     from kg_splitter import maybe_split_kg, is_block_code, parent_kg_code
@@ -134,9 +134,9 @@ MAX_TILES_PER_BLOCK = 22
 ADAPTIVE_SPLIT_THRESHOLD = 2
 
 # Runtime oversize tolerance. The splitter estimates tiles from the KG
-# *API* bbox, but process_one_kg expands the bbox to the cadastre union
-# before computing the real grid — some KGs (91017 Schröcken: 20 est →
-# 30 runtime) blow well past MAX_TILES_PER_BLOCK only at runtime. When
+# list bbox, but the runtime grid (overlap, grid anchor) can differ —
+# some KGs (91017 Schröcken: 20 est → 30 runtime) blow well past
+# MAX_TILES_PER_BLOCK only at runtime. When
 # the runtime grid exceeds MAX * this factor, the subprocess aborts with
 # needs_split instead of grinding into a gpkg_full it cannot finish.
 # The 1.3 slack means moderately-over KGs (23-28 tiles) that complete
@@ -242,8 +242,6 @@ def maybe_split_kg(kg: dict) -> list:
           - bbox: adjusted bbox for this block
           - All other original kg fields preserved
 
-        Parcel filtering to each block's bbox happens at runtime in
-        process_one_kg() — no parcel data needed at split time.
     """
     bb = kg.get("bbox", {})
     if not bb or "min_lon" not in bb:
@@ -297,7 +295,7 @@ def maybe_split_kg(kg: dict) -> list:
 
 
 def _split_bbox_grid(kg, n_blocks):
-    """Split KG bbox into a grid of blocks (fallback when no parcels available)."""
+    """Split KG bbox into a grid of blocks."""
     kg_code = kg["kg_code"]
     bb = kg["bbox"]
     west, south = bb["min_lon"], bb["min_lat"]

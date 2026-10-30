@@ -1,7 +1,7 @@
 """trees v3 — product-backed tree inventory (``/api/v3/trees*``).
 
 The 2.1 product ships a ``tree_apices`` point layer in every ``_light_v2.gpkg``
-(apex inventory on the stitched 1 m nDSM, ndsm_only, cadastre building mask;
+(apex inventory on the stitched 1 m nDSM, ndsm_only, building-context mask;
 see ``docs/v2.1-product-spec.md``) plus a 25 m ``landcover.grid25`` index in
 the JSON (``kg_v2_store.get_grid25``).  v3 answers an AOI from those frozen
 products instead of re-running the detector on live BEV rasters:

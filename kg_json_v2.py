@@ -6,8 +6,7 @@ object keys and ~40 % ``vertex_heights`` dicts.  v2 keeps the *same logical
 document* (every reader in ``search_index`` / ``app``
 keeps working on the decoded dict) but stores it as:
 
-* **columnar tables** for every record array (``parcels.details``,
-  ``building_footprints.details``, ``new_buildings.features``,
+* **columnar tables** for every record array (``new_buildings.features``,
   ``infrastructure.by_type.*.features``, ``top_by_type.*``, ...):
   ``{"_cols": {key: [v0, v1, ...]}, "_n": N}`` — keys written once, missing
   values ``null``; fixed-shape sub-dicts (``centroid``, ``classification``)
@@ -18,7 +17,7 @@ keeps working on the decoded dict) but stores it as:
 * **gzip** (level 6) on the compact serialisation.  Files are
   ``<code>_v2.json.gz``; manifest key ``<code>_json_v2``.
 
-Measured on 01002 (Alsergrund, 2442 parcels / 12 720 new buildings):
+Measured on 01002 (Alsergrund, 12 720 new buildings; legacy v1 document):
 21.6 MB pretty v1 → 4.1 MB compact v2 → **0.99 MB** gzip'd (22×).  Decode
 is a few hundred ms for the largest KGs.
 
@@ -32,8 +31,9 @@ API
 
 The container carries ``"_codec": "kgjson/2"`` at top level; everything
 else is the v1 document with tables swapped in-place.  Unknown record
-arrays are handled generically, so new v2 sections (``acquisition``,
-``parcels.details[].outline_z`` …) need no codec change.
+arrays are handled generically, so new v2 sections (``acquisition`` …)
+need no codec change.  The legacy table paths stay listed so old
+documents still decode.
 """
 from __future__ import annotations
 

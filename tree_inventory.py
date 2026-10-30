@@ -76,9 +76,9 @@ ORTHO_SEED_CLOSURE_MIN = 0.7     # only seed where canopy closure >= this
 # like a crown. Roof ridges, hay/silage stacks, maize plateaus, masts and
 # rock outcrops all produce apices; they used to be reported as stems with
 # full DBH/volume (visible as bogus crowns over the farmhouse in the
-# forestry-manager map). Gates below are evidence-ordered: cadastre first
+# forestry-manager map). Gates below are evidence-ordered: building context first
 # (authoritative), then spectral (NDVI), then surface geometry.
-BUILDING_DILATE_PX = 1        # cadastre footprints grow 1 m (eaves/roof overhang)
+BUILDING_DILATE_PX = 1        # building-context footprints grow 1 m (eaves/roof overhang)
 BUILDING_FRAC_REJECT = 0.5    # crown pixel share inside a footprint → building
 BUILDING_FRAC_WEAK = 0.30     # partial overlap → building only if no foliage
 BUILDING_APEX_REJECT = True   # apex pixel itself inside a footprint → building
@@ -398,7 +398,7 @@ def classify_surfaces(
 
     Evidence, in order of authority:
 
-    1. **Cadastre** — crown mostly inside a building footprint (or its apex
+    1. **Building context** — crown mostly inside a building footprint (or its apex
        on one) is a roof, full stop. Footprints are dilated by
        ``BUILDING_DILATE_PX`` because BEV outlines are wall lines while the
        DSM sees the eaves.
@@ -491,7 +491,7 @@ def classify_surfaces(
     areas = (np.bincount(labels.ravel(), minlength=n + 1)[1:]
              * px_area).astype(np.float32)
 
-    # --- cadastre building overlap ---------------------------------------
+    # --- building-context overlap ---------------------------------------
     bfrac = np.zeros(n, np.float32)
     apex_on_building = np.zeros(n, bool)
     if building_mask is not None and building_mask.shape == labels.shape:
@@ -526,7 +526,7 @@ def classify_surfaces(
         planar_surface = (planar[i] <= PLANAR_RESID_MAX
                           and rough[i] <= PLANAR_ROUGH_MAX)
         flat_top = relief[i] <= PLANAR_RELIEF_MAX
-        # 1. cadastre
+        # 1. building context
         if apex_on_building[i] and BUILDING_APEX_REJECT:
             c, p = 'building', 0.02
         elif bfrac[i] >= BUILDING_FRAC_REJECT:
@@ -839,7 +839,7 @@ def build_inventory(
     telemetry for the response meta.
 
     v2.3: with ``reject_nonforest`` (default on) every crown is checked by
-    :func:`classify_surfaces` against the cadastre building mask, NDVI and
+    :func:`classify_surfaces` against the building-context mask, NDVI and
     its own surface geometry; apices sitting on roofs, silos, slabs or crop
     plateaus are dropped instead of being reported as stems. Rejected
     candidates are counted in ``det_info['rejected_by_surface']``.
@@ -1167,7 +1167,7 @@ def summarise(trees: list[Tree], canopy: np.ndarray, mask: np.ndarray,
         # many apices are roofs / crops / hard surfaces.
         "by_surface_class": by_surface,
         "surface_class_note": (
-            "non-forest suppression: apices on cadastre building footprints, "
+            "non-forest suppression: apices on building-context footprints, "
             "on NDVI-dead planar surfaces, or on low smooth plateaus are "
             "classified building / hard_surface / crop / flat_structure and "
             "excluded from the inventory (and from the canopy denominator). "

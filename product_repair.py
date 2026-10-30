@@ -126,11 +126,10 @@ def defects_from_quality(dq: dict | None) -> list[str]:
 
 def defects(doc: dict | None) -> list[str]:
     out = defects_from_quality((doc or {}).get("data_quality"))
-    # v2.4: a product without its NE cells layer (declared layer not built at
-    # umfeld-at when the KG ran, or the build failed) is repairable by a
+    # v2.4: a product without its NE cells layer (declared layer not
+    # available when the KG ran, or the build failed) is repairable by a
     # re-upgrade.  Not a Copernicus cell gap: ``missing_cells`` ignores it
-    # (→ fixable at once); the director's candidate ranking gates on the
-    # umfeld manifest saying ``built`` instead.
+    # (→ fixable at once).
     try:
         pv = str((doc or {}).get("product_version") or "")
         if pv and float(pv.split("-")[0]) >= 2.4:
@@ -181,8 +180,8 @@ def _footprint_of(doc: dict) -> list | None:
     actually fetched Copernicus cells for.
 
     ``_compute_tile_grid`` overshoots the KG bbox by up to one tile
-    (1.5 km) east/north, and parents grow their bbox from the cadastre
-    union first — so a KG whose bbox ends at 13.778 can have an edge
+    (1.5 km) east/north, and legacy parents grew their bbox beyond the
+    list bbox — so a KG whose bbox ends at 13.778 can have an edge
     tile that needs the 13.8 cell.  Judging ``missing_cells`` on the bare
     bbox called such codes ``fixable``, dispatched them, and the re-run
     hit the same ``CacheMissError`` → ``stuck`` (58032, 91112, 14174 …
@@ -209,7 +208,7 @@ def _footprint_of(doc: dict) -> list | None:
 
 # Tile-grid overshoot pad for entries without a recorded footprint:
 # ``_compute_tile_grid`` lets the last column/row run up to a full tile
-# (1.5 km) past the bbox, and the cadastre-union refinement adds up to
+# (1.5 km) past the bbox, and legacy bbox refinement added up to
 # ~0.007° on any side (58032: +0.0072° E).
 _TILE_KM = 1.5
 _PAD_DEG = 0.01

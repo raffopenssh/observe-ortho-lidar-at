@@ -63,6 +63,13 @@ def default_token(required: bool = True) -> str:
     return config.zenodo_token(required=required)
 
 
+def auth_headers() -> dict:
+    """``{'Authorization': 'Bearer …'}`` toward zenodo.org, or ``{}`` without
+    a token (published records are readable anonymously)."""
+    tok = default_token(required=False)
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
+
+
 def __getattr__(name):
     # ``from zenodo_client import DEFAULT_TOKEN`` keeps working for the ~30
     # call sites, resolved lazily at *use* time so a rotation is picked up.
@@ -376,7 +383,7 @@ def landscape_metadata(
                 f"{quality_line}\n"
                 f"Derived from BEV ALS LIDAR (DTM/DSM), BEV DOP orthophoto, "
                 f"Sentinel-2 NDVI, Sentinel-1 SAR, ESA WorldCover, Hansen GFC, "
-                f"OpenStreetMap; BEV Kataster only as aggregated NE cell statistics."
+                f"OpenStreetMap; BEV land use only as aggregated NE cell statistics."
                 + _attr.zenodo_description_footer()
             ),
             "creators": [{"name": "SRTM-LIDAR Pipeline"}],

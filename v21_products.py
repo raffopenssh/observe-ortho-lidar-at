@@ -13,7 +13,7 @@ holds; NO BEV / openEO / network I/O.  Two halves:
     indexes (≤ 25 KB per KG together, see the disk rule).
   - :func:`build_tree_apices` — ``tree_inventory.build_inventory`` on the
     stitched 1 m nDSM in memory-bounded chunks, joined with the v2 segment
-    classes (stand_context), cadastre footprints and the evidence rasters.
+    classes (stand_context), building-context footprints and the evidence rasters.
   - :func:`write_terrain_coarse` / :func:`write_tree_apices` — light GPKG layers.
 
 * **Primary side** (``app.py`` fast paths, ``kg_v2_store``):
