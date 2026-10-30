@@ -4,7 +4,7 @@
 /*/PRIVATE*/`` block removed (private context toggles, evaluation panels,
 admin-only dashboard links / pollers) and ``window.SRTM_PUBLIC = true`` injected.  The
 endpoints that page needs are relayed to the full ``app.py`` on
-``127.0.0.1:8000`` through an explicit allow-list (:data:`ROUTES`) with the
+``config.APP_URL`` (loopback) through an explicit allow-list (:data:`ROUTES`) with the
 ``X-Srtm-Public: 1`` header, which makes app.py (see its *public-tier relay*
 section):
 
@@ -40,7 +40,7 @@ from pathlib import Path
 
 from flask import Blueprint, Response, request
 
-import api_tiers as tiers
+import config
 import service_guard as sg
 
 log = logging.getLogger('public_segmentation')
@@ -49,7 +49,7 @@ bp = Blueprint('public_segmentation', __name__)
 PUBLIC_HDR = 'X-Srtm-Public'
 UI_PATH = Path(__file__).resolve().parent / 'static' / 'index.html'
 PRIVATE_OPEN, PRIVATE_CLOSE = '/*PRIVATE*/', '/*/PRIVATE*/'
-UPSTREAM = tiers.PRIVATE_UPSTREAM
+UPSTREAM = config.APP_URL
 
 #: (method, path-regex) pairs the public UI may reach on app.py.  Anything
 #: else stays 404 on this tier — extend here, never with a catch-all.
@@ -82,9 +82,10 @@ _ROUTE_RE = [(m, re.compile('^' + p + '$'), kind) for m, p, kind in ROUTES]
 
 _HOP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te',
         'trailers', 'transfer-encoding', 'upgrade', 'host', 'content-length'}
-#: never forwarded — app.py must see the relay as loopback-without-XFF + public header
+#: never forwarded — app.py must see the relay as a public-tier request; any
+#: operator credential a client might send is dropped here.
 _STRIP_IN = _HOP | {'x-forwarded-for', 'x-forwarded-host', 'x-real-ip', 'authorization',
-                    'x-admin-token', 'x-api-key', 'cookie', PUBLIC_HDR.lower(), 'x-srtm-tier'}
+                    'x-operator-token', 'x-api-key', 'cookie', PUBLIC_HDR.lower(), 'x-srtm-tier'}
 
 HEAVY_GATE = sg.Gate('segmentation_heavy', 2, 3.0, env='SEG_MAX_CONCURRENT')
 HEAVY_RATE = sg.RateLimiter('segmentation_heavy', 0.5, 20, env='SEG_RATE_PER_S')   # 30/min sustained
@@ -93,22 +94,13 @@ UPSTREAM_TIMEOUT = (5, float(os.environ.get('SEG_UPSTREAM_TIMEOUT_S', '900')))
 
 _SESSION = None
 _SESSION_LOCK = threading.Lock()
-_PRIMARY = {'t': 0.0, 'v': False}
 
 
 def is_primary() -> bool:
-    """The UI + relay exist on the primary VM only (``director_ha.self_id()
-    == 'primary'``); on every peer they stay 404 like the rest of the hidden
-    surface.  Cached 30 s — consulted on every request."""
-    now = time.monotonic()
-    if now - _PRIMARY['t'] > 30:
-        try:
-            import director_ha
-            _PRIMARY['v'] = director_ha.self_id() == 'primary'
-        except Exception:  # noqa: BLE001
-            _PRIMARY['v'] = False
-        _PRIMARY['t'] = now
-    return _PRIMARY['v']
+    """The UI + relay exist on the instance that serves the public tier: in
+    single-VM mode always; in multi-VM mode only when this host is not a
+    worker pointed at a remote director (``config.PRIMARY_URL`` empty)."""
+    return not config.PRIMARY_URL
 
 
 def _session():
@@ -263,6 +255,9 @@ def relay():
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _STRIP_IN}
     headers[PUBLIC_HDR] = '1'
     headers['X-Public-Client'] = key
+    # The relay carries the client's address so app.py never treats a relayed
+    # request as loopback (its loopback rule is what gates mutating routes).
+    headers['X-Forwarded-For'] = key
     headers['X-Forwarded-Proto'] = request.headers.get('X-Forwarded-Proto', 'https')
     headers['X-Forwarded-Host'] = request.headers.get('X-Forwarded-Host') or request.host
     headers['Accept-Encoding'] = 'identity'          # we need to read + scrub JSON bodies

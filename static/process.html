@@ -687,7 +687,6 @@
         <button class="btn" id="btnDirShowIdle" onclick="event.stopPropagation();toggleShowIdlePeers()" style="font-size:10px;padding:1px 6px;" title="Show stopped/idle/complete peers (hidden by default; peers needing attention are always shown)">Show idle</button>
         <button class="btn" id="btnDirAuto" onclick="setDirectorMode('auto')" style="font-size:10px;padding:1px 6px;" title="Auto-select peer by bandwidth">Auto</button>
         <button class="btn" id="btnDirPause" onclick="setDirectorMode('paused')" style="font-size:10px;padding:1px 6px;" title="Pause all processing">Pause</button>
-        <button class="btn btn-g" id="btnDirUpdate" onclick="updatePeers()" style="font-size:10px;padding:1px 6px;" title="Git pull + restart on all remote peers">⬆ Update Peers</button>
         <button class="btn" id="btnAddPeer" onclick="showAddPeerModal()" style="font-size:10px;padding:1px 6px;" title="Add a new peer instance">+ Add Peer</button>
       </span>
     </div>
@@ -780,37 +779,15 @@
       <button onclick="closeAddPeerModal()" style="background:none;border:none;color:var(--dim);font-size:18px;cursor:pointer;padding:0 4px">&times;</button>
     </div>
 
-    <div style="margin-bottom:10px">
-      <div style="font-size:11px;color:var(--dim);margin-bottom:4px">VM name:</div>
-      <input id="addPeerVmName" type="text" placeholder="srtm-lidar-at3" oninput="updateDeployCmd()" style="background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:5px 8px;color:var(--text);font-size:12px;font-family:inherit;width:100%;box-sizing:border-box">
+    <div style="font-size:11px;color:var(--dim);margin-bottom:10px">
+      Deploy this repository on the peer, set <code>SRTM_PRIMARY_URL</code> to this instance and the same
+      <code>SRTM_OPERATOR_TOKEN</code> in its <code>.env</code>, then register it here (or list it in <code>SRTM_PEERS</code>).
     </div>
-
-    <div style="margin-bottom:10px">
-      <div style="font-size:11px;color:var(--dim);margin-bottom:4px">1. Create &amp; deploy <span style="opacity:.6">(exe.dev REPL)</span>:</div>
-      <div style="position:relative">
-        <pre id="addPeerCmd" style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:10px 40px 10px 10px;font-size:11px;color:var(--green);white-space:pre-wrap;word-break:break-all;margin:0;line-height:1.5"></pre>
-        <button onclick="_copyPre('addPeerCmd',this)" style="position:absolute;top:6px;right:6px;background:var(--card);border:1px solid var(--border);border-radius:3px;color:var(--dim);font-size:11px;padding:2px 8px;cursor:pointer" title="Copy">📋</button>
-      </div>
-    </div>
-
-    <div style="margin-bottom:14px">
-      <div style="font-size:11px;color:var(--dim);margin-bottom:4px">2. Make public <span style="opacity:.6">(exe.dev REPL, after deploy finishes)</span>:</div>
-      <div style="position:relative">
-        <pre id="addPeerPublicCmd" style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:8px 40px 8px 10px;font-size:11px;color:var(--yellow);white-space:pre-wrap;word-break:break-all;margin:0;line-height:1.4">share set-public &lt;vm-name&gt;</pre>
-        <button onclick="_copyPre('addPeerPublicCmd',this)" style="position:absolute;top:4px;right:6px;background:var(--card);border:1px solid var(--border);border-radius:3px;color:var(--dim);font-size:11px;padding:2px 8px;cursor:pointer" title="Copy">📋</button>
-      </div>
-    </div>
-
-    <div style="margin-bottom:14px">
-      <details style="font-size:11px;color:var(--dim)">
-        <summary style="cursor:pointer;margin-bottom:4px">Manual registration (only if auto-register failed)</summary>
-        <div style="display:grid;grid-template-columns:100px 1fr;gap:6px;align-items:center;margin-top:6px">
-          <label style="font-size:11px;color:var(--dim)">Peer ID</label>
-          <input id="addPeerId" type="text" placeholder="e.g. at3" style="background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:4px 8px;color:var(--text);font-size:12px;font-family:inherit">
-          <label style="font-size:11px;color:var(--dim)">Peer URL</label>
-          <input id="addPeerUrl" type="text" placeholder="https://example.invalid:8000" style="background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:4px 8px;color:var(--text);font-size:12px;font-family:inherit">
-        </div>
-      </details>
+    <div style="display:grid;grid-template-columns:100px 1fr;gap:6px;align-items:center;margin-bottom:14px">
+      <label style="font-size:11px;color:var(--dim)">Peer ID</label>
+      <input id="addPeerId" type="text" placeholder="e.g. worker2" style="background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:4px 8px;color:var(--text);font-size:12px;font-family:inherit">
+      <label style="font-size:11px;color:var(--dim)">Peer URL</label>
+      <input id="addPeerUrl" type="text" placeholder="http://peer.example.net:8000" style="background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:4px 8px;color:var(--text);font-size:12px;font-family:inherit">
     </div>
 
     <div id="addPeerStatus" style="font-size:11px;margin-bottom:10px;display:none"></div>
@@ -981,63 +958,8 @@
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-// === Admin token interceptor ===
-// Cluster admin endpoints require X-Admin-Token. Token lives in
-// localStorage; on 401 we prompt once and retry. Operator gets the
-// token from `cat data/admin_token` on the primary.
-(function(){
-  const KEY = 'srtm_admin_token';
-  function getTok(){ return localStorage.getItem(KEY) || ''; }
-  function setTok(v){ if(v) localStorage.setItem(KEY, v); else localStorage.removeItem(KEY); }
-  // Dedupe prompts: one in-flight at a time, and once dismissed we stop
-  // pestering the operator for the rest of the page lifetime. Background
-  // pollers (status, log, peers) hit several protected endpoints in
-  // parallel; without dedupe the operator gets one prompt per request.
-  let _promptInFlight = null;
-  // Prompts disabled by default — dashboard is used in live presentations.
-  // Re-enable in the JS console with `srtmResetAdminToken()` if needed.
-  let _dismissed = true;
-  function promptToken(reason){
-    if (_dismissed) return Promise.resolve(null);
-    if (_promptInFlight) return _promptInFlight;
-    _promptInFlight = new Promise(resolve => {
-      setTimeout(() => {
-        const cur = getTok();
-        const v = prompt('Admin token required' + (reason ? ' (' + reason + ')' : '') +
-                         '.\nGet it from `cat data/admin_token` on the primary VM.', cur);
-        _promptInFlight = null;
-        if (v === null) { _dismissed = true; resolve(null); return; }
-        const t = v.trim();
-        setTok(t);
-        resolve(t);
-      }, 0);
-    });
-    return _promptInFlight;
-  }
-  const _origFetch = window.fetch.bind(window);
-  window.fetch = async function(input, init){
-    init = init || {};
-    const url = (typeof input === 'string') ? input : (input && input.url) || '';
-    if (url.startsWith('/api/v1/') || url.startsWith(location.origin + '/api/v1/')) {
-      const tok = getTok();
-      if (tok) {
-        init.headers = new Headers(init.headers || {});
-        init.headers.set('X-Admin-Token', tok);
-      }
-    }
-    let r = await _origFetch(input, init);
-    if (r.status === 401 && url.includes('/api/v1/') && !_dismissed) {
-      const t = await promptToken('current token rejected');
-      if (t) {
-        init.headers = new Headers(init.headers || {});
-        init.headers.set('X-Admin-Token', t);
-        r = await _origFetch(input, init);
-      }
-    }
-    return r;
-  };
-  window.srtmResetAdminToken = () => { setTok(''); _dismissed = false; location.reload(); };
-})();
+// Mutating routes are gated server-side (loopback or X-Operator-Token);
+// this dashboard is served from the operator tier (ssh tunnel / SRTM_APP_BIND).
 const API = '/api/v1/processing/status';
 // Sep 2026 bandwidth pass: 10 s foreground cadence (was 5), and every
 // poller backs off to HIDDEN_POLL_MS while the tab is in the background
@@ -1127,8 +1049,8 @@ function fmtRelFuture(iso) {
 }
 
 // Step pipeline
-const STEPS = ['cadastre','lidar','terrain','ortho','copernicus','hansen','segment','vectorise','gpkg_full','gpkg_light','json','validate','upload','done'];
-const STEP_LBL = {cadastre:'Cadastre',lidar:'LiDAR',ortho:'Ortho',copernicus:'Copernicus',
+const STEPS = ['lidar','terrain','ortho','copernicus','hansen','segment','vectorise','gpkg_full','gpkg_light','json','validate','upload','done'];
+const STEP_LBL = {lidar:'LiDAR',ortho:'Ortho',copernicus:'Copernicus',
   hansen:'Hansen',segment:'Segment',terrain:'Terrain',vectorise:'Vectorise',
   gpkg_full:'GPKG Full',gpkg_light:'GPKG Light',json:'JSON',validate:'Validate',
   upload:'Upload',done:'Done'};
@@ -1943,7 +1865,6 @@ function updateSubtitle(d) {
   // ── Processed (authoritative DB totals across all peers) ──
   parts.push('<b>' + fmt(doneDb) + '</b>/' + fmt(totKg) + ' KGs (' + pct + '%)');
   if (d.db_area_km2) parts.push('<b>' + fmt(Math.round(d.db_area_km2)) + '</b> km²');
-  if (d.db_parcels_total) parts.push('<b>' + fmtC(d.db_parcels_total) + '</b> parcels');
   if (d.db_buildings_total) {
     let b = '<b>' + fmtC(d.db_buildings_total) + '</b> buildings';
     if (d.db_new_buildings_total) b += ' (+<b>' + fmtC(d.db_new_buildings_total) + '</b> new)';
@@ -2093,7 +2014,7 @@ function updateKgCard(d, peerMeta) {
   }
   // Check step_times for the most recent pipeline step within the current tile
   const stepTimes = kg.step_times || {};
-  const tileKeys = Object.keys(stepTimes).filter(k => !k.startsWith('tile_') && k !== 'tiles' && k !== 'cadastre');
+  const tileKeys = Object.keys(stepTimes).filter(k => !k.startsWith('tile_') && k !== 'tiles');
   if (tileKeys.length > 0 && tileStepMatch) {
     // Use the last pipeline sub-step that has time recorded
     const last = tileKeys[tileKeys.length - 1];
@@ -2571,17 +2492,6 @@ function peerActionsMenu(p, opts) {
   if (!isActive && p.enabled && p.online && !isScheduled) {
     items.push(`<button class="pmenu-item" onclick="_pmenuRun(this, () => activatePeer(${idJ}))">▶ Activate</button>`);
   }
-  // Manual director handover — only if local instance is currently director,
-  // target peer is reachable and isn't already the director.
-  try {
-    const dd = (typeof _directorData !== 'undefined') ? (_directorData || {}) : {};
-    const myId = dd.self_id || 'primary';
-    if (dd.is_director_local && p.url && p.online && p.id !== myId) {
-      const isShadow = dd.shadow_peer === p.id;
-      const lbl = isShadow ? '⇋ Hand over director (shadow)' : '⇋ Hand over director here';
-      items.push(`<button class="pmenu-item" onclick="_pmenuRun(this, () => handoverDirectorTo(${idJ}))" title="Step down and promote this peer to director">${lbl}</button>`);
-    }
-  } catch(_) {}
   if (isRunning) {
     items.push(`<button class="pmenu-item warn" onclick="_pmenuRun(this, () => peerCmd(${idJ}, 'pause'))">‖ Pause</button>`);
   } else if (isPaused) {
@@ -2688,11 +2598,9 @@ document.addEventListener('click', (ev) => {
 
 async function peerCmd(peerId, action) {
   // Send pause/resume/stop to a specific peer. Always go through the
-  // primary's /director/peers/<id>/cmd/<action> proxy so the cluster
-  // admin token is forwarded server-side; cross-origin POSTs from the
-  // browser drop the X-Admin-Token (the JS fetch wrapper only injects
-  // it for same-origin URLs) and return 401 — which is what made
-  // the per-peer Stop button appear to do nothing.
+  // director's /director/peers/<id>/cmd/<action> proxy so the operator
+  // token is forwarded server-side (cross-origin POSTs from the browser
+  // would be rejected by the peer's operator gate).
   try {
     const meta = (_peerCards||[]).find(p => p.id === peerId);
     let url;
@@ -2956,7 +2864,7 @@ const ZEN_STALE_MS = 48 * 3600 * 1000;  // first-file age past which an
 // 'full' | 'light' | 'json' | 'json_v2' | 'ne' | null. The grouping `code`
 // keeps the block suffix (50017 vs 50017-west) because each block uploads
 // its own product set. Completeness is still the v1 "triple": full +
-// light (_light_gpkg or _light_gpkg_v2) + _json (the cadastre-stripped
+// light (_light_gpkg or _light_gpkg_v2) + _json (the compact
 // completion marker every "already done?" gate keys on). json_v2 / ne_h3b
 // are grouped so their rows take the KG's colour, but are not required
 // (ne_h3b may legitimately be absent → '-partial', repaired later).
@@ -3039,7 +2947,7 @@ function _zenManifestRow(e) {
   if (e.status === 'removed') {
     // v2.4 legacy clean-up: deposition deleted on Zenodo, record kept for
     // the audit. Show it as such instead of a misleading green "0 B".
-    const _rt = 'v1 light GPKG removed (cadastre layers) — superseded by ' + esc(_sp.code||'') + '_light_v2.gpkg; was uploaded ' + esc(e.prev_uploaded_at||'?');
+    const _rt = 'v1 light GPKG removed (legacy layers) — superseded by ' + esc(_sp.code||'') + '_light_v2.gpkg; was uploaded ' + esc(e.prev_uploaded_at||'?');
     return '<tr' + _cls + ' style="opacity:.55">' +
       '<td class="zen-hide-sm" title="' + esc(e.key||'') + '">' + esc(e.key||'') + '</td>' +
       '<td class="zen-hide-sm">' + (e.depo_id||'—') + '</td>' +
@@ -3473,7 +3381,7 @@ let _peerFetchLast = 0;
 
 function _peerProgressKey(p) {
   // Lower = closer to completion. We score 0..1 where 1 = step `done`.
-  const STEPS_LOCAL = ['cadastre','lidar','terrain','ortho','copernicus','hansen',
+  const STEPS_LOCAL = ['lidar','terrain','ortho','copernicus','hansen',
     'segment','vectorise','gpkg_full','gpkg_light','json','validate','upload','done'];
   const s = p.status || {};
   const kg = s.current_kg || {};
@@ -3824,33 +3732,6 @@ function renderLastKg(js) {
       });
       js.top_by_type = out;
     }
-    // Per-parcel highlights too (parcel_top_obj/parcel_top_tree refs).
-    // Supports both compact (top_objs/top_trees) and verbose (top_10_*) layouts.
-    if (js.parcels && js.parcels.details) {
-      js.parcels = Object.assign({}, js.parcels, {
-        details: js.parcels.details.map(p => {
-          const pid = p.parcel_id || '';
-          const np = Object.assign({}, p);
-          if (p.top_objs) {
-            np.top_objs = p.top_objs.filter((o,i) =>
-              !flagged.has(kg + ':parcel_top_obj:' + pid + ':' + i));
-          }
-          if (p.top_trees) {
-            np.top_trees = p.top_trees.filter((o,i) =>
-              !flagged.has(kg + ':parcel_top_tree:' + pid + ':' + i));
-          }
-          if (p.top_10_objects) {
-            np.top_10_objects = p.top_10_objects.filter((o,i) =>
-              !flagged.has(kg + ':parcel_top_obj:' + pid + ':' + i));
-          }
-          if (p.top_10_trees) {
-            np.top_10_trees = p.top_10_trees.filter((o,i) =>
-              !flagged.has(kg + ':parcel_top_tree:' + pid + ':' + i));
-          }
-          return np;
-        })
-      });
-    }
   }
   document.getElementById('lastKgName').textContent =
     (js.kg_code || '?') + ' ' + (js.kg_name || '') + (js.state_name ? ' (' + js.state_name + ')' : '');
@@ -3881,7 +3762,6 @@ function renderLastKg(js) {
   const harm = js.ndvi_harmonics || {};
   const temporal = js.temporal_change || {};
   const hansen = js.hansen || {};
-  const parcels = js.parcels || {};
   const bfp = js.building_footprints || {};
   const newb = js.new_buildings || {};
   const infra = js.infrastructure || {};
@@ -3891,9 +3771,8 @@ function renderLastKg(js) {
 
   items.push({l: 'Area', v: ((js.total_area_sqm||0)/10000).toFixed(1) + ' ha'});
   items.push({l: 'Segments', v: fmt(landscape.n_segments)});
-  if (js.cadastre_free || (!js.parcels && !js.building_footprints)) {
-    // v2.4+: product is cadastre-free (no parcels / footprints). Show the
-    // NE cells layer summary instead of misleading zeros.
+  if (!js.building_footprints) {
+    // v2.4+: product carries the NE cells layer instead of footprints.
     const ne = js.ne || {};
     const nd = ne.declared || {}, no = ne.observed || {};
     const neOk = ne.status === 'ok' || nd.cells_n;
@@ -3902,7 +3781,6 @@ function renderLastKg(js) {
       : (ne.status || 'missing')});
     items.push({l: 'Man-made (NE)', v: neOk ? fmt(no.manmade_n||0) : '—'});
   } else {
-    items.push({l: 'Parcels', v: fmt(parcels.count) + ' (' + (parcels.details||[]).length + ' det)'});
     items.push({l: 'Buildings', v: fmt(bfp.count) + ' (' + (bfp.details||[]).length + ' det)'});
   }
   items.push({l: 'New Buildings', v: fmt(newb.count || 0)});
@@ -3910,97 +3788,7 @@ function renderLastKg(js) {
   items.push({l: 'Trees', v: fmt(trees.count) + ' / ' + ((trees.total_canopy_sqm||0)/10000).toFixed(2) + 'ha'});
   const _tint = activeColor ? ('color:' + activeColor) : '';
   // Cascade: when top_10 is empty (eg fully flagged), fall through to
-  // top_by_type then to per-parcel top_10. The data has plenty of objects
-  // to surface — no reason to show '—' just because the 10-deep KG-wide
-  // list happens to be flagged.
-  // Compact-format decoders for legacy (pre-2.4) KG docs that still carry
-  // per-parcel rows (parcel_compact.py itself was removed 2026-10-13,
-  // Kataster purge; 2.4 docs have no parcels, so these are fall-throughs).
-  // top_objs[i] = [type_letter, hmax, hmean, area, lon, lat, conf, rf_conf, manmade]
-  // top_trees[i] = [hmax, hmean, hp90, area, lon, lat, ndvi_m, ndvi_f, hchg, phen, conf, rf_conf]
-  const _LETTER2TYPE = {t:'tree',s:'shrub',g:'grass',h:'hedge',w:'water',
-    R:'roof',G:'greenhouse',P:'solar_panel',F:'fence',W:'wall',M:'mast',
-    T:'wind_turbine',X:'substation',r:'road',p:'path',k:'parking',b:'bridge',
-    c:'crop',o:'orchard',v:'vineyard',a:'garden',B:'bare_soil',K:'rock',
-    E:'excavation',L:'fill',l:'tree_loss',C:'construction',e:'earthwork',u:'unclassified'};
-  function _decObj(x) {
-    if (!Array.isArray(x)) return x;
-    return {type:_LETTER2TYPE[x[0]]||x[0], height_max_m:x[1], height_mean_m:x[2],
-      area_sqm:x[3], coordinate:{lon:x[4],lat:x[5]}, confidence:x[6],
-      rf_confidence:x[7], is_manmade:!!x[8]};
-  }
-  function _decTree(x) {
-    if (!Array.isArray(x)) return x;
-    return {height_m:x[0], canopy_height_m:x[1], height_p90_m:x[2],
-      area_sqm:x[3], coordinate:{lon:x[4],lat:x[5]}, ndvi_mean:x[6],
-      ndvi_fused:x[7], height_change_m:x[8], phenology_class:x[9],
-      confidence:x[10], rf_confidence:x[11]};
-  }
-  // Parcel auto-class tally for legacy docs (mirrors the former
-  // parcel_compact.classify_parcel; uses frav + top_trees + terrain only,
-  // no building rollup). Lightweight.
-  function _classifyParcelLite(p) {
-    const frav = p.frav || {};
-    const a = {};
-    let total = 0;
-    for (const k of Object.keys(frav)) { a[_LETTER2TYPE[k]||k] = frav[k]; total += frav[k]; }
-    if (total === 0) {
-      const s = p.area_summary || {};
-      for (const t of Object.keys(s)) { a[t] = s[t].area_sqm||0; total += a[t]; }
-    }
-    if (total === 0) return null;
-    const F = (t) => (a[t]||0)/total;
-    const sumF = (arr) => arr.reduce((s,t)=>s+F(t), 0);
-    const tree = F('tree'), shrub = F('shrub'), grass = F('grass');
-    const built = sumF(['roof','greenhouse','solar_panel','construction']);
-    const infra = sumF(['road','path','parking','bridge']);
-    const water = F('water'), bare = sumF(['bare_soil','rock']);
-    const disturb = sumF(['tree_loss','excavation','fill','construction','earthwork']);
-    const farmland = F('crop')+F('orchard')+F('vineyard')+bare;
-    const slope = p.slope_mean_deg||0, elev = p.elevation_m||0;
-    const hRecent = ((p.hansen_loss||{}).recent_5yr_pixels||0)*900/(p.area_sqm||1);
-    let mTreeH = null, n = 0;
-    for (const r of (p.top_trees||[])) {
-      const h = Array.isArray(r) ? r[1] : (r.canopy_height_m||r.height_m);
-      if (h != null) { mTreeH = (mTreeH||0)+h; n++; }
-    }
-    if (n) mTreeH /= n;
-    if (water >= 0.40) return 'water_body';
-    if (disturb >= 0.25 || hRecent >= 0.20) return 'disturbance';
-    if (built >= 0.35) return 'built_up';
-    if (infra >= 0.35) return 'infrastructure';
-    if (built >= 0.10 && (farmland+grass) >= 0.30) return 'farmstead';
-    if (F('vineyard') >= 0.05) return 'vineyard';
-    if (F('orchard') >= 0.05) return 'orchard';
-    if (tree >= 0.60) {
-      if (hRecent >= 0.05) return 'forest (thinned)';
-      if (mTreeH != null && mTreeH < 8) return 'young_forest';
-      return 'forest';
-    }
-    if (tree >= 0.30) return 'wooded';
-    if (shrub >= 0.40 && tree < 0.30) return 'shrubland';
-    if ((F('crop')+bare) >= 0.50) return 'cropland';
-    if (grass >= 0.60) {
-      if (slope >= 20 || elev >= 1500) return 'alpine_meadow';
-      return 'meadow';
-    }
-    if (bare >= 0.50) return 'bare';
-    return 'mixed';
-  }
-  let _parcelTypesEntry = null;
-  if ((parcels.details||[]).length > 0) {
-    const tally = {};
-    for (const p of parcels.details) {
-      const c = _classifyParcelLite(p);
-      if (c) tally[c] = (tally[c]||0) + 1;
-    }
-    const ranked = Object.entries(tally).sort((a,b)=>b[1]-a[1]);
-    if (ranked.length > 0) {
-      const top = ranked.slice(0, 6).map(([k,v]) => k + ' ' + v).join(', ');
-      const more = ranked.length > 6 ? ' … +' + (ranked.length-6) : '';
-      _parcelTypesEntry = {l: 'Parcel Types', v: '<span style="font-size:0.82em">'+top+more+'</span>'};
-    }
-  }
+  // top_by_type.
   function _cascadeTop() {
     if (top10[0]) return top10[0];
     const tbt = js.top_by_type || {};
@@ -4011,12 +3799,7 @@ function renderLastKg(js) {
         if (h > bestH) { bestH = h; best = o; }
       });
     });
-    if (best) return best;
-    for (const p of (parcels.details || [])) {
-      const arr = p.top_objs || p.top_10_objects || [];
-      if (arr[0]) return _decObj(arr[0]);
-    }
-    return null;
+    return best;
   }
   function _cascadeTopTree() {
     // Always consider both top_10_trees AND top_by_type.tree and pick
@@ -4034,12 +3817,7 @@ function renderLastKg(js) {
       const h = trees[0].height_max_m || 0;
       if (h > bestH) { bestH = h; best = Object.assign({height_m: trees[0].height_max_m}, trees[0]); }
     }
-    if (best) return best;
-    for (const p of (parcels.details || [])) {
-      const arr = p.top_trees || p.top_10_trees || [];
-      if (arr[0]) return _decTree(arr[0]);
-    }
-    return null;
+    return best;
   }
   const _cTop = _cascadeTop();
   const _cTree = _cascadeTopTree();
@@ -4084,7 +3862,6 @@ function renderLastKg(js) {
     // Show top divergence pairs
     const topDiv = cls.top_divergences || [];
     if (topDiv.length > 0) {
-      if (_parcelTypesEntry) { items.push(_parcelTypesEntry); _parcelTypesEntry = null; }
       const pairs = topDiv.slice(0, 5).map(d => d.rf_type + '\u2192' + d.final_type + ' (' + d.count + ')').join(', ');
       items.push({l: 'Top Mismatches', v: '<span style="font-size:0.82em">' + pairs + '</span>'});
     }
@@ -4104,7 +3881,7 @@ function renderLastKg(js) {
     {name:'Harmonics', ok: !!(harm.mean_mean != null)},
     {name:'Temporal', ok: !!(temporal.datasets_compared && temporal.datasets_compared.length > 1)},
     {name:'Hansen', ok: !!(hansen.total_loss_pixels != null || hansen.treecover2000 != null)},
-    {name:'Cadastre', ok: !!(parcels.count > 0)},
+    {name:'Footprints', ok: !!(bfp.count > 0)},
     {name:'Phenology', ok: !!js.phenology && Object.keys(js.phenology).length > 0},
   ];
   ds.innerHTML = sources.map(s =>
@@ -5424,9 +5201,6 @@ function renderDirector(d) {
     const stale = _localCommit && commit !== _localCommit;
     const color = stale ? 'var(--yellow)' : 'var(--dim)';
     let tag = '<span style="font-size:9px;color:' + color + ';font-family:monospace" title="git ' + esc(commit) + '">' + esc(commit) + '</span>';
-    if (stale && p.url !== null) {
-      tag += ' <button id="btn-update-' + esc(p.id) + '" class="btn" style="font-size:8px;padding:0 3px;line-height:14px;color:var(--yellow);border-color:var(--yellow)" onclick="event.stopPropagation();updateSinglePeer(\'' + esc(p.id) + '\')" title="Update to ' + esc(_localCommit) + '">⬆</button>';
-    }
     return tag;
   }
   // Director/shadow indicators (last sync info)
@@ -6113,161 +5887,17 @@ async function restartPeer(peerId) {
   } catch(e) { console.error('restartPeer:', e); }
 }
 
-async function updatePeers() {
-  const btn = document.getElementById('btnDirUpdate');
-  btn.textContent = '\u23f3 Updating\u2026';
-  btn.disabled = true;
-  try {
-    let r = await fetch('/api/v1/director/update_peers', {method:'POST'});
-    let d = await r.json();
-    if (r.status === 409 && d.push) {
-      // Local commits couldn't be pushed (e.g. non-fast-forward).
-      const out = (d.push.push_out || d.push.error || 'unknown error');
-      const ahead = d.push.ahead || '?';
-      if (confirm(`Push to origin failed (${ahead} local commits).\n\n${out}\n\nUpdate peers anyway from the current origin?`)) {
-        r = await fetch('/api/v1/director/update_peers', {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({skip_push: true})
-        });
-        d = await r.json();
-      } else {
-        btn.textContent = '\u274c Push failed';
-        setTimeout(() => { btn.textContent = '\u2b06 Update Peers'; btn.disabled = false; }, 3000);
-        return;
-      }
-    }
-    if (d.push && d.push.attempted && d.push.ahead && Number(d.push.ahead) > 0 && d.push.push_rc === 0) {
-      console.log(`Pushed ${d.push.ahead} commits before updating peers.`);
-    }
-    btn.textContent = '\u2705 Done';
-    setTimeout(() => { btn.textContent = '\u2b06 Update Peers'; btn.disabled = false; fetchDirectorStatus(); }, 3000);
-  } catch(e) {
-    btn.textContent = '\u274c Failed';
-    setTimeout(() => { btn.textContent = '\u2b06 Update Peers'; btn.disabled = false; }, 3000);
-  }
-}
-
-async function updateSinglePeer(peerId) {
-  const btn = document.getElementById('btn-update-' + peerId);
-  if (!btn) return;
-  btn.textContent = '\u23f3';
-  btn.disabled = true;
-  try {
-    const r = await fetch('/api/v1/director/update_peers', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({peer_id: peerId})
-    });
-    const d = await r.json();
-    const res = (d.results || {})[peerId] || {};
-    btn.textContent = res.status === 'updated' ? '\u2705' : '\u274c';
-    setTimeout(() => { fetchDirectorStatus(); }, 3000);
-  } catch(e) {
-    btn.textContent = '\u274c';
-    setTimeout(() => { fetchDirectorStatus(); }, 3000);
-  }
-}
-
-// ── Director handover ─────────────────────────────────
-async function handoverDirectorTo(peerId) {
-  const dd = _directorData || {};
-  if (!dd.is_director_local) {
-    if (!confirm('This dashboard is not connected to the current director.\n'
-      + 'Handover must be initiated from the director itself. Continue anyway?')) return;
-  }
-  const target = (dd.peers || []).find(p => p.id === peerId);
-  if (!target) { alert('Unknown peer: ' + peerId); return; }
-  if (!target.url) { alert('Peer has no URL: ' + peerId); return; }
-  if (!confirm(`Hand over director role to ${target.id} (${target.url})?\n\n`
-    + 'This VM will step down and become a regular peer. The new director\n'
-    + 'will broadcast the change to all peers.')) return;
-  try {
-    const r = await fetch('/api/v1/director/handover?to=' + encodeURIComponent(target.id),
-      {method:'POST'});
-    const j = await r.json();
-    if (r.ok && j.status === 'handed_over') {
-      alert('Director handed over to ' + target.id
-        + '.\n\nReload the dashboard against ' + target.url + '/process.html');
-    } else {
-      alert('Handover failed: ' + JSON.stringify(j));
-    }
-  } catch(e) {
-    alert('Handover error: ' + e);
-  } finally {
-    setTimeout(() => fetchDirectorStatus(), 1500);
-  }
-}
-
 // ── Add Peer modal ──────────────────────────────────────────────
-// Repo is public — no token needed for raw.githubusercontent.com.
-const _GH_TOKEN = '';
-function _directorPublicUrl() {
-  return location.origin.includes('exe.xyz') ? location.origin : 'https://example.invalid:8000';
-}
-function _nextPeerVmName() {
-  const peers = (_directorData && _directorData.peers) || [];
-  const ids = new Set(peers.map(p => p.id));
-  for (let i = 2; ; i++) {
-    const candidate = 'at' + i;
-    if (!ids.has(candidate)) return 'srtm-lidar-' + candidate;
-  }
-}
 function showAddPeerModal() {
-  const suggested = _nextPeerVmName();
-  document.getElementById('addPeerVmName').value = suggested;
   document.getElementById('addPeerId').value = '';
   document.getElementById('addPeerUrl').value = '';
   document.getElementById('addPeerStatus').style.display = 'none';
-  updateDeployCmd();
   document.getElementById('addPeerModal').style.display = 'flex';
-  document.getElementById('addPeerVmName').focus();
-  document.getElementById('addPeerVmName').select();
-}
-let _mintCache = {};   // vm -> {admin_token, mesh_token, director_url}
-let _mintTimer = null;
-function updateDeployCmd() {
-  const vm = document.getElementById('addPeerVmName').value.trim() || '<vm-name>';
-  const selfUrl = vm === '<vm-name>' ? 'https://<vm-name>.exe.xyz:8000' : `https://${vm}.exe.xyz:8000`;
-  const pre = document.getElementById('addPeerCmd');
-  document.getElementById('addPeerPublicCmd').textContent = vm === '<vm-name>' ? 'share set-public <vm-name>' : `share set-public ${vm}`;
-  // Per-peer token (security hardening 2026-10-23): the primary mints a
-  // unique ADMIN_TOKEN + the fleet MESH_TOKEN for this VM name; the
-  // owner/master token is never baked into a deploy command.
-  const m = _mintCache[vm];
-  if (m) {
-    const deployScript = `curl -sL https://raw.githubusercontent.com/raffopenssh/srtm-lidar-at/main/deploy.sh | ADMIN_TOKEN=${m.admin_token} MESH_TOKEN=${m.mesh_token} SELF_URL=${selfUrl} PEER_URL=${m.director_url} bash`;
-    pre.textContent = `new --name=${vm} --setup-script='${deployScript}'`;
-    pre.style.color = 'var(--green)';
-    return;
-  }
-  pre.style.color = 'var(--dim)';
-  pre.textContent = /^srtm-lidar-at\d+$/.test(vm) ? 'minting per-peer token…' : 'enter a VM name like srtm-lidar-at77';
-  if (!/^srtm-lidar-at\d+$/.test(vm)) return;
-  clearTimeout(_mintTimer);
-  _mintTimer = setTimeout(async () => {
-    try {
-      const r = await fetch('/api/v1/director/peers/mint_token', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({vm})
-      });
-      const d = await r.json();
-      if (!r.ok) { pre.textContent = 'token mint failed: ' + (d.error || r.status); pre.style.color = 'var(--red)'; return; }
-      _mintCache[vm] = d;
-      if ((document.getElementById('addPeerVmName').value.trim() || '<vm-name>') === vm) updateDeployCmd();
-    } catch (e) { pre.textContent = 'token mint failed: ' + e; pre.style.color = 'var(--red)'; }
-  }, 400);
+  document.getElementById('addPeerId').focus();
 }
 function closeAddPeerModal() {
   document.getElementById('addPeerModal').style.display = 'none';
 }
-function _copyPre(preId, btn) {
-  const txt = document.getElementById(preId).textContent;
-  navigator.clipboard.writeText(txt).then(() => {
-    const orig = btn.textContent;
-    btn.textContent = '\u2705';
-    setTimeout(() => btn.textContent = '\ud83d\udccb', 2000);
-  });
-}
-function copyDeployCmd() { _copyPre('addPeerCmd', event.target); }
 async function registerPeer() {
   const id = document.getElementById('addPeerId').value.trim();
   const url = document.getElementById('addPeerUrl').value.trim().replace(/\/+$/, '');

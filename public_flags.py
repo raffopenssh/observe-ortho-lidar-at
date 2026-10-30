@@ -58,7 +58,7 @@ CACHE_MAX_AGE = 30
 HEAT_MAX_AGE = 300
 
 LAYERS = (
-    'cells.cover',        # the observed land-cover groups of a cell (what umfeld-at's glyph paints under v=obs)
+    'cells.cover',        # the observed land-cover groups of a cell (what a map glyph paints under v=obs)
     'cells.height',       # height.mean / p90 / max of a cell
     'cells.trees',        # trees.n / h_max / canopy + the apex list of a cell
     'cells.structures',   # structures_n / cover + the structure list of a cell
@@ -893,8 +893,13 @@ def flags_one(rid: int):
 
 @flags_bp.route('/api/v1/flags/<int:rid>/status', methods=['POST'])
 def flags_status(rid: int):
-    import api_tiers as tiers
-    if not tiers.token_valid(tiers.request_token(request)):
+    # Operator-only moderation: needs the configured operator token
+    # (``config.operator_token()``); unconfigured ⇒ the route does not exist.
+    import hmac
+    import config
+    tok = config.operator_token()
+    sent = request.headers.get('X-Operator-Token') or ''
+    if not tok or not hmac.compare_digest(sent, tok):
         raise FlagError(404, 'not_found')
     body = request.get_json(silent=True) or {}
     d = set_status(rid, str(body.get('status') or '').lower(), body.get('note'))

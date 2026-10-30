@@ -3328,8 +3328,8 @@ def _kg_weights(codes: list) -> dict:
 
     Weight ≈ expected processing cost relative to a tiny KG. Built
     from tile count (the dominant cost driver — each tile runs
-    Felzenszwalb + RAG + RF inference) plus a small term for parcel
-    count (vectorise + per-parcel features). Block codes inherit their
+    Felzenszwalb + RAG + RF inference) plus a small legacy term for the
+    vector-feature count (vectorise). Block codes inherit their
     parent's geometry; ``maybe_split_kg`` is invoked lazily so this
     works correctly for both parent and block codes.
 
@@ -3390,9 +3390,9 @@ def _kg_weights(codes: list) -> dict:
                     n_tiles = _compute_n_tiles(
                         bb['min_lon'], bb['min_lat'],
                         bb['max_lon'], bb['max_lat'])
-                    # Per-parcel cost — parent's count divided
+                    # Per-feature cost — parent's count divided
                     # across blocks (cheap & good enough).
-                    parcels = kg.get('parcel_count', 0) / max(
+                    feats = kg.get('feature_count', 0) / max(
                         len(blocks), 1)
                 else:
                     bb = kg.get('bbox') or {}
@@ -3400,18 +3400,16 @@ def _kg_weights(codes: list) -> dict:
                         bb.get('min_lon', 0), bb.get('min_lat', 0),
                         bb.get('max_lon', 0), bb.get('max_lat', 0)
                     ) / max(len(blocks) if blocks else 1, 1)
-                    parcels = kg.get('parcel_count', 0) / max(
+                    feats = kg.get('feature_count', 0) / max(
                         len(blocks) if blocks else 1, 1)
             else:
                 bb = kg.get('bbox') or {}
                 n_tiles = _compute_n_tiles(
                     bb.get('min_lon', 0), bb.get('min_lat', 0),
                     bb.get('max_lon', 0), bb.get('max_lat', 0))
-                parcels = kg.get('parcel_count', 0)
-            # Weight: tile count dominates; tiny parcel-count nudge so
-            # a 1-tile KG with 5000 parcels still ranks above a
-            # 1-tile KG with 50.
-            w = max(1.0, float(n_tiles) + 0.0005 * float(parcels))
+                feats = kg.get('feature_count', 0)
+            # Weight: tile count dominates; tiny feature-count nudge.
+            w = max(1.0, float(n_tiles) + 0.0005 * float(feats))
         except Exception:
             w = 1.0
         _KG_WEIGHT_CACHE[c] = w
@@ -6980,7 +6978,7 @@ class PeerDirector:
             return min(1.0, max(0.0, (ct - 1) / nt))
         # Canonical pipeline order — keep in sync with STEPS in
         # static/process.html.
-        steps = ('cadastre', 'lidar', 'terrain', 'ortho', 'copernicus',
+        steps = ('lidar', 'terrain', 'ortho', 'copernicus',
                  'hansen', 'segment', 'vectorise', 'gpkg_full',
                  'gpkg_light', 'json', 'validate', 'upload', 'done')
         step = str(ckg.get('step') or '')
@@ -7952,7 +7950,7 @@ class PeerDirector:
 
     def _v24_audit_tick(self) -> None:
         """Every 5 min (docs/v2.4-rollout.md → Director step 5): refresh the
-        umfeld NE manifest (candidate gate ``ne_require_built``), verify up
+        NE manifest (candidate gate ``ne_require_built``), verify up
         to 20 ``status=removed`` legacy records against the deposition API
         and re-issue the delete for ``present`` verdicts.  Runs in a
         background thread so Zenodo latency never blocks the tick."""
@@ -7976,12 +7974,11 @@ class PeerDirector:
             except Exception as e:  # noqa: BLE001
                 log.warning('label_mix sweep failed: %s', e)
             try:
-                # 10 min is plenty: umfeld builds every ~33 s so the ETag never
-                # 304s; each miss costs ~260 KB on the metered primary link.
+                # 10 min is plenty; each miss costs ~260 KB on the metered link.
                 ne_rollout.refresh_ne_manifest(max_age_s=600)
             except Exception as e:  # noqa: BLE001
                 log.debug('ne manifest refresh: %s', e)
-            # Cadastre-free metadata wording on every committed deposition
+            # Current metadata wording on every committed deposition
             # (title/description/keywords only; never publishes, never
             # touches uploaded_at) — zenodo_meta_refresh, ≤ PER_TICK/5 min.
             try:
@@ -7992,7 +7989,7 @@ class PeerDirector:
             except Exception as e:  # noqa: BLE001
                 log.debug('meta refresh: %s', e)
             # Primary's local v1 JSON copies follow the Zenodo strip
-            # (docs/kataster-purge.md → local mirror).
+            # (local mirror).
             try:
                 ls = ne_rollout.strip_local_json()
                 if ls.get('stripped'):
@@ -11767,7 +11764,7 @@ class PeerDirector:
             import product_repair as _pr
             _repair_reg = _pr.load()
             import v24_fast as _v24
-            # v2.4: the declared NE layer must be built at umfeld-at before
+            # v2.4: the declared NE layer must be built before
             # a code is worth dispatching (the peer skips an unbuilt KG
             # without a strike, but a slice full of them churns the peer
             # to COMPLETE every few minutes).  Knob ``ne_require_built``.
@@ -11873,7 +11870,7 @@ class PeerDirector:
             fast_set = {c for rk, _, c in ranked if rk == -0.5}
             if n_fast or n_ne_wait:
                 log.info('v2 upgrade candidates: %d fast-eligible (v2.4 relabel; %d without _full_gpkg), '
-                         '%d full-path, %d partial waiting, %d waiting for umfeld NE build (%d built)',
+                         '%d full-path, %d partial waiting, %d waiting for NE build (%d built)',
                          n_fast, n_fast_nofull, len(ranked) - n_fast, n_partial_wait, n_ne_wait, len(_built))
             if n_partial_wait:
                 log.debug('v2 upgrade candidates: %d partial code(s) waiting for cache cells / parked',
@@ -11892,7 +11889,7 @@ class PeerDirector:
         return codes
 
     def _v24_first(self, cfg: dict | None = None) -> bool:
-        """True while the v2.4 cadastre-clean-up wave should take precedence
+        """True while the v2.4 legacy clean-up wave should take precedence
         over fresh cache-ready work.  Knob ``v24_first`` (director_config);
         default = legacy suspect files remain on Zenodo (ne_rollout, 60 s
         cache).  Logs once when it auto-clears."""
@@ -11906,7 +11903,7 @@ class PeerDirector:
             return False
         on = n > 0
         if not on and getattr(self, '_v24_first_was', True):
-            log.info('v24: archive cadastre-free — v24_first auto-cleared, normal fill')
+            log.info('v24: archive clean — v24_first auto-cleared, normal fill')
         self._v24_first_was = on
         return on
 
@@ -11956,7 +11953,7 @@ class PeerDirector:
         if not knob(cfg, 'v2_upgrade', True):
             return []
         # v2.4-first wave (docs/v2.4-rollout.md): while Zenodo still holds
-        # cadastre-bearing files, upgrade units are injected REGARDLESS of
+        # legacy files, upgrade units are injected REGARDLESS of
         # how much fresh cache-ready work exists (2026-10-04: 200 ready
         # KGs kept this gate shut → 0 candidates dispatched, v2.4 stuck at
         # the 3 hand-run test KGs).  Fresh work stays as filler behind

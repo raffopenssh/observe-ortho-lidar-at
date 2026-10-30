@@ -1,14 +1,13 @@
-"""public_api — the public, parcel-free tier of srtm-lidar-at.
+"""public_api — the public read-only tier.
 
-Runs as its own gunicorn (``srv_public.service``, port 8100; the exe.dev
-default port is switched to it so it answers on https://example.invalid/).
+Runs as its own gunicorn (``systemd/srv_public.service``, ``config.PUBLIC_PORT``).
 
     PUBLIC   /api/v1/…  /llm.txt  /tiles/…    landscape_query.py — bbox / point /
-                                              KG-code keyed, nothing cadastre-derived,
-                                              index + grid25 fast path only (no Zenodo)
-    PRIVATE  /k/…                              token-gated reverse proxy to the full
-                                              app.py on 127.0.0.1:8000 (api_tiers.py);
-                                              404 without a valid token
+                                              KG-code keyed, index + grid25 fast
+                                              path only (no Zenodo in the request path)
+    /segmentation                             public_segmentation.py — UI + an
+                                              explicit allow-list relay of analysis
+                                              routes to app.py (config.APP_URL)
 
 Never imports ``app.py`` (that would start a second director / sync / index
 thread set). ``hillshade_tiles`` is reused as-is.
@@ -24,7 +23,7 @@ import time
 
 from flask import Flask, Response, g, jsonify, request
 
-import api_tiers as tiers
+import config
 import landscape_query as lq
 import mem_lru
 import public_docs as docs
@@ -34,6 +33,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname
 log = logging.getLogger('public_api')
 
 app = Flask(__name__, static_folder=None)
+# Body-size cap: the biggest legitimate public body is a /parse-geometry upload
+# (relayed to app.py, which applies its own cap) — 32 MiB is generous.
+app.config['MAX_CONTENT_LENGTH'] = config.env_int('SRTM_PUBLIC_MAX_BODY_MB', 32) * 1024 * 1024
 try:
     import hillshade_tiles as _hs
     app.register_blueprint(_hs.bp)              # /tiles/hillshade|slope/z/x/y.png
@@ -72,21 +74,6 @@ LICENSE_URL = _attr.OUTPUT_LICENSE_URL
 ATTRIBUTION_HDR = ATTRIBUTION.replace('–', '-').replace('·', ';').replace('©', '(c)').encode('latin-1', 'replace').decode('latin-1')
 MAX_AGE = 120
 
-_SESSION = None
-
-
-def _session():
-    global _SESSION
-    if _SESSION is None:
-        import requests
-        from requests.adapters import HTTPAdapter
-        s = requests.Session()
-        s.trust_env = False
-        s.mount('http://', HTTPAdapter(pool_connections=8, pool_maxsize=64, max_retries=0))
-        _SESSION = s
-    return _SESSION
-
-
 # --------------------------------------------------------------------------
 # response helpers
 # --------------------------------------------------------------------------
@@ -121,13 +108,16 @@ def _not_found():
 def _common_headers(resp):
     p = request.path or ''
     # header value hygiene: never emit a literal None/null/empty on any X-* header
-    # (umfeld-at hashes X-Cells-Epoch into its bin state; str(None) churned it)
+    # (downstream consumers hash X-Cells-Epoch into cache state; str(None) churned it)
     for k in [k for k, v in resp.headers.items() if k.startswith('X-') and (v or '').strip().lower() in ('', 'none', 'null')]:
         del resp.headers[k]
-    if not p.startswith(tiers.PRIVATE_PREFIX):
-        resp.headers['Access-Control-Allow-Origin'] = '*'
-        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, If-None-Match, Authorization'
-        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    if True:
+        # CORS: wildcard origin only for read-only requests; the relayed
+        # /segmentation POSTs are same-origin (served from this host).
+        if request.method in ('GET', 'HEAD', 'OPTIONS'):
+            resp.headers['Access-Control-Allow-Origin'] = '*'
+            resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, If-None-Match'
+            resp.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
         resp.headers.setdefault('X-Data-Attribution', ATTRIBUTION_HDR)
         resp.headers.setdefault('Link', f'<{LICENSE_URL}>; rel="license"')
         # gzip JSON/text/binary ≥ 1 KiB (not h3b — already deflated)
@@ -152,7 +142,7 @@ def _common_headers(resp):
 
 @app.before_request
 def _preflight():
-    if request.method == 'OPTIONS' and not (request.path or '').startswith(tiers.PRIVATE_PREFIX):
+    if request.method == 'OPTIONS':
         return Response(status=204)
     g.t0 = time.time()
     sg.WATCHDOG.check()          # ≤ 1 RSS sample / 5 s / worker; sheds caches or recycles (service_guard)
@@ -191,80 +181,6 @@ def health():
     r = _json(body, 200 if body['ok'] else 503, max_age=0)
     r.headers['Cache-Control'] = 'no-store'
     return r
-
-
-# --------------------------------------------------------------------------
-# PRIVATE tier: /k/… → 127.0.0.1:8000 with the prefix kept (app.py strips it)
-# --------------------------------------------------------------------------
-_HOP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te',
-        'trailers', 'transfer-encoding', 'upgrade', 'host', 'content-length'}
-
-
-@app.route(tiers.PRIVATE_PREFIX, defaults={'path': ''},
-           methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
-@app.route(tiers.PRIVATE_PREFIX + '/<path:path>',
-           methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
-def private_tier(path):
-    tok = tiers.request_token(request)
-    if not tiers.token_valid(tok) and not tiers.process_txt_pwd_ok(request):
-        return _not_found()
-    if tiers.k_landscape_off() and tiers.landscape_route_retired(request.path):
-        return _json({'gone': True, 'see': tiers.LANDSCAPE_GONE_SEE}, 410)
-    url = tiers.PRIVATE_UPSTREAM + request.path         # keep /k — app.py strips it
-    if request.query_string:
-        url += '?' + request.query_string.decode('latin-1')
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP}
-    # app.py's loopback bypass requires X-Forwarded-For to be absent → always set it,
-    # so the upstream applies its own admin-token checks to the forwarded headers.
-    xff = request.headers.get('X-Forwarded-For') or request.remote_addr or '0.0.0.0'
-    headers['X-Forwarded-For'] = xff
-    headers['X-Forwarded-Proto'] = request.headers.get('X-Forwarded-Proto', 'https')
-    headers['X-Srtm-Tier'] = 'private'
-    # requests would add its own Accept-Encoding: gzip and we stream raw bytes →
-    # only ask upstream for what the client can decode.
-    headers['Accept-Encoding'] = request.headers.get('Accept-Encoding') or 'identity'
-    body = request.get_data() if request.method in ('POST', 'PUT', 'PATCH', 'DELETE') else None
-    try:
-        up = _session().request(request.method, url, headers=headers, data=body,
-                                stream=True, timeout=(5, 600), allow_redirects=False)
-    except Exception as e:  # noqa: BLE001
-        log.warning('private tier upstream error %s %s: %s', request.method, request.path, e)
-        return _json({'error': 'upstream unavailable'}, 502)
-    out_headers = [(k, v) for k, v in up.raw.headers.items() if k.lower() not in _HOP]
-    out_headers.append(('X-Robots-Tag', 'noindex, nofollow'))
-    out_headers.append(('Vary', 'Authorization'))
-    if tok and request.args.get('token') and request.cookies.get(tiers.COOKIE) != tok:
-        out_headers.append(('Set-Cookie', f'{tiers.COOKIE}={tok}; Max-Age=2592000; Path=/k; '
-                                          f'Secure; HttpOnly; SameSite=Lax'))
-    if _is_text_docs(request.path):
-        data = up.raw.read(decode_content=True)
-        out_headers = [(k, v) for k, v in out_headers if k.lower() not in ('content-encoding', 'content-length')]
-        return Response(_rewrite_doc_prefixes(data), status=up.status_code, headers=out_headers)
-
-    def _gen():
-        try:
-            for chunk in up.raw.stream(64 * 1024, decode_content=False):
-                if chunk:
-                    yield chunk
-        finally:
-            up.close()
-    resp = Response(_gen(), status=up.status_code, headers=out_headers, direct_passthrough=True)
-    return resp
-
-
-def _is_text_docs(p: str) -> bool:
-    p = p[len(tiers.PRIVATE_PREFIX):]
-    return p in ('/llm.txt', '/api/v1/docs/llm.txt')
-
-
-def _rewrite_doc_prefixes(b: bytes) -> bytes:
-    """Prepend /k to absolute API paths in the private docs so examples paste."""
-    import re
-    txt = b.decode('utf-8', 'replace')
-    txt = re.sub(r'(?<![\w/.:])(?<!/k)(/(?:api|llm|tiles|process)(?:/|\.txt|\.html))',
-                 tiers.PRIVATE_PREFIX + r'\1', txt)
-    txt = txt.replace(':8000/', '/' + tiers.PRIVATE_PREFIX.strip('/') + '/').replace('/k/k/', '/k/')
-    return txt.encode()
 
 
 # --------------------------------------------------------------------------
@@ -484,7 +400,7 @@ def buildings_bbox():
 @app.route('/llm/manifest.json')
 def kgs():
     """KG coverage: which Katastralgemeinden are processed (bbox or whole
-    country, paginated). Codes/names only — a register, not cadastre."""
+    country, paginated). Codes/names only — a register."""
     try:
         bb = lq.parse_bbox(request.args) if any(k in request.args for k in ('bbox', 'west', 'lon')) else None
     except ValueError as e:
@@ -494,7 +410,7 @@ def kgs():
     st = lq.status()
     fields = {f.strip() for f in (request.args.get('fields') or '').split(',') if f.strip()}
     if fields == {'codes'}:
-        # Peer universe check (umfeld-at contract): codes only, enough to
+        # Universe check for downstream consumers: codes only, enough to
         # recompute universe_hash. Hash is the ETag so If-None-Match → 304.
         try:
             cl = lq.kg_codes(processed_only=processed_only)
@@ -506,7 +422,7 @@ def kgs():
                       'meta': _meta()}, max_age=3600,
                      etag=f'"{st["universe_hash"]}"' if not processed_only else None)
     if fields == {'codes', 'als'}:
-        # Bulk ALS flight-year block (umfeld-at: one GET instead of 6 500):
+        # Bulk ALS flight-year block (one GET instead of 6 500):
         # per KG {kg_code, als:{newest, oldest, dominant, dominant_share,
         # precision, reflown_share}}; als=null where no cells product /
         # backfill pending.  Served straight from the als_kg cache.
@@ -625,7 +541,7 @@ def _meta(**extra):
 @app.errorhandler(404)
 def _404(_e):
     # unmatched /api/v1/* may be one of the analysis endpoints the public
-    # /segmentation UI relays to app.py (explicit allow-list, docs/api-tiers.md)
+    # /segmentation UI relays to app.py (explicit allow-list, public_segmentation.ROUTES)
     if _seg is not None and (request.path or '').startswith('/api/v1/'):
         try:
             r = _seg.relay()
@@ -642,4 +558,4 @@ def _405(_e):
 
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=int(os.environ.get('PORT', 8100)), threaded=True)
+    app.run(host=config.PUBLIC_BIND, port=config.PUBLIC_PORT, threaded=True)
