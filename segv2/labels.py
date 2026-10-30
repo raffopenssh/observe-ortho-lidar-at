@@ -19,7 +19,9 @@ weight / ablate sources, and the per-source height + NDVI vetoes from v1
 (`train_rf_4000kg`) are kept: e.g. a 'grass' pixel with nDSM > 2 m is unlabelled
 (tree canopy over a legal meadow), a 'road' pixel with NDVI > 0.3 is unlabelled.
 
-Everything is fetched from the umfeld-at cadastre API (cadastre + OSM, gzip; see umfeld.py) and the
+Cadastre (parcels, footprints, NS landuse polygons) comes from the local bevdirect-serve
+(BEV Katastralmappe tiles, ``vct_pilot._viewport``); OSM from umfeld-at's public
+``/api/v1/osm/geometry?bbox=`` (see umfeld.py) and the
 local INVEKOS GPKG (`data/invekos/INSPIRE_SCHLAEGE_2024-1_POLYGON.gpkg`,
 EPSG:31287). No BEV / openEO traffic.
 """
@@ -254,38 +256,100 @@ def _to_3035(geom):
     return shp_transform(_T_4326_3035.transform, geom)
 
 
-def fetch_cadastre(kg_code: str) -> dict:
-    """{'footprints': [geom3035], 'landuse': [(geom3035, code)], 'parcels': [geom3035]}"""
+def fetch_cadastre(kg_code: str, bbox_wgs: tuple[float, float, float, float] | None = None) -> dict:
+    """{'footprints': [geom3035], 'landuse': [(geom3035, ns_code)], 'parcels': [geom3035]}
+
+    Source (2026-10-30): the **local bevdirect-serve** viewport documents
+    (``vct_pilot._viewport``, layers parcels+footprints+landuse) — the same
+    BEV Katastralmappe tiles the bev-mode processor uses.  umfeld-at's
+    parcel-keyed ``/k/api/v1/export/geojson`` is gone (404).
+
+    ``bbox_wgs`` = (W, S, E, N); defaults to the KG's bbox from the
+    director's ``kg_list.json`` / bevdirect ``/kg/<code>`` (``austria_processor.
+    _kg_bbox_lookup``).  Landuse codes are the BEV ``ns`` (Nutzungsschlüssel)
+    the ``NS_CODE_TO_TYPE`` table expects; parcels without a dedicated
+    landuse polygon fall back to ``dominant_ns``.
+    """
     out = {"footprints": [], "landuse": [], "parcels": []}
-    d = _get_json(f"{CADASTRE_BASE}/export/geojson",
-                  {"kg": kg_code, "layers": "building_footprints,landuse_polygons,parcels",
-                   "include_geometry": "true"})
-    if not d:
-        return out
-    for f in d.get("building_footprints", {}).get("features", []):
+    import sys as _sys
+    if str(ROOT) not in _sys.path:
+        _sys.path.insert(0, str(ROOT))
+    import vct_pilot
+    import ne_h3
+    if bbox_wgs is None:
+        import austria_processor as _ap
+        bb = _ap._kg_bbox_lookup(kg_code)
+        if not bb:
+            raise UpstreamUnavailable(f"KG {kg_code}: no bbox (kg_list.json / bevdirect /kg)")
+        bbox_wgs = (bb["min_lon"], bb["min_lat"], bb["max_lon"], bb["max_lat"])
+    try:
+        ne_h3._ensure_bevdirect_server()
+    except Exception as e:  # noqa: BLE001
+        raise UpstreamUnavailable(f"bevdirect-serve not running: {e}") from e
+    W, S, E, N = (float(v) for v in bbox_wgs)
+    cells = vct_pilot._cells(W, S, E, N)
+    deadline = time.time() + 240 + 20 * len(cells)
+    seen_p, seen_f, seen_l = set(), set(), set()
+    n_parcel_fallback = 0
+
+    def _geom(g):
+        s_ = shape(g)
+        if s_.is_empty:
+            return None
+        if not s_.is_valid:
+            s_ = s_.buffer(0)
+        return _to_3035(s_)
+
+    for ix, iy in cells:
         try:
-            g = shape(f["geometry"])
-            if not g.is_empty:
-                out["footprints"].append(_to_3035(g))
-        except Exception:  # noqa: BLE001
-            pass
-    for f in d.get("landuse_polygons", {}).get("features", []):
-        try:
-            code = int(f["properties"].get("landuse_code"))
-            g = shape(f["geometry"])
-            if not g.is_empty:
-                out["landuse"].append((_to_3035(g), code))
-        except Exception:  # noqa: BLE001
-            pass
-    for f in d.get("parcels", {}).get("features", []):
-        try:
-            g = shape(f["geometry"])
-            if not g.is_empty:
-                out["parcels"].append(_to_3035(g))
-        except Exception:  # noqa: BLE001
-            pass
-    log.info("KG %s cadastre: %d footprints, %d landuse polys, %d parcels", kg_code,
-             len(out["footprints"]), len(out["landuse"]), len(out["parcels"]))
+            doc = vct_pilot._viewport(vct_pilot._cell_bbox(ix, iy), deadline)
+        except vct_pilot.UpstreamDownError as e:
+            raise UpstreamUnavailable(str(e)) from e
+        except Exception as e:  # noqa: BLE001
+            raise UpstreamUnavailable(f"viewport {ix},{iy}: {str(e)[:160]}") from e
+        for f in doc.get("footprints") or []:
+            fid = str(f.get("id") or "")
+            if not f.get("geometry") or fid in seen_f:
+                continue
+            seen_f.add(fid)
+            try:
+                g = _geom(f["geometry"])
+                if g is not None:
+                    out["footprints"].append(g)
+            except Exception:  # noqa: BLE001
+                pass
+        for lu in doc.get("landuse") or []:
+            lid = str(lu.get("id") or "")
+            if not lu.get("geometry") or lid in seen_l or lu.get("ns") in (None, ""):
+                continue
+            seen_l.add(lid)
+            try:
+                g = _geom(lu["geometry"])
+                if g is not None:
+                    out["landuse"].append((g, int(lu["ns"])))
+            except Exception:  # noqa: BLE001
+                pass
+        for p in doc.get("parcels") or []:
+            pid = str(p.get("parcel_id") or "")
+            if not p.get("geometry") or pid in seen_p:
+                continue
+            seen_p.add(pid)
+            try:
+                g = _geom(p["geometry"])
+                if g is None:
+                    continue
+                out["parcels"].append(g)
+                # parcel-level fallback when the tile carries no landuse
+                # polygon for it (the landuse layer wins in the priority
+                # stack because it is appended first → rasterised first)
+                if not doc.get("landuse") and p.get("dominant_ns") not in (None, ""):
+                    out["landuse"].append((g, int(p["dominant_ns"])))
+                    n_parcel_fallback += 1
+            except Exception:  # noqa: BLE001
+                pass
+        del doc
+    log.info("KG %s cadastre (bevdirect, %d cells): %d footprints, %d landuse polys (%d parcel-fallback), %d parcels",
+             kg_code, len(cells), len(out["footprints"]), len(out["landuse"]), n_parcel_fallback, len(out["parcels"]))
     return out
 
 
@@ -466,7 +530,7 @@ class LabelContext:
         lons, lats = zip(*pts)
         pad = 0.002
         self.bbox_wgs = (min(lons) - pad, min(lats) - pad, max(lons) + pad, max(lats) + pad)
-        self.cad = fetch_cadastre(kg_code)
+        self.cad = fetch_cadastre(kg_code, self.bbox_wgs)
         self.osm = fetch_osm(self.bbox_wgs)
         self.inv = fetch_invekos(bbox_3035, nearest_to=flight_year)
         log.info("KG %s osm: %d road, %d rail, %d water lines, %d water areas; invekos: %d",

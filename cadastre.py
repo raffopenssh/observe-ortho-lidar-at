@@ -1,23 +1,26 @@
 """Cadastre building footprint fetcher and ground-truth evaluator.
 
-Fetches building polygons from the Austrian Cadastre API, transforms them
-to EPSG:3035, rasterizes onto our 1 m LIDAR grid, and provides evaluation
-metrics against our object classifier output.
+Building polygons come from the **local bevdirect-serve** (vtcseamless, BEV
+Katastralmappe vector tiles) via :mod:`live_cadastre` — the same source the
+bev-mode KG pipeline uses (``austria_processor.fetch_cadastre_data_bevdirect``).
+They are transformed to EPSG:3035, rasterised onto our 1 m LIDAR grid and
+used as run-time model context / ground truth for the classifier.
 
-API base: https://example.invalid/k/api/v1 (token-gated; see umfeld.py)
+History: until 2026-10 this module fetched from the cadastre API
+(``example.invalid/k/api/v1/spatial/points|footprints`` and
+``/export/geojson``).  Those parcel-keyed routes are gone (plain 404 since the
+umfeld-at publication, 410 before) — **no HTTP call to umfeld is made here
+any more**.  Run-time context only: nothing from this module is written to a
+product (``austria_processor.CADASTRE_PRODUCTS = False``).
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import requests
 from pyproj import Transformer
 from shapely.geometry import shape as shapely_shape, mapping
 from shapely.ops import transform as shapely_transform
@@ -28,25 +31,8 @@ log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-import umfeld as _umfeld
-CADASTRE_BASE = _umfeld.CADASTRE_BASE  # token-gated /k tier, see umfeld.py
-CACHE_DIR = Path("/tmp/cadastre_cache")
+CACHE_DIR = Path("/tmp/cadastre_cache")  # legacy on-disk GeoJSON cache (unused; live_cadastre keeps a RAM LRU)
 MAX_PER_REQUEST = 100_000
-REQUEST_TIMEOUT = 60  # seconds
-
-# The cadastre API restarts on every deploy (~16 s of bare proxy 503s) and
-# occasionally times out under load.  Every HTTP call in this module goes
-# through ``_request`` so a restart window is ridden out instead of turning
-# into a "No KG codes found" / "No footprints" hole in the tile.  Backoff
-# 5 s -> 10 s -> 20 s (~35 s total) comfortably outlasts one restart.
-TRANSIENT_STATUS = {429, 500, 502, 503, 504}
-MAX_ATTEMPTS = 4
-BACKOFF_BASE_S = 5.0
-# Sep 2026: cold KGs answer HTTP 202 + Retry-After (warming from the API's
-# Zenodo mirror) instead of blocking. ``?wait=`` (max 120 s) asks the server
-# to block first; leftover 202s are polled up to PENDING_BUDGET_S.
-EXPORT_WAIT_S = 120
-PENDING_BUDGET_S = 10 * 60
 
 # Reusable CRS transformer (thread-safe after creation)
 _TRANSFORMER_4326_TO_3035 = Transformer.from_crs(
@@ -54,116 +40,10 @@ _TRANSFORMER_4326_TO_3035 = Transformer.from_crs(
 )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 class CadastreRetired(RuntimeError):
-    """umfeld's ``/k`` cadastre routes (``spatial/*``, ``export/geojson``)
-    answer 410 — retired after the Kataster purge.  Raised *without* a
-    network call once a 410 has been seen (``RETIRED_HOLD_S``), so a peer
-    that is not in bev mode fails fast instead of spamming umfeld per tile."""
-
-
-#: After one 410 every umfeld cadastre call short-circuits for this long.
-RETIRED_HOLD_S = 6 * 3600
-_retired_until = 0.0
-
-
-def _request(method: str, url: str, *, what: str, attempts: int = MAX_ATTEMPTS,
-             **kw) -> requests.Response:
-    """``requests.request`` with backoff on transient failures (5xx/429,
-    connection errors, timeouts).  Raises the last exception after
-    *attempts*; non-transient HTTP errors raise immediately."""
-    last: Exception | None = None
-    if _retired_until > time.monotonic():
-        raise CadastreRetired(f"cadastre {what}: umfeld /k cadastre routes answer 410 (retired) — "
-                              "bev mode (vtcseamless) is the only cadastre source")
-    pending_deadline = time.monotonic() + PENDING_BUDGET_S
-    attempt = 0
-    while attempt < attempts:
-        attempt += 1
-        try:
-            resp = requests.request(method, url, **kw)
-            if resp.status_code == 410:
-                globals()["_retired_until"] = time.monotonic() + RETIRED_HOLD_S
-                log.error("cadastre %s: HTTP 410 Gone from umfeld — route retired; "
-                          "no further umfeld cadastre calls for %ds (peers must run bev mode)",
-                          what, RETIRED_HOLD_S)
-                resp.raise_for_status()
-            if resp.status_code in TRANSIENT_STATUS:
-                resp.raise_for_status()
-            if resp.status_code == 202:
-                # Not an error and NOT an empty result: the KG is still being
-                # fetched from Zenodo by the cadastre API. Poll per Retry-After.
-                try:
-                    ra = float(resp.headers.get("Retry-After") or 8)
-                except ValueError:
-                    ra = 8.0
-                ra = min(max(ra, 1.0), 60.0)
-                if time.monotonic() + ra > pending_deadline:
-                    raise requests.exceptions.RetryError(
-                        f"cadastre {what} still pending (202) after {PENDING_BUDGET_S}s")
-                log.info("cadastre %s pending (202) — retry in %.0fs", what, ra)
-                time.sleep(ra)
-                attempt -= 1
-                continue
-            return resp
-        except requests.exceptions.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            if status not in TRANSIENT_STATUS:
-                raise
-            last = e
-        except (requests.exceptions.Timeout,
-                requests.exceptions.ConnectionError) as e:
-            last = e
-        if attempt < attempts:
-            sleep = BACKOFF_BASE_S * (2 ** (attempt - 1))
-            log.warning("cadastre %s transient (%s) attempt %d/%d — retry in %.0fs",
-                        what, str(last)[:120], attempt, attempts, sleep)
-            time.sleep(sleep)
-    assert last is not None
-    raise last
-
-
-def _bbox_hash(bbox: tuple[float, float, float, float]) -> str:
-    """Deterministic short hash for a WGS84 bounding box."""
-    key = f"{bbox[0]:.6f},{bbox[1]:.6f},{bbox[2]:.6f},{bbox[3]:.6f}"
-    return hashlib.sha256(key.encode()).hexdigest()[:16]
-
-
-def _ensure_cache_dir() -> Path:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    return CACHE_DIR
-
-
-def _cache_path(bbox: tuple[float, float, float, float]) -> Path:
-    return _ensure_cache_dir() / f"buildings_{_bbox_hash(bbox)}.geojson"
-
-
-def _load_cached(bbox: tuple[float, float, float, float]) -> Optional[dict]:
-    """Load cached GeoJSON response, if fresh (< 24 h)."""
-    p = _cache_path(bbox)
-    if not p.exists():
-        return None
-    age_h = (time.time() - p.stat().st_mtime) / 3600
-    if age_h > 24:
-        log.debug("Cache expired for bbox %s (%.1f h old)", bbox, age_h)
-        return None
-    try:
-        data = json.loads(p.read_text())
-        log.debug("Cache hit for bbox %s (%d features)", bbox, len(data.get("features", [])))
-        return data
-    except (json.JSONDecodeError, OSError) as exc:
-        log.warning("Corrupt cache file %s: %s", p, exc)
-        return None
-
-
-def _save_cache(bbox: tuple[float, float, float, float], data: dict) -> None:
-    try:
-        _cache_path(bbox).write_text(json.dumps(data))
-    except OSError as exc:
-        log.warning("Failed to write cache: %s", exc)
+    """The umfeld ``/k`` cadastre routes (``spatial/*``, ``export/geojson``)
+    are retired (404).  Kept for callers that still ``except CadastreRetired``;
+    nothing raises it on a network path any more."""
 
 
 def _transform_geom_to_3035(geom):
@@ -172,79 +52,8 @@ def _transform_geom_to_3035(geom):
 
 
 # ---------------------------------------------------------------------------
-# 1. Fetch building footprints
+# 1. Fetch building footprints (local bevdirect via live_cadastre)
 # ---------------------------------------------------------------------------
-
-def _find_kgs_for_bbox(bbox_wgs84: tuple[float, float, float, float]) -> list[str]:
-    """Find KG codes covering a WGS84 bounding box via the cadastre lookup."""
-    west, south, east, north = bbox_wgs84
-    # Sample points across the bbox to discover KG codes
-    import itertools
-    lons = [west, (west + east) / 2, east]
-    lats = [south, (south + north) / 2, north]
-    points = [{"lon": lo, "lat": la, "id": f"{lo:.5f}_{la:.5f}"}
-              for lo, la in itertools.product(lons, lats)]
-    try:
-        resp = _request(
-            "POST", f"{CADASTRE_BASE}/spatial/points", what="spatial/points",
-            json={"points": points},
-            timeout=REQUEST_TIMEOUT,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        kg_codes = set()
-        for r in data.get("results", []):
-            kc = r.get("kg_code")
-            if kc:
-                kg_codes.add(kc)
-        return sorted(kg_codes)
-    except Exception as e:
-        log.warning("KG lookup failed: %s", e)
-        return []
-
-
-def fetch_footprints_viewport(
-    bbox_wgs84: tuple[float, float, float, float],
-    *,
-    limit: int = 20000,
-    retries: int = 2,
-    timeout: float = 20.0,
-) -> Optional[dict]:
-    """Cadastre FAST PATH: ``GET /spatial/footprints`` (R-tree viewport read,
-    single-digit ms server-side, all KGs in the bbox in one call).
-
-    Returns a GeoJSON-like FeatureCollection (WGS84 polygons) or ``None`` when
-    the API is unreachable, the viewport is ``truncated`` (> limit rows) or the
-    per-KG caches are still warming (``ready: false`` after ``retries``).  The
-    caller then falls back to the per-KG export path.
-    """
-    west, south, east, north = bbox_wgs84
-    for attempt in range(retries + 1):
-        try:
-            resp = _request(
-                "GET", f"{CADASTRE_BASE}/spatial/footprints", what="spatial/footprints",
-                params={"west": west, "south": south, "east": east, "north": north,
-                        "limit": limit},
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            d = resp.json()
-        except Exception as e:  # noqa: BLE001
-            log.warning("spatial/footprints failed (%s)", e)
-            return None
-        if d.get("truncated"):
-            log.info("spatial/footprints truncated at %d rows → export fallback", limit)
-            return None
-        if d.get("ready", True):
-            feats = [{"type": "Feature", "geometry": f.get("geometry"),
-                      "properties": {k: v for k, v in f.items() if k != "geometry"}}
-                     for f in d.get("footprints", []) if f.get("geometry")]
-            return {"type": "FeatureCollection", "features": feats, "_fast_path": True}
-        # KG caches warming — the API queued them; give it a moment
-        time.sleep(1.5 * (attempt + 1))
-    log.info("spatial/footprints not ready after %d retries → export fallback", retries)
-    return None
-
 
 def fetch_building_footprints(
     bbox_wgs84: tuple[float, float, float, float],
@@ -253,126 +62,48 @@ def fetch_building_footprints(
     limit: int = MAX_PER_REQUEST,
     fast_path: bool = True,
 ) -> Optional[list]:
-    """Fetch building footprint POLYGONS from the Austrian Cadastre API.
+    """Building footprint POLYGONS (EPSG:3035, clipped to *bbox_wgs84*) from
+    the local bevdirect-serve.
 
-    Uses the /export/geojson endpoint with layers=building_footprints to get
-    actual polygon geometries from KG source files (mm-precision).
-    Falls back to /spatial/bbox (Point centroids) if export fails.
+    ``use_cache`` / ``limit`` / ``fast_path`` are accepted for call-site
+    compatibility (the RAM cell cache in :mod:`live_cadastre` is always on).
 
-    Parameters
-    ----------
-    bbox_wgs84 : (west, south, east, north)
-        Bounding box in WGS84 / EPSG:4326.
-    use_cache : bool
-        If True, cache responses in /tmp/cadastre_cache/.
-
-    Returns
-    -------
-    list[shapely.geometry.Polygon | MultiPolygon] in EPSG:3035,
-    or None if the API is unreachable / returns an error.
+    Returns ``[]`` for a rural AOI without buildings, ``None`` when bevdirect
+    is unavailable on this host (tooling missing, server down, AOI too big).
     """
     west, south, east, north = bbox_wgs84
-    if _retired_until > time.monotonic():
-        log.debug("cadastre retired (410) — viewport footprints skipped for bbox %s", bbox_wgs84)
-        return []
-    log.info(
-        "Fetching cadastre building footprints for bbox [%.4f, %.4f, %.4f, %.4f]",
-        west, south, east, north,
-    )
-
-    # --- try cache ---
-    geojson = None
-    if use_cache:
-        geojson = _load_cached(bbox_wgs84)
-
-    # --- HTTP fetch, fast path: one R-tree viewport call for all KGs ---
-    if geojson is None and fast_path:
-        t0 = time.time()
-        geojson = fetch_footprints_viewport(bbox_wgs84)
-        if geojson is not None:
-            log.info("spatial/footprints fast path: %d footprints in %.2fs",
-                     len(geojson.get("features", [])), time.time() - t0)
-            if use_cache:
-                _save_cache(bbox_wgs84, geojson)
-
-    # --- HTTP fetch, slow path: export/geojson per KG ---
-    if geojson is None:
-        kg_codes = _find_kgs_for_bbox(bbox_wgs84)
-        if not kg_codes:
-            log.warning("No KG codes found for bbox, cannot fetch footprints")
-            return []
-
-        all_features = []
-        for kg in kg_codes:
-            try:
-                t0 = time.time()
-                resp = _request(
-                    "GET", f"{CADASTRE_BASE}/export/geojson", what=f"export kg={kg}",
-                    params={
-                        "kg": kg,
-                        "layers": "building_footprints",
-                        "include_geometry": "true",
-                        "wait": EXPORT_WAIT_S,
-                    },
-                    timeout=EXPORT_WAIT_S + REQUEST_TIMEOUT,  # server may block on ?wait
-                )
-                elapsed = time.time() - t0
-                resp.raise_for_status()
-                kg_data = resp.json()
-                feats = _extract_features(kg_data)
-                log.info(
-                    "KG %s: %d building footprints in %.1fs",
-                    kg, len(feats), elapsed,
-                )
-                all_features.extend(feats)
-            except Exception as e:
-                log.warning("KG %s footprint export failed: %s", kg, e)
-
-        if all_features:
-            geojson = {"type": "FeatureCollection", "features": all_features}
-            if use_cache:
-                _save_cache(bbox_wgs84, geojson)
-        else:
-            log.warning("No footprints from export, returning empty")
-            return []
-
-    # --- parse GeoJSON -> shapely polygons in EPSG:3035 ---
-    features = _extract_features(geojson)
-    if not features:
-        log.info("No building features in bbox %s (rural tile)", bbox_wgs84)
-        return []
-
+    try:
+        import live_cadastre as _lc
+    except ImportError:
+        return None
+    t0 = time.time()
+    try:
+        ctx = _lc.fetch((west, south, east, north))
+    except _lc.Unavailable as e:
+        log.warning("cadastre footprints unavailable (bevdirect): %s", e)
+        return None
+    except Exception as e:  # noqa: BLE001
+        log.warning("cadastre footprints failed (bevdirect): %s", e)
+        return None
     from shapely.geometry import box as shapely_box
-    clip_box = shapely_box(west, south, east, north)
-
+    clip_box = _transform_geom_to_3035(shapely_box(west, south, east, north))
     polygons_3035 = []
     n_skipped = 0
-    for feat in features:
-        geom_json = feat.get("geometry")
-        if geom_json is None:
-            n_skipped += 1
-            continue
+    for g in ctx.get("footprints") or []:
         try:
-            geom_4326 = shapely_shape(geom_json)
-            if geom_4326.is_empty or geom_4326.geom_type == "Point":
-                n_skipped += 1
+            if g.is_empty or g.geom_type == "Point" or not g.intersects(clip_box):
                 continue
-            # Clip to bbox (KG export returns all footprints in the KG)
-            if not geom_4326.intersects(clip_box):
-                continue
-            geom_clipped = geom_4326.intersection(clip_box)
-            if geom_clipped.is_empty:
-                continue
-            geom_3035 = _transform_geom_to_3035(geom_clipped)
-            polygons_3035.append(geom_3035)
-        except Exception as exc:
+            gc = g.intersection(clip_box)
+            if not gc.is_empty:
+                polygons_3035.append(gc)
+        except Exception as exc:  # noqa: BLE001
             n_skipped += 1
-            log.debug("Skipping invalid feature geometry: %s", exc)
-
-    log.info(
-        "Parsed %d building footprints (%d skipped) -> EPSG:3035",
-        len(polygons_3035), n_skipped,
-    )
+            log.debug("Skipping invalid footprint geometry: %s", exc)
+        if len(polygons_3035) >= limit:
+            break
+    log.info("cadastre: %d building footprints (%d skipped, %s) for bbox "
+             "[%.4f, %.4f, %.4f, %.4f] in %.1fs", len(polygons_3035), n_skipped,
+             ctx.get("source"), west, south, east, north, time.time() - t0)
     return polygons_3035
 
 

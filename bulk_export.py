@@ -1159,6 +1159,9 @@ def resolve_kg_codes(args) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def main():
+    # 2026-10-30: this tool is parcel-keyed on umfeld's retired /k cadastre
+    # routes (export/geojson, search/kg, spatial/*) — all 404 now.
+    _umfeld.assert_k_cadastre_available(__file__)
     parser = argparse.ArgumentParser(
         description="Bulk KG Export — comprehensive GPKG + GeoTIFF per KG",
         formatter_class=argparse.RawDescriptionHelpFormatter,

@@ -627,6 +627,9 @@ def process_one_kg(
 
 
 def main():
+    # 2026-10-30: this tool is parcel-keyed on umfeld's retired /k cadastre
+    # routes (export/geojson, search/kg, spatial/*) — all 404 now.
+    _umfeld.assert_k_cadastre_available(__file__)
     t_start = time.time()
     log.info("=" * 70)
     log.info("RF Training: 100 random KGs with include_copernicus=True")

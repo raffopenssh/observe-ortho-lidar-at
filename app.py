@@ -13447,15 +13447,17 @@ def _try_copernicus_cached(bbox_dict: dict, *, ndvi=True, landcover=True,
 
 
 def _try_cadastre(geom_wgs84, transform, shape) -> np.ndarray | None:
-    """Building mask for the live request path (primary-only UI). bevdirect
-    (local vtcseamless server, ``live_cadastre.py``) first; umfeld's legacy
-    ``/k`` export as the fallback.  Peers never call this."""
+    """Building mask for the live request path (primary-only UI) from the
+    local bevdirect-serve (``live_cadastre.py``).  umfeld's ``/k`` cadastre
+    routes are gone (404) — there is no remote fallback; ``cadastre.
+    get_building_mask`` is the same bevdirect source behind the legacy
+    signature.  Peers never call this."""
     try:
         import live_cadastre as _lc
         if _is_primary_self_cached() and _lc.available(probe_server=False):
             return _lc.building_mask(_lc.fetch(geom_wgs84.bounds), transform, shape)
     except Exception as e:
-        log.warning("live cadastre (bevdirect) failed: %s — trying umfeld", e)
+        log.warning("live cadastre (bevdirect) failed: %s — trying cadastre.get_building_mask", e)
     try:
         import cadastre
         bbox = geom_wgs84.bounds
@@ -18740,6 +18742,17 @@ def ortho_geotiff():
 
 @app.route('/api/v1/classifier/train', methods=['POST'])
 def train_classifier():
+    """Retired (410, 2026-10-30). Online RF training keyed on cadastre parcel
+    land-use codes needs umfeld's parcel-keyed routes (``/export/geojson``,
+    ``/spatial/parcels``), which are gone (404) — and
+    ``cadastre.fetch_parcel_land_use`` no longer exists.  Training lives in
+    the offline ``train_rf_4000kg.py`` job (``docs/rf-training.md``)."""
+    return jsonify({'error': 'retired',
+                    'detail': 'online classifier training (parcel-keyed) is gone; '
+                              'see docs/rf-training.md / train_rf_4000kg.py'}), 410
+
+
+def _train_classifier_retired_body():  # pragma: no cover — kept for reference only
     """Train RF classifier from cadastre ground truth over a bbox.
 
     Params: geometry (bbox/geojson), dataset, include_ortho, include_copernicus,

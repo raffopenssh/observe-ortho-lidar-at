@@ -1293,6 +1293,9 @@ def train_and_save_model(n_kgs, tag="checkpoint"):
 
 
 def main():
+    # 2026-10-30: this tool is parcel-keyed on umfeld's retired /k cadastre
+    # routes (export/geojson, search/kg, spatial/*) — all 404 now.
+    _umfeld.assert_k_cadastre_available(__file__)
     # Use 'spawn' to avoid fork-safety issues with loaded C libraries
     try:
         multiprocessing.set_start_method("spawn")

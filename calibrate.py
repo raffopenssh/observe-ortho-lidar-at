@@ -648,6 +648,9 @@ def analyse_results():
 # ---------------------------------------------------------------------------
 
 def main():
+    # 2026-10-30: this tool is parcel-keyed on umfeld's retired /k cadastre
+    # routes (export/geojson, search/kg, spatial/*) — all 404 now.
+    _umfeld.assert_k_cadastre_available(__file__)
     if len(sys.argv) < 2:
         print("Usage: calibrate.py [sample|run|analyse|all] [--temporal]")
         sys.exit(1)

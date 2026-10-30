@@ -111,6 +111,35 @@ def install_token(tok: str) -> bool:
     return True
 
 
+# Parcel-keyed routes retired on umfeld-at (plain 404 since 2026-10-30; 410
+# before): /api/v1/search/parcel, /query, /spatial/parcels|footprints|points|
+# bbox|kgs, /osm/parcel, /natura2000/parcel, /land_prices/parcel,
+# /legal/parcel, /kg/{kg}/parcels, /llm/*, /export/*, /search/*.  Replacements
+# are point / bbox / cell / KG keyed: /api/v1/context?lon&lat,
+# /api/v1/osm/geometry?bbox=&cat=, /api/v1/ne/*, /api/v1/kgs.  Cadastre
+# geometry (parcels, footprints) comes from the local bevdirect-serve
+# (``live_cadastre.py`` / ``austria_processor.fetch_cadastre_data_bevdirect``).
+RETIRED_K_PATHS = ('/search/', '/query', '/spatial/', '/osm/parcel', '/natura2000/parcel',
+                   '/land_prices/parcel', '/legal/parcel', '/export/', '/llm/')
+
+
+class KCadastreRetired(RuntimeError):
+    """A caller still wants umfeld's parcel-keyed ``/k`` cadastre routes."""
+
+
+def assert_k_cadastre_available(what: str) -> None:
+    """Legacy v1 offline tools (bulk_export, calibrate, train_rf_*) were
+    built on ``/k/api/v1/export/geojson`` + ``/search/kg``.  Fail loudly up
+    front instead of 404-ing per KG for hours.  The live harness
+    (``segv2/labels.fetch_cadastre``) is already ported to bevdirect — copy
+    that if one of these tools is ever needed again."""
+    raise KCadastreRetired(
+        f"{what}: umfeld-at's parcel-keyed /k cadastre routes (export/geojson, search/kg, "
+        f"spatial/*) are gone (404). Parcel/footprint geometry now comes from the local "
+        f"bevdirect-serve (live_cadastre.py, austria_processor.fetch_cadastre_data_bevdirect); "
+        f"KG lists from the public {PUBLIC_BASE}/kgs. Port this tool before running it.")
+
+
 def is_umfeld_url(url: str) -> bool:
     try:
         from urllib.parse import urlsplit
