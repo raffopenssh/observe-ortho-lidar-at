@@ -12,10 +12,10 @@ Status: **fixed** (in this audit), **accepted** (documented, no change),
 
 | id | sev | location | finding | status |
 |---|---|---|---|---|
-| S-1 | H | git history (53 commits since Step 0) | Author/committer e-mail of every post-rewrite commit is `exedev@<vm-hostname>.exe.xyz` (hostname + username leak); the pre-Step-0 history still contains the maintainer's personal Gmail address in the former OSM/Overpass `USER_AGENT` string (4 diff lines, `osm_features.py` / `power_infrastructure.py`). The spec explicitly wanted personal e-mails out of the kept history. | **open** — needs one `git filter-repo --mailmap authors.txt --replace-text secrets.txt` pass right before the push (this audit must not rewrite history). `secrets.txt` entry: `noreply@users.noreply.github.com==>noreply@users.noreply.github.com`; mailmap `srtm-lidar maintainers <noreply@users.noreply.github.com> <exedev@example.invalid>`. |
-| S-2 | I | git history | ~585 diff lines mention former fleet hostnames (`srtm-lidar-at*.exe.xyz`, `umfeld-at`, `austria-power`, …) and two NAT-pool /24 prefixes (`peer_director.py` docstring, still in the tree). Not secrets; the hostnames are already dead. | accepted (hostnames are not credentials; a full purge would need a second filter-repo pass — optional) |
+| S-1 | H | git history (53 commits since Step 0) | Author/committer identity of every post-rewrite commit is the VM service account at the former hosting domain (username + hostname leak); the pre-Step-0 history still contains the maintainer's personal e-mail address in the former OSM/Overpass `USER_AGENT` string (4 diff lines, `osm_features.py` / `power_infrastructure.py`). The spec explicitly wanted personal e-mails out of the kept history. | **open** — needs one `git filter-repo --mailmap … --replace-text …` pass right before the push (this audit must not rewrite history); the exact mailmap / replacement lines were handed to the release manager out of band. |
+| S-2 | I | git history | ~585 diff lines mention former fleet hostnames at the previous hosting domain and two NAT-pool /24 prefixes (`peer_director.py` docstring, still in the tree). Not secrets; the hostnames are already dead. | accepted (hostnames are not credentials; a full purge would need a second filter-repo pass — optional) |
 | S-3 | I | history + tree | Token-pattern scan (`2dnLSA`, `ghp_`, `AKIA`, PEM headers, `sk-…`, JWT, `password=`, `api_key=`, `client_secret=` with values) over `git log -p --all`: 0 hits; the 10 occurrences of `REDACTED_ROTATED_ZENODO_TOKEN` are the filter-repo placeholder. `detect-secrets scan --all-files` on the tree: only sha256 pins (`ne_h3.py`, `segv2/model_v2.py`, `data/models_manifest.json`, `kg_universe.py`) and H3 cell ids (`public_docs.py`, `docs/ne-public-api.md`) — all false positives. `.env` exists locally but is git-ignored and untracked. | accepted |
-| S-4 | L | `copernicus.py:402` | Hard-coded `/home/exedev/srtm-lidar/rf_training_data/copernicus_cache` (username + private path; `mkdir` at import). | fixed → `config.DATA_DIR/copernicus_cache` (`COPERNICUS_CACHE_DIR` override, added to `.env.example`); comments mentioning the `exedev` uid in `app.py` / `austria_processor.py` reworded. |
+| S-4 | L | `copernicus.py:402` | Hard-coded absolute cache path under the former user's home (username + private path; `mkdir` at import). | fixed → `config.DATA_DIR/copernicus_cache` (`COPERNICUS_CACHE_DIR` override, added to `.env.example`); comments naming the former service uid in `app.py` / `austria_processor.py` reworded. |
 | D-1 | I | `safe_load.py`, `tile_cache.py`, `zenodo_cache.py`, `hansen.py`, `app.py:426`, `austria_processor.py:46` | Every `np.load(allow_pickle=True)` (11 sites) runs after `safe_load.install()` in the importing module; explicit `pickle.load` sites (`app.py` ×3 seg-cache, `austria_processor._load_tile_checkpoint`) call `safe_load.load`; joblib models (`learned_classifier`, `segv2/model_v2`, `segv2/train`) go through `safe_load.load_model` (checksum fence). No `yaml.load`, `marshal`, `dill`, `torch.load`, `shelve` in the tree. `tile_checkpoint_registry` untars bundles member-by-member (basename, `tile_*.pkl` only). `tests/test_safe_load.py` passes. | accepted (no gaps) |
 | N-1 | H | `app.py` peer-sync + `backfill_jsons_from_manifest`, `v2_ingest._link`, `search_index._zenodo_url`, `zenodo_fetch._auth_headers` | Manifest entries (`link`, `bucket_url`) are merged from peers in multi-VM mode and were fetched verbatim **with the Zenodo bearer token attached** → token exfiltration / SSRF to any host a malicious peer names. | fixed: `zenodo_client.is_zenodo_url()` (https + host ∈ {ZENODO_BASE_URL host, zenodo.org, sandbox.zenodo.org}); every manifest-derived fetch is skipped unless it passes; `auth_headers(url)` and `zenodo_fetch._auth_headers` drop `Authorization` for non-Zenodo URLs. Single-VM deployments were not exposed (no peer manifests). |
 | N-2 | M | `zenodo_cache.py` (`_request`, bucket PUT, `_authed_session`), `austria_processor.py:10760` | Zenodo token sent as `?access_token=` query parameter (ends up in proxy / server access logs; the Step-3 commit claimed this was gone). | fixed → `Authorization: Bearer` header. |
@@ -41,15 +41,15 @@ Status: **fixed** (in this audit), **accepted** (documented, no change),
 
 1. **S-1** — rewrite author e-mails and the one personal address with
    `git filter-repo` immediately before the first push (see the row).
-2. Optionally purge the dead `*.exe.xyz` hostnames from history (S-2).
+2. Optionally purge the dead fleet hostnames from history (S-2).
 3. Re-run `pip-audit -r requirements.txt` and `make check` in a fresh
    `make venv` to exercise the bumped pins (V-1).
 
 ## Method
 
 * Secrets: regex scan over `git log -p --all` (900 MB), `detect-secrets`
-  on the tree, author/committer e-mail listing, grep for e-mails, `exe.xyz`
-  / `exe.dev` hostnames, RFC1918 / public IPs, `exedev` / `raffael`.
+  on the tree, author/committer e-mail listing, grep for e-mails, former hosting-domain
+  hostnames, RFC1918 / public IPs and the former VM user / owner names.
 * Deserialisation / network / subprocess: grep + an AST walk over every
   `requests`-style call checking for a `timeout` keyword.
 * Routes: `app.url_map` enumeration against `_is_operator_path` and
