@@ -8,7 +8,7 @@ legal assessment behind each entry.
 
 Summary of the obligations we carry:
 
-* **BEV** (ALS DTM/DSM, DOP orthophoto, cadastre) — Open Government Data,
+* **BEV** (ALS DTM/DSM, DOP orthophoto, register statistics) — Open Government Data,
   CC BY 4.0.  Attribution "Datenquelle: BEV – Bundesamt für Eich- und
   Vermessungswesen" (+ Stichtag), licence link, mark as modified, no
   implied endorsement.
@@ -27,6 +27,10 @@ from __future__ import annotations
 
 import json
 from typing import Iterable, Optional
+
+import config as _config
+
+PROJECT_URL = "https://github.com/raffopenssh/observe-ortho-lidar-at"
 
 # === SECTION: Licence registry ===
 
@@ -86,8 +90,8 @@ SOURCES: dict[str, dict] = {
         "url": "https://data.bev.gv.at/",
     },
     "bev_cadastre": {
-        "name": "BEV Kataster — as NE cells only (H3 res-12 statistics via umfeld-at, "
-                "algo ne-cells-2; no parcel, footprint, GNR or EZ in any product)",
+        "name": "BEV Kataster — as NE cells only (H3 res-12 statistics, "
+                "algo ne-cells-2; no lot, footprint, GNR or EZ in any product)",
         "provider": "BEV – Bundesamt für Eich- und Vermessungswesen",
         "license": CC_BY_4,
         "license_url": CC_BY_4_URL,
@@ -96,12 +100,12 @@ SOURCES: dict[str, dict] = {
             "Kataster, CC BY 4.0, bearbeitet (Nutzungseinheit-Zellen, keine Objektgeometrie)"
         ),
         "url": "https://kataster.bev.gv.at/",
-        "note": "Since product 2.4 the cadastre enters the products solely as the "
-                "declared NE layer (NEC1, umfeld-at ne-cells-2): per-H3-cell land-use "
-                "mix and k-anonymous statistics. Cadastre geometry is used at run time "
-                "only as model context (segment features) and is never stored or "
-                "redistributed. No parcel, footprint, GNR, EZ or address is contained "
-                "or recoverable from any file.",
+        "note": "Since product 2.4 the register enters the products solely as the "
+                "declared NE layer (NEC1, ne-cells-2): per-H3-cell land-use "
+                "mix and k-anonymous statistics. Register geometry (public BEV vector "
+                "tiles) is used at run time only as model context (segment features) "
+                "and is never stored or redistributed. No lot, footprint, GNR, EZ or "
+                "address is contained or recoverable from any file.",
     },
     "basemap_at": {
         "name": "basemap.at Orthofoto (web-map display only)",
@@ -182,14 +186,14 @@ SOURCES: dict[str, dict] = {
     },
     "austria_power": {
         "name": "austria-power API (wind turbines, masts, substations)",
-        "provider": "example.invalid aggregating Austro Control "
-                    "obstacle data, IG Windkraft and OSM",
+        "provider": "power-infrastructure lookup service (config.POWER_API_URL) "
+                    "aggregating Austro Control obstacle data, IG Windkraft and OSM",
         "license": "Mixed — per-feature `source` attribute: austrocontrol / "
                    "igwindkraft (open data), osm_power (ODbL)",
-        "license_url": "https://example.invalid:8000/",
+        "license_url": _config.POWER_API_URL or "",
         "attribution": "Infrastructure: Austro Control, IG Windkraft, "
                        "© OpenStreetMap contributors (ODbL)",
-        "url": "https://example.invalid:8000/",
+        "url": _config.POWER_API_URL or "",
         "share_alike": True,
         "note": "OSM-derived features carry source=osm_power and fall under "
                 "ODbL; verify upstream licence for austrocontrol / igwindkraft "

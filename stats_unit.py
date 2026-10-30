@@ -1,7 +1,6 @@
 """Public ``GET /api/v1/stats/unit`` — one "stats envelope" per spatial unit.
 
-Shared contract (schema ``stats-envelope/1``) with umfeld-at and
-farm-subsidies-austria: one JSON per H3 cell (res 5–12), KG code or small
+Shared contract (schema ``stats-envelope/1``) with sibling services: one JSON per H3 cell (res 5–12), KG code or small
 bbox with FLAT dotted figure keys, so spreadsheets / agents can read our
 observed aggregates per unit without walking cells.  Docs:
 ``public_docs.STATS_TXT``; design notes ``docs/ne-public-api.md → §12``.

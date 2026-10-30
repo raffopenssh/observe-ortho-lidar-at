@@ -1,17 +1,17 @@
-"""ne_rollout — primary-side bookkeeping for the v2.4 cadastre clean-up + NE cells.
+"""ne_rollout — primary-side bookkeeping for the v2.4 legacy-section clean-up + NE cells.
 
 Two questions the operator asks every hour of the wave, answered from the
-Zenodo manifest (+ umfeld's NE manifest, cached):
+Zenodo manifest (+ the NE server's NE manifest, cached):
 
-* ``legacy:``  how many Zenodo files may still carry cadastre data, how many
+* ``legacy:``  how many Zenodo files may still carry legacy sections, how many
   legacy depositions were removed (records kept, ``status=removed``) and how
   many of those removals the audit has already confirmed gone on Zenodo.
-* ``ne:``      NE coverage — umfeld built / 7 850, our ``_ne_h3b`` products,
+* ``ne:``      NE coverage — NE-server built / 7 850, our ``_ne_h3b`` products,
   NEO1 posted, the active ``ne_source``, h3b bytes on the primary disk.
 
-Rules (mirror ``austria_processor.legacy_pending`` / ``_mark_cadastre_free``):
+Rules (mirror ``austria_processor.legacy_pending`` / ``_mark_property_free``):
   a product record is CLEAN iff ``status in (cf, stripped)`` or
-  ``status == removed`` or it is a ``_full_gpkg`` (never had cadastre) or an
+  ``status == removed`` or it is a ``_full_gpkg`` (never had legacy sections) or an
   ``_ne_h3b``.  Everything else written before this code (every v1 ``_json``,
   v1 ``_light_gpkg``, v2.x ``_json_v2`` / ``_light_gpkg_v2``) is SUSPECT.
 
@@ -35,7 +35,7 @@ log = logging.getLogger("ne_rollout")
 DATA_DIR = Path("data/austria_processor")
 MANIFEST_PATH = DATA_DIR / "zenodo_manifest.json"
 AUDIT_FILE = DATA_DIR / "legacy_audit.json"
-NE_MANIFEST_CACHE = DATA_DIR / "ne_umfeld_manifest.json"
+NE_MANIFEST_CACHE = DATA_DIR / "ne_server_manifest.json"
 NE_SOURCE_FILE = DATA_DIR / "ne_source"
 NE_DIR = Path("data/ne")
 JSON_DIR = DATA_DIR / "json"
@@ -156,9 +156,9 @@ def strip_local_json(entries: dict | None = None, max_files: int = 200) -> dict:
     or replace it with a 2.4 run (``status=cf``); the primary keeps a local
     copy under ``data/austria_processor/json/<code>.json`` for the coverage
     oracle / search-index ingest, which nobody rewrites.  Once the manifest
-    says the Zenodo copy is clean we drop the cadastre sections from the
-    local file too (same ``strip_cadastre_from_doc``), so the primary never
-    holds parcel data past the point the fleet has retired it.  Bounded
+    says the Zenodo copy is clean we drop the legacy sections from the
+    local file too (same ``strip_legacy_sections``), so the primary never
+    holds legacy data past the point the fleet has retired it.  Bounded
     per call; ``legacy_local_strip.json`` records what was done.
     Returns {stripped, remaining, checked}."""
     if entries is None:
@@ -168,7 +168,7 @@ def strip_local_json(entries: dict | None = None, max_files: int = 200) -> dict:
         except Exception:
             entries = {}
     try:
-        from austria_processor import strip_cadastre_from_doc, LEGACY_JSON_SECTIONS
+        from austria_processor import strip_legacy_sections, LEGACY_JSON_SECTIONS
     except Exception as e:  # noqa: BLE001
         log.debug("strip_local_json: import failed: %s", e)
         return {"stripped": 0, "remaining": -1, "checked": 0}
@@ -194,7 +194,7 @@ def strip_local_json(entries: dict | None = None, max_files: int = 200) -> dict:
             with open(p) as fh:
                 doc = json.load(fh)
             if any(k in doc for k in LEGACY_JSON_SECTIONS):
-                out = strip_cadastre_from_doc(doc)
+                out = strip_legacy_sections(doc)
                 tmp = p.with_suffix(".tmp")
                 with open(tmp, "w") as fh:
                     json.dump(out, fh, separators=(",", ":"), default=str)
@@ -317,7 +317,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# === SECTION: umfeld NE manifest (cached) ===
+# === SECTION: NE-server manifest (cached) ===
 
 NE_MANIFEST_FULL_EVERY_S = 6 * 3600   # deltas omit queue/frozen → refetch full body this often
 
@@ -343,8 +343,8 @@ def _merge_ne_delta(base: dict, delta: dict) -> dict:
 
 
 def refresh_ne_manifest(max_age_s: int = 600, full: bool = False) -> dict | None:
-    """GET umfeld's /ne/manifest at most every *max_age_s*, persisted to
-    ``ne_umfeld_manifest.json`` so both gunicorn workers and the HA shadow
+    """GET the NE server's /ne/manifest at most every *max_age_s*, persisted to
+    ``ne_server_manifest.json`` so both gunicorn workers and the HA shadow
     read the same view.  Returns the manifest dict.
 
     Polling is delta-based: every call after the first sends
@@ -412,13 +412,12 @@ def ne_built_codes(mf: dict | None = None) -> set[str]:
 
 
 def ne_source() -> str:
+    """Active declared-layer source — mirrors ``ne_h3.ne_source``."""
     try:
-        v = NE_SOURCE_FILE.read_text().strip().lower()
-        if v in ("umfeld", "bevdirect"):
-            return v
+        import ne_h3
+        return ne_h3.ne_source()
     except Exception:
-        pass
-    return "umfeld"
+        return "bevdirect"
 
 
 # === SECTION: summary + process.txt lines ===
@@ -449,12 +448,12 @@ def summary(force: bool = False) -> dict:
                 mf = (json.loads(NE_MANIFEST_CACHE.read_text()) or {}).get("manifest")
         except Exception:
             mf = None
-        ne = {"source": ne_source(), "umfeld_built": None, "umfeld_total": None, "umfeld_queue": None,
+        ne = {"source": ne_source(), "ne_server_built": None, "ne_server_total": None, "ne_server_queue": None,
               "obs_posted": None, "frozen": None}
         if mf:
-            ne.update(umfeld_built=mf.get("built"), umfeld_total=mf.get("kgs_total"),
+            ne.update(ne_server_built=mf.get("built"), ne_server_total=mf.get("kgs_total"),
                       obs_posted=mf.get("obs_posted"), kgs_obs_on_bev=mf.get("kgs_obs_on_bev"),
-                      umfeld_queue={k: (mf.get("queue") or {}).get(k) for k in ("done", "total", "avg_seconds", "finished", "current")},
+                      ne_server_queue={k: (mf.get("queue") or {}).get(k) for k in ("done", "total", "avg_seconds", "finished", "current")},
                       frozen={k: (mf.get("frozen") or {}).get(k) for k in ("algo", "lu_epoch", "lu_source", "bev_source", "until")})
         # on-disk h3b corpus (primary fast path)
         n_disk = 0
@@ -473,16 +472,10 @@ def summary(force: bool = False) -> dict:
             import peer_director as _pd
             rdy = tot = 0
             tags: dict = {}
-            import umfeld as _um
-            my_sha = _um.token_sha()
-            tok_ok = tok_n = 0
             for fp in _pd._PEER_PUSH_DIR.glob("*.json"):
                 if time.time() - fp.stat().st_mtime > 1800:
                     continue
                 st = ((json.loads(fp.read_text()) or {}).get("status") or {})
-                if "umfeld_token_sha" in st:
-                    tok_n += 1
-                    tok_ok += int(bool(my_sha) and st.get("umfeld_token_sha") == my_sha)
                 nt = st.get("ne_tooling")
                 if not isinstance(nt, dict):
                     continue
@@ -490,8 +483,7 @@ def summary(force: bool = False) -> dict:
                 if nt.get("binary") and nt.get("package"):
                     rdy += 1
                     tags[nt.get("tag")] = tags.get(nt.get("tag"), 0) + 1
-            ne.update(bevdirect_ready=rdy, bevdirect_reporting=tot, bevdirect_tags=tags,
-                      umfeld_token_ok=tok_ok, umfeld_token_reporting=tok_n)
+            ne.update(bevdirect_ready=rdy, bevdirect_reporting=tot, bevdirect_tags=tags)
         except Exception:
             pass
         out = {"legacy": a, "ne": ne, "generated_at": _now()}
@@ -512,15 +504,13 @@ def process_txt_lines() -> list[str]:
           f"codes={a['suspect_codes']}/{a['codes_with_json']} · clean: cf={a['cf']} stripped={a['stripped']} "
           f"removed={a['removed_records']} (gone={ra['verified_gone']} unverified={ra['unverified']}){flag} · "
           f"v2.4-clean pairs={a['codes_v24_clean_pair']} · local_json: suspect={a['local_json']['local_suspect']} clean={a['local_json']['local_clean']}")
-    q = ne.get("umfeld_queue") or {}
-    l2 = (f"ne:       source={ne['source']} umfeld_built={ne.get('umfeld_built')}/{ne.get('umfeld_total')} "
+    q = ne.get("ne_server_queue") or {}
+    l2 = (f"ne:       source={ne['source']} ne_server_built={ne.get('ne_server_built')}/{ne.get('ne_server_total')} "
           f"(queue {q.get('done')}/{q.get('total')} @{q.get('avg_seconds')}s{' done' if q.get('finished') else ''}) "
           f"obs_posted={ne.get('obs_posted')}{(' obs_on_bev=' + str(ne.get('kgs_obs_on_bev'))) if ne.get('kgs_obs_on_bev') is not None else ''}"
           f" · h3b: zenodo={ne['h3b_zenodo']} ({ne['h3b_zenodo_gb']} GB)"
           + (f" +sweep={ne['h3b_sweep']}" if ne.get('h3b_sweep') else "") + " "
           f"disk={ne['h3b_disk']} ({ne['h3b_disk_gb']} GB)")
-    if ne.get("umfeld_token_reporting"):
-        l2 += f" · contrib_token={ne.get('umfeld_token_ok')}/{ne.get('umfeld_token_reporting')}"
     if ne.get("bevdirect_reporting") is not None:
         l2 += f" · bevdirect_ready={ne.get('bevdirect_ready')}/{ne.get('bevdirect_reporting')}"
         if ne.get("bevdirect_tags"):

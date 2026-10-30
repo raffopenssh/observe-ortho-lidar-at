@@ -9,8 +9,18 @@ from kg_universe import KG_TOTAL as _KG_TOTAL
 import datetime as _dt
 
 import attributions as _attr
+import config as _config
 
-BASE = 'https://example.invalid'
+# Public base URL of this deployment (SRTM_PUBLIC_URL, else the local public tier).
+BASE = _config.env('SRTM_PUBLIC_URL') or f'http://127.0.0.1:{_config.PUBLIC_PORT}'
+# Optional sibling service that serves the *statistical* (declared) land-use
+# layer per H3 cell — same cell ids (SRTM_NE_STATS_URL).  Empty => the
+# paragraphs are omitted.
+NE_STATS_URL = _config.env('SRTM_NE_STATS_URL')
+NE_STATS_NOTE = (f" The statistical counterpart (same cell ids) is served at {NE_STATS_URL}/api/v1/ne."
+                 if NE_STATS_URL else '')
+NE_STATS_HTML = (f' The statistical counterpart (same cell ids): <code>GET {NE_STATS_URL}/api/v1/ne</code>.'
+                 if NE_STATS_URL else '')
 # One-line credit used in headers, meta.attribution, llm.txt and the landing footer.
 ATTRIBUTION_SHORT = _attr.attribution_short()
 ALPHA_NOTE = 'alpha — field names and limits may still move between epochs'
@@ -27,11 +37,8 @@ CELLS_TXT = """## Cells (H3 res 12, ~300 m² hexagons) — what we measured, per
 
 Every processed KG is also published as a grid of H3 res-12 cells (~307 m², ~52 000 per KG) with
 one 41-byte observation record each, plus every tree apex (h ≥ 3 m) and every segmented structure
-with LiDAR heights. Same cell ids and query shapes as umfeld-at's statistical land-use layer, so a
-client zips both by cell id. The statistical land-use counterpart (same cell ids) is
-umfeld-at's public NE API: https://example.invalid/api/v1/ne (pin + counts), /api/v1/ne/cell/{{h3}},
-/api/v1/ne/cells?lon=&lat=&k=, /api/v1/ne/chunk/{{h3_res9}}; contract https://example.invalid/api/v1/docs/ne.md,
-overview https://example.invalid/llm.txt. Observed (here) + statistical (there) = the full cell picture.
+with LiDAR heights. Cell ids and query shapes follow the shared NE cells contract (ne-cells-2), so a
+client can zip this observed layer with a statistical land-use layer by cell id.{{NE_STATS_NOTE}}
 Served from pre-built chunk files on this host (1–80 ms). Not on
 disk yet → 404 {ready:false, status:not_processed|pending|partial, retry_after_s, kgs_missing,
 kgs_pending, kgs_not_processed} + Retry-After.
@@ -113,10 +120,10 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
                "als_year_newest": 2022, "als_year_oldest": 2010}},
     "terrain": {{"elev_m": 612, "slope": 14, "slope_p90": 23, "aspect": "SE", "roughness": 1.3, "tri": 0.8, "tpi": -0.5}},
     "consistency": "consistent"}}
-  cover groups (shared codes with umfeld-at): geb=buildings, bau=construction & parking, acker=cropland,
+  cover groups (shared NE cells codes): geb=buildings, bau=construction & parking, acker=cropland,
     gruen=grass/garden/orchard/vineyard/shrub/hedge, wald=trees, wasser=water, verkehr=roads & paths,
     alpen=rock/bare/glacier, sonst=other.  consistency = our observation vs. the statistical land-use layer
-    of umfeld-at for the same cell (frozen epoch), computed when the product was built:
+    (declared NE layer) for the same cell (frozen epoch), computed when the product was built:
     consistent | forest_loss | forest_gain | sealed_new | structure_new | green_new | unknown.
   format=columns  {{cells:[hex], kg:[…], cover:[[9 × u8]], h_mean:[u8], …, units, codes}} — raw quantised
     integers at res 12 (~20 B/cell gzipped), the format for map heat layers; res 11/10 → aggregated floats.
@@ -172,9 +179,9 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
 
 """
 
-STATS_TXT = """## Stats envelope — one flat JSON per spatial unit (shared with umfeld-at)          #stats
+STATS_TXT = """## Stats envelope — one flat JSON per spatial unit          #stats
   GET /api/v1/stats/unit?h3=<id> | kg=<code>[,<code>…≤50] | bbox=w,s,e,n   [&format=json|flat|csv] [&keys=a,b]
-  Schema "stats-envelope/1": the same envelope umfeld-at (/api/v1/ne/stats/unit, land-use + diff) and
+  Schema "stats-envelope/1": the same envelope a statistical NE service (land-use + diff) and
   farm-subsidies-austria emit, so a spreadsheet or an agent can zip the three by unit key without walking cells.
   unit:   h3   res 5–12; the unit = every res-12 cell that is a descendant of the id (exact set, not bbox)
           kg   5-digit code; several codes → one envelope per code in "units":[…] (unknown / unprocessed → 200,
@@ -185,7 +192,7 @@ STATS_TXT = """## Stats envelope — one flat JSON per spatial unit (shared with
           figures{{…flat…}}, attribution, license:"CC-BY-4.0", computed_at, age_s}}
   figures (flat, dotted, scalar; unit in the suffix _ha _n _m _deg _pct _year):
           cells_n, area_ha, cells_observed_n, trees_n, structures_n, structures.cover_pct,
-          cover_ha.<geb|bau|acker|gruen|wald|wasser|verkehr|alpen|sonst>          (shared with umfeld-at)
+          cover_ha.<geb|bau|acker|gruen|wald|wasser|verkehr|alpen|sonst>
           consistency_ha.<consistent|forest_loss|forest_gain|sealed_new|structure_new|green_new|unknown>,
           consistency_n.<same>, terrain.elev_min_m / elev_max_m / elev_mean_m / slope_mean_deg,
           height.mean_m / p90_mean_m / max_m, canopy.cover_pct, ndvi.mean, change.dh_mean_m, hansen_loss_ha,
@@ -206,7 +213,7 @@ STATS_TXT = """## Stats envelope — one flat JSON per spatial unit (shared with
 
 FLAGS_TXT = """## Flags — tell us when something we serve looks wrong                       #flags
 
-Tokenless, for every public layer: an NE cell whose observed cover group looks off (umfeld-at's glyph under
+Tokenless, for every public layer: an NE cell whose observed cover group looks off (a glyph under
 v=obs), a giant tree that is a mast, a structure height that cannot be, a tile artefact, a stale KG. Flags are
 QA evidence, not edits: nothing you send changes what we serve; they drive re-checks and re-processing
 (`superseded` tells you the product was rebuilt since). Subjects are H3 res-12 cells or KG codes only —
@@ -228,7 +235,7 @@ what you expect, and send `looks_right` too: a confirmation is as useful as a co
                                                     (nearest apex / structure for the *trees* / *structures* layers)
      "expected": {{"group": "gruen"}},                what it should be (≤ 256 B): {{group}}, {{type}}, {{h_m}}, {{absent:true}} …
      "note": "mown meadow, no trees",               ≤ 280 chars, shown publicly (no personal data please)
-     "source": "umfeld-at/glyph",                   your client label ≤ 40 (stats are grouped by it)
+     "source": "my-client/glyph",                   your client label ≤ 40 (stats are grouped by it)
      "reporter": "opaque-id",                       optional; hashed with a server salt, never stored or returned
      "epoch": "…"}}                                  optional: meta.epoch / X-Cells-Epoch you read (else ours)
     → {{id, folded, n, status, layer, claim, subject{{cell, kg, lon, lat}}, epoch, served, snapshot?, tally{{n,
@@ -403,8 +410,7 @@ GET /api/v1/kg/{{kg_code}}                  one KG's landscape dossier:
 GET /api/v1/status                           kgs_processed / kgs_total, universe_hash, product versions, grid25 count, cells{{…}}
 
 ## KG universe — the contract: kgs_total = 7850
-The set of Katastralgemeinden is shared with the sibling service umfeld-at (cadastre /
-Umfeld; https://example.invalid/llm.txt §"KG universe"). Both serve the SAME 7 850 codes.
+The set of Katastralgemeinden (BEV, 7 850 codes) is pinned per epoch:
   universe_hash = sha256(join(sorted(kg_code), "\n")) hex — fingerprint of the SET of codes,
     currently 057334c3faa38fc0443df14a34444f2b273f42cf27065fb1845c1c49b1fe6f05. Exposed in
     /api/v1/status and every /api/v1/kgs response (field universe_hash + header
@@ -413,12 +419,12 @@ Umfeld; https://example.invalid/llm.txt §"KG universe"). Both serve the SAME 7 
   GET /api/v1/kgs?fields=codes&processed_only=0   {{codes:[7850], count, universe_hash}} (~60 KB)
     — enough to recompute the hash yourself. Cache-Control max-age 3600, revalidate with ETag.
   kgs_total ≠ 7850 or a changed universe_hash means the universe changed → treat as a new
-  epoch; we bump this contract and tell umfeld-at first (and vice versa). Status also carries
+  epoch; we bump this contract. Status also carries
   universe_agrees_contract (live index vs the pinned hash) so a drift is visible at once.
 
-{CELLS_TXT.replace("{{", "{").replace("}}", "}")}{STATS_TXT.replace("{{", "{").replace("}}", "}")}{FLAGS_TXT.replace("{{", "{").replace("}}", "}")}
+{CELLS_TXT.replace("{{", "{").replace("}}", "}").replace("{NE_STATS_NOTE}", NE_STATS_NOTE)}{STATS_TXT.replace("{{", "{").replace("}}", "}")}{FLAGS_TXT.replace("{{", "{").replace("}}", "}")}
 ## Segmentation UI — the interactive map at /segmentation                                #segmentation
-  https://example.invalid/segmentation — draw or upload an area (≤ 5 km²), run
+  {BASE}/segmentation — draw or upload an area (≤ {_config.PUBLIC_MAX_AREA_KM2:g} km²), run
   Segment / Elevation / Terrain, toggle the LiDAR / ortho / CIR / forest-change overlays, export
   GeoPackage / KML / MBTiles, save & share a result (?share=<id>; shares made here are kept in
   their own namespace). The same endpoints are callable directly, no token:
@@ -439,11 +445,6 @@ Umfeld; https://example.invalid/llm.txt §"KG universe"). Both serve the SAME 7 
     product         products only; 400 when nothing is finished there yet
     bev             always live (BEV DTM/DSM/ortho + Copernicus context; minutes for 1 km²)
   model=v2 (default, LightGBM — the same classifier the fleet products use) | v1 (legacy RF).
-  include_cadastre=true (UI toggle "BEV context", default on) lets a live run load buildings +
-    property boundaries from the public BEV vector tiles (vtcseamless, built locally) as
-    run-time model context only (v1 building mask, v2 distance features + INVEKOS field
-    polygons via the v2 context). meta.context_layer = {{source, cells}}; none of that
-    geometry is served or stored — only the resulting object classes.
   Limits: 5 km² per request, 30 heavy requests/min per client (429 + Retry-After), 2 concurrent
   analyses per worker (503 + Retry-After when the gate is full). Results carry the same object
   vocabulary as the rest of this API; no property-boundary geometry is served or stored.
@@ -489,8 +490,8 @@ _USED_FOR = {
 
 
 def license_block() -> dict:
-    """/api/v1/license — same shape as umfeld-at's (per-source obligations, headers,
-    not_served, personal_data, caching); wording from attributions.py."""
+    """/api/v1/license — per-source obligations, headers, not_served,
+    personal_data, caching; wording from attributions.py."""
     d = _attr.attribution_dict(PUBLIC_SOURCES)
     sources = []
     obligations = []
@@ -519,8 +520,7 @@ def license_block() -> dict:
                         f'{_attr.OUTPUT_LICENSE}: credit "srtm-lidar-at landscape segmentation".',
         'not_served': 'No property-register data (lot or building outlines, lot identifiers, land-use '
                       'register codes) and nothing derived from it beyond per-cell statistics is served by '
-                      'this public API. The statistical land-use layer itself is umfeld-at '
-                      '(https://example.invalid/api/v1/license).',
+                      'this public API.',
         'personal_data': 'None. No owner data, no lot identifiers are stored or returned.',
         'response_headers': ['X-Data-Attribution', 'Link: <' + _attr.OUTPUT_LICENSE_URL + '>; rel="license"'],
         'caching': 'Allowed. Keep meta.attribution with every stored copy. Never cache ready:false / '
@@ -592,14 +592,11 @@ GET /api/v1/cells?lon=15.0857&amp;lat=47.0665&amp;k=1</pre>
 groups (<code>geb bau acker gruen wald wasser verkehr alpen sonst</code>), structure cover and count, LiDAR
 heights (mean / p90 / max), tree count, tallest tree and canopy share, NDVI mean + seasonal amplitude and a
 phenology class, height and ground change between ALS years, Hansen forest-loss year, terrain (elevation,
-slope, aspect, roughness, TRI, TPI) and a consistency verdict against the statistical land-use layer of
-<a href="https://example.invalid">umfeld-at</a> for the same cell. On top of that: every tree apex
+slope, aspect, roughness, TRI, TPI) and a consistency verdict against the declared (statistical)
+land-use layer for the same cell. On top of that: every tree apex
 ≥ 3 m and every segmented structure with its LiDAR height, positioned inside the cell.
-Same cell ids as umfeld-at, so the two layers zip together client-side: the <em>statistical</em> land use
-per cell lives in umfeld-at's public NE API — <code>GET https://example.invalid/api/v1/ne</code>
-(pin + counts), <code>/api/v1/ne/cell/{{h3}}</code>, <code>/api/v1/ne/cells?lon=&amp;lat=&amp;k=1</code>,
-<code>/api/v1/ne/chunk/{{h3_res9}}</code>; contract <a href="https://example.invalid/api/v1/docs/ne.md">ne.md</a>,
-overview <a href="https://example.invalid/llm.txt">umfeld-at llm.txt</a>. Observed here, statistical there.</p>
+Cell ids follow the shared NE cells contract (ne-cells-2), so an observed and a statistical layer
+zip together client-side by cell id.{NE_STATS_HTML}</p>
 <pre>GET /api/v1/cells?bbox=16.354,48.187,16.357,48.189
     # cells in a box (span &le; 0.05&deg;, &le; 16 384 cells)
 GET /api/v1/cells?lon=16.355&amp;lat=48.188&amp;k=1
@@ -675,7 +672,7 @@ def _current_count(st: dict) -> tuple[int, int]:
 
     *complete* = KGs whose product is the FULL current version (``vX.Y``
     exactly) AND whose cells file is served completely here — the same
-    number umfeld-at reports as "observed layer live at srtm-lidar-at".
+    number reported as "observed layer live".
     *pending* = register says ``vX.Y`` but cells not yet published
     (``vX.Y-pending`` in ``/api/v1/kgs``).  ``-partial`` variants, split
     blocks and older versions are deliberately NOT counted: clients only
@@ -695,7 +692,7 @@ def coverage_txt(st: dict) -> str:
     return (f'coverage (live, refreshed ~10 min): {_fmt_n(n)} / {_fmt_n(tot)} complete KGs at product {cur} ({pct:.1f} %)'
             f' — complete = whole KG (no split blocks), all layers, cells served'
             + (f'; {_fmt_n(pend)} more at {cur} awaiting cells publication ({cur}-pending — poll, not a gap)' if pend else '') + '\n'
-            f'  {_fmt_n(tot)} = all Austrian Katastralgemeinden (same universe as umfeld-at). '
+            f'  {_fmt_n(tot)} = all Austrian Katastralgemeinden. '
             f'Index updated {st.get("index_updated_at") or "?"} — exact numbers: GET /api/v1/status')
 
 
@@ -707,7 +704,7 @@ def coverage_html(st: dict) -> str:
     return (f'<p class="cov"><strong>Coverage right now:</strong> {_fmt_n(n)} / {_fmt_n(tot)} complete KGs at product {cur} '
             f'({pct:.1f}&nbsp;%) — complete = whole KG (no split blocks), all layers, cells served'
             + (f'; {_fmt_n(pend)} more at {cur} awaiting cells publication (<code>{cur}-pending</code> — poll, not a gap)' if pend else '')
-            + f'. {_fmt_n(tot)} = all Austrian Katastralgemeinden (same universe as umfeld-at). '
+            + f'. {_fmt_n(tot)} = all Austrian Katastralgemeinden. '
             f'Index updated {st.get("index_updated_at") or "?"}; '
             f'live numbers at <a href="/api/v1/status">/api/v1/status</a>. Unprocessed areas answer '
             f'<code>202</code> / <code>404 ready:false</code> — processing runs around the clock.</p>')

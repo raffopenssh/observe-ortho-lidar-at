@@ -7,7 +7,7 @@ Storage model (schema v2, Sep 2026)
 -----------------------------------
 Only **flags** and **feedback** are stored. There is deliberately NO
 `objects` table any more: the v1 schema mirrored every inspectable object
-of every KG (parcels, parcel top objects, buildings, infra ... ~20k rows per
+of every KG (lots, top objects, buildings, infra ... ~20k rows per
 KG) *including* a full `attrs_json` copy of the source record. That made
 feedback.sqlite a bloated second copy of `data/austria_processor/json`
 (31 GB for 3.4k KGs, i.e. ~75 GB at full fleet -- larger than the JSONs
@@ -694,7 +694,7 @@ def parse_snippet(text: str) -> dict:
 
 
 _KIND_PRIORITY = {
-    'building': 0, 'parcel': 1, 'top_tree': 2, 'top_obj': 3,
+    'building': 0, 'lot': 1, 'top_tree': 2, 'top_obj': 3,
     'top_by_type': 4, 'new_building': 5, 'infra': 6,
 }
 

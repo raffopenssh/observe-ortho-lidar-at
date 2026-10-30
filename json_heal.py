@@ -2,7 +2,7 @@
 
 Why
 ---
-``<code>_json`` (the v1-shaped, cadastre-stripped summary) is the fleet-wide
+``<code>_json`` (the v1-shaped, legacy-stripped summary) is the fleet-wide
 COMPLETION MARKER: ``app._kg_coverage_complete``, the processor's
 ``completed_codes``, ``zen_stall`` and the dashboard all key on it.  Fresh
 v2.4 KGs write it last (full → light_v2 → ne_h3b → json_v2 → json).  Between
@@ -16,7 +16,7 @@ from scratch (~1.5 h each, forever, since the re-run lost it again).
 ``kg_json_v2`` is a lossless encoding of the very same ``json_summary`` dict
 (``roundtrip_ok``), so the primary can rebuild the marker itself: decode the
 ``_json_v2`` blob (own ``kg_v2_store`` first, Zenodo download as fallback),
-strip any cadastre residue (pre-2.4 blobs), write ``<code>.json`` and stream
+strip any legacy residue (pre-2.4 blobs), write ``<code>.json`` and stream
 it to Zenodo as ``<code>_json`` with ``status=cf``.  Runs on the director
 loop (``peer_director._check_json_heal``), a few codes per tick, under the
 fleet Zenodo lock; skips codes that are queued / running on a peer (the peer
@@ -103,10 +103,10 @@ def heal_one(code: str, entry: dict, manifest=None, client=None) -> dict:
     """Rebuild + upload ``<code>_json``.  Returns ``{ok, size, source}``."""
     import zenodo_client as _zc
     from zenodo_lock import zenodo_upload_lock
-    from austria_processor import strip_cadastre_from_doc
+    from austria_processor import strip_legacy_sections
     manifest = manifest or _zc.Manifest(str(MANIFEST_PATH))
     client = client or _zc.Client(token=_zc.DEFAULT_TOKEN)
-    doc = strip_cadastre_from_doc(_load_doc(code, entry, manifest))
+    doc = strip_legacy_sections(_load_doc(code, entry, manifest))
     doc.setdefault('kg_code', code)
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     out_p = TMP_DIR / f'{code}.json'

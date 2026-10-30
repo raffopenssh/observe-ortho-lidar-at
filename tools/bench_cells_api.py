@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark the public cells API against docs/ne-public-api.md §4.
 
-    python3 tools/bench_cells_api.py [--base http://localhost:8100] [--kg 63330] [--n 15]
+    python3 tools/bench_cells_api.py [--base http://localhost:<PUBLIC_PORT>] [--kg 63330] [--n 15]
 
 Picks a KG that is on disk (data/ne/<kg>.h3b), derives bboxes from its cells,
 and prints p50 / p95 latency + body bytes (gzip on the wire) per row of the
@@ -68,7 +68,9 @@ def bench(name, url, n):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--base', default=os.environ.get('CELLS_BASE', 'http://localhost:8100'))
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import config
+    ap.add_argument('--base', default=os.environ.get('CELLS_BASE', f'http://127.0.0.1:{config.PUBLIC_PORT}'))
     ap.add_argument('--kg', default=None)
     ap.add_argument('--n', type=int, default=15)
     a = ap.parse_args()

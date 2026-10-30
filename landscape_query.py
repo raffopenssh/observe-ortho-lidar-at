@@ -1,4 +1,4 @@
-"""landscape_query — parcel-free, bbox/point-keyed views of what the
+"""landscape_query — bbox/point-keyed views of what the
 segmentation learned, for the public API (``public_api.py``).
 
 Everything answers from the primary's local stores — ``data/search_index.db``
@@ -7,8 +7,8 @@ Everything answers from the primary's local stores — ``data/search_index.db``
 dominant-class / canopy fractions) and ``data/feedback.sqlite`` (QA flags).
 No KG JSON, no GPKG, no Zenodo / BEV fetch in the request path.
 
-Design rule (licensing): nothing here reads or echoes ``kg_parcels``, parcel
-ids, parcel areas, footprint ids or anything else keyed by the BEV cadastre.
+Design rule (licensing): nothing here reads or echoes lot ids, lot areas,
+footprint ids or anything else keyed by the property register.
 Inputs are lon/lat, a bbox or a KG *code*; outputs are our own LiDAR /
 Sentinel-derived measurements. Trees and landmarks are QA-filtered here so
 clients get the realistic set without needing the flag endpoints.
@@ -261,7 +261,7 @@ def grids_for_kg(kg_code: str) -> list[dict]:
 
 def _cells_in_envelope(grid, E0, N0, E1, N1):
     """Cells overlapping the EPSG:3035 envelope → (index tuple, weights) where
-    ``weights`` is the overlap fraction of each cell (0..1], so a parcel-sized
+    ``weights`` is the overlap fraction of each cell (0..1], so a lot-sized
     bbox straddling four 25 m cells is averaged by area, not by cell count.
     None when nothing overlaps."""
     cell = grid['cell_m']; x0 = grid['x0']; y0 = grid['y0']
@@ -759,7 +759,7 @@ def _bilinear(grid, a, E, N):
 
 
 # --------------------------------------------------------------------------
-# per-KG summary (no parcels)
+# per-KG summary
 # --------------------------------------------------------------------------
 def kg_summary(code: str) -> dict | None:
     k = kg_row(code)

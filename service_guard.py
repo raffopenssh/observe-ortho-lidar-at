@@ -6,7 +6,7 @@ Three independent mechanisms, all per gunicorn worker, all env-tunable:
   Callers wait at most ``max_wait_s`` for a slot, then get ``Overloaded`` →
   the view answers 503 + ``Retry-After`` in a millisecond instead of holding
   a worker thread.  Without this, a tile flood pins all 24 threads in numpy
-  and the cheap endpoints (status, /k heartbeats from the fleet) starve.
+  and the cheap endpoints (status, peer heartbeats) starve.
 
 * ``RateLimiter`` — per-client token bucket (first ``X-Forwarded-For`` hop,
   which the exe.dev proxy sets).  429 + ``Retry-After`` + ``X-RateLimit-*``

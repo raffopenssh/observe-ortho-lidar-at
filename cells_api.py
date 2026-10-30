@@ -423,8 +423,8 @@ def _epoch_pin() -> str | None:
 def epoch_hdr(v=None) -> str | None:
     """Value for ``X-Cells-Epoch``: the product epoch *v* when it is a real
     string, else the corpus-wide pin (newest epoch on disk), else None — the
-    caller must then omit the header.  Never ``str(None)``: umfeld-at hashes
-    this header into its bin state and a literal ``None`` forced rebuilds."""
+    caller must then omit the header.  Never ``str(None)``: downstream indexes
+    hash this header into their bin state and a literal ``None`` forced rebuilds."""
     if isinstance(v, str) and v.strip() and v.strip().lower() not in ('none', 'null'):
         return v.strip()
     return _epoch_pin() or None
@@ -1798,7 +1798,7 @@ def cells_dict():
         'groups': {g: GROUP_LABELS[g] for g in ne_h3.GROUPS},
         'consistency': {
             'codes': list(_CONSISTENCY_NAMES),
-            'note': 'our observation vs. the statistical land-use layer of umfeld-at for the same cell '
+            'note': 'our observation vs. the statistical land-use layer for the same cell '
                     '(frozen epoch), computed when the product was built. sealed_new / structure_new / '
                     'green_new = we see it, the statistical layer does not (yet).'},
         'phenology': list(PHENOLOGY), 'aspect': list(ASPECTS), 'species': list(SPECIES), 'vitality': list(VITALITY),

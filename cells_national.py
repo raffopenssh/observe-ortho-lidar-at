@@ -1,9 +1,8 @@
 """cells_national — Austria-wide res-8 / res-9 H3 aggregate of the public
 cells corpus (``GET /api/v1/cells/national?res=9&fields=…``).
 
-Why: umfeld-at renders zooms 9–11 of its cell tile layer (res 7–9
-polygons) and the all-Austria PMTiles archive from one in-RAM national
-table.  Those tiles carried no LiDAR columns because the per-cell
+Why: a cell tile layer renders zooms 9–11 (res 7–9 polygons) and an
+all-Austria PMTiles archive from one in-RAM national table.  Those tiles carried no LiDAR columns because the per-cell
 0.025° bins (``cells_bins``) only feed z ≥ 12.  This module reduces every
 published ``data/ne/<kg>.h3b`` once per build to **one row per res-9
 parent** (~1.05 M rows, ~20 MB gz) — per field the mean over the valid

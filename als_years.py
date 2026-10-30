@@ -3,8 +3,7 @@
 Why: the frozen 41 B NEO1 row carries ``flight_years`` as a bitmask
 (bit i = ALS 2020+i).  ~60 % of Austria was last flown before 2020, so the
 mask is 0 there and conflates "flown ≤2019" with "no data"; the year
-itself is lost.  umfeld-at needs the real year for the declared-vs-observed
-diff.  BEV publishes the acquisition footprint per mosaic (the
+itself is lost.  The declared-vs-observed diff needs the real year.  BEV publishes the acquisition footprint per mosaic (the
 ``Metadatenuebersicht_SHP_DTM_DSM_<stichtag>`` shapefile listed on the
 data.gv.at / data.bev.gv.at series record, ``Flugjahr`` per block) and we
 vendor it as ``data/als_acquisition/flight_blocks_<dataset>.geojson``
@@ -442,8 +441,8 @@ _SLIM_KEYS = ("newest", "oldest", "dominant", "dominant_share", "precision", "re
 
 
 def bulk_slim(kgs: list[str] | None = None) -> dict[str, dict]:
-    """Bulk ``als`` blocks for ``/api/v1/kgs?fields=codes,als`` (umfeld-at
-    saves one GET per KG per pass): one SELECT over the cache, no compute,
+    """Bulk ``als`` blocks for ``/api/v1/kgs?fields=codes,als`` (clients
+    save one GET per KG per pass): one SELECT over the cache, no compute,
     no histograms.  KGs without a cached block (no product yet / backfill
     pending) are absent from the result."""
     c = _conn()

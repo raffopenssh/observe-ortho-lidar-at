@@ -15332,7 +15332,7 @@ def _tree_v3_params(params):
         else 'ndsm_only'
     eff['fallback_live'] = str(params.get('fallback_live', 'true')).lower() in ('true', '1', 'yes')
     eff['dataset'] = params.get('dataset', ti.DEFAULT_DATASET)
-    # Two distinct knobs (2.4.1 fix, example.invalid report): the live
+    # Two distinct knobs (2.4.1 fix, forestry user report): the live
     # detector's non-forest rejection threshold stays at the v2.3 default
     # (tv.MIN_TREE_LIKELIHOOD, set by _tree_v2_params) and is only moved by
     # an explicit ``min_tree_likelihood``; the *row filter* over product +

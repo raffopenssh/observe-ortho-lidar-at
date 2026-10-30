@@ -1,8 +1,8 @@
 """cells_bins — per-bin columnar export of everything we hold locally per
 H3 res-12 cell (``GET /api/v1/cells?bbox=<0.025° bin>&format=bin&fields=…``).
 
-Why: umfeld-at builds a per-cell AND/OR filter (their ``docs/ne-filter.md``
-§4a) on the NEO1 rows we POST, but the 41 B row cannot tell a tall
+Why: a downstream statistical index builds a per-cell AND/OR filter on the
+NEO1 rows, but the 41 B row cannot tell a tall
 structure from a tall tree and carries no terrain for cells we never
 posted.  This module joins **all three local product forms** once per bin
 and stores the result, so a downstream index can pull every bin exactly

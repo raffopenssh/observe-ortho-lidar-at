@@ -2,8 +2,16 @@
 import sys, os, gzip
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
+import pytest
 import cells_api as ca
 import cells_national as cn
+
+
+def _first_kg():
+    files = sorted(ca._files())
+    if not files:
+        pytest.skip('no published cells (data/ne/*.h3b) on this machine')
+    return files[0]
 
 
 def _table(kg):
@@ -15,7 +23,7 @@ def _table(kg):
 
 def test_parents():
     hn = ca._h3n()
-    t = _table(sorted(ca._files())[0])
+    t = _table(_first_kg())
     for res in (8, 9):
         p = cn.parent_ids(t.ids, res)
         for i in range(0, len(t), max(1, len(t) // 50)):
@@ -25,7 +33,7 @@ def test_parents():
 
 
 def test_aggregate_matches_direct():
-    kg = sorted(ca._files())[0]
+    kg = _first_kg()
     t = _table(kg)
     acc = cn.Acc(9); acc.add_table(t); red = acc.reduce(); cols = cn.finalise(red)
     p9 = cn.parent_ids(t.ids, 9)

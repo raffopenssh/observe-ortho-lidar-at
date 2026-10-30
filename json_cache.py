@@ -3,7 +3,7 @@
 Oct 2026: profiling the director gunicorn worker showed ~40 % of its CPU
 in ``json.loads`` of the same handful of multi-MB files (12 MB
 ``zenodo_manifest.json``, 5 MB ``director_state.json``, 4 MB
-``ne_umfeld_manifest.json`` / ``kg_list.json``) re-parsed on every
+``ne_manifest.json`` / ``kg_list.json``) re-parsed on every
 heartbeat request, every status render and per-KG inside loops.  All of
 those grow with fleet progress, so the primary's CPU crept up day by day.
 

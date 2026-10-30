@@ -50,7 +50,8 @@ MANIFEST = DATA_DIR / "zenodo_manifest.json"
 NE_JOURNAL = Path("data/ne/stale_removals.json")
 PRODUCT_SUFFIXES = ("json", "full_gpkg", "light_gpkg", "light_gpkg_v2", "json_v2", "ne_h3b")
 _KEY_RE = re.compile(r"^(\d{5}(?:-[a-z][-a-z0-9]*)?)_(" + "|".join(PRODUCT_SUFFIXES) + r")$")
-PRIMARY = "http://127.0.0.1:8000"
+import config as _config
+PRIMARY = _config.APP_URL
 
 
 def _live(e) -> bool:
@@ -137,12 +138,10 @@ def _running_parents() -> set:
 
 def _post(path: str, body: dict, admin: bool = True) -> dict:
     import requests
+    import config
     hdr = {}
-    if admin:
-        try:
-            hdr["X-Admin-Token"] = Path("data/admin_token").read_text().strip()
-        except Exception:  # noqa: BLE001
-            pass
+    if admin and config.operator_token():
+        hdr["X-Operator-Token"] = config.operator_token()
     r = requests.post(PRIMARY + path, json=body, headers=hdr, timeout=30)
     try:
         return {"status": r.status_code, **(r.json() if r.content else {})}

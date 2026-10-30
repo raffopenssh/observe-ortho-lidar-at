@@ -1,7 +1,4 @@
-"""llm_api — sibling-service contract for the Siedler Österreich game.
-
-Implements the surviving part of the AHEAD list at
-https://example.invalid:8000/llm/ahead (service=srtm).
+"""llm_api — small machine-readable helper endpoints (warm-up hint, sampled trees).
 
 Everything here answers from ``data/search_index.db`` (kg / kg_trees) —
 never from a KG JSON, never from a GPKG — so every call is a few ms and
@@ -14,11 +11,8 @@ Endpoints (CORS ``*``, ETag via app after_request):
   POST /api/v1/prewarm?kgs=  warm-up hint (ALL-4)
   /api/v1/trees/bbox         sampled tree apices (LID-2)
 
-Kataster purge (2026-10-13, docs/kataster-purge.md): the per-KG dossiers
-(``/llm/kg/<c>``, ``/llm/kgs``, ``/llm/manifest.json``, ``/llm.txt``) and
-``/api/v1/query/buildings`` were removed together with the parcel data;
-the public tier (``public_api.py`` / ``public_docs.py``) carries its own
-``llm.txt``.
+The public tier (``public_api.py`` / ``public_docs.py``) carries the
+``llm.txt`` documentation.
 """
 from __future__ import annotations
 
@@ -139,8 +133,7 @@ def prewarm():
         return jsonify({'error': 'kgs required (comma list, ≤50)'}), 400
     codes = codes[:50]
     idx = _idx()
-    # ``queued`` is always empty since the Kataster purge (no per-parcel
-    # slim backfill any more) — kept for client compatibility.
+    # ``queued`` is always empty (no backfill step) — kept for client compatibility.
     out = {'already_warm': [], 'queued': [], 'pending': [], 'not_processed': [], 'unknown': []}
     for code in codes:
         if not _code_ok(code):
@@ -148,8 +141,7 @@ def prewarm():
             continue
         st = _kg_state(code, idx)
         if st == 'indexed':
-            # Kataster purge (2026-10-13): no per-parcel slim backfill / footprint
-            # match any more — an indexed KG is warm by definition.
+            # an indexed KG is warm by definition.
             out['already_warm'].append(code)
         elif st == 'pending':
             out['pending'].append(code)
@@ -199,7 +191,7 @@ def trees_bbox():
         'trees': trees, 'count': len(trees), 'truncated': r['truncated'],
         'ready': not pending, 'kgs': r['kgs'], 'min_height': min_h,
         'limit': min(limit, 2000),
-        'source': 'index kg_trees: ≤5 tallest apices per cadastre parcel (sampled; '
+        'source': 'index kg_trees: sampled tallest apices (~0.1 ha sampling; '
                   'full apex set via POST /api/v3/trees)',
         'complete': False,
     }

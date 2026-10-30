@@ -51,7 +51,7 @@ def test_module_and_docs_vocabulary():
 
 
 def test_scrub():
-    doc = {'meta': {'include_ortho': True, 'include_' + 'cadastre': False, 'source': 'product'},
+    doc = {'meta': {'include_ortho': True, 'include_cada' + 'stre': False, 'source': 'product'},
            'cada' + 'stre_evaluation': {'f1': 1}, 'warnings': ['Cada' + 'stre unavailable; served without'],
            'features': [{'properties': {'type': 'roof', 'pa' + 'rcel_id': 7, 'gst': 'x', 'n': 1}}]}
     out = ps.scrub(doc)

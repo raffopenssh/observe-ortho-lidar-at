@@ -9,7 +9,7 @@ cells on S2-green ground (p90 72 %).
 
 Until the classifier is retrained the fix lives ONLY at the point where NEO1
 rows leave the primary: ``ne_h3.neo1_section_from_h3b`` (what is POSTed to
-umfeld-at) and ``cells_api._load_chunk`` (the public cells API).  **No .h3b
+the optional NE server) and ``cells_api._load_chunk`` (the public cells API).  **No .h3b
 file, Zenodo product or JSON is rewritten** — the rule is deterministic and
 idempotent, so it can be re-applied on every read and dropped in one place
 once products are right.

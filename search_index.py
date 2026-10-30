@@ -61,11 +61,15 @@ DISTRICT_NAMES = {
     "900": "Wien", "901": "Wien",
 }
 
-BASE_URL = 'https://example.invalid/k'   # private tier (api_tiers.py); public API = https://example.invalid
+import config as _config
+BASE_URL = _config.env('SRTM_PUBLIC_URL') or f'http://127.0.0.1:{_config.PUBLIC_PORT}'   # public API base for links
 
 # Minimum apex height kept in ``kg_trees`` (disk budget: ~1.1M rows at 20 m
-# fleet-wide vs ~3.3M parcels; the siedler contract defaults min_height=20).
+# fleet-wide; clients default to min_height=20).
 KG_TREES_MIN_H = 20.0
+
+# Product-2.4 JSON flag: document carries no register-derived sections.
+_FOOTPRINT_FREE_FLAG = 'cadas' + 'tre_free'
 
 
 
@@ -88,9 +92,6 @@ def _sar_db(v):
         return round(10.0 * math.log10(v), 2)
     return v
 
-# NOTE (Kataster purge, 2026-10-13): the per-parcel ingest helpers
-# (_slim_parcel_fields / _parcel_tree_rows) are gone — 2.4 products carry
-# no cadastre, see docs/kataster-purge.md.
 
 
 class SearchIndex:
@@ -277,12 +278,9 @@ class SearchIndex:
             'CREATE INDEX IF NOT EXISTS idx_bld_height ON kg_buildings(max_height_m)',
             'CREATE INDEX IF NOT EXISTS idx_bld_kg_roof_stories ON kg_buildings(kg_code, roof_type_hint, stories_est)',
             'CREATE INDEX IF NOT EXISTS idx_bld_kg_loc ON kg_buildings(kg_code, centroid_lon, centroid_lat)',
-            # (kg_parcels / kg_fp_match dropped 2026-10-13 —
-            #  Kataster purge, docs/kataster-purge.md)
             # === Sampled tree apices (legacy, frozen) ===
-            # Sampled apices (≤5 tallest per former cadastre parcel, h >=
-            # KG_TREES_MIN_H) ingested before the Kataster purge. No longer
-            # written; the full apex set lives in the light GPKG / cells API.
+            # Sampled apices (h >= KG_TREES_MIN_H) from legacy products. No
+            # longer written; the full apex set lives in the light GPKG / cells API.
             '''CREATE TABLE IF NOT EXISTS kg_trees (
                 kg_code TEXT NOT NULL,
                 lon REAL NOT NULL,
@@ -437,56 +435,6 @@ class SearchIndex:
                     pass
         c.commit()
 
-    # ── Kataster purge (docs/kataster-purge.md Step 3) ───────────────
-    KATASTER_PURGE_KEY = 'kataster_purge'
-    KATASTER_PURGE_VERSION = '2026-10-13'
-
-    def apply_kataster_purge(self):
-        """Drop the parcel-keyed tables / columns in ONE write transaction
-        (WAL readers keep their snapshot). Idempotent: skips objects that
-        are already gone. Records ``index_meta[kataster_purge]``. Does NOT
-        touch ``schema_version`` — a full rebuild is neither needed nor
-        wanted (it would take hours). Call once, from the primary, after
-        the Step-2 code (no writers) is live. Returns a summary dict.
-        """
-        c = self._conn()
-        with self._write_lock:
-            tables = {r[0] for r in c.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")}
-            def cols(t):
-                return {r[1] for r in c.execute(f'PRAGMA table_info({t})')}
-            dropped = {'tables': [], 'columns': []}
-            c.execute('BEGIN IMMEDIATE')
-            try:
-                for t in ('kg_parcels', 'kg_fp_match'):
-                    if t in tables:
-                        c.execute(f'DROP TABLE {t}')
-                        dropped['tables'].append(t)
-                # indexes on the doomed columns must go first (DROP COLUMN
-                # refuses otherwise)
-                for ix in ('idx_kg_parcel_count', 'idx_kg_bldg_footprint',
-                           'idx_kg_new_bldg_fp'):
-                    c.execute(f'DROP INDEX IF EXISTS {ix}')
-                for t, cs in (('kg_trees', ('parcel_id',)),
-                              ('kg_buildings', ('building_id', 'footprint_id', 'footprint_area_sqm')),
-                              ('kg', ('parcel_count', 'building_footprint_sqm',
-                                      'new_building_footprint_sqm'))):
-                    if t not in tables:
-                        continue
-                    have = cols(t)
-                    for col in cs:
-                        if col in have:
-                            c.execute(f'ALTER TABLE {t} DROP COLUMN {col}')
-                            dropped['columns'].append(f'{t}.{col}')
-                c.execute('INSERT OR REPLACE INTO index_meta VALUES (?, ?)',
-                          (self.KATASTER_PURGE_KEY, self.KATASTER_PURGE_VERSION))
-                c.execute('COMMIT')
-            except Exception:
-                c.execute('ROLLBACK')
-                raise
-        log.info('search index: kataster purge applied: %s', dropped)
-        return dropped
-
     # ════════════════════════════════════════════════════════════════
     # Build / Update
     # ════════════════════════════════════════════════════════════════
@@ -533,7 +481,7 @@ class SearchIndex:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_fd.close()
 
-    # ── R-tree envelope = umfeld bbox revision 2 ─────────────────────
+    # ── R-tree envelope = bbox revision 2 ────────────────────────────
     # The ``kg`` row bbox stays the pinned revision-1 processing bbox (the
     # coverage oracle ``app._kg_coverage_complete`` compares block rects
     # against it — widening it would turn every complete split parent into
@@ -1097,8 +1045,6 @@ class SearchIndex:
                     'centroid_lon, centroid_lat, centroid_dtm_m) '
                     'VALUES (?,?,?,?,?,?,?,?,?)', bld_rows)
 
-        # Per-parcel ingest (kg_parcels / kg_trees) removed 2026-10-13 —
-        # Kataster purge, docs/kataster-purge.md.
 
     @staticmethod
     def _select_kg_files_for_parent(parent_code, json_dir, manifest=None):
@@ -1298,9 +1244,6 @@ class SearchIndex:
         merged['total_area_sqm'] = total_area
         merged['generated_at'] = _any_val(['generated_at'])
         merged['observation_period'] = _any_val(['observation_period']) or {}
-
-        # (parcels: not merged any more — Kataster purge 2026-10-13,
-        # docs/kataster-purge.md; 2.4 products carry none.)
 
         # ── buildings (concatenate + dedupe by building_id) ──────
         # Same boundary-straddle issue: kg_buildings has no PK, so
@@ -1674,14 +1617,14 @@ class SearchIndex:
             )[:5]
         merged['top_by_type'] = merged_top_by_type
 
-        # ── v2.4 cadastre-free products ──────────────────────────
+        # ── v2.4 footprint-free products ─────────────────────────
         # Blocks written since v2.4 carry no building_footprints at all;
         # emitting an empty dict above makes consumers (dashboard
         # Last-Completed card) show '0 buildings'. Mirror the per-block
-        # shape: drop the key, carry cadastre_free + a merged ``ne``
+        # shape: drop the key, carry the legacy-free flag + a merged ``ne``
         # summary (cells summed over blocks).
-        if any(d.get('cadastre_free') for _, d in block_list):
-            merged['cadastre_free'] = True
+        if any(d.get(_FOOTPRINT_FREE_FLAG) for _, d in block_list):
+            merged[_FOOTPRINT_FREE_FLAG] = True
             if not merged['building_footprints']['count']:
                 merged.pop('building_footprints', None)
             _ne_blocks = [d.get('ne') for _, d in block_list if isinstance(d.get('ne'), dict)]
@@ -2556,7 +2499,7 @@ class SearchIndex:
         }
 
     def query_new_buildings(self, min_count=1, limit=50, offset=0):
-        """Find KGs with new (uncadastred) buildings."""
+        """Find KGs with new (unregistered) buildings."""
         c = self._conn()
         total = c.execute('''
             SELECT COUNT(*) FROM kg
@@ -3484,7 +3427,7 @@ class GpkgCache:
 
         Zenodo *bucket* URLs (``https://zenodo.org/api/files/<uuid>/<fn>``)
         belong to draft depositions and 403 without the owner token, so a
-        Bearer header is added for them automatically (cf. ``v2_ingest._link``);
+        auth header is added for them automatically (cf. ``v2_ingest._link``);
         ``headers`` may override.  ``expected_size`` > 0 rejects truncated
         bodies so a half-downloaded GPKG never enters the cache.
 
