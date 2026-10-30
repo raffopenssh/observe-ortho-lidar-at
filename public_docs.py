@@ -592,7 +592,7 @@ GET /api/v1/cells?lon=15.0857&amp;lat=47.0665&amp;k=1</pre>
 groups (<code>geb bau acker gruen wald wasser verkehr alpen sonst</code>), structure cover and count, LiDAR
 heights (mean / p90 / max), tree count, tallest tree and canopy share, NDVI mean + seasonal amplitude and a
 phenology class, height and ground change between ALS years, Hansen forest-loss year, terrain (elevation,
-slope, aspect, roughness, TRI, TPI) and a consistency verdict against the declared (statistical)
+slope, aspect, roughness, TRI, TPI) and a consistency verdict against the statistical
 land-use layer for the same cell. On top of that: every tree apex
 ≥ 3 m and every segmented structure with its LiDAR height, positioned inside the cell.
 Cell ids follow the shared NE cells contract (ne-cells-2), so an observed and a statistical layer
