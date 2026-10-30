@@ -46,6 +46,12 @@ except Exception as e:  # noqa: BLE001
     _cells = None
     log.warning('cells api unavailable: %s', e)
 try:
+    import stats_unit as _stats                  # /api/v1/stats/unit (stats-envelope/1)
+    app.register_blueprint(_stats.stats_bp)
+except Exception as e:  # noqa: BLE001
+    _stats = None
+    log.warning('stats unit api unavailable: %s', e)
+try:
     import public_flags as _flags                # /api/v1/flags* (docs/public-flags.md)
     app.register_blueprint(_flags.flags_bp)
 except Exception as e:  # noqa: BLE001

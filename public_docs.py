@@ -149,6 +149,38 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
 
 """
 
+STATS_TXT = """## Stats envelope — one flat JSON per spatial unit (shared with umfeld-at)          #stats
+  GET /api/v1/stats/unit?h3=<id> | kg=<code>[,<code>…≤50] | bbox=w,s,e,n   [&format=json|flat|csv] [&keys=a,b]
+  Schema "stats-envelope/1": the same envelope umfeld-at (/api/v1/ne/stats/unit, land-use + diff) and
+  farm-subsidies-austria emit, so a spreadsheet or an agent can zip the three by unit key without walking cells.
+  unit:   h3   res 5–12; the unit = every res-12 cell that is a descendant of the id (exact set, not bbox)
+          kg   5-digit code; several codes → one envelope per code in "units":[…] (unknown / unprocessed → 200,
+               coverage.complete=false, empty figures — never 404, spreadsheet rows stay intact)
+          bbox WGS84, span ≤ 0.1°; cells whose centre lies inside
+  body:   {{schema, service:"srtm-lidar-at", unit{{kind, key, bbox, res:12, cells_n, area_ha, kgs[]}}, source
+          ("srtm-lidar-at@2.4"), epoch ("2026-10"), coverage{{complete, cells_known, cells_total, note?}},
+          figures{{…flat…}}, attribution, license:"CC-BY-4.0", computed_at, age_s}}
+  figures (flat, dotted, scalar; unit in the suffix _ha _n _m _deg _pct _year):
+          cells_n, area_ha, cells_observed_n, trees_n, structures_n, structures.cover_pct,
+          cover_ha.<geb|bau|acker|gruen|wald|wasser|verkehr|alpen|sonst>          (shared with umfeld-at)
+          consistency_ha.<consistent|forest_loss|forest_gain|sealed_new|structure_new|green_new|unknown>,
+          consistency_n.<same>, terrain.elev_min_m / elev_max_m / elev_mean_m / slope_mean_deg,
+          height.mean_m / p90_mean_m / max_m, canopy.cover_pct, ndvi.mean, change.dh_mean_m, hansen_loss_ha,
+          als.newest_year / oldest_year / coverage_pct   (BEV flight year, chunk precision ≈ 300 m)
+          kg units: area_ha / cover_ha / consistency_ha are the product-header figures (border cells weighted
+          by the KG's share, identical to /kgs/summary); counts and means are over every cell of the product.
+          h3 / bbox units: whole cells, de-duplicated across KG products, ha = cells × cell area.
+  format=flat → figures only (array of flat objects with "unit" for several codes);
+  format=csv  → header row + one row per unit (text/csv UTF-8, no BOM; first columns unit, coverage_complete)
+          → Google Sheets =IMPORTDATA("{BASE}/api/v1/stats/unit?kg=63330&format=csv"), Excel Power Query.
+  keys=cover_ha,als → only those figure keys (prefix match).
+  Ops: ETag + Cache-Control max-age=600, CORS *, gzip; warm answers < 10 ms, first touch of a KG / res-7 cell
+  ~0.1–0.5 s; a cold res-5 cell (823 k cells) may answer 202 {{status:"computing", retry_after_s}} once —
+  retry after Retry-After, the result is then cached. Consistency counts apply the read-time green-ground
+  override (see cells), so consistency_n can differ by a few cells from the frozen product header.
+
+"""
+
 FLAGS_TXT = """## Flags — tell us when something we serve looks wrong                       #flags
 
 Tokenless, for every public layer: an NE cell whose observed cover group looks off (umfeld-at's glyph under
@@ -361,7 +393,7 @@ Umfeld; https://example.invalid/llm.txt §"KG universe"). Both serve the SAME 7 
   epoch; we bump this contract and tell umfeld-at first (and vice versa). Status also carries
   universe_agrees_contract (live index vs the pinned hash) so a drift is visible at once.
 
-{CELLS_TXT.replace("{{", "{").replace("}}", "}")}{FLAGS_TXT.replace("{{", "{").replace("}}", "}")}
+{CELLS_TXT.replace("{{", "{").replace("}}", "}")}{STATS_TXT.replace("{{", "{").replace("}}", "}")}{FLAGS_TXT.replace("{{", "{").replace("}}", "}")}
 ## Segmentation UI — the interactive map at /segmentation                                #segmentation
   https://example.invalid/segmentation — draw or upload an area (≤ 5 km²), run
   Segment / Elevation / Terrain, toggle the LiDAR / ortho / CIR / forest-change overlays, export

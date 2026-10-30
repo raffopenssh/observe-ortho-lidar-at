@@ -43,6 +43,13 @@ def test_bins_source_vocabulary():
     assert not hits, f'forbidden words in cells_bins.py: {hits}'
 
 
+def test_stats_unit_vocabulary():
+    hits = _hits((ROOT / 'stats_unit.py').read_text())
+    assert not hits, f'forbidden words in stats_unit.py: {hits}'
+    hits = _hits(public_docs.STATS_TXT)
+    assert not hits, f'forbidden words in public_docs.STATS_TXT: {hits}'
+
+
 def test_docs_vocabulary():
     hits = _hits(public_docs.CELLS_TXT)
     assert not hits, f'forbidden words in public_docs.CELLS_TXT: {hits}'
