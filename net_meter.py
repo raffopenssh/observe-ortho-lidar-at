@@ -11,7 +11,7 @@ Two probes, both cheap (a dict increment per request):
   path segments collapsed) with body-in / body-out byte counts.
 
 Counters are per-process; each gunicorn worker flushes its dict to
-``/tmp/net_meter/<pid>.json`` every ``FLUSH_INTERVAL`` seconds and
+``/tmp/net_meter-<uid>-<app port>/<pid>.json`` (``SRTM_NET_METER_DIR``) every ``FLUSH_INTERVAL`` seconds and
 ``snapshot()`` merges every file so ``/api/v1/net_stats`` shows the
 whole box regardless of which worker answers. Files are keyed by pid
 so a restart starts fresh (stale pids are dropped on read).
@@ -29,7 +29,18 @@ import threading
 import time
 from pathlib import Path
 
-METER_DIR = Path('/tmp/net_meter')
+def _meter_dir() -> Path:
+    # Scoped per user and deployment so two instances on one host (or a
+    # test tree next to a live one) never read each other's counters.
+    try:
+        import config
+        return Path(config.env('SRTM_NET_METER_DIR')
+                    or f'/tmp/net_meter-{os.getuid()}-{config.APP_PORT}')
+    except Exception:
+        return Path(f'/tmp/net_meter-{os.getuid()}')
+
+
+METER_DIR = _meter_dir()
 FLUSH_INTERVAL = 20.0
 _lock = threading.Lock()
 _out: dict[str, list] = {}   # key -> [n, req_bytes, resp_bytes]

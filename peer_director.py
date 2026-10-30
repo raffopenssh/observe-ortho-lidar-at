@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -73,6 +74,9 @@ def _peer_commit_contains(base: str, peer_commit: str) -> bool:
     Cached per (base, peer); ``git merge-base --is-ancestor BASE PEER``.
     False on any git error (peer commit unknown locally, etc.)."""
     if not peer_commit or not base or base == 'unknown':
+        return False
+    # peer-reported value → only a hex object name may reach the git argv
+    if not re.fullmatch(r'[0-9a-fA-F]{4,64}', str(peer_commit)):
         return False
     if peer_commit == base or peer_commit.startswith(base) or base.startswith(peer_commit):
         return True
@@ -2420,7 +2424,7 @@ def get_peer_log(peer_url: str | None, lines: int = 50) -> list[str]:
         if log_file.exists():
             try:
                 result = subprocess.run(
-                    ['tail', f'-{lines}', str(log_file)],
+                    ['tail', f'-{max(1, min(int(lines), 5000))}', str(log_file)],
                     capture_output=True, text=True, timeout=5
                 )
                 return result.stdout.splitlines()
@@ -8321,6 +8325,9 @@ class PeerDirector:
         state['_cache_reconcile_at']. Skipped while the circuit is
         degraded (the listing is exactly what's flaky then) unless
         forced. Emits a director_event when anything changed."""
+        if not config.uploads_enabled():
+            # Reconcile edits the deposit; nothing to do without a token.
+            return
         now = time.time()
         last = float(self.state.get('_cache_reconcile_at') or 0)
         if not force and now - last < CACHE_RECONCILE_INTERVAL_S:
