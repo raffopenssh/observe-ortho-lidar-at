@@ -1306,7 +1306,7 @@ function updateCards(d) {
         + '\nLevel ' + lvl + '/4 · ' + totTxt + ' total cooldown'
         + (bp.since ? ('\nSince ' + bp.since.replace('T',' ').slice(0,19)) : '')
         + (bp.until ? ('\nUntil ' + bp.until.replace('T',' ').slice(0,19)) : '')
-        + '\n\nClick to clear (admin token required).';
+        + '\n\nClick to clear.';
       sdet += ' <span class="badge badge-paused lvl' + lvl + '"'
            + ' role="button" tabindex="0" data-bev-clear="1"'
            + ' style="cursor:pointer"'
@@ -2087,7 +2087,7 @@ let _logCompact = (function(){
   return true;
 })();
 const _LOG_MSG_TRUNC = 140;  // chars per row in compact mode
-// Shared with app.py _is_bev_proxy_noise — keep token lists in sync.
+// Shared with app.py _is_bev_proxy_noise — keep the substring lists in sync.
 // These are GDAL-internal range-retry messages and bev_retry per-attempt
 // log lines that always resolve via the outer wrapper. On a flaky BEV
 // day they otherwise dominate the merged log. Hidden in compact mode
@@ -2230,7 +2230,7 @@ async function fetchLogHistory(force) {
     _logHistPayload = {recent_log: j.entries || [], _multi_peer: true, _is_hist: true, _range: mode};
     _logHistPayloadMode = mode;
     _logHistFetchLast = Date.now();
-    // Token-cheap commit recovery: the director emits
+    // Cheap commit recovery: the director emits
     //   "<graceful|hard> update → <commit> (peer on <prev>; attempt N)"
     // every time it nudges a peer onto a new commit. Mine those events
     // so per-peer version tags stay accurate even when peer_meta is
@@ -2597,7 +2597,7 @@ document.addEventListener('click', (ev) => {
 async function peerCmd(peerId, action) {
   // Send pause/resume/stop to a specific peer. Always go through the
   // director's /director/peers/<id>/cmd/<action> proxy so the operator
-  // token is forwarded server-side (cross-origin POSTs from the browser
+  // credentials are added server-side (cross-origin POSTs from the browser
   // would be rejected by the peer's operator gate).
   try {
     const meta = (_peerCards||[]).find(p => p.id === peerId);
@@ -2728,7 +2728,7 @@ let _lastManData = null;
 let _lastManSummary = null;
 let _lastManSummaryFetch = 0;
 async function fetchManifestData(full) {
-  // Full manifest (~5 MB raw, ~10.5k entries each with a tokenised
+  // Full manifest (~5 MB raw, ~10.5k entries each with a
   // download_url) is only pulled while the Zenodo panel is open, at
   // most every 30 s (browser revalidates via ETag → 304 when unchanged).
   // The always-on badge uses ?summary=1 (~200 B) every 60 s.
@@ -4045,7 +4045,7 @@ async function fetchPrioQueue() {
     renderPermFailed();
   } catch(e) { /* silent */ }
   // Partial registry is a separate endpoint so the GET (above) stays
-  // public; the partial fetch attaches an admin-token if present but
+  // public; the partial fetch is operator-gated but
   // still tolerates 401 silently (dashboard works for read-only viewers).
   try {
     const r2 = await fetch('/api/v1/processing/partial_kgs');

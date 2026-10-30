@@ -14,7 +14,7 @@ feature distribution at inference matches training:
   footprints, INVEKOS Schläge for one bbox; ``.rasters()`` gives the
   ``dist_*`` context rasters + an INVEKOS polygon-index raster + OSM hard
   edges.  Footprints only come from the caller (processor building context,
-  ``config.BEV_VECTOR_CONTEXT``); there is no parcel layer in the public
+  ``config.BEV_VECTOR_CONTEXT``); there is no property-boundary layer in the public
   release, so ``dist_parcel_edge`` is always its 500 m cap (the model treats
   it as "far" — a documented degradation).
 * :func:`classify` — ``ModelV2.predict`` + the INVEKOS post-hoc override

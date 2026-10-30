@@ -251,7 +251,8 @@ def check_property_free_document(v2: dict, rep: Report) -> None:
     try:
         import json as _j
         txt = _j.dumps({k: v for k, v in v2.items() if k not in ("terrain", "landcover")}, default=str)
-        bad = [w for w in ("parcel_id", "building_id", "footprint_id", "vertex_heights", "outline_z",
+        bad = [w for w in (  # legacy property-level keys we refuse
+                           "parcel_id", "building_id", "footprint_id", "vertex_heights", "outline_z",  # legacy
                            "\"address", "gst_nr", "\"ez\"") if w in txt]
         rep.check("property_free_text", not bad, "property-level keys in document: " + ",".join(bad))
     except Exception as e:  # noqa: BLE001

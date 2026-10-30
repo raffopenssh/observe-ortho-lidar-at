@@ -1,0 +1,21 @@
+{
+  "_comment": "Large model artefacts, fetched by tools/fetch_models.py. Zenodo record 22824068 (unpublished deposit; set ZENODO_TOKEN until it is published, or MODELS_BASE_URL for a mirror).",
+  "entries": {
+    "rf_model_v1": {
+      "path": "data/best_model/rf_model.joblib.xz",
+      "filename": "rf_model.joblib.xz",
+      "size": 103498632,
+      "md5": "0d5fb880c8399475391101c88d0807e0",
+      "zenodo_record": 22824068,
+      "bucket_url": "https://zenodo.org/api/files/4b5ecdd4-c1f9-455a-8f76-a48d6496622a"
+    },
+    "segv2_model_G": {
+      "path": "data/segv2/models/model_G.joblib",
+      "filename": "model_G.joblib",
+      "size": 36104198,
+      "md5": "c4131c11f28332c6c7407fda7c3f91c4",
+      "zenodo_record": 22824068,
+      "bucket_url": "https://zenodo.org/api/files/4b5ecdd4-c1f9-455a-8f76-a48d6496622a"
+    }
+  }
+}

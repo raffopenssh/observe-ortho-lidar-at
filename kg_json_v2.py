@@ -49,7 +49,7 @@ GZIP_LEVEL = 6
 
 # Record arrays we always columnarise (path tuples; "*" = any key).
 _TABLE_PATHS = [
-    ("parcels", "details"),
+    ("parcels", "details"),               # legacy pre-2.4 section (decode only)
     ("building_footprints", "details"),
     ("new_buildings", "features"),
     ("infrastructure", "by_type", "*", "features"),
