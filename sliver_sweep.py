@@ -7,7 +7,7 @@ the strip between the two envelopes were never observed (``unseen``, all
 nodata).  The NE server now serves ``bbox_new = old ∪ VGD envelope + pad``
 (``bbox_revision: 2``) and lists the per-KG ``slivers`` at
 ``GET /api/v1/kgs/bbox_changes?min_delta=``.  Everything here needs
-``config.UMFELD_URL``; without it ``refresh`` is a no-op.
+``config.NE_SERVER_URL``; without it ``refresh`` is a no-op.
 
 This module, instead of re-running whole KGs:
 
@@ -23,7 +23,7 @@ This module, instead of re-running whole KGs:
   parent is in, ``integrate`` merges them into the parent's file
   (``ne_ingest.merge_blocks`` — per cell the best-observed source wins, so
   interior cells are untouched) and refreshes the ingest index rows so
-  ``ne_ingest.confirm_umfeld`` re-POSTs the parent to the NE server ``/contrib``
+  ``ne_ingest.confirm_ne_server`` re-POSTs the parent to the NE server ``/contrib``
   (digest mismatch → fresh retry ladder).  KGs outside BEV coverage
   (border, no LiDAR) resolve as ``nodata`` — never a failure, never
   re-dispatched.
@@ -157,8 +157,8 @@ def refresh(force: bool = False) -> dict:
     bbox moved again (new revision) goes back to ``wait`` for a re-scan."""
     import requests
     import config as _config
-    if not _config.UMFELD_URL:
-        return {"disabled": "config.UMFELD_URL empty"}
+    if not _config.NE_SERVER_URL:
+        return {"disabled": "config.NE_SERVER_URL empty"}
     with _Locked() as st:
         age = time.time() - (st.get("fetched_ts") or 0)
         if not force and st["kgs"] and age < REFRESH_S:
@@ -167,7 +167,7 @@ def refresh(force: bool = False) -> dict:
         hdrs = {"Accept-Encoding": "gzip"}
         if st.get("etag") and not force:
             hdrs["If-None-Match"] = st["etag"]
-        r = requests.get(f"{_config.UMFELD_URL}/api/v1/kgs/bbox_changes", params={"min_delta": md},
+        r = requests.get(f"{_config.NE_SERVER_URL}/api/v1/kgs/bbox_changes", params={"min_delta": md},
                          headers=hdrs, timeout=120)
         st["fetched_ts"] = time.time(); st["fetched_at"] = _now()
         if r.status_code == 304:
@@ -309,7 +309,7 @@ LU_PER_TICK_DEFAULT = 3   # NE-server ``lu`` fetches per scan tick (~1.2 MB each
 
 def missing_outside(path: Path, lu_ids: np.ndarray, bbox_old: list) -> tuple[np.ndarray, np.ndarray, int]:
     """Like :func:`unseen_outside`, but against the NE server's frozen ``lu`` cell
-    set (``ne_h3.fetch_declared_umfeld(kg, layer="lu")``, which covers the
+    set (``ne_h3.fetch_declared_remote(kg, layer="lu")``, which covers the
     whole VGD polygon): a cell counts when it is in ``lu_ids`` and NOT
     observed in *path* — i.e. unseen there OR absent altogether.  Needed for
     parents whose declared layer was built by bevdirect on the OLD viewport:
@@ -436,7 +436,7 @@ def scan(max_n: int = SCAN_PER_TICK, entries: dict | None = None, idx: dict | No
                     # old viewport → strip cells are missing, not unseen:
                     # diff against the NE server's lu (whole VGD polygon) instead.
                     import ne_h3
-                    sec = ne_h3.fetch_declared_umfeld(code, layer="lu")
+                    sec = ne_h3.fetch_declared_remote(code, layer="lu")
                     out["lu_fetched"] += 1
                     k["lu_cells_n"] = int(sec.header.get("cells_n") or 0)
                     k["lu_bytes"] = int(len(sec.raw))
@@ -890,7 +890,7 @@ def integrate(idx: dict, entries: dict | None = None, max_n: int = INTEGRATE_PER
                 continue
             k.pop("integrate_error", None)
             digest = hdr["neo1"]["digest"]
-            # index rows (mirror ne_ingest.merge_dirty_parents) → confirm_umfeld sees a new digest
+            # index rows (mirror ne_ingest.merge_dirty_parents) → confirm_ne_server sees a new digest
             stp = idx["parents"].setdefault(code, {})
             stp.update(complete=complete, digest=digest, merged_at=_now(), dirty=False,
                        cells_n=hdr["cells_n"], nec1_source=(hdr.get("nec1") or {}).get("source"),
@@ -1034,7 +1034,7 @@ def status() -> dict:
     try:
         import ne_ingest
         idx = ne_ingest.load_index_ro()
-        um = idx.get("umfeld") or {}
+        um = idx.get("ne_server") or {}
         for code, k in kgs.items():
             if k.get("state") == "done" and k.get("integrated_digest") and (um.get(code) or {}).get("confirmed_at") \
                     and str(um[code]["confirmed_at"]) >= str(k.get("done_at") or ""):
@@ -1149,7 +1149,7 @@ def detail_lines(limit: int = 30) -> list[str]:
         idx = ne_ingest.load_index_ro()
     except Exception:
         idx = {}
-    um = idx.get("umfeld") or {}
+    um = idx.get("ne_server") or {}
     parents = idx.get("parents") or {}
     order = {"done": 0, "received": 1, "dispatched": 2, "pending": 3, "failed": 4}
     rows = [(c, k) for c, k in st["kgs"].items()

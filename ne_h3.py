@@ -3,12 +3,12 @@
 
 What lives here
 ---------------
-* Container I/O byte-compatible with umfeld-at's ``ne_cells/pack.py``
+* Container I/O byte-compatible with the NE server's ``ne_cells/pack.py``
   (``NEC1`` declared layer, ``NEO1`` observed layer; ``NET1``/``NEB1`` are ours only).
 * ``fetch_declared(kg)`` — build the declared layer locally from a
   bevdirect-serve tile assembly of the public BEV vector tiles with the
   pinned ``ne_cells`` package (``config.BEV_VECTOR_CONTEXT``, in RAM only),
-  or GET it from an optional NE server (``config.UMFELD_URL``).
+  or GET it from an optional NE server (``config.NE_SERVER_URL``).
 * ``build_observed(...)`` — NEO1 (29 B/cell), NET1 (4 B/tree), NEB1 (8 B/object)
   from the stitched 1 m ``segment_type`` / nDSM arrays, the segment objects and
   the v2.1 apex inventory.  Verdict per cell = declared vs observed.
@@ -17,7 +17,7 @@ What lives here
   NEB1 rows of that chunk, all sorted by cell id → concatenating the chunks
   reproduces every layer's digest).
 * ``post_observed(kg, neo1_section)`` — optional round-trip to the NE
-  server (``/obs``), only when ``config.UMFELD_URL`` is set.
+  server (``/obs``), only when ``config.NE_SERVER_URL`` is set.
 
 Nothing in this module writes property-level data anywhere.
 """
@@ -51,7 +51,7 @@ H3B_MAGIC = b"H3B1"
 ALGO_OBS = "obs-cells-1"
 ALGO_TREES = "obs-trees-1"
 ALGO_BLD = "obs-bld-1"
-ALGO_DECLARED = "ne-cells-2"          # the frozen umfeld algo we accept
+ALGO_DECLARED = "ne-cells-2"          # the frozen NE server algo we accept
 OBS_SOURCE = "srtm-lidar-at@2.4"
 OBS_SOURCE_FIXED = "srtm-lidar-at@2.4.1"   # NEO1 export with the green-ground override applied (ne_green_fix; epoch unchanged)
 H3_RES = 12
@@ -59,11 +59,11 @@ CHUNK_RES = 10
 
 GROUPS = ("geb", "bau", "acker", "gruen", "wald", "wasser", "verkehr", "alpen", "sonst")
 
-# umfeld layouts (pack.py) — verified sizes 30 / 29
+# NE server layouts (pack.py) — verified sizes 30 / 29
 LU_REC = struct.Struct("<QBBBB9sBHBBHBB")
 K_REC = struct.Struct("<QHIIIHBHH")
 # ours
-# NEO1 row, 40 B.  umfeld's spec text lists the first 14 fields after the id
+# NEO1 row, 40 B.  the NE server's spec text lists the first 14 fields after the id
 # (its "29 B" is a miscount: that is 30 B); the server only requires fixed-size
 # rows 9..64 B with the cell id first and passes them through, so we append the
 # terrain / change / phenology fields that used to live per parcel (v2.3
@@ -133,7 +133,7 @@ class NEError(Exception):
 
 
 class NENotBuilt(NEError):
-    """umfeld-at has not built the declared layer for this KG yet (404).
+    """the NE server has not built the declared layer for this KG yet (404).
     ``retry_after_s`` honours the server's Retry-After; ``status`` is one of
     queued / stalled / failed / not_in_index."""
 
@@ -142,7 +142,7 @@ class NENotBuilt(NEError):
         self.kg, self.status, self.retry_after_s, self.body = kg, status, retry_after_s, body or {}
 
 
-# === SECTION: container I/O (umfeld-compatible) ===
+# === SECTION: container I/O (NE server-compatible) ===
 
 def canonical_json(obj) -> bytes:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
@@ -225,7 +225,7 @@ def unpack_sections(buf: bytes) -> list[Section]:
 
 
 def h3_parent(cid: int, res: int) -> int:
-    """Pure-int H3 parent (h3 v4 bit layout) — identical to umfeld's pack.h3_parent."""
+    """Pure-int H3 parent (h3 v4 bit layout) — identical to the NE server's pack.h3_parent."""
     cur = (cid >> 52) & 0xF
     if res >= cur:
         return cid
@@ -250,40 +250,40 @@ def h3hex(cid: int) -> str:
     return format(int(cid), "x")
 
 
-# === SECTION: declared layer — umfeld-at or local bevdirect ===
+# === SECTION: declared layer — the NE server or local bevdirect ===
 
 def ne_source() -> str:
     """``bevdirect`` when ``config.BEV_VECTOR_CONTEXT`` is on (declared layer
-    computed locally, in RAM, from the public BEV vector tiles); ``umfeld``
+    computed locally, in RAM, from the public BEV vector tiles); ``NE server``
     otherwise (declared layer from the optional NE server at
-    ``config.UMFELD_URL`` — when that is empty too, no declared layer is
+    ``config.NE_SERVER_URL`` — when that is empty too, no declared layer is
     available and the product ships ``-partial`` without NE cells)."""
     import config
-    return "bevdirect" if config.BEV_VECTOR_CONTEXT else "umfeld"
+    return "bevdirect" if config.BEV_VECTOR_CONTEXT else "ne_server"
 
 
 def ne_server_enabled() -> bool:
     import config
-    return bool(config.UMFELD_URL)
+    return bool(config.NE_SERVER_URL)
 
 
-def _umfeld_base() -> str:
+def _ne_server_base() -> str:
     """Read tier of the optional NE server — ``/ne/manifest``, ``/ne/{kg}?layers=``."""
     import config
-    if not config.UMFELD_URL:
-        raise NEError("no NE server configured (UMFELD_URL empty)")
-    return config.UMFELD_URL + "/api/v1/ne"
+    if not config.NE_SERVER_URL:
+        raise NEError("no NE server configured (NE_SERVER_URL empty)")
+    return config.NE_SERVER_URL + "/api/v1/ne"
 
 
-def _umfeld_contrib_base() -> str:
+def _ne_server_contrib_base() -> str:
     """Write tier of the optional NE server (``/obs``)."""
     import config
-    if not config.UMFELD_URL:
-        raise NEError("no NE server configured (UMFELD_URL empty)")
-    return config.UMFELD_URL + "/contrib/api/v1/ne"
+    if not config.NE_SERVER_URL:
+        raise NEError("no NE server configured (NE_SERVER_URL empty)")
+    return config.NE_SERVER_URL + "/contrib/api/v1/ne"
 
 
-def _umfeld_headers(auth: bool = True) -> dict:
+def _ne_server_headers(auth: bool = True) -> dict:
     import http_pool
     return {"User-Agent": http_pool.USER_AGENT}
 
@@ -292,34 +292,34 @@ def fetch_manifest(timeout: float = 60.0, etag: str | None = None,
                    since: str | None = None) -> tuple[dict | None, str | None]:
     """GET /ne/manifest (gzip + ETag).  Returns (manifest or None on 304, etag).
 
-    With *since* (= ``generated_at`` of the previous answer) umfeld returns a
+    With *since* (= ``generated_at`` of the previous answer) NE server returns a
     DELTA — ``{delta:true, kgs:{only kgs with updated_at >= since}, built,
     kgs_total, obs_posted, generated_at, kgs_changed}`` (no queue/frozen);
     a cursor older than 7 d / in the future yields the full body with
     ``delta:false``.  Callers must merge/replace accordingly (see
     ``ne_rollout.refresh_ne_manifest``).  400 = unparseable cursor."""
     import requests
-    h = _umfeld_headers(auth=False)
+    h = _ne_server_headers(auth=False)
     h["Accept-Encoding"] = "gzip"
     if etag:
         h["If-None-Match"] = etag
     params = {"since": since} if since else None
-    r = requests.get(_umfeld_base() + "/manifest", params=params, headers=h, timeout=timeout)
+    r = requests.get(_ne_server_base() + "/manifest", params=params, headers=h, timeout=timeout)
     if r.status_code == 304:
         return None, etag
     r.raise_for_status()
     return r.json(), r.headers.get("ETag")
 
 
-def fetch_declared_umfeld(kg: str, timeout: float = 120.0, layer: str = "lu") -> Section:
+def fetch_declared_remote(kg: str, timeout: float = 120.0, layer: str = "lu") -> Section:
     """GET /ne/<kg>?layers=lu → verified NEC1 section.  404 → NENotBuilt."""
     import requests
     kg = str(kg).zfill(5)
-    url = f"{_umfeld_base()}/{kg}"
+    url = f"{_ne_server_base()}/{kg}"
     last = None
     for attempt in range(3):
         try:
-            r = requests.get(url, params={"layers": layer}, headers=_umfeld_headers(auth=False), timeout=timeout)
+            r = requests.get(url, params={"layers": layer}, headers=_ne_server_headers(auth=False), timeout=timeout)
         except Exception as e:  # noqa: BLE001
             last = e
             time.sleep(2 + 3 * attempt)
@@ -337,19 +337,19 @@ def fetch_declared_umfeld(kg: str, timeout: float = 120.0, layer: str = "lu") ->
                 ra = None
             raise NENotBuilt(kg, str(body.get("status") or "missing"), ra, body)
         if r.status_code in (429, 500, 502, 503, 504):
-            last = NEError(f"umfeld /ne/{kg}: HTTP {r.status_code}")
+            last = NEError(f"NE server /ne/{kg}: HTTP {r.status_code}")
             time.sleep(5 + 10 * attempt)
             continue
         if r.status_code in (401, 403):
-            raise NEError(f"umfeld /ne/{kg}: HTTP {r.status_code} — refused")
+            raise NEError(f"NE server /ne/{kg}: HTTP {r.status_code} — refused")
         r.raise_for_status()
         secs = [s for s in unpack_sections(r.content) if s.magic == MAGIC_LU]
         if not secs:
-            raise NEError(f"umfeld /ne/{kg}: no NEC1 section in answer")
+            raise NEError(f"NE server /ne/{kg}: no NEC1 section in answer")
         sec = secs[0]
         _check_declared_header(sec, kg)
         return sec
-    raise NEError(f"umfeld /ne/{kg}: {last}")
+    raise NEError(f"NE server /ne/{kg}: {last}")
 
 
 def _check_declared_header(sec: Section, kg: str) -> None:
@@ -390,17 +390,17 @@ def _check_declared_header(sec: Section, kg: str) -> None:
 # ``frozen.bev_equivalent_tags`` and compared against the v0.2.0 baseline.
 # Pieces now carry ``complete`` and merged footprints ``members`` (ne_cells
 # canon ignores both).  Any aligned-cell digest change on upgrade = upstream
-# regression → report to umfeld.
+# regression → report to NE server.
 # v0.3.3 (2026-10-08): empty layers are ``[]`` instead of ``null`` (the
 # frozen ne_cells canon crashed on ``null`` footprints); nothing changes for
-# the cells, v0.3.3 stays in the comparable tag class.  Requested by umfeld
+# the cells, v0.3.3 stays in the comparable tag class.  Requested by NE server
 # together with the aligned-cell ``input_bbox`` rule (vct_pilot.run).
 # v0.3.5 (2026-10-23): BEV TLS outage fix — kataster.bev.gv.at stopped sending
 # the GEANT TLS RSA 1 intermediate (~13:00Z); every tile fetch failed with
 # "x509: certificate signed by unknown authority", /viewport 502/pending,
 # zero NE builds.  v0.3.5 ships the intermediate + AIA fallback (extras via
 # -ca-bundle / BEVDIRECT_CA_BUNDLE).  No data/assembly change, same
-# equivalence class at umfeld.  /health gains ``upstream`` {state ∈
+# equivalence class at NE server.  /health gains ``upstream`` {state ∈
 # unknown|ok|degraded|down, tls_errors, http_5xx, last_error}; 502 and
 # pending bodies carry the same object (vct_pilot._viewport honours it).
 # Never work around with InsecureSkipVerify / curl -k.
@@ -412,7 +412,7 @@ def _check_declared_header(sec: Section, kg: str) -> None:
 # cell+pad — border rows differed per KG / observer.  Now
 # ``floor(lon/0.02 + 1e-9)``.  Documents + ne_cells digests of affected
 # cells change ONCE (legitimate, not land-use change); all other cells are
-# byte-identical.  umfeld lists v0.3.6 in ``bev_equivalent_tags`` → same
+# byte-identical.  NE server lists v0.3.6 in ``bev_equivalent_tags`` → same
 # source class, no re-baseline: boundary chunks flip on our first v0.3.6
 # pass (candidate), the second pass confirms.
 BEVDIRECT_TAG = os.environ.get("BEVDIRECT_TAG", "v0.3.6")
@@ -439,11 +439,11 @@ BEVDIRECT_RELEASE_SHA256 = {
     ("v0.3.6", "amd64"): "d564589300332540630b9bcb192eea2de409e40d35eacdc63d60fcf3c2ab5f2e",
     ("v0.3.6", "arm64"): "b9ad0fe7cfa099a07999dfd1711bf0519d2ab935b38a7641ea10d07736ca564f",
 }
-# umfeld's pinned ``ne_cells`` package ships in the PUBLIC vtcseamless-py repo
+# the NE server's pinned ``ne_cells`` package ships in the PUBLIC vtcseamless-py repo
 # (pip project ``vtcseamless``, modules ``vtcseamless`` + ``ne_cells``).  It
 # used to be pulled from cadastre-process-api, which is private — peers
 # could never clone it, so the first pilot election stalled at 1/49 ready
-# (Oct 2026).  algo/pack/canon/ns_groups are byte-identical to umfeld's.
+# (Oct 2026).  algo/pack/canon/ns_groups are byte-identical to the NE server's.
 NE_CELLS_REPO = "https://github.com/raffopenssh/vtcseamless-py.git"
 NE_CELLS_MIN_VERSION = "2.1.0"     # first vtcseamless-py release of the package
 VTCSEAMLESS_MIN_VERSION = "0.3.2"  # client dist: pins bevdirect@v0.3.6 + cells_for epsilon (0.3.1: /health.upstream contract; 0.3.0: QC provenance)
@@ -812,7 +812,7 @@ def _stop_bevdirect_server(timeout_s: float = 15.0) -> bool:
 
 # BEV regenerates the Katastralmappe vector tiles nightly at ~00:54Z.  A
 # build whose tiles straddle that moment mixes two tile epochs (at210's
-# 73008 one-column deviation, umfeld 2026-10-08), so: no fetch inside the
+# 73008 one-column deviation, NE server 2026-10-08), so: no fetch inside the
 # regeneration window, and the server's RAM tile/cell cache is dropped
 # (restart) after every regeneration — a build can then only ever see one
 # epoch.  ``vct_pilot.run`` additionally re-fetches a build that crossed
@@ -919,9 +919,9 @@ def _ensure_bevdirect_server() -> None:
     raise NEError("bevdirect-serve did not come up")
 
 
-# Static floor of bev-equivalent tags (mirrors umfeld ``frozen.bev_equivalent_tags``
+# Static floor of bev-equivalent tags (mirrors NE server ``frozen.bev_equivalent_tags``
 # as of 2026-10-23).  ``bev_sources_ok()`` extends it with the current binary pin
-# and whatever the cached umfeld manifest lists, so a ``BEVDIRECT_TAG`` bump can
+# and whatever the cached NE server manifest lists, so a ``BEVDIRECT_TAG`` bump can
 # never again reject every local build fleet-wide (v0.3.5 incident, 2026-10-23).
 BEV_SOURCES_OK = frozenset({"bevdirect@v0.2.0", "bevdirect@v0.2.1", "bevdirect@v0.3.0", "bevdirect@v0.3.1",
                             "bevdirect@v0.3.2", "bevdirect@v0.3.3", "bevdirect@v0.3.4", "bevdirect@v0.3.5",
@@ -930,7 +930,7 @@ BEV_SOURCES_OK = frozenset({"bevdirect@v0.2.0", "bevdirect@v0.2.1", "bevdirect@v
 
 def bev_sources_ok() -> frozenset:
     """Accepted NEC1 ``source`` tags: static floor ∪ ``bevdirect@<pin>`` ∪
-    umfeld's ``frozen.bev_equivalent_tags`` from the on-disk manifest cache
+    the NE server's ``frozen.bev_equivalent_tags`` from the on-disk manifest cache
     (``ne_rollout.NE_MANIFEST_CACHE``; no network call)."""
     tags = set(BEV_SOURCES_OK)
     tags.add(f"bevdirect@{BEVDIRECT_TAG}")
@@ -948,7 +948,7 @@ def bev_sources_ok() -> frozenset:
 
 def is_bev_declared(h) -> bool:
     """True when a NEC1 header / Section / h3b ``nec1`` dict is a bevdirect
-    (local) build rather than umfeld's frozen ``index-2026-03`` layer."""
+    (local) build rather than the NE server's frozen ``index-2026-03`` layer."""
     if isinstance(h, Section):
         h = h.header
     return str((h or {}).get("source") or "").startswith("bevdirect@")
@@ -961,10 +961,10 @@ def nec1_bytes(sec: Section) -> bytes:
 def build_declared_bevdirect(kg: str, bbox_wgs: tuple, is_block: bool = False) -> Section:
     """Compute the declared layer locally from the public BEV vector tiles:
     the VTC pilot run (``vct_pilot.build_declared`` — one ``/viewport`` per
-    parent, cells aggregated in memory with umfeld's pinned ``ne_cells``,
-    digests reported to umfeld-at ``/contrib``) writes the NEC1 section
+    parent, cells aggregated in memory with the NE server's pinned ``ne_cells``,
+    digests reported to the NE server ``/contrib``) writes the NEC1 section
     (statistics only) and we validate it here.  Source must be one of the
-    bev-equivalent tags umfeld's ``/obs`` accepts (``BEV_SOURCES_OK``)."""
+    bev-equivalent tags the NE server's ``/obs`` accepts (``BEV_SOURCES_OK``)."""
     import vct_pilot
     kg = str(kg).zfill(5)
     blob = vct_pilot.build_declared(kg, bbox_wgs, is_block=is_block)
@@ -976,7 +976,7 @@ def build_declared_bevdirect(kg: str, bbox_wgs: tuple, is_block: bool = False) -
     src = str(sec.header.get("source") or "")
     ok = bev_sources_ok()
     if src not in ok:
-        raise NEError(f"NEC1 source {src!r} is not a bev-equivalent tag umfeld accepts ({sorted(ok)})")
+        raise NEError(f"NEC1 source {src!r} is not a bev-equivalent tag NE server accepts ({sorted(ok)})")
     if src != f"bevdirect@{BEVDIRECT_TAG}":
         log.warning("ne_h3: declared layer %s built with %s (binary pin is %s)", kg, src, BEVDIRECT_TAG)
     if sec.header.get("algo") != "ne-cells-2":
@@ -1000,7 +1000,7 @@ def fetch_declared(kg: str, bbox_wgs: tuple | None = None, code: str | None = No
     tiles (``build_declared_bevdirect``; split blocks too — every block
     fetches the parent's viewport grid, the build is deterministic across
     hosts).  On failure, or when the flag is off, the optional NE server
-    (``config.UMFELD_URL``) is asked; with neither configured
+    (``config.NE_SERVER_URL``) is asked; with neither configured
     ``NENotBuilt`` is raised and the product ships without NE cells
     (``-partial`` label).
     """
@@ -1018,8 +1018,8 @@ def fetch_declared(kg: str, bbox_wgs: tuple | None = None, code: str | None = No
             if not ne_server_enabled():
                 raise
     if not ne_server_enabled():
-        raise NENotBuilt(str(kg).zfill(5), "no declared-layer source configured (BEV_VECTOR_CONTEXT off, UMFELD_URL empty)", None, {})
-    return fetch_declared_umfeld(kg)
+        raise NENotBuilt(str(kg).zfill(5), "no declared-layer source configured (BEV_VECTOR_CONTEXT off, NE_SERVER_URL empty)", None, {})
+    return fetch_declared_remote(kg)
 
 
 OBS_BODY_CAP = 32 * 1024 * 1024
@@ -1028,30 +1028,30 @@ OBS_BODY_CAP = 32 * 1024 * 1024
 def post_observed(kg: str, neo1_section: bytes, timeout: float = 120.0,
                   nec1_section: bytes | None = None) -> dict:
     """POST the observed layer to the optional NE server ``/obs``
-    (``config.UMFELD_URL``; ``NEError`` when none is configured).  Returns
+    (``config.NE_SERVER_URL``; ``NEError`` when none is configured).  Returns
     the server's JSON (``unchanged`` / ``replaced`` …).
 
-    * bare NEO1 (``nec1_section=None``): the cell set must equal umfeld's
+    * bare NEO1 (``nec1_section=None``): the cell set must equal the NE server's
       frozen ``lu``; 409 on mismatch → NEError.
     * NEC1 + NEO1 (``nec1_section`` = our bevdirect build, since 2026-10-06):
       validated against THAT NEC1 (409 only when the two disagree = a local
-      bug); umfeld stores the NEC1 as the KG's ``bev`` section and answers
+      bug); NE server stores the NEC1 as the KG's ``bev`` section and answers
       ``declared_layer:"bev"``, ``bev{digest,cells_n,source}`` and, if its
       ``lu`` exists, ``lu_diff{lu_cells_n,bev_cells_n,missing_n,extra_n}``
       (border-cell drift, informational).  400 = bad NEC1 header/source.
     """
     import requests
     kg = str(kg).zfill(5)
-    h = _umfeld_headers()
+    h = _ne_server_headers()
     h["Content-Type"] = "application/vnd.ne-cells"
     body = (nec1_section + neo1_section) if nec1_section else neo1_section
     if len(body) > OBS_BODY_CAP:
-        # umfeld's /obs cap (16 MB until 2026-10-27, 32 MB since — raised for
+        # the NE server's /obs cap (16 MB until 2026-10-27, 32 MB since — raised for
         # 80110 Sölden, 1.55 M cells = 17.5 MB NEO1 / 21.5 MB NEC1+NEO1)
-        raise NEError(f"umfeld /ne/{kg}/obs body {len(body)} B > {OBS_BODY_CAP // (1024 * 1024)} MB (over-cap)")
-    r = requests.post(f"{_umfeld_contrib_base()}/{kg}/obs", data=body, headers=h, timeout=timeout)
+        raise NEError(f"NE server /ne/{kg}/obs body {len(body)} B > {OBS_BODY_CAP // (1024 * 1024)} MB (over-cap)")
+    r = requests.post(f"{_ne_server_contrib_base()}/{kg}/obs", data=body, headers=h, timeout=timeout)
     if r.status_code in (400, 409):
-        raise NEError(f"umfeld /ne/{kg}/obs {r.status_code}{' (NEC1+NEO1)' if nec1_section else ''}: {r.text[:700]}")
+        raise NEError(f"NE server /ne/{kg}/obs {r.status_code}{' (NEC1+NEO1)' if nec1_section else ''}: {r.text[:700]}")
     r.raise_for_status()
     try:
         out = r.json()
@@ -1850,7 +1850,7 @@ def neo1_section_from_h3b(path: str | Path, green_fix: bool = True) -> bytes:
              declared_source=hdr["nec1"].get("source"))
     if green_fix:
         import ne_green_fix as _gf
-        h["source"] = OBS_SOURCE_FIXED      # umfeld's manifest shows which KGs carry the corrected export
+        h["source"] = OBS_SOURCE_FIXED      # the NE server's manifest shows which KGs carry the corrected export
         h.update(_gf.header_note(n_fix, hdr["cells_n"]))
     als = _als_header_for(hdr, obs)
     if als:
@@ -1879,10 +1879,10 @@ def _als_header_for(hdr: dict, obs: bytes) -> dict | None:
         return None
 
 
-# === SECTION: declared view (umfeld chunk-log view, 2026-10-27) ===
+# === SECTION: declared view (NE server chunk-log view, 2026-10-27) ===
 
 def fetch_declared_view(kg: str, timeout: float = 120.0) -> "Section | None":
-    """``GET /contrib/api/v1/ne/{kg}/declared`` → the NEC1 section umfeld
+    """``GET /contrib/api/v1/ne/{kg}/declared`` → the NEC1 section NE server
     assembles from its chunk log (``source: chunks@<state>``, header
     ``view{state,hidden,…}``, register bytes zero).  This is the cell set a
     bare NEO1 is validated against since 2026-10-27 (ne-change.md §4b).
@@ -1890,11 +1890,11 @@ def fetch_declared_view(kg: str, timeout: float = 120.0) -> "Section | None":
     on disk — call it only right before a POST."""
     import requests
     kg = str(kg).zfill(5)
-    url = f"{_umfeld_contrib_base()}/{kg}/declared"
+    url = f"{_ne_server_contrib_base()}/{kg}/declared"
     last = None
     for attempt in range(3):
         try:
-            r = requests.get(url, headers=_umfeld_headers(), timeout=timeout)
+            r = requests.get(url, headers=_ne_server_headers(), timeout=timeout)
         except Exception as e:  # noqa: BLE001
             last = e
             time.sleep(2 + 3 * attempt)
@@ -1902,19 +1902,19 @@ def fetch_declared_view(kg: str, timeout: float = 120.0) -> "Section | None":
         if r.status_code == 404:
             return None
         if r.status_code in (429, 500, 502, 503, 504):
-            last = NEError(f"umfeld {kg}/declared: HTTP {r.status_code}")
+            last = NEError(f"NE server {kg}/declared: HTTP {r.status_code}")
             time.sleep(5 + 10 * attempt)
             continue
         if r.status_code in (401, 403):
-            raise NEError(f"umfeld {kg}/declared: HTTP {r.status_code} — token refused")
+            raise NEError(f"NE server {kg}/declared: HTTP {r.status_code} — token refused")
         r.raise_for_status()
         secs = [s for s in unpack_sections(r.content) if s.magic == MAGIC_LU]
         if not secs:
-            raise NEError(f"umfeld {kg}/declared: no NEC1 section in answer")
+            raise NEError(f"NE server {kg}/declared: no NEC1 section in answer")
         sec = secs[0]
         sec.header.setdefault("_etag", r.headers.get("ETag"))
         return sec
-    raise NEError(f"umfeld {kg}/declared: {last}")
+    raise NEError(f"NE server {kg}/declared: {last}")
 
 
 def unseen_obs_row(cid: int) -> bytes:

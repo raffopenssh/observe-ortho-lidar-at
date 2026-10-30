@@ -118,7 +118,7 @@ def self_id() -> str:
 
 # --- Optional upstream services (all disabled when empty) -------------------
 POWER_API_URL = _url("POWER_API_URL")          # power-infrastructure lookup service
-UMFELD_URL = _url("UMFELD_URL")                # NE declared-layer / contrib endpoint
+NE_SERVER_URL = _url("NE_SERVER_URL")                # NE declared-layer / contrib endpoint
 INVEKOS_API_URL = _url("INVEKOS_API_URL")      # agricultural-use labels for segv2 training
 ZENODO_LOCK_URL = _url("ZENODO_LOCK_URL")      # external Zenodo write mutex; empty ⇒ local lock
 
@@ -210,7 +210,7 @@ def describe() -> dict:
         "primary_url": bool(PRIMARY_URL),
         "uploads_enabled": uploads_enabled(),
         "power_api": bool(POWER_API_URL),
-        "umfeld": bool(UMFELD_URL),
+        "ne_server": bool(NE_SERVER_URL),
         "bev_vector_context": BEV_VECTOR_CONTEXT,
         "data_dir": str(DATA_DIR),
     }

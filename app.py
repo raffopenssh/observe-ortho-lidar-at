@@ -1515,17 +1515,17 @@ def _sync_peer_data():
                         continue
 
                     # Construct download URL – prefer explicit link, then draft API, then bucket
-                    from zenodo_client import DEFAULT_TOKEN
+                    from zenodo_client import auth_headers as _zc_auth
                     link = entry.get('link', '')
                     if not link and entry.get('depo_id') and entry.get('filename'):
-                        link = f"https://zenodo.org/api/records/{entry['depo_id']}/draft/files/{entry['filename']}/content?access_token={DEFAULT_TOKEN}"
+                        link = f"https://zenodo.org/api/records/{entry['depo_id']}/draft/files/{entry['filename']}/content"
                     if not link and entry.get('bucket_url') and entry.get('filename'):
                         link = f"{entry['bucket_url']}/{entry['filename']}"
                     if not link:
                         continue
 
                     try:
-                        jr = req.get(link, timeout=120, stream=True)
+                        jr = req.get(link, timeout=120, stream=True, headers=_zc_auth())
                         jr.raise_for_status()
                         # Atomic write: temp file then rename
                         tmp_path = local_path.with_suffix('.tmp')
@@ -6328,7 +6328,6 @@ def processing_manifest():
     if not manifest_path.exists():
         return jsonify({'entries': {}, 'count': 0})
     try:
-        from zenodo_client import DEFAULT_TOKEN
         data = json.loads(manifest_path.read_text())
         entries = data.get('entries', {})
         # ``?summary=1``: header-only view for the dashboard's Zenodo
@@ -6352,7 +6351,9 @@ def processing_manifest():
             depo_id = e.get('depo_id')
             fn = e.get('filename')
             if depo_id and fn:
-                e['download_url'] = f'https://zenodo.org/api/records/{depo_id}/draft/files/{fn}/content?access_token={DEFAULT_TOKEN}'
+                # Draft files need the owner's Zenodo credentials (sent as a header by
+                # the fetchers); the dashboard link works once the record is published.
+                e['download_url'] = f'https://zenodo.org/api/records/{depo_id}/draft/files/{fn}/content'
         return jsonify({
             'count': len(entries),
             'entries': entries,
@@ -9085,7 +9086,7 @@ def admin_backfill_jsons_from_manifest():
       * dry_run       : don't download, just return the list
     """
     import requests as _req
-    from zenodo_client import DEFAULT_TOKEN
+    import zenodo_client as _zc
     body = request.get_json(silent=True) or {}
     limit = int(body.get('limit') or 200)
     explicit = set(body.get('codes') or [])
@@ -9133,8 +9134,7 @@ def admin_backfill_jsons_from_manifest():
         link = entry.get('link', '')
         if not link and entry.get('depo_id') and entry.get('filename'):
             link = (f"https://zenodo.org/api/records/{entry['depo_id']}"
-                    f"/draft/files/{entry['filename']}/content?"
-                    f"access_token={DEFAULT_TOKEN}")
+                    f"/draft/files/{entry['filename']}/content")
         if not link and entry.get('bucket_url') and entry.get('filename'):
             link = f"{entry['bucket_url']}/{entry['filename']}"
         if not link:
@@ -9143,7 +9143,7 @@ def admin_backfill_jsons_from_manifest():
         target = json_dir / f'{code}.json'
         tmp = target.with_suffix('.tmp')
         try:
-            with _req.get(link, timeout=120, stream=True) as r:
+            with _req.get(link, timeout=120, stream=True, headers=_zc.auth_headers()) as r:
                 r.raise_for_status()
                 with open(tmp, 'wb') as f:
                     for chunk in r.iter_content(65536):

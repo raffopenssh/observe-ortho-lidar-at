@@ -1498,10 +1498,10 @@ def transform_to_wgs(geom):
 
 # === SECTION: KG list (fetch + cache all 7850 KGs — see kg_universe.py) ===
 
-#: Optional KG universe refresh endpoint (``config.UMFELD_URL`` + /api/v1/kgs,
+#: Optional KG universe refresh endpoint (``config.NE_SERVER_URL`` + /api/v1/kgs,
 #: one ~520 KB gz response for all 7850 KGs, ETag == universe_hash).  Empty
 #: → the shipped ``data/austria_processor/kg_list.json`` is the universe.
-KG_UNIVERSE_URL = (f"{_config.UMFELD_URL}/api/v1/kgs" if _config.UMFELD_URL else "")
+KG_UNIVERSE_URL = (f"{_config.NE_SERVER_URL}/api/v1/kgs" if _config.NE_SERVER_URL else "")
 KG_LIST_ETAG_FILE = KG_LIST_FILE.with_suffix('.etag')
 KG_LIST_REFRESH_S = 24 * 3600   # local cache lifetime before a conditional GET
 KG_LIST_MIN_REFETCH_S = 3600    # never refetch more often than hourly
@@ -1582,7 +1582,7 @@ def _fetch_kg_universe(etag: str | None):
     import kg_universe
     import http_pool
     if not KG_UNIVERSE_URL:
-        raise RuntimeError("no KG universe endpoint configured (UMFELD_URL empty)")
+        raise RuntimeError("no KG universe endpoint configured (NE_SERVER_URL empty)")
     hdrs = {'Accept': 'application/json', 'Accept-Encoding': 'gzip',
             'User-Agent': http_pool.USER_AGENT}
     if etag:
@@ -1615,7 +1615,7 @@ def _fetch_kg_universe(etag: str | None):
 def get_all_kgs(state_filter: str = None) -> list[dict]:
     """All 7850 KGs (kg_list.json shape).  The shipped
     ``data/austria_processor/kg_list.json`` is the universe; with
-    ``config.UMFELD_URL`` set it is refreshed by a single conditional GET
+    ``config.NE_SERVER_URL`` set it is refreshed by a single conditional GET
     of :data:`KG_UNIVERSE_URL` (``If-None-Match`` once we hold an ETag),
     at most hourly and only when the cache is older than :data:`KG_LIST_REFRESH_S`.
     The response must satisfy the shared universe contract

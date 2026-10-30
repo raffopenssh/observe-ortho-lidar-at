@@ -22,7 +22,7 @@ The original training stack also painted BEV land-use (NS code) polygons
 and were removed; the ``SOURCES`` ids are kept so existing training
 artefacts still decode.  Building footprints are only used when the caller
 passes them (``LabelContext(footprints=...)``, in RAM, from the optional
-``config.BEV_VECTOR_CONTEXT`` path); OSM geometry needs ``config.UMFELD_URL``
+``config.BEV_VECTOR_CONTEXT`` path); OSM geometry needs ``config.NE_SERVER_URL``
 and INVEKOS needs ``config.INVEKOS_API_URL`` or the local GPKG
 (``data/invekos/INSPIRE_SCHLAEGE_2024-1_POLYGON.gpkg``, EPSG:31287).  With
 none configured the label raster is empty and the ``dist_*`` context
@@ -51,10 +51,10 @@ if str(ROOT) not in _sys.path:
 import config as _config  # noqa: E402
 import http_pool as _http_pool  # noqa: E402
 
-# OSM geometry service: umfeld's public, key-less ``GET /api/v1/osm/geometry
+# OSM geometry service: the NE server's public, key-less ``GET /api/v1/osm/geometry
 # ?bbox=W,S,E,N&cat=road,rail,water,water_area&limit=`` (ODbL, see
 # ``/api/v1/docs/llm.txt`` on that host); '' = no OSM context
-OSM_GEOMETRY_URL = f"{_config.UMFELD_URL}/api/v1/osm/geometry" if _config.UMFELD_URL else ""
+OSM_GEOMETRY_URL = f"{_config.NE_SERVER_URL}/api/v1/osm/geometry" if _config.NE_SERVER_URL else ""
 INVEKOS_GPKG = ROOT / "data/invekos/INSPIRE_SCHLAEGE_2024-1_POLYGON.gpkg"
 # INVEKOS Schläge API (years 2022-2026, EPSG:3035, ``nearest_to=<flight year>``
 # picks the release closest to the LiDAR flight); '' = disabled.  Spec:
@@ -230,7 +230,7 @@ def fetch_osm(bbox_wgs: tuple[float, float, float, float], strict: bool = False)
     w, s, e, n = bbox_wgs
     out = {"road": [], "rail": [], "water_line": [], "water_area": []}
     if not OSM_GEOMETRY_URL:
-        # no OSM geometry service configured (config.UMFELD_URL empty): empty
+        # no OSM geometry service configured (config.NE_SERVER_URL empty): empty
         # context, never an upstream error — strict callers would otherwise
         # defer every KG forever
         return out
