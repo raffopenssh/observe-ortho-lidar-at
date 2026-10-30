@@ -120,6 +120,10 @@ def _not_found():
 @app.after_request
 def _common_headers(resp):
     p = request.path or ''
+    # header value hygiene: never emit a literal None/null/empty on any X-* header
+    # (umfeld-at hashes X-Cells-Epoch into its bin state; str(None) churned it)
+    for k in [k for k, v in resp.headers.items() if k.startswith('X-') and (v or '').strip().lower() in ('', 'none', 'null')]:
+        del resp.headers[k]
     if not p.startswith(tiers.PRIVATE_PREFIX):
         resp.headers['Access-Control-Allow-Origin'] = '*'
         resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, If-None-Match, Authorization'

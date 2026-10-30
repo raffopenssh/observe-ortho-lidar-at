@@ -420,6 +420,26 @@ def _epoch_pin() -> str | None:
     return eps[-1] if eps else None
 
 
+def epoch_hdr(v=None) -> str | None:
+    """Value for ``X-Cells-Epoch``: the product epoch *v* when it is a real
+    string, else the corpus-wide pin (newest epoch on disk), else None — the
+    caller must then omit the header.  Never ``str(None)``: umfeld-at hashes
+    this header into its bin state and a literal ``None`` forced rebuilds."""
+    if isinstance(v, str) and v.strip() and v.strip().lower() not in ('none', 'null'):
+        return v.strip()
+    return _epoch_pin() or None
+
+
+def _with_epoch(headers: dict | None, v=None) -> dict:
+    h = dict(headers or {})
+    e = epoch_hdr(v)
+    if e:
+        h['X-Cells-Epoch'] = e
+    else:
+        h.pop('X-Cells-Epoch', None)
+    return h
+
+
 def _kgs_intersecting(w, s, e, n) -> list[str]:
     c = _search_conn()
     if c is None:
@@ -1477,6 +1497,8 @@ def _resp(body, *, status=200, mimetype='application/json', headers: dict | None
         r.headers['X-Cells-Partial'] = '1'
     if headers:
         for k, v in headers.items():
+            if v is None or (isinstance(v, str) and v.strip().lower() in ('', 'none', 'null')):
+                continue
             r.headers[k] = v
     if status == 200 and etag:
         r.headers['ETag'] = etag
@@ -1504,7 +1526,7 @@ def _not_ready(meta: dict) -> Response:
     body['kgs_not_processed'] = meta.get('kgs_not_processed') or []
     if body['kgs_pending'] and st == 'not_processed':
         body['status'] = 'pending'
-    return _resp(body, status=404, headers={'Retry-After': str(RETRY_AFTER_S)})
+    return _resp(body, status=404, headers=_with_epoch({'Retry-After': str(RETRY_AFTER_S)}, meta.get('epoch')))
 
 
 @cells_bp.errorhandler(CellsError)
@@ -1626,7 +1648,7 @@ def _render_inner(t: Table, hdrs: dict, meta: dict, *, fmt: str, res: int, layer
         if res != RES:
             raise CellsError(400, 'format=bin only at res 12')
         body, hx = table_bin(t, layers)
-        hx['X-Cells-Epoch'] = str(meta.get('epoch'))
+        hx = _with_epoch(hx, meta.get('epoch'))
         hx['X-Cells-Kgs'] = ','.join(meta.get('kgs') or [])
         return _resp(body, mimetype='application/octet-stream', headers=hx, etag=etag, partial=partial)
     if res == RES:
@@ -1644,7 +1666,7 @@ def _render_inner(t: Table, hdrs: dict, meta: dict, *, fmt: str, res: int, layer
     if fmt == 'csv':
         return _resp(table_csv(t, dec, ids=ids, res=res, centres=centres, extras=extras, kg_col=kg_col).encode(),
                      mimetype='text/csv', etag=etag, partial=partial,
-                     headers={'X-Cells-Kgs': ','.join(meta.get('kgs') or []), 'X-Cells-Epoch': str(meta.get('epoch'))})
+                     headers=_with_epoch({'X-Cells-Kgs': ','.join(meta.get('kgs') or [])}, meta.get('epoch')))
     rows = table_json(t, dec, ids=ids, res=res, layers=layers, centres=centres, extras=extras, kg_col=kg_col)
     if fmt == 'geojson':
         if n_out > MAX_GEOJSON_CELLS:
@@ -1850,7 +1872,8 @@ def kg_cells(code):
     r.headers['ETag'] = etag
     r.headers['Cache-Control'] = f'public, max-age={CACHE_MAX_AGE}'
     r.headers['X-Cells-Source'] = 'disk'
-    r.headers['X-Cells-Epoch'] = str(h['epoch'])
+    for _k, _v in _with_epoch({}, h.get('epoch')).items():
+        r.headers[_k] = _v
     if h.get('partial_cells'):
         r.headers['X-Cells-Partial'] = '1'
     return r

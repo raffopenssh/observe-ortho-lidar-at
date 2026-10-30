@@ -697,9 +697,10 @@ def serve(i: int, j: int, fields: list[str], ids_enc: str, *, rebuild: bool = Fa
     hdr, cols, inp = load_bin(i, j, rebuild=rebuild)
     body = encode(hdr, cols, fields, ids_enc)
     etag = bin_etag(hdr['gen'], fields, ids_enc)
-    hx = {'X-Cells-Gen': hdr['gen'], 'X-Cells-Epoch': str(hdr.get('epoch')), 'X-Cells-Bin': f'{i},{j}',
+    hx = {'X-Cells-Gen': hdr['gen'], 'X-Cells-Bin': f'{i},{j}',
           'X-Cells-Record': f'nex1/{ALGO}', 'X-Cells-Kgs': ','.join(hdr.get('kgs') or []),
           'X-Cells-Fields': ','.join(fields), 'X-Cells-Layout': f'nex1={hdr["n"]}'}
+    hx = ca._with_epoch(hx, hdr.get('epoch'))  # empty bin → corpus epoch pin, never 'None'
     return body, hx, etag
 
 
