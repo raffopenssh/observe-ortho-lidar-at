@@ -192,6 +192,13 @@ def scan(*, full: bool = False, budget_s: float | None = None) -> dict:
                 codes[code] = {"state": "detected", "why": why, "detected_at": now_iso,
                                "attempts": int((c or {}).get("attempts", 0)),
                                "counts": {"geb_flat": r["geb_flat"], "wald_flat": r["wald_flat"]}}
+                # split parents: keep the per-block rerun ledger + audit
+                # cache (keyed on each block's ``uploaded_at``) so a
+                # re-detect neither re-fetches clean blocks nor forgets
+                # which block already burned its two attempts
+                for keep in ("block_attempts", "block_audit"):
+                    if (c or {}).get(keep):
+                        codes[code][keep] = c[keep]
                 new_det.append(code)
             elif c.get("state") == "fp":
                 c["why"] = why
@@ -469,20 +476,35 @@ def sweep(*, requeue: bool = True, scan_budget_s: float = 20.0) -> dict:
                 continue
             if n_rq >= MAX_REQUEUE_PER_TICK or outstanding >= MAX_OUTSTANDING:
                 break
-            if int(e.get("attempts", 0)) >= 2:
-                e["state"] = "stuck"
-                events.append((f"label_mix: {code} still label-mixed after 2 reruns — parked (stuck)", code, "warning"))
-                continue
-            # split parent → resolve to the affected block(s)
+            # split parent → resolve to the affected block(s).  This runs
+            # BEFORE the attempt budget: a parent re-detected after a
+            # ``done`` (its merged h3b changed — sweep units merged, stale
+            # blocks retired, a different block re-run) is only stuck when
+            # the *same block* was rerun twice and still shows the
+            # signature.  85105 (14 blocks, 2026-10-30): southeast-2 was
+            # rerun once, the parent re-fired on a merge, and the parent
+            # level ``attempts == 2`` parked it without auditing a single
+            # block — the real culprit (west-2, never rerun) showed up on
+            # the first block audit once this ran first.
             blocks = _blocks_of(code, ent)
             targets = [code]
             if blocks:
                 affected, pending = _audit_blocks(code, e, blocks, ent, fetch_budget)
                 if affected:
+                    ba = e.setdefault("block_attempts", {})
+                    exhausted = [b for b in affected if int(ba.get(b, 0)) >= 2]
+                    affected = [b for b in affected if b not in exhausted]
+                    if exhausted and not affected:
+                        e["state"] = "stuck"
+                        e["note"] = f"split parent: block(s) {','.join(exhausted)} still label-mixed after 2 reruns each"
+                        events.append((f"label_mix: {code} block(s) {','.join(exhausted)} still label-mixed "
+                                       f"after 2 reruns — parked (stuck)", code, "warning"))
+                        continue
                     targets = affected
                     e["blocks"] = affected
                     e["note"] = (f"split parent: {len(affected)}/{len(blocks)} block(s) label-mixed"
-                                 + (f", {len(pending)} not auditable yet" if pending else ""))
+                                 + (f", {len(pending)} not auditable yet" if pending else "")
+                                 + (f", {len(exhausted)} exhausted" if exhausted else ""))
                 elif pending:
                     no_h3b = e.get("no_h3b") or []
                     if len(no_h3b) == len(pending):
@@ -502,11 +524,19 @@ def sweep(*, requeue: bool = True, scan_budget_s: float = 20.0) -> dict:
                     events.append((f"label_mix: {code} split parent — every block's own NE cells are clean; "
                                    f"parent signature is a merge artefact (fp)", code, "info"))
                     continue
+            elif int(e.get("attempts", 0)) >= 2:
+                e["state"] = "stuck"
+                events.append((f"label_mix: {code} still label-mixed after 2 reruns — parked (stuck)", code, "warning"))
+                continue
             to_post = [t for t in targets if t not in queue]
             ok = all(_post_requeue(t) for t in to_post)
             if ok:
                 e["state"] = "requeued"; e["requeued_at"] = now_iso
                 e["attempts"] = int(e.get("attempts", 0)) + 1
+                if blocks:
+                    ba = e.setdefault("block_attempts", {})
+                    for t in targets:
+                        ba[t] = int(ba.get(t, 0)) + 1
                 if not to_post:
                     e["note"] = "already queued"
                 n_rq += 1; outstanding += 1

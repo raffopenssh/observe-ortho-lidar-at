@@ -3249,6 +3249,12 @@ def _ignored_version_voter(cc, codes, manifest) -> bool:
       ``remove_legacy_products`` never touches because the parent code
       itself is no longer scheduled).  Only the parent's own record is
       ignored — a lagging real block still keeps the parent down.
+    * **superseded block residue** — the mirror case (48210, 2026-10-30):
+      May v1 ``-east``/``-west`` blocks whose ``_json`` is OLDER than the
+      parent's own live ``_json`` (the parent was re-run unsplit in Oct).
+      The block records only survive because a peer-sync re-imported
+      them after their tombstones were dropped; ``v2_regen`` already
+      dismissed the codes as old-split residue and Zenodo answers 404.
     """
     try:
         from kg_splitter import is_sweep_code as _isw, is_block_code as _isb
@@ -3266,6 +3272,17 @@ def _ignored_version_voter(cc, codes, manifest) -> bool:
                 return True
         except Exception:
             pass
+    if _isb(cc):
+        try:
+            from kg_splitter import parent_kg_code as _pk
+            pj = manifest.get(f'{_pk(cc)}_json')
+        except Exception:
+            pj = None
+        if isinstance(pj, dict) and int(pj.get('size') or 0) > 0 \
+                and 'error' not in str(pj.get('status') or '') \
+                and str(pj.get('status') or '') != 'removed' \
+                and str(pj.get('uploaded_at') or '') > str(zj.get('uploaded_at') or ''):
+            return True
     if not _isb(cc):
         own_ts = str(zj.get('uploaded_at') or '')
         for bc in codes:

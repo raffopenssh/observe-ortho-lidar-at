@@ -260,7 +260,15 @@ def _retire_one(code: str, entries: dict, manifest, client, queue: list, reason:
     if code in queue:
         queue[:] = [q for q in queue if q != code]
         (DATA_DIR / "retry_queue.json").write_text(json.dumps(queue))
-    _post("/api/v1/admin/drop_tombstones", {"prefix": code})
+    # Drop only the tombstones we superseded (a fresh ``removed`` record
+    # outranks them) plus the ``_requeue`` marker.  A product key that is
+    # NOT in the manifest any more (deleted earlier by a force requeue /
+    # v2_regen, Zenodo file long gone) must keep its tombstone: dropping
+    # it lets the peer-sync re-import the stale record from any peer that
+    # still holds it — 48210-east/-west ``_json`` (May 2026, Zenodo 404)
+    # came back that way on 2026-10-30 and dragged the parent's index
+    # ``product_version`` to v1.
+    _post("/api/v1/admin/drop_tombstones", {"keys": keys + [f"{code}_requeue"]})
     _journal_ne([code])
     return keys
 
