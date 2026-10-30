@@ -68,7 +68,7 @@ scope. The threat model assumes `:8100` is reachable by anyone and
   `public_flags.salt` HMAC salt is the one random file, 0600).
   Stored error strings scrub `access_token=` query parameters.
 * **Resource limits** on the public tier (`docs/public-api.md`):
-  byte-bounded caches, a concurrency gate and token-bucket rate limiter
+  byte-bounded caches, a concurrency gate and a leaky-bucket rate limiter
   on every render, single-flight per tile, an RSS watchdog that sheds
   caches and finally restarts the worker, and systemd `MemoryMax` on
   every unit. Public flags store an HMAC of reporter id | IP, never the

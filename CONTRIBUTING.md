@@ -35,7 +35,7 @@ Nothing in `tests/` needs network access or secrets.
   in logs, not in tests (`tests/test_cells_vocab.py` enforces the
   vocabulary on the public tier).
 * New public endpoints: document in `public_docs.LLM_TXT` and
-  `docs/public-api.md`, add to `tools/golden_public.py`.
+  `docs/public-api.md`, and extend `tests/test_public_segmentation.py` when the relay allow-list changes.
 * Commit messages: imperative, one topic per commit; explain *why* in
   the body when it is not obvious.
 * Security issues: see `SECURITY.md`, not the issue tracker.

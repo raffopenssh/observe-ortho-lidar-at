@@ -69,5 +69,6 @@ ss -ltn | grep 8100
   task semaphore).
 * Subjects are H3 cells or KG codes — nothing in the public tier is keyed
   by any property or ownership unit (`tests/test_cells_vocab.py`).
-* New public endpoints: add to `public_docs.LLM_TXT`, to the family
-  table above, and to `tools/golden_public.py`.
+* New public endpoints: add to `public_docs.LLM_TXT` and to the family
+  table above; relayed routes also to `public_segmentation.ROUTES` and
+  `tests/test_public_segmentation.py`.
