@@ -94,7 +94,7 @@ products are labelled partial). Register at
 | `ZENODO_CACHE_DEPOSIT` | `19650075` | shared tile-cache deposit (read-only use without a secret) |
 | `SRTM_DRY_RUN` | `0` | never upload |
 | `COPERNICUS_CREDENTIALS_FILE` | `$SRTM_SECRETS_DIR/copernicus_credentials.json` | openEO credentials |
-| `POWER_API_URL`, `UMFELD_URL`, `INVEKOS_API_URL`, `ZENODO_LOCK_URL` | empty | optional upstream services, disabled when empty |
+| `POWER_API_URL`, `INVEKOS_API_URL`, `ZENODO_LOCK_URL`, … | empty | optional upstream services (full list in `.env.example`), disabled when empty |
 | `SRTM_BEV_VECTOR_CONTEXT` | `0` | in-RAM building-footprint context from public BEV vector tiles (`docs/vct-pilot.md`) |
 | `PUBLIC_MAX_AREA_KM` | `5` | area cap for public-tier analysis requests (km²) |
 | `SRTM_SHARE_CAP_MB` | `1024` | disk cap for saved shares |
