@@ -138,7 +138,7 @@ for _name, (_sf, _kind) in ca.OBS_PUBLIC.items():
     _f(_name, _dts, ca.UNITS.get(_name) or next((u for k, u in ca.UNITS.items() if _name in k.split('/')), ''),
        _nd, 'NEO1 row field, quantised as in format=columns', 'neo1')
 
-NP_DT = {'u8': np.uint8, 'i8': np.int8, 'u16': np.dtype('<u2'), 'u64': np.dtype('<u8')}
+NP_DT = {'u8': np.uint8, 'i8': np.int8, 'u16': np.dtype('<u2'), 'u32': np.dtype('<u4'), 'u64': np.dtype('<u8')}
 DEFAULT_FIELDS = ('obs', 'kg', 'terrain_src', 'elev_mean', 'slope_mean', 'slope_p90', 'aspect_deg',
                   'bld_n', 'bld_h_max', 'bld_h_p50', 'stories_max', 'roof_dom', 'struct_h_max',
                   'canopy_h_p90', 'h_max', 'tree_h_max', 'canopy', 'cover')

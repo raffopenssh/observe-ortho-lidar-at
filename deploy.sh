@@ -188,6 +188,13 @@ chmod +x srv_watchdog.sh
 sudo systemctl daemon-reload
 sudo systemctl enable --now srv-watchdog.timer
 echo "  ✓ srv liveness watchdog installed"
+# primary only: daily Austria-wide cells aggregate (cells_national.py, needs data/ne)
+if [ -f "${PROJECT_DIR}/data/austria_processor/is_director" ]; then
+  sudo cp cells-national.service cells-national.timer /etc/systemd/system/
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now cells-national.timer
+  echo "  ✓ cells-national.timer installed (primary)"
+fi
 
 # ── 7. Start services ────────────────────────────────────
 echo "\n[7/7] Starting services..."

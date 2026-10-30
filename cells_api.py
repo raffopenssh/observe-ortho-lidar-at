@@ -1729,6 +1729,43 @@ def cells_bins_manifest():
 _bins_body_cache: dict = {}
 
 
+@cells_bp.route('/api/v1/cells/national')
+def cells_national():
+    """Austria-wide res-8/9 aggregate (``cells_national``): one NEX1 row per
+    parent, means over the res-12 children; pre-built + pre-gzipped on disk,
+    served as is (``fields=`` slices are cached per generation)."""
+    import cells_national as cn
+    a = _args()
+    try:
+        res = int(a.get('res') or cn.DEFAULT_RES)
+    except ValueError:
+        raise CellsError(400, 'res must be an integer')
+    if res not in cn.RESES:
+        raise CellsError(400, f'res must be one of {list(cn.RESES)}')
+    fmt = _format(('bin', 'json'), default='bin')
+    m = cn.meta()
+    if fmt == 'json' or _flag('meta'):
+        if not m:
+            raise CellsError(404, 'national aggregate not built yet', retry_after_s=RETRY_AFTER_S)
+        d = dict(m); d['res_available'] = list(cn.RESES); d['etag'] = cn.etag_for(m['gen'], res, None)
+        return _resp(d, etag=f'"n-meta-{m["gen"]}"', headers=_with_epoch({'X-Cells-Gen': m['gen']}, m.get('epoch')))
+    fields = cn.parse_fields(a.get('fields'))
+    if m:
+        etag = cn.etag_for(m['gen'], res, fields)
+        inm = request.headers.get('If-None-Match') or ''
+        if etag in [x.strip() for x in inm.split(',')] or inm.strip() == '*':
+            return Response(status=304, headers={'ETag': etag, 'Cache-Control': f'public, max-age={CACHE_MAX_AGE}',
+                                                 'X-Cells-Gen': m['gen']})
+    gz, hx, etag, m = cn.serve(res, fields)
+    if 'gzip' in (request.headers.get('Accept-Encoding') or ''):
+        body = gz; hx = dict(hx, **{'Content-Encoding': 'gzip', 'Vary': 'Accept-Encoding'})
+    else:
+        import gzip as _gz
+        body = _gz.decompress(gz)
+    hx['Content-Disposition'] = f'inline; filename="cells-national-r{res}.nex"'
+    return _resp(body, mimetype='application/octet-stream', headers=hx, etag=etag)
+
+
 @cells_bp.route('/api/v1/cells', methods=['GET', 'POST'])
 def cells():
     r = _bin_request()
@@ -1775,6 +1812,7 @@ def cells_dict():
                    'geojson_cells': MAX_GEOJSON_CELLS, 'k': MAX_K, 'rate_hint': '≤ 5 r/s sustained, burst 20'},
         'formats': list(FORMATS), 'epoch': _epoch_pin(),
         'bins': __import__('cells_bins').dict_block(),
+        'national': __import__('cells_national').dict_block(),
         'dedupe': 'a border cell present in several KG products is served once: observed copy first, then the '
                   'larger chunk, then the lowest kg; meta.kgs lists the products touched',
         'rollup': {'res': [11, 10], 'mean': ['cover', 'structures_cover', 'canopy', 'ndvi.*', 'terrain.* (aspect → mode)',

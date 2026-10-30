@@ -59,6 +59,7 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
   GET  /api/v1/cells/chunk/<h3>                   one res-10 (or res-9 = 7 chunks) chunk for bulk clients; format=h3b|bin|json
   GET  /api/v1/cells/dict                         fields, units, code tables, group labels, limits, epoch, bins
   GET  /api/v1/cells/bins                         every 0.025° bin with a published product + its generation (see format=bin)
+  GET  /api/v1/cells/national?res=9[&fields=…]    Austria-wide NEX1 table, one row per res-9 (or res-8) H3 parent (see below)
   GET  /api/v1/kg/<code>/cells                    whole-KG container: format=h3b (default, downloadable) | json (summary)
   GET  /api/v1/kgs/summary?codes=a,b,…             merged observed summary over a KG SET (≤ 500 codes, else 400);
        …?gemeinde=61630 | district=616 | state=6    or by Statistik Austria GKZ prefix (5 / 3 / 1 digits).
@@ -138,6 +139,19 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
     Discovery: GET /api/v1/cells/bins → columns {{i, j, gen, epoch, complete, kgs_n, stored}} for every
     bin touching a published product (ETag "bins-<generation>"); diff gen against your copy, pull only
     changed bins, ≤ 4 in flight. Field table + semantics: /api/v1/cells/dict → bins.
+  /api/v1/cells/national?res=9|8[&fields=a,b,…]  → the NATIONAL aggregate for overview zooms: one NEX1
+    row per res-9 parent (~1.05 M rows, ~20 MB gz; res 8 ≈ 150 k rows), Austria-wide, built daily from every
+    published cells product. Same container / dtypes / units as the bins (header "res": 9, no ij / bbox); per
+    field the MEAN over the res-12 children where the field is non-null (bld_* / canopy_h_* over object-holding
+    children; bld_h_top / canopy_h_top = max), verdict = u16 counts per consistency class (header.verdicts),
+    n_cells / n_obs = children with a row / observed. Border cells deduplicated across products. Fields:
+    n_cells n_obs verdict elev_mean slope_mean slope_p90 roughness tri tpi h_mean h_p90 h_max tree_h_max canopy
+    ndvi_mean ndvi_amp dh_m dtm_m structures_cover cover[9] tree_n structures_n forest_loss_n bld_n bld_cells
+    bld_h_max bld_h_p50 bld_h_top bld_area_sum struct_h_max canopy_h_p90 canopy_h_p50 canopy_h_top (u32 = count/
+    area sums). No fields= → the whole table (pre-gzipped); fields= → a cached slice. Headers: ETag
+    "n-r<res>-<gen>-<fields>", X-Cells-Gen (key your copy on it; rebuilt only when the corpus changed),
+    X-Cells-Epoch, X-Cells-Built, Cache-Control max-age 86400. format=json (or meta=1) → build meta {gen, epoch,
+    built_at, rows, bytes_gz}. 404 + Retry-After until the first build. Fetch once per generation, never per tile.
   format=h3b      H3B1 container: magic | ver u8 | hdr_len u32 | header JSON | zlib chunks of
     shuffle(NEO1)|shuffle(NET1)|shuffle(NEB1) per res-10 cell (header.chunks[] has off/len/cells/trees/bld).
     The whole-KG file is the public product download (CC BY 4.0, attribution in the header).

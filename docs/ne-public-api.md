@@ -457,3 +457,40 @@ lazily back-filled by `kg_summary()` when the mtime differs), with a
 process-local dict in front and a 256-entry response cache keyed on
 `(scope, codes, cells_generation())`. `state=6` (1 596 KGs) is ~3 s on a
 cold sqlite, ~10 ms warm.
+
+## 12. National aggregate `/api/v1/cells/national` (`cells_national.py`, 2026-10-30)
+
+umfeld-at renders zooms 9–11 of its cell tile layer (res 7–9 polygons) and
+the all-Austria PMTiles archive from one in-RAM national table; the per-cell
+0.025° bins (`cells_bins.py`, `format=bin&fields=`) only feed z ≥ 12. The
+national aggregate gives those overview tiles LiDAR columns with **one fetch
+per generation** (~20 MB gz), never per tile.
+
+* **What**: one NEX1 row per res-9 H3 parent (~1.05 M rows; `res=8` ≈ 150 k),
+  Austria-wide. Per field the **mean over the res-12 children where the field
+  is non-null** (`bld_*` / `canopy_h_*` over object-holding children;
+  `*_top` = max), `verdict` = u16 counts per consistency class, `n_cells` /
+  `n_obs`. Same container / dtypes / units / nodata as the bins
+  (`cells_national.FIELDS`; header `res`, no `ij`/`bbox`). `u32` added to the
+  NEX1 dtype set for count/area sums.
+* **Source**: observation rows + NET1 + NEB1 of every `data/ne/<kg>.h3b` —
+  no grid25 fallback, no roof hints (bin-only). Border cells deduplicated like
+  `cells_api.gather`: chunks whose res-10 id is unique to one product are
+  aggregated per KG (pass A), the ~10 % duplicated res-10 chunks in batches
+  across products (pass B). Parent ids via bit arithmetic
+  (`parent_ids`, verified against `h3.cell_to_parent`).
+* **Build**: `python3 cells_national.py --build` — ~10 min / ~1 GB over
+  5.4 M chunks → `data/ne/national/r9.nex.gz`, `r8.nex.gz`, `meta.json`.
+  `cells-national.timer` (primary only, 03:40 UTC daily, installed by
+  `deploy.sh` when `is_director` exists) — skipped when
+  `gen = sha(ALGO | green_fix | cells_generation())` is unchanged. **Never
+  build inside gunicorn.**
+* **Serve**: no `fields=` → the stored gz as is (`Content-Encoding: gzip`);
+  `fields=` → decode + slice + gzip once, cached under
+  `data/ne/national/cache/r<res>-<gen>-<hash>.nex.gz` (LRU 24, single-flight).
+  ETag `"n-r<res>-<gen>-<fields>"`, `X-Cells-Gen`, `X-Cells-Epoch`,
+  `X-Cells-Built`, `Cache-Control max-age=86400`; `format=json` / `meta=1` →
+  build meta; 404 + `Retry-After` before the first build. Aliases
+  `elev_m→elev_mean`, `slope→slope_mean`, `consistency→verdict`.
+* **Test**: `python3 tests/test_cells_national.py` (parent arithmetic,
+  aggregate vs. direct per-KG numbers, codec round-trip, route headers).
