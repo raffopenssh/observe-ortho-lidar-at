@@ -296,8 +296,8 @@ class V1Baseline:
     """Deployed RF; predicts on the 66 FEATURE_KEYS with NaN→0 like the processor."""
 
     def __init__(self):
-        import joblib
-        self.rf = joblib.load(V1_MODEL)
+        import safe_load
+        self.rf = safe_load.load_model(V1_MODEL)   # checksum fence
         self.classes_ = [MERGE.get(c, c) for c in self.rf.classes_]
 
     def predict_proba(self, df):

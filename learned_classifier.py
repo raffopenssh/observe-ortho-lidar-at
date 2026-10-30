@@ -1,15 +1,23 @@
-"""Learned classifier: Random Forest trained on cadastre ground truth.
+"""Learned classifier: Random Forest trained on BEV land-use reference labels.
 
 Replaces the hand-tuned decision tree in classify_object() with a
-data-driven Random Forest that learns from cadastre land-use labels.
+data-driven Random Forest that learns from land-use reference labels.
 
 Architecture:
   1. Feature extraction: same per-segment features as before
      (height, slope, roughness, shape, NDVI, texture, harmonics, SAR)
-  2. Training: cadastre parcel codes provide noisy labels
+  2. Training: BEV land-use (Benützungsart) codes provide noisy labels
   3. Prediction: RF predicts type + probability per segment
-  4. Disagreement detection: segments where RF disagrees with cadastre
-     are flagged as likely cadastre errors
+  4. Disagreement detection: segments where RF disagrees with the
+     reference label are flagged as likely reference errors
+
+Public-release note (step 4): ``FEATURE_KEYS`` contains NO property-level
+feature — every key is derived from rasters (DTM/DSM/ortho/Sentinel/
+WorldCover/Hansen/SAR) and segment shape, so ``extract_object_features``
+produces the full vector without any building/land-register context and
+the shipped ``data/best_model/rf_model.joblib.xz`` loads and predicts
+unchanged.  The building context mask (``config.BEV_VECTOR_CONTEXT``) only
+feeds the post-hoc calibration in ``object_segmentation``.
 
 The classifier falls back to the rule-based system when no trained
 model is available, so there's zero risk of regression.
@@ -20,7 +28,7 @@ Usage::
     clf = LearnedClassifier.load()       # load trained model
     pred = clf.predict(feature_dict)     # returns (type, conf)
     clf.train(features, labels)          # retrain from new data
-    disagreements = clf.find_disagreements(features, cadastre_labels)
+    disagreements = clf.find_disagreements(features, reference_labels)
 """
 from __future__ import annotations
 
@@ -83,9 +91,8 @@ FEATURE_KEYS = [
     "ndvi_max", "slope_max", "h_p10", "perimeter", "esa_dominant_lc",
 ]
 
-# Mapping from cadastre land-use codes (Benützungsart) to our types.
-# These are the Austrian BEV cadastre "BA" codes.
-CADASTRE_TO_TYPE = {
+# Mapping from BEV land-use codes (Benützungsart, "BA"/"NS" codes) to our types.
+LANDUSE_CODE_TO_TYPE = {
     # Agricultural
     51: "crop",       # Acker (arable)
     62: "crop",       # Acker (field)
@@ -143,7 +150,7 @@ TYPE_CLASSES = [
 ]
 
 # Classes excluded from RF training — detected by rule-based logic instead.
-# Keep in CADASTRE_TO_TYPE so they're still recognised during ground truth
+# Keep in LANDUSE_CODE_TO_TYPE so they're still recognised during ground truth
 # extraction, but filter them out before training.
 RF_EXCLUDED_CLASSES = {"wind_turbine", "substation", "solar_panel"}
 
@@ -197,7 +204,7 @@ def _downsample(
 
 
 class LearnedClassifier:
-    """Random Forest classifier trained on cadastre ground truth."""
+    """Random Forest classifier trained on BEV land-use reference labels."""
 
     def __init__(self):
         self.model = None
@@ -358,25 +365,25 @@ class LearnedClassifier:
     def find_disagreements(
         self,
         features: list[dict],
-        cadastre_labels: list[str],
+        reference_labels: list[str],
     ) -> list[dict]:
-        """Find segments where RF disagrees with cadastre.
+        """Find segments where RF disagrees with the reference label.
 
-        These are candidate cadastre errors.
+        These are candidate reference errors.
 
-        Returns list of {segment_features, cadastre_label, rf_prediction,
+        Returns list of {segment_features, reference_label, rf_prediction,
         rf_confidence, likely_correct}.
         """
         if self.model is None:
             return []
 
         results = []
-        for feat, cad_label in zip(features, cadastre_labels):
+        for feat, cad_label in zip(features, reference_labels):
             pred, conf = self.predict(feat)
             if pred != cad_label and conf > 0.6:
                 results.append({
                     "label": feat.get("label", 0),
-                    "cadastre_type": cad_label,
+                    "reference_type": cad_label,
                     "rf_prediction": pred,
                     "rf_confidence": round(conf, 3),
                     "likely_correct": "rf" if conf > 0.75 else "uncertain",
@@ -386,7 +393,7 @@ class LearnedClassifier:
                 })
 
         results.sort(key=lambda x: -x["rf_confidence"])
-        log.info("Found %d disagreements (RF vs cadastre)", len(results))
+        log.info("Found %d disagreements (RF vs reference)", len(results))
         return results
 
     @classmethod
@@ -403,7 +410,8 @@ class LearnedClassifier:
         # Determine which model to load: best_model > live
         if model_path and meta_path:
             mp, mtp = pathlib.Path(model_path), pathlib.Path(meta_path)
-        elif BEST_MODEL_PATH.exists() and BEST_META_PATH.exists():
+        elif (BEST_MODEL_PATH.exists() or BEST_MODEL_PATH.with_name(BEST_MODEL_PATH.name + ".xz").exists()) \
+                and BEST_META_PATH.exists():
             mp, mtp = BEST_MODEL_PATH, BEST_META_PATH
         elif MODEL_PATH.exists() and META_PATH.exists():
             mp, mtp = MODEL_PATH, META_PATH
@@ -411,8 +419,10 @@ class LearnedClassifier:
             return inst
 
         try:
-            import joblib, hashlib
-            inst.model = joblib.load(mp)
+            import hashlib
+            import safe_load
+            inst.model = safe_load.load_model(mp)      # checksum fence (models_manifest.json)
+            mp = safe_load.ensure_decompressed(mp)
             meta = json.loads(mtp.read_text())
             inst.classes = meta.get("classes", [])
             inst.n_train = meta.get("n_train", 0)

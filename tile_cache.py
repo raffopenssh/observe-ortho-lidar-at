@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
+import safe_load as _safe_load
+_safe_load.install()   # every np.load(allow_pickle=True) below goes through the whitelist unpickler
 
 log = logging.getLogger(__name__)
 

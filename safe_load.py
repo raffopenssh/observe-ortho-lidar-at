@@ -19,6 +19,14 @@ whitelist — one call at process start covers ``tile_cache``, ``zenodo_cache``
 and ``hansen`` without touching their call sites. Explicit ``pickle.load``
 sites (tile checkpoints, seg cache) call :func:`load` / :func:`loads`.
 
+Model files (sklearn / LightGBM joblib) cannot be whitelisted — they pickle
+dozens of library classes — so they go through :func:`load_model` instead:
+the file must sit under the repo's ``data/`` tree (never a peer-shared
+cache), its checksum is compared against ``data/models_manifest.json``
+(``tools/fetch_models.py``) or an explicit ``sha1``/``md5`` argument, and
+only then is ``joblib.load`` called.  ``.xz``-compressed models are
+decompressed next to the archive on first use.
+
 Test: ``python3 tests/test_safe_load.py``.
 """
 from __future__ import annotations
@@ -113,3 +121,99 @@ def install() -> bool:
 
 def installed() -> bool:
     return _installed
+
+
+# --- model files (joblib) ------------------------------------------------------
+
+class ModelChecksumError(RuntimeError):
+    pass
+
+
+def _digest(path, algo: str) -> str:
+    import hashlib
+    h = hashlib.new(algo)
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _manifest_entry(path) -> dict | None:
+    """Entry of ``data/models_manifest.json`` whose ``path`` or ``filename``
+    matches *path* (None when the manifest is absent or has no entry)."""
+    import json
+    from pathlib import Path
+    p = Path(path).resolve()
+    root = Path(__file__).resolve().parent
+    mf = root / "data" / "models_manifest.json"
+    try:
+        entries = json.loads(mf.read_text())
+    except Exception:
+        return None
+    if isinstance(entries, dict):
+        entries = entries.get("models") or entries.get("files") or list(entries.values())
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        ep = e.get("path")
+        if (ep and (root / ep).resolve() == p) or e.get("filename") == p.name:
+            return e
+    return None
+
+
+def ensure_decompressed(path):
+    """``<x>.joblib`` from ``<x>.joblib.xz`` when only the archive exists."""
+    from pathlib import Path
+    p = Path(path)
+    xz = p.with_name(p.name + ".xz")
+    if not p.exists() and xz.exists():
+        import lzma, shutil
+        tmp = p.with_name(p.name + ".tmp")
+        with lzma.open(xz, "rb") as src, open(tmp, "wb") as dst:
+            shutil.copyfileobj(src, dst, 1 << 20)
+        tmp.replace(p)
+    return p
+
+
+def load_model(path, *, sha1: str | None = None, md5: str | None = None,
+               require_checksum: bool = False):
+    """``joblib.load`` behind a checksum fence.
+
+    The checksum comes from *sha1* / *md5*, else from the models manifest
+    entry for the file (``md5`` / ``sha1`` / ``sha256`` keys; the ``.xz``
+    archive's entry counts for the decompressed file).  A mismatch raises
+    :class:`ModelChecksumError`.  Without any known checksum the load is
+    allowed unless *require_checksum* (env ``SRTM_REQUIRE_MODEL_CHECKSUM=1``).
+    """
+    import os
+    from pathlib import Path
+    p = ensure_decompressed(path)
+    if not p.exists():
+        raise FileNotFoundError(str(p))
+    checks = {}
+    if sha1:
+        checks["sha1"] = sha1
+    if md5:
+        checks["md5"] = md5
+    if not checks:
+        e = _manifest_entry(p)
+        if e is None and Path(str(p) + ".xz").exists():
+            e = _manifest_entry(str(p) + ".xz")
+            target = Path(str(p) + ".xz")
+        else:
+            target = p
+        for k in ("sha256", "sha1", "md5"):
+            if e and e.get(k):
+                checks[k] = e[k]
+                break
+    else:
+        target = p
+    if not checks:
+        if require_checksum or os.environ.get("SRTM_REQUIRE_MODEL_CHECKSUM"):
+            raise ModelChecksumError(f"no checksum known for {p}")
+    for algo, want in checks.items():
+        got = _digest(target, algo)
+        if got.lower() != str(want).lower():
+            raise ModelChecksumError(f"{target}: {algo} {got} != expected {want}")
+    import joblib
+    return joblib.load(p)

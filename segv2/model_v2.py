@@ -138,7 +138,6 @@ class ModelV2:
     # --- loading ---------------------------------------------------------------
     @classmethod
     def load(cls, model: str | os.PathLike | None = None) -> "ModelV2":
-        import joblib
         mp, metap = _resolve(model or DEFAULT_MODEL)
         if not mp.exists():
             try:
@@ -148,7 +147,9 @@ class ModelV2:
         if not mp.exists():
             raise FileNotFoundError(f"v2 model not found: {mp}")
         meta = json.loads(metap.read_text()) if metap.exists() else {}
-        mdl = joblib.load(mp)
+        import safe_load
+        _pin = (MODEL_ZENODO.get(str(model or DEFAULT_MODEL)) or {}).get("joblib") or {}
+        mdl = safe_load.load_model(mp, sha1=_pin.get("sha1"))   # checksum fence
         if "feature_keys" not in meta:
             # RF/LGBM both expose feature_names_in_ when fitted on a DataFrame; we fit on
             # ndarray, so the meta is the only source of truth.

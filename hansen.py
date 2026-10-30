@@ -22,6 +22,8 @@ import os
 from pathlib import Path
 
 import numpy as np
+import safe_load as _safe_load
+_safe_load.install()   # every np.load(allow_pickle=True) below goes through the whitelist unpickler
 import rasterio
 from rasterio.windows import from_bounds
 from rasterio.warp import reproject, Resampling
