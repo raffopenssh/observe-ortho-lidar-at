@@ -163,10 +163,24 @@ class RateLimiter:
 
 
 def client_key(request) -> str:
+    """Rate-limit key: the first ``X-Forwarded-For`` hop when the request
+    reached us through a reverse proxy (loopback / private peer address),
+    else the socket address — a direct client cannot pick its own bucket by
+    sending a forged header."""
     xff = request.headers.get('X-Forwarded-For')
-    if xff:
+    ra = request.remote_addr or ''
+    if xff and _from_proxy(ra):
         return xff.split(',')[0].strip() or 'unknown'
-    return request.remote_addr or 'unknown'
+    return ra or 'unknown'
+
+
+def _from_proxy(addr: str) -> bool:
+    try:
+        import ipaddress
+        ip = ipaddress.ip_address(addr)
+        return ip.is_loopback or ip.is_private
+    except ValueError:
+        return False
 
 
 # --------------------------------------------------------------------------
