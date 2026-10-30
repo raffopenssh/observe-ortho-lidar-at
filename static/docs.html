@@ -232,7 +232,6 @@ td code { font-size: 12px; }
   <span class="version">v5.1</span>
   <div class="header-links">
     <a href="/" class="hide-mobile">← Back to App</a>
-    <a href="/query.html">query</a>
     <a href="/api/v1/docs/llm.txt">llm.txt</a>
   </div>
 </header>
@@ -267,20 +266,13 @@ td code { font-size: 12px; }
     <a href="#utilities">Utilities</a>
     <a href="#search-index">Search Index</a>
     <div class="nav-sub">
-      <a href="#query-pagination">Pagination</a>
-      <a href="#query-async">Async Queries</a>
-      <a href="#query-compound">Compound Filter</a>
-      <a href="#query-filter-logic">AND vs OR</a>
-      <a href="#query-segments">Power Queries</a>
-      <a href="#query-parcels">Per-Parcel Index</a>
     </div>
-    <a href="#query-explorer">Query Explorer (UI)</a>
     <a href="#quality-flags">Quality Flags &amp; Feedback</a>
   </div>
   <div class="nav-group">
     <div class="nav-group-title">Methods</div>
     <a href="#methods-overview">Overview</a>
-    <a href="#methods-data-sources">Data Sources (8)</a>
+    <a href="#methods-data-sources">Data Sources (7)</a>
     <div class="nav-sub">
       <a href="#ds-bev-lidar">BEV LiDAR</a>
       <a href="#ds-bev-ortho">BEV Orthophoto</a>
@@ -288,7 +280,6 @@ td code { font-size: 12px; }
       <a href="#ds-worldcover">ESA WorldCover</a>
       <a href="#ds-sentinel1">Sentinel-1 SAR</a>
       <a href="#ds-hansen">Hansen Forest Change</a>
-      <a href="#ds-cadastre">Austrian Cadastre</a>
       <a href="#ds-osm">OpenStreetMap</a>
     </div>
     <a href="#methods-segmentation">Segmentation Pipeline</a>
@@ -343,14 +334,14 @@ td code { font-size: 12px; }
   <div class="callout-title" style="font-size:15px;color:#0d7377;">🛰️ How it works</div>
   <p style="margin:8px 0 6px;font-size:14px;line-height:1.7;">
     This API reads <strong>six remote sensing sources</strong> — 1m LiDAR elevation (DTM+DSM), 20cm aerial orthophotos, Sentinel-2 NDVI, ESA WorldCover,
-    Sentinel-1 SAR, and Austrian cadastre footprints — then runs a two-stage pipeline:
+    Sentinel-1 SAR, and Hansen forest change — then runs a two-stage pipeline:
   </p>
   <ol style="margin:6px 0 10px 20px;font-size:13px;line-height:1.8;color:#334155;">
     <li><strong>Watershed segmentation</strong> — Felzenszwalb over-segmentation + Region Adjacency Graph merging splits the landscape into homogeneous objects</li>
     <li><strong>Random Forest classification</strong> — each segment is described by 44 features (height, shape, spectral, texture, SAR, phenology) and classified into one of <a href="#object-types">25 types</a></li>
   </ol>
   <p style="margin:0;font-size:13px;color:#555;">
-    The RF model is <a href="#rf-training">continuously trained</a> on cadastre + OSM ground truth across 4,000 Austrian municipalities (Katastralgemeinden).
+    The RF model is <a href="#rf-training">trained</a> on open land-use + OSM ground truth across thousands of Austrian municipalities (Katastralgemeinden).
     Adjacent compatible segments are grouped into <a href="#group-types">11 higher-level groups</a> (forest, building, road network, etc.).
   </p>
 </div>
@@ -372,7 +363,7 @@ td code { font-size: 12px; }
 
 <div class="callout callout-info">
   <div class="callout-title">ℹ️ Base URL</div>
-  All endpoints are relative to <code>https://example.invalid:8000</code>.<br>
+  All endpoints are relative to <code>http://localhost:8000</code>.<br>
   All coordinates use <strong>WGS84</strong> (lon/lat). Processing is done in <strong>EPSG:3035</strong>. Maximum analysis area: <strong>25 km²</strong>. Austria only.
 </div>
 
@@ -385,7 +376,7 @@ td code { font-size: 12px; }
 <div class="code-wrap">
   <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
   <pre><code><span class="tok-comment"># Start an async segment analysis for a GeoJSON polygon</span>
-curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://example.invalid:8000/api/v1/segment?async=true</span> \
+curl <span class="tok-flag">-X</span> POST <span class="tok-url">http://localhost:8000/api/v1/segment?async=true</span> \
   <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
   <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span></code></pre>
 </div>
@@ -401,7 +392,7 @@ curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://example
 <h4>2. Poll progress</h4>
 <div class="code-wrap">
   <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
-  <pre><code>curl <span class="tok-url">https://example.invalid:8000/api/v1/segment/progress?task_id=a1b2c3d4-e5f6-...</span></code></pre>
+  <pre><code>curl <span class="tok-url">http://localhost:8000/api/v1/segment/progress?task_id=a1b2c3d4-e5f6-...</span></code></pre>
 </div>
 
 <div class="code-wrap">
@@ -419,7 +410,7 @@ curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://example
 <div class="code-wrap">
   <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
   <pre><code><span class="tok-comment"># Once "done": true, fetch the full FeatureCollection</span>
-curl <span class="tok-url">https://example.invalid:8000/api/v1/segment/result?task_id=a1b2c3d4-e5f6-...</span></code></pre>
+curl <span class="tok-url">http://localhost:8000/api/v1/segment/result?task_id=a1b2c3d4-e5f6-...</span></code></pre>
 </div>
 
 <div class="callout callout-tip">
@@ -459,7 +450,7 @@ curl <span class="tok-url">https://example.invalid:8000/api/v1/segment/result?ta
 <p><strong>File upload example:</strong></p>
 <div class="code-wrap">
   <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
-  <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://example.invalid:8000/api/v1/segment</span> \
+  <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">http://localhost:8000/api/v1/segment</span> \
   <span class="tok-flag">-F</span> <span class="tok-string">"file=@area.kml"</span> \
   <span class="tok-flag">-F</span> <span class="tok-string">"include_ortho=true"</span></code></pre>
 </div>
@@ -491,7 +482,6 @@ curl <span class="tok-url">https://example.invalid:8000/api/v1/segment/result?ta
       <tr><td>include_ortho</td><td>boolean</td><td>Include BEV RGBI orthophoto features (NDVI, NIR, brightness, GLCM texture). <span class="param-default">Default: <code>false</code></span></td></tr>
       <tr><td>include_temporal</td><td>boolean</td><td>Include 3-date DTM comparison (2022/2023/2024). <span class="param-default">Default: <code>false</code></span></td></tr>
       <tr><td>include_copernicus</td><td>boolean</td><td>Include Sentinel-2 NDVI + ESA WorldCover + SAR + NDVI harmonics. <span class="param-default">Default: <code>false</code></span></td></tr>
-      <tr><td>include_cadastre</td><td>boolean</td><td>Include cadastre building footprint ground truth. <span class="param-default">Default: <code>false</code></span></td></tr>
       <tr><td>include_hansen</td><td>boolean</td><td>Include Hansen Global Forest Change calibration. <span class="param-default">Default: <code>false</code></span></td></tr>
       <tr><td>types</td><td>string</td><td>Comma-separated type filter. Example: <code>"roof,tree,road"</code></td></tr>
       <tr><td>groups</td><td>string</td><td>Comma-separated group filter. Example: <code>"building,forest"</code></td></tr>
@@ -504,7 +494,7 @@ curl <span class="tok-url">https://example.invalid:8000/api/v1/segment/result?ta
   <h4>Example</h4>
   <div class="code-wrap">
     <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
-    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">"https://example.invalid:8000/api/v1/segment?include_ortho=true&amp;include_temporal=true"</span> \
+    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">"http://localhost:8000/api/v1/segment?include_ortho=true&amp;include_temporal=true"</span> \
   <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
   <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span></code></pre>
   </div>
@@ -514,7 +504,7 @@ curl <span class="tok-url">https://example.invalid:8000/api/v1/segment/result?ta
   <div class="callout callout-tip" style="margin-top:12px">
     <div class="callout-title">🌳 Random Forest classifier</div>
     Classification uses a continuously-trained RF model with 44 features per segment.
-    The model learns from cadastre building footprints and OSM ground truth across thousands of Austrian municipalities.
+    The model learns from open land-use polygons and OSM ground truth across thousands of Austrian municipalities.
     See <a href="#rf-training">Random Forest Training</a> for details on the training pipeline, feature importances, and status endpoints.
   </div>
 </div>
@@ -532,7 +522,7 @@ curl <span class="tok-url">https://example.invalid:8000/api/v1/segment/result?ta
   <h4>Example</h4>
   <div class="code-wrap">
     <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
-    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://example.invalid:8000/api/v1/elevation</span> \
+    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">http://localhost:8000/api/v1/elevation</span> \
   <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
   <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Point","coordinates":[15.43,47.07]}'</span></code></pre>
   </div>
@@ -551,7 +541,7 @@ curl <span class="tok-url">https://example.invalid:8000/api/v1/segment/result?ta
   <h4>Example</h4>
   <div class="code-wrap">
     <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
-    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://example.invalid:8000/api/v1/terrain</span> \
+    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">http://localhost:8000/api/v1/terrain</span> \
   <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
   <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span></code></pre>
   </div>
@@ -590,7 +580,7 @@ curl <span class="tok-url">https://example.invalid:8000/api/v1/segment/result?ta
   <h4>Example</h4>
   <div class="code-wrap">
     <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
-    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">"https://example.invalid:8000/api/v1/changes?min_change=0.5"</span> \
+    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">"http://localhost:8000/api/v1/changes?min_change=0.5"</span> \
   <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
   <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span></code></pre>
   </div>
@@ -608,7 +598,7 @@ curl <span class="tok-url">https://example.invalid:8000/api/v1/segment/result?ta
   <h4>Example</h4>
   <div class="code-wrap">
     <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
-    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://example.invalid:8000/api/v1/changes/trees</span> \
+    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">http://localhost:8000/api/v1/changes/trees</span> \
   <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
   <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span></code></pre>
   </div>
@@ -627,7 +617,7 @@ curl <span class="tok-url">https://example.invalid:8000/api/v1/segment/result?ta
   <h4>Example</h4>
   <div class="code-wrap">
     <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
-    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://example.invalid:8000/api/v1/changes/summary</span> \
+    <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">http://localhost:8000/api/v1/changes/summary</span> \
   <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
   <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span></code></pre>
   </div>
@@ -719,7 +709,7 @@ curl <span class="tok-url">https://example.invalid:8000/api/v1/segment/result?ta
 <h4>Example</h4>
 <div class="code-wrap">
   <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
-  <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://example.invalid:8000/api/v1/ortho/overlay</span> \
+  <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">http://localhost:8000/api/v1/ortho/overlay</span> \
   <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
   <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span> \
   <span class="tok-flag">-o</span> ortho.png <span class="tok-flag">-D</span> -</code></pre>
@@ -792,15 +782,15 @@ curl <span class="tok-url">https://example.invalid:8000/api/v1/segment/result?ta
   <div class="code-wrap">
     <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
     <pre><code><span class="tok-comment"># Export all layers as GeoPackage (async)</span>
-curl <span class="tok-flag">-X</span> POST <span class="tok-url">"https://example.invalid:8000/api/v1/export/geopackage?async=true&layers=dtm,segments,raster"</span> \
+curl <span class="tok-flag">-X</span> POST <span class="tok-url">"http://localhost:8000/api/v1/export/geopackage?async=true&layers=dtm,segments,raster"</span> \
   <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
   <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span>
 
 <span class="tok-comment"># Download from share (all layers)</span>
-curl <span class="tok-url">https://example.invalid:8000/api/v1/share/Kohlschwarz80/download.gpkg</span> <span class="tok-flag">-o</span> analysis.gpkg
+curl <span class="tok-url">http://localhost:8000/api/v1/share/Kohlschwarz80/download.gpkg</span> <span class="tok-flag">-o</span> analysis.gpkg
 
 <span class="tok-comment"># Download from share (specific layers)</span>
-curl <span class="tok-url">"https://example.invalid:8000/api/v1/share/Kohlschwarz80/download.gpkg?layers=dtm,ortho-2024"</span> <span class="tok-flag">-o</span> layers.gpkg</code></pre>
+curl <span class="tok-url">"http://localhost:8000/api/v1/share/Kohlschwarz80/download.gpkg?layers=dtm,ortho-2024"</span> <span class="tok-flag">-o</span> layers.gpkg</code></pre>
   </div>
 
   <div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:10px 14px;margin-top:14px;font-size:13px">
@@ -848,7 +838,7 @@ curl <span class="tok-url">"https://example.invalid:8000/api/v1/share/Kohlschwar
 <h4>Example</h4>
 <div class="code-wrap">
   <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
-  <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://example.invalid:8000/api/v1/lidar/geotiff</span> \
+  <pre><code>curl <span class="tok-flag">-X</span> POST <span class="tok-url">http://localhost:8000/api/v1/lidar/geotiff</span> \
   <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
   <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Polygon","coordinates":[[[15.43,47.07],[15.44,47.07],[15.44,47.08],[15.43,47.08],[15.43,47.07]]]}'</span> \
   <span class="tok-flag">-o</span> lidar.tif</code></pre>
@@ -894,7 +884,6 @@ curl <span class="tok-url">"https://example.invalid:8000/api/v1/share/Kohlschwar
       <tr><td>include_ortho</td><td>boolean</td><td>Include 20 cm orthophoto features. <span class="param-default">Default: <code>true</code></span></td></tr>
       <tr><td>include_temporal</td><td>boolean</td><td>Include 3-date temporal comparison. <span class="param-default">Default: <code>false</code></span></td></tr>
       <tr><td>include_copernicus</td><td>boolean</td><td>Sentinel-2 NDVI + SAR + WorldCover. <span class="param-default">Default: <code>false</code></span></td></tr>
-      <tr><td>include_cadastre</td><td>boolean</td><td>Cadastre building footprint ground truth. <span class="param-default">Default: <code>false</code></span></td></tr>
       <tr><td>include_hansen</td><td>boolean</td><td>Hansen Global Forest Change. <span class="param-default">Default: <code>false</code></span></td></tr>
       <tr><td>types</td><td>string</td><td>Object type filter. Example: <code>tree,roof</code></td></tr>
       <tr><td>height_min</td><td>number</td><td>Keep only objects with height ≥ this value (metres)</td></tr>
@@ -914,7 +903,7 @@ curl <span class="tok-url">"https://example.invalid:8000/api/v1/share/Kohlschwar
     The URL is straightforward to construct — just append query parameters:
   </p>
   <div class="code-wrap" style="margin:12px 0;">
-    <pre style="font-size:12px;"><code>https://example.invalid:8000/api/v1/onestop
+    <pre style="font-size:12px;"><code>http://localhost:8000/api/v1/onestop
   ?bbox=<em>lon_min</em>,<em>lat_min</em>,<em>lon_max</em>,<em>lat_max</em>
   &amp;format=gpkg
   &amp;types=tree
@@ -951,7 +940,7 @@ curl <span class="tok-url">"https://example.invalid:8000/api/v1/share/Kohlschwar
     <tbody>
       <tr><td>Ortho only (default)</td><td>~30–60 s</td><td>DTM + DSM + orthophoto</td></tr>
       <tr><td>Ortho + temporal</td><td>~60–90 s</td><td>+ 3-date comparison</td></tr>
-      <tr><td>All sources</td><td>~90–120 s</td><td>+ Copernicus + cadastre + Hansen</td></tr>
+      <tr><td>All sources</td><td>~90–120 s</td><td>+ Copernicus + Hansen</td></tr>
       <tr><td>GPKG / KML export</td><td>+ 5–10 s</td><td>Added on top of analysis</td></tr>
       <tr><td>Auto-save</td><td>+ 1–2 s</td><td>Always happens automatically</td></tr>
     </tbody>
@@ -974,61 +963,61 @@ curl <span class="tok-url">"https://example.invalid:8000/api/v1/share/Kohlschwar
   <div class="code-wrap">
     <div class="code-header"><span>Example 1 — Trees &gt; 20 m as GeoPackage</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
     <pre><code><span class="tok-comment"># Start analysis (returns task_id + poll_url)</span>
-curl <span class="tok-url">'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;types=tree&amp;height_min=20&amp;format=gpkg'</span>
+curl <span class="tok-url">'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;types=tree&amp;height_min=20&amp;format=gpkg'</span>
 
 <span class="tok-comment"># Response:</span>
 <span class="tok-comment"># {"task_id":"abc123...","status":"running","poll_url":"...?task_id=abc123...&amp;format=gpkg","estimated_seconds":35}</span>
 
 <span class="tok-comment"># Poll until done (repeat every 5s)</span>
-curl <span class="tok-url">'https://example.invalid:8000/api/v1/onestop?task_id=abc123...&amp;format=gpkg'</span>
+curl <span class="tok-url">'http://localhost:8000/api/v1/onestop?task_id=abc123...&amp;format=gpkg'</span>
 
 <span class="tok-comment"># When done: the response IS the .gpkg file — pipe to a file</span>
-curl <span class="tok-flag">-o</span> trees.gpkg <span class="tok-url">'https://example.invalid:8000/api/v1/onestop?task_id=abc123...&amp;format=gpkg'</span></code></pre>
+curl <span class="tok-flag">-o</span> trees.gpkg <span class="tok-url">'http://localhost:8000/api/v1/onestop?task_id=abc123...&amp;format=gpkg'</span></code></pre>
   </div>
 
   <div class="code-wrap">
     <div class="code-header"><span>Example 2 — All objects as KML, grouped by height</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
-    <pre><code>curl <span class="tok-url">'https://example.invalid:8000/api/v1/onestop?bbox=15.35,47.15,15.355,47.154&amp;include_temporal=true&amp;format=kml&amp;group_by=height_class'</span></code></pre>
+    <pre><code>curl <span class="tok-url">'http://localhost:8000/api/v1/onestop?bbox=15.35,47.15,15.355,47.154&amp;include_temporal=true&amp;format=kml&amp;group_by=height_class'</span></code></pre>
   </div>
 
   <div class="code-wrap">
-    <div class="code-header"><span>Example 3 — Buildings 5–15 m, with ortho + cadastre</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
-    <pre><code>curl <span class="tok-url">'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;types=roof&amp;height_min=5&amp;height_max=15&amp;include_cadastre=true&amp;format=gpkg'</span></code></pre>
+    <div class="code-header"><span>Example 3 — Buildings 5–15 m, with ortho</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
+    <pre><code>curl <span class="tok-url">'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;types=roof&amp;height_min=5&amp;height_max=15&amp;format=gpkg'</span></code></pre>
   </div>
 
   <div class="code-wrap">
     <div class="code-header"><span>Example 4 — Named save (custom share ID)</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
     <pre><code><span class="tok-comment"># The result will be saved as share "Graz-Trees" instead of auto-&lt;task_id&gt;</span>
-curl <span class="tok-url">'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;types=tree&amp;height_min=20&amp;format=gpkg&amp;name=Graz-Trees'</span>
+curl <span class="tok-url">'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;types=tree&amp;height_min=20&amp;format=gpkg&amp;name=Graz-Trees'</span>
 
 <span class="tok-comment"># Later, load or download via the share URL:</span>
-curl <span class="tok-url">'https://example.invalid:8000/api/v1/share/Graz-Trees'</span>
-curl <span class="tok-flag">-o</span> trees.gpkg <span class="tok-url">'https://example.invalid:8000/api/v1/share/Graz-Trees/download.gpkg'</span></code></pre>
+curl <span class="tok-url">'http://localhost:8000/api/v1/share/Graz-Trees'</span>
+curl <span class="tok-flag">-o</span> trees.gpkg <span class="tok-url">'http://localhost:8000/api/v1/share/Graz-Trees/download.gpkg'</span></code></pre>
   </div>
 
   <div class="code-wrap">
     <div class="code-header"><span>Example 5 — Polygon KML coloured by height</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
     <pre><code><span class="tok-comment"># Trees as polygon outlines, coloured by height ramp (viridis), grouped by height class</span>
-curl <span class="tok-url">'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;types=tree&amp;format=kml&amp;segment_geometry=polygon&amp;segment_geometry_style=height&amp;group_by=height_class'</span>
+curl <span class="tok-url">'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;types=tree&amp;format=kml&amp;segment_geometry=polygon&amp;segment_geometry_style=height&amp;group_by=height_class'</span>
 
 <span class="tok-comment"># Polygons coloured by type (default style)</span>
-curl <span class="tok-url">'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;format=kml&amp;segment_geometry=polygon'</span>
+curl <span class="tok-url">'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;format=kml&amp;segment_geometry=polygon'</span>
 
 <span class="tok-comment"># Points only (default, fast — no raster vectorisation)</span>
-curl <span class="tok-url">'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;format=kml&amp;segment_geometry=point'</span>
+curl <span class="tok-url">'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;format=kml&amp;segment_geometry=point'</span>
 
 <span class="tok-comment"># GPKG with height-coloured polygons (segment_geometry defaults to polygon for GPKG)</span>
-curl <span class="tok-url">'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;format=gpkg&amp;segment_geometry_style=height'</span>
+curl <span class="tok-url">'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;format=gpkg&amp;segment_geometry_style=height'</span>
 
 <span class="tok-comment"># GPKG with points only (skip vectorisation, smaller file)</span>
-curl <span class="tok-url">'https://example.invalid:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;format=gpkg&amp;segment_geometry=point'</span></code></pre>
+curl <span class="tok-url">'http://localhost:8000/api/v1/onestop?bbox=15.40,47.07,15.405,47.076&amp;format=gpkg&amp;segment_geometry=point'</span></code></pre>
   </div>
 
   <div class="code-wrap">
     <div class="code-header"><span>Example 6 — Full automation (shell script)</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
     <pre><code><span class="tok-comment">#!/bin/bash</span>
 <span class="tok-comment"># Analyse a bounding box and download the GPKG when ready</span>
-BASE=<span class="tok-string">"https://example.invalid:8000/api/v1/onestop"</span>
+BASE=<span class="tok-string">"http://localhost:8000/api/v1/onestop"</span>
 BBOX=<span class="tok-string">"15.40,47.07,15.405,47.076"</span>
 
 <span class="tok-comment"># Start</span>
@@ -1096,13 +1085,13 @@ done</code></pre>
 <div class="code-wrap">
   <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
   <pre><code><span class="tok-comment"># List recent shares</span>
-curl <span class="tok-url">https://example.invalid:8000/api/v1/shares?limit=5</span>
+curl <span class="tok-url">http://localhost:8000/api/v1/shares?limit=5</span>
 
 <span class="tok-comment"># Load a share</span>
-curl <span class="tok-url">https://example.invalid:8000/api/v1/share/abc123</span>
+curl <span class="tok-url">http://localhost:8000/api/v1/share/abc123</span>
 
 <span class="tok-comment"># Download as GeoPackage</span>
-curl <span class="tok-url">https://example.invalid:8000/api/v1/share/abc123/download.gpkg</span> <span class="tok-flag">-o</span> result.gpkg</code></pre>
+curl <span class="tok-url">http://localhost:8000/api/v1/share/abc123/download.gpkg</span> <span class="tok-flag">-o</span> result.gpkg</code></pre>
 </div>
 
 <!-- ==================== UTILITIES ==================== -->
@@ -1126,13 +1115,13 @@ curl <span class="tok-url">https://example.invalid:8000/api/v1/share/abc123/down
 <div class="code-wrap">
   <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
   <pre><code><span class="tok-comment"># Check API info</span>
-curl <span class="tok-url">https://example.invalid:8000/api/v1/info</span>
+curl <span class="tok-url">http://localhost:8000/api/v1/info</span>
 
 <span class="tok-comment"># List layers for a bounding box</span>
-curl <span class="tok-url">"https://example.invalid:8000/api/v1/layers?bbox=15.4,47.0,15.5,47.1"</span>
+curl <span class="tok-url">"http://localhost:8000/api/v1/layers?bbox=15.4,47.0,15.5,47.1"</span>
 
 <span class="tok-comment"># Parse and validate geometry</span>
-curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://example.invalid:8000/api/v1/parse-geometry</span> \
+curl <span class="tok-flag">-X</span> POST <span class="tok-url">http://localhost:8000/api/v1/parse-geometry</span> \
   <span class="tok-flag">-H</span> <span class="tok-string">"Content-Type: application/json"</span> \
   <span class="tok-flag">-d</span> <span class="tok-string">'{"type":"Point","coordinates":[15.43,47.07]}'</span></code></pre>
 </div>
@@ -1142,571 +1131,36 @@ curl <span class="tok-flag">-X</span> POST <span class="tok-url">https://example
 <h2 id="search-index">Search Index <a class="anchor-link" href="#search-index">#</a></h2>
 
 <p>
-  A pre-built SQLite FTS5 + R-tree index over all 8,440 Austrian Katastralgemeinden (KGs).
-  Queries are fast (&lt;25ms for index lookups) and support full-text search, spatial queries,
-  admin hierarchy, object type rankings, and compound filters.
-</p>
-
-<h3 id="query-pagination">Pagination <a class="anchor-link" href="#query-pagination">#</a></h3>
-<p>
-  All list-returning query modes return a <strong>paginated envelope</strong>:
-</p>
-<div class="code-wrap"><pre><code>{
-  "total": 1234,    <span class="tok-comment">// total matching records (before limit/offset)</span>
-  "offset": 0,      <span class="tok-comment">// current offset</span>
-  "limit": 100,     <span class="tok-comment">// page size</span>
-  "results": [...]  <span class="tok-comment">// array of KG records</span>
-}</code></pre></div>
-<p>
-  Use <code>limit=</code> and <code>offset=</code> query parameters to paginate.
-  Default limit is 100, max is 1000.
-  Single-item lookups (<code>kg=</code>, <code>parcel=</code>) return the item directly without the envelope.
-  Aggregate queries (<code>aggregate=true</code>) return aggregate stats directly.
+  A pre-built SQLite FTS5 + R-tree index over all 8,440 Austrian Katastralgemeinden (KGs)
+  (<code>search_index.py</code>, <code>data/search_index.db</code>). It is rebuilt from the
+  product corpus and answers KG lookups in milliseconds.
 </p>
 
 <div class="endpoint">
-  <div class="ep-header">
-    <span class="method method-get">GET</span>
-    <code class="ep-path">/api/v1/query</code>
-    <span class="ep-summary">Unified query endpoint</span>
-  </div>
-  <p class="ep-desc">
-    Supports multiple query modes via query parameters. Pick one mode per request.
-  </p>
-  <div class="table-wrap">
-  <table>
-    <thead><tr><th style="width:230px">Parameter</th><th style="width:90px">Type</th><th>Description</th></tr></thead>
-    <tbody>
-      <tr><td>q</td><td>string</td><td>Full-text search (KG/gemeinde/district/state names)</td></tr>
-      <tr><td>kg</td><td>string</td><td>Exact KG code lookup</td></tr>
-      <tr><td>parcel</td><td>string</td><td>Parcel lookup (format: KGCODE-GNR)</td></tr>
-      <tr><td>bbox</td><td>string</td><td>Spatial R-tree query: <code>w,s,e,n</code></td></tr>
-      <tr><td>point</td><td>string</td><td>Point proximity: <code>lon,lat</code> (sorted by distance)</td></tr>
-      <tr><td>state / district / gemeinde</td><td>string</td><td>Admin hierarchy filter (code or name)</td></tr>
-      <tr><td>type</td><td>string</td><td>Rank KGs by object type. Combine with <code>metric=</code></td></tr>
-      <tr><td>hansen</td><td>boolean</td><td>Hansen forest loss query. Combine with <code>year_from</code>, <code>year_to</code></td></tr>
-      <tr><td>new_buildings</td><td>boolean</td><td>KGs with new uncadastred buildings</td></tr>
-      <tr><td>segments</td><td>boolean</td><td>Segment-level power queries. See <a href="#query-segments">Segment Power Queries</a> below.</td></tr>
-      <tr><td>divergence</td><td>boolean</td><td>KGs ranked by RF→final type divergence</td></tr>
-      <tr><td>parcels_by_type</td><td>string</td><td>Per-parcel filter by type + RF confidence (slow, async-capable)</td></tr>
-      <tr><td>top_features</td><td>string</td><td>Cross-KG features: <code>trees|objects|new_buildings|infrastructure</code> (slow, async-capable)</td></tr>
-      <tr><td colspan="3" style="background:#f8f9fa;font-weight:600;font-size:13px">Modifiers (combine with any mode above)</td></tr>
-      <tr><td>limit</td><td>int</td><td>Max results per page. <span class="param-default">Default: 100, max: 1000</span></td></tr>
-      <tr><td>offset</td><td>int</td><td>Pagination offset. <span class="param-default">Default: 0</span></td></tr>
-      <tr><td>async</td><td>boolean</td><td>Run slow queries asynchronously (parcels_by_type, top_features). Returns <code>task_id</code> to poll.</td></tr>
-      <tr><td>task_id</td><td>string</td><td>Poll an async query task. Returns 202 while running, result when done.</td></tr>
-      <tr><td>aggregate</td><td>boolean</td><td>Return aggregate stats instead of KG list</td></tr>
-      <tr><td>processed_only</td><td>boolean</td><td>Only return processed KGs</td></tr>
-      <tr><td>min_confidence</td><td>float</td><td>Min RF confidence threshold</td></tr>
-      <tr><td>min_area_sqm</td><td>float</td><td>Min area in m² for type filter</td></tr>
-    </tbody>
-  </table>
-  </div>
-  <div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">📋</button>
-  <pre><code><span class="tok-comment"># Paginated text search</span>
-curl <span class="tok-url">https://example.invalid:8000/api/v1/query?q=Wien&limit=10&offset=0</span>
-<span class="tok-comment"># → {"total": 23, "offset": 0, "limit": 10, "results": [...]}</span>
-
-<span class="tok-comment"># Page 2</span>
-curl <span class="tok-url">https://example.invalid:8000/api/v1/query?q=Wien&limit=10&offset=10</span>
-
-<span class="tok-comment"># Spatial query with pagination</span>
-curl <span class="tok-url">https://example.invalid:8000/api/v1/query?bbox=15.0,47.0,16.0,48.0&limit=50&offset=0</span>
-
-<span class="tok-comment"># Admin hierarchy</span>
-curl <span class="tok-url">https://example.invalid:8000/api/v1/query?state=Vorarlberg&limit=25&offset=0</span></code></pre></div>
+  <div class="endpoint-header"><span class="method get">GET</span><code>/api/v1/kg/&lt;code&gt;</code></div>
+  <p>KG summary document (product JSON) with <code>_links</code> to the Zenodo products.
+     <code>?index_only=true</code> returns the index row only; <code>?history=1</code> adds the processing history.</p>
 </div>
-
-<h3 id="query-async">Async Queries <a class="anchor-link" href="#query-async">#</a></h3>
-<p>
-  Slow queries that scan KG JSON files (<code>parcels_by_type</code>, <code>top_features</code>)
-  support asynchronous execution with <code>async=true</code>. This is recommended when querying
-  across many KGs to avoid HTTP timeouts.
-</p>
-<div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">📋</button>
-<pre><code><span class="tok-comment"># 1. Start async query</span>
-curl <span class="tok-url">https://example.invalid:8000/api/v1/query?top_features=trees&min_confidence=0.9&async=true</span>
-<span class="tok-comment"># → 202 {"task_id": "abc-123", "status": "running", "poll": "/api/v1/query?task_id=abc-123"}</span>
-
-<span class="tok-comment"># 2. Poll until done</span>
-curl <span class="tok-url">https://example.invalid:8000/api/v1/query?task_id=abc-123</span>
-<span class="tok-comment"># → 202 {"active": true, "step": "running", "elapsed": 3.2} (while running)</span>
-<span class="tok-comment"># → 200 {"total": 456, "offset": 0, "limit": 100, "results": [...]} (when done)</span>
-
-<span class="tok-comment"># Alternative: dedicated progress endpoint</span>
-curl <span class="tok-url">https://example.invalid:8000/api/v1/query/progress?task_id=abc-123</span></code></pre></div>
-
-<div class="table-wrap">
-<table>
-  <thead><tr><th style="width:200px">Endpoint</th><th>Purpose</th></tr></thead>
-  <tbody>
-    <tr><td><code>GET /api/v1/query?task_id=X</code></td><td>Poll async query — returns 202 while running, result (200) when done, error (500) on failure</td></tr>
-    <tr><td><code>GET /api/v1/query/progress?task_id=X</code></td><td>Dedicated progress endpoint — same behavior</td></tr>
-  </tbody>
-</table>
-</div>
-<p style="font-size:13px;color:#666;">Async results are auto-cleaned after 4 hours.</p>
-
-<h3 id="query-compound">Compound Filter <a class="anchor-link" href="#query-compound">#</a></h3>
 <div class="endpoint">
-  <div class="ep-header">
-    <span class="method method-get">GET</span><span class="method method-post" style="margin-left:4px">POST</span>
-    <code class="ep-path">/api/v1/query/compound</code>
-    <span class="ep-summary">Filter KGs by any combination of attributes</span>
-  </div>
-  <p class="ep-desc">
-    GET with query params or POST a JSON body. All filters are pure SQL on indexed columns — very fast.
-    Returns paginated <code>{total, offset, limit, results}</code>.
-    Supports <code>async=true</code>; poll with <code>task_id=&lt;id&gt;</code>.
-  </p>
-  <p class="ep-desc" style="font-size:12px;color:#666">
-    <strong>GET syntax:</strong> flat params (<code>state=Vorarlberg&amp;min_slope=15</code>),
-    <code>aspect=S,SW,W</code> (comma-separated),
-    <code>type_filter=tree:0.8:800</code> (repeatable, type:confidence:area),
-    <code>landcover_filter=grass:1300:0.1</code> (repeatable, type:area:fraction).
-  </p>
-  <div class="table-wrap">
-  <table>
-    <thead><tr><th style="width:230px">Filter key</th><th style="width:120px">Type</th><th>Description</th></tr></thead>
-    <tbody>
-      <tr><td>bbox</td><td>[w,s,e,n]</td><td>Spatial bounding box</td></tr>
-      <tr><td>state / district / gemeinde</td><td>string</td><td>Admin filter</td></tr>
-      <tr><td>aspect</td><td>["S","SW",...]</td><td>Dominant aspect direction</td></tr>
-      <tr><td>dominant_type / phenology / quality_grade</td><td>string</td><td>Exact match filters</td></tr>
-      <tr><td>min_/max_ + numeric field</td><td>float</td><td>Numeric ranges: slope, elevation, ndvi, tree_count, building_height, sar_vv, etc.</td></tr>
-      <tr><td>type_filters</td><td>array</td><td><code>[{"type": "tree", "min_confidence": 0.8, "min_area_sqm": 800}]</code></td></tr>
-      <tr><td>landcover_filters</td><td>array</td><td><code>[{"type": "crop", "min_fraction": 0.2, "max_height_mean": 1.0}]</code></td></tr>
-      <tr><td>sort / sort_dir</td><td>string</td><td>Sort column + direction (<code>asc</code>/<code>desc</code>)</td></tr>
-      <tr><td>limit / offset</td><td>int</td><td>Pagination. Default limit=50, max 1000</td></tr>
-      <tr><td>async</td><td>boolean</td><td>Run asynchronously. Returns <code>{task_id}</code></td></tr>
-    </tbody>
-  </table>
-  </div>
-  <div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">📋</button>
-  <pre><code><span class="tok-comment"># Trees + grass with high RF confidence, no buildings, rugged terrain</span>
-curl <a href="https://example.invalid:8000/api/v1/query/compound?type_filter=tree:0.8:800&amp;type_filter=grass:0.8:1300&amp;max_buildings=0&amp;aspect=S,SW,W&amp;min_roughness=2.0" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query/compound?type_filter=tree:0.8:800&amp;type_filter=grass:0.8:1300&amp;max_buildings=0&amp;aspect=S,SW,W&amp;min_roughness=2.0"</a>
-<span class="tok-comment"># → {"total": 47, "offset": 0, "limit": 50, "results": [...]}</span>
-
-<span class="tok-comment"># High-elevation steep terrain with lots of trees, page 3</span>
-curl <a href="https://example.invalid:8000/api/v1/query/compound?min_elevation=1500&amp;min_slope=15&amp;min_tree_count=100&amp;sort=tree_canopy_sqm&amp;sort_dir=desc&amp;limit=20&amp;offset=40" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query/compound?min_elevation=1500&amp;min_slope=15&amp;min_tree_count=100&amp;sort=tree_canopy_sqm&amp;sort_dir=desc&amp;limit=20&amp;offset=40"</a></code></pre></div>
+  <div class="endpoint-header"><span class="method get">GET</span><code>/api/v1/kg/&lt;code&gt;/segments</code></div>
+  <p>Segment polygons from the light GPKG. Params: <code>bbox=w,s,e,n</code>, <code>type=tree,roof</code>, <code>limit</code>, <code>offset</code>.</p>
 </div>
-
-
 <div class="endpoint">
-  <div class="ep-header">
-    <span class="method method-get">GET</span>
-    <code class="ep-path">/api/v1/index/status</code>
-    <span class="ep-summary">Index statistics</span>
-  </div>
-  <p class="ep-desc">Returns kg_count, processed_count, total_area_km2, zenodo_kgs, and more.</p>
+  <div class="endpoint-header"><span class="method get">GET</span><code>/api/v1/kg/&lt;code&gt;/heightfield</code> · <code>/landcover</code> · <code>/layers</code></div>
+  <p>25 m terrain grid (bilinear DTM estimate), 25 m land-cover grid, and the layer inventory of the KG's GPKG.</p>
 </div>
-
 <div class="endpoint">
-  <div class="ep-header">
-    <span class="method method-post">POST</span>
-    <code class="ep-path">/api/v1/index/rebuild</code>
-    <span class="ep-summary">Rebuild search index</span>
-  </div>
-  <p class="ep-desc">Rebuilds from scratch (~0.3s). Picks up new processor results and Zenodo manifest entries.</p>
+  <div class="endpoint-header"><span class="method get">GET</span><code>/api/v1/index/status</code> · <span class="method post">POST</span><code>/api/v1/index/rebuild</code></div>
+  <p>Index statistics; rebuild from the product corpus (operator, loopback only).</p>
 </div>
 
-<h3 id="processing-queue">Processing Queue Management <a class="anchor-link" href="#processing-queue">#</a></h3>
-<p>Control which KGs get processed next. The priority queue is a persistent ordered list; the processor pops from the front.</p>
-
-<div class="endpoint">
-  <div class="ep-header">
-    <span class="method method-get">GET</span>
-    <code class="ep-path">/api/v1/processing/queue</code>
-    <span class="ep-summary">Read current priority queue</span>
-  </div>
-  <p class="ep-desc">Returns the ordered list of KG numbers waiting to be processed.</p>
-  <div class="code-wrap"><pre><code>curl https://example.invalid:8000/api/v1/processing/queue</code></pre></div>
+<div class="code-wrap">
+  <div class="code-header"><span>Examples</span></div>
+  <pre><code>curl 'http://localhost:8000/api/v1/kg/91109?index_only=true'
+curl 'http://localhost:8000/api/v1/kg/91109/segments?type=roof&amp;limit=50'
+curl 'http://localhost:8000/api/v1/index/status'</code></pre>
 </div>
 
-<div class="endpoint">
-  <div class="ep-header">
-    <span class="method method-post">POST</span>
-    <code class="ep-path">/api/v1/processing/queue</code>
-    <span class="ep-summary">Add KGs at a specific position</span>
-  </div>
-  <p class="ep-desc">Insert one or more KGs into the queue at a given position. Use <code>skip_processed: true</code> to ignore already-processed KGs.</p>
-  <div class="code-wrap"><pre><code><span class="tok-kw">POST</span> /api/v1/processing/queue
-Content-Type: application/json
-
-{
-  "kgs": ["49006", "49013"],
-  "position": 2,
-  "skip_processed": true
-}</code></pre></div>
-  <p class="ep-desc" style="margin-top:10px">
-    <strong>Example — Prioritise Gesäuse + Kalkalpen national park KGs:</strong>
-  </p>
-  <div class="code-wrap"><pre><code>curl <span class="tok-flag">-X</span> POST https://example.invalid:8000/api/v1/processing/queue \
-  <span class="tok-flag">-H</span> 'Content-Type: application/json' \
-  <span class="tok-flag">-d</span> '{"kgs": ["49006","49013","49106","49311","49313","49321","49405","49406","49407","49409","49412","60102","60106","60107","67106","67107","67109","67111","67404","67405","67412","67501"],
-    "position": 2, "skip_processed": true}'</code></pre></div>
-  <p style="font-size:13px;color:#94a3b8;margin-top:6px">Inserts Gesäuse &amp; Kalkalpen KGs at position 2, right after whatever is currently processing.</p>
-</div>
-
-<div class="endpoint">
-  <div class="ep-header">
-    <span class="method method-put">PUT</span>
-    <code class="ep-path">/api/v1/processing/queue</code>
-    <span class="ep-summary">Replace entire queue</span>
-  </div>
-  <p class="ep-desc">Overwrites the full queue with a new ordered list.</p>
-  <div class="code-wrap"><pre><code><span class="tok-kw">PUT</span> /api/v1/processing/queue
-Content-Type: application/json
-
-{
-  "queue": ["12345", "67890", "91109"]
-}</code></pre></div>
-</div>
-
-<div class="endpoint">
-  <div class="ep-header">
-    <span class="method method-delete">DELETE</span>
-    <code class="ep-path">/api/v1/processing/queue?kg=X</code>
-    <span class="ep-summary">Remove a KG from queue</span>
-  </div>
-  <p class="ep-desc">Removes the specified KG number from the processing queue.</p>
-  <div class="code-wrap"><pre><code>curl <span class="tok-flag">-X</span> DELETE 'https://example.invalid:8000/api/v1/processing/queue?kg=49006'</code></pre></div>
-</div>
-
-<h3 id="query-filter-logic">Filter Logic: AND vs OR <a class="anchor-link" href="#query-filter-logic">#</a></h3>
-<p>
-  All filters within a single query combine with <strong>AND</strong>. For example:
-</p>
-<div class="code-wrap"><pre><code>segments=true &amp; object_type=tree &amp; min_rf_confidence=0.9 &amp; min_height=20 &amp; state=Vorarlberg</code></pre></div>
-<p style="font-size:13px;color:#666;margin-top:6px">means: type = tree <strong>AND</strong> rf_conf &ge; 0.9 <strong>AND</strong> height &ge; 20m <strong>AND</strong> state = Vorarlberg</p>
-
-<p style="margin-top:12px">
-  <strong>Multiple types</strong> in <code>object_type</code> combine with <strong>OR</strong> (comma-separated):
-</p>
-<div class="code-wrap"><pre><code>object_type=tree,shrub,hedge</code></pre></div>
-<p style="font-size:13px;color:#666;margin-top:6px">means: (type = tree <strong>OR</strong> shrub <strong>OR</strong> hedge) <strong>AND</strong> all other filters.</p>
-
-<p style="margin-top:12px">
-  <strong>Text search</strong> (<code>q=</code>) tokenises by whitespace; terms are AND&rsquo;d:
-  <code>q=Bregenz Gaissau</code> matches KGs whose name/admin contains <em>both</em> terms.
-</p>
-<p style="margin-top:8px;font-size:13px;color:#666">
-  <code>district=</code> and <code>gemeinde=</code> accept names (e.g. <code>district=Bregenz</code>) or numeric codes (<code>district=802</code>).
-  <code>state=</code> accepts names (e.g. <code>state=Vorarlberg</code>) or single-digit codes (<code>state=8</code>).
-</p>
-
-<h3 id="query-segments">Segment Power Queries <a class="anchor-link" href="#query-segments">#</a></h3>
-<p>
-  The search index stores the <strong>top 50 individual segments per object type per KG</strong>.
-  This enables cross-KG queries at segment level &mdash; find specific objects across
-  all of Austria without scanning full GeoPackage files.
-  Add <code>segments=true</code> to <code>/api/v1/query</code>.
-</p>
-
-<div class="table-wrap">
-<table>
-  <thead><tr><th style="width:200px">Parameter</th><th style="width:100px">Type</th><th>Description</th></tr></thead>
-  <tbody>
-    <tr><td><code>object_type</code></td><td>string</td><td>Single type or comma-separated OR list: <code>tree</code>, <code>tree,shrub,hedge</code></td></tr>
-    <tr><td><code>min_rf_confidence</code></td><td>float</td><td>Raw RF model score lower bound (0&ndash;1)</td></tr>
-    <tr><td><code>max_rf_confidence</code></td><td>float</td><td>Raw RF model score upper bound</td></tr>
-    <tr><td><code>min_confidence</code></td><td>float</td><td>Combined/calibrated score lower bound</td></tr>
-    <tr><td><code>max_confidence</code></td><td>float</td><td>Combined/calibrated score upper bound</td></tr>
-    <tr><td><code>min_area_sqm</code></td><td>float</td><td>Minimum segment area (m&sup2;)</td></tr>
-    <tr><td><code>max_area_sqm</code></td><td>float</td><td>Maximum segment area</td></tr>
-    <tr><td><code>min_height</code></td><td>float</td><td>Minimum height_max_m (metres)</td></tr>
-    <tr><td><code>max_height</code></td><td>float</td><td>Maximum height_max_m</td></tr>
-    <tr><td><code>min_volume</code></td><td>float</td><td>Minimum |volume_change_m&sup3;| (absolute)</td></tr>
-    <tr><td><code>max_volume</code></td><td>float</td><td>Maximum |volume_change_m&sup3;|</td></tr>
-    <tr><td><code>bbox</code></td><td>string</td><td>Spatial filter: <code>w,s,e,n</code></td></tr>
-    <tr><td><code>state</code></td><td>string</td><td>State name or code</td></tr>
-    <tr><td><code>district</code></td><td>string</td><td>District name or code</td></tr>
-    <tr><td><code>sort</code></td><td>string</td><td><code>height_max_m</code> (default), <code>height_mean_m</code>, <code>area_sqm</code>, <code>volume</code>, <code>rf_confidence</code>, <code>confidence</code></td></tr>
-    <tr><td><code>sort_dir</code></td><td>string</td><td><code>desc</code> (default) or <code>asc</code></td></tr>
-    <tr><td><code>percentile</code></td><td>float</td><td>0&ndash;1: return only top N% (e.g. 0.01 = top 1%). Threshold computed from all matching segments, then applied as filter.</td></tr>
-    <tr><td><code>limit</code>, <code>offset</code></td><td>int</td><td>Pagination (default limit=100, max 1000)</td></tr>
-  </tbody>
-</table>
-</div>
-
-<p style="margin-top:12px">
-  Each result includes <code>kg_code</code>, <code>object_type</code>, <code>lon</code>/<code>lat</code>,
-  <code>area_sqm</code>, <code>height_max_m</code>, <code>height_mean_m</code>, <code>volume_change_m3</code>,
-  <code>rf_confidence</code>, <code>confidence</code>, <code>rank</code>, admin names,
-  and <code>_links</code> with a <code>kg</code> API URL and a <code>map</code> Google Maps link.
-  When <code>percentile</code> is used, the response also includes <code>percentile_threshold</code>
-  and <code>percentile_count</code>.
-</p>
-
-<h4 style="margin-top:16px">Example Queries</h4>
-<div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">&#x1f4cb;</button>
-<pre><code><span class="tok-comment"># Top 1% tallest trees with RF confidence &gt; 90%</span>
-<span class="tok-comment"># Returns 1 result: 35.43m tree near Gaissau, rf_conf=0.937</span>
-curl <a href="https://example.invalid:8000/api/v1/query?segments=true&object_type=tree&min_rf_confidence=0.9&percentile=0.01" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?segments=true&amp;object_type=tree&amp;min_rf_confidence=0.9&amp;percentile=0.01"</a>
-
-<span class="tok-comment"># Top 5% largest tree loss areas, RF confidence &gt; 80%</span>
-<span class="tok-comment"># Returns segments ranked by area where forest has been lost</span>
-curl <a href="https://example.invalid:8000/api/v1/query?segments=true&object_type=tree_loss&min_rf_confidence=0.8&percentile=0.05&sort=area_sqm" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?segments=true&amp;object_type=tree_loss&amp;min_rf_confidence=0.8&amp;percentile=0.05&amp;sort=area_sqm"</a>
-
-<span class="tok-comment"># Top 10 excavations by volume, RF confidence &gt; 70%</span>
-<span class="tok-comment"># Finds the largest ground disturbances measured in m³ of earth moved</span>
-curl <a href="https://example.invalid:8000/api/v1/query?segments=true&object_type=excavation&min_rf_confidence=0.7&sort=volume&limit=10" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?segments=true&amp;object_type=excavation&amp;min_rf_confidence=0.7&amp;sort=volume&amp;limit=10"</a>
-
-<span class="tok-comment"># Tallest 5 roofs with combined confidence &gt; 70%</span>
-<span class="tok-comment"># Identifies the tallest buildings (by nDSM height at segment peak)</span>
-curl <a href="https://example.invalid:8000/api/v1/query?segments=true&object_type=roof&min_confidence=0.7&sort=height_max_m&limit=5" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?segments=true&amp;object_type=roof&amp;min_confidence=0.7&amp;sort=height_max_m&amp;limit=5"</a>
-
-<span class="tok-comment"># All tall vegetation: trees OR shrubs OR hedges above 15m, high confidence</span>
-<span class="tok-comment"># Multi-type OR — comma-separated types act as OR, other filters AND</span>
-curl <a href="https://example.invalid:8000/api/v1/query?segments=true&object_type=tree,shrub,hedge&min_height=15&min_rf_confidence=0.7&sort=height_max_m" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?segments=true&amp;object_type=tree,shrub,hedge&amp;min_height=15&amp;min_rf_confidence=0.7&amp;sort=height_max_m"</a>
-
-<span class="tok-comment"># Largest building structures: roofs OR greenhouses, sorted by footprint</span>
-curl <a href="https://example.invalid:8000/api/v1/query?segments=true&object_type=roof,greenhouse&sort=area_sqm&sort_dir=desc&min_confidence=0.7&limit=10" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?segments=true&amp;object_type=roof,greenhouse&amp;sort=area_sqm&amp;sort_dir=desc&amp;min_confidence=0.7&amp;limit=10"</a>
-
-<span class="tok-comment"># All disturbance events ranked by volume of earth moved</span>
-<span class="tok-comment"># Combines excavation, fill, construction, and tree_loss into one query</span>
-curl <a href="https://example.invalid:8000/api/v1/query?segments=true&object_type=excavation,fill,construction,tree_loss&sort=volume&sort_dir=desc&limit=20" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?segments=true&amp;object_type=excavation,fill,construction,tree_loss&amp;sort=volume&amp;sort_dir=desc&amp;limit=20"</a>
-
-<span class="tok-comment"># Trees in Bregenz district above 30m</span>
-<span class="tok-comment"># Combines type + spatial admin + height filter (all AND)</span>
-curl <a href="https://example.invalid:8000/api/v1/query?segments=true&object_type=tree&district=Bregenz&min_height=30&sort=height_max_m" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?segments=true&amp;object_type=tree&amp;district=Bregenz&amp;min_height=30&amp;sort=height_max_m"</a>
-
-<span class="tok-comment"># Top 5% largest crop segments with high RF confidence</span>
-curl <a href="https://example.invalid:8000/api/v1/query?segments=true&object_type=crop&min_rf_confidence=0.8&percentile=0.05&sort=area_sqm" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?segments=true&amp;object_type=crop&amp;min_rf_confidence=0.8&amp;percentile=0.05&amp;sort=area_sqm"</a></code></pre>
-</div>
-
-<h4 style="margin-top:16px">More Query Examples (non-segment)</h4>
-<div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">&#x1f4cb;</button>
-<pre><code><span class="tok-comment"># KG lookup by code — returns full index record with landcover, hansen, links</span>
-curl <a href="https://example.invalid:8000/api/v1/query?kg=91109" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?kg=91109"</a>
-
-<span class="tok-comment"># Aggregate landscape stats for a state</span>
-curl <a href="https://example.invalid:8000/api/v1/query?state=Vorarlberg&aggregate=true" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?state=Vorarlberg&amp;aggregate=true"</a>
-
-<span class="tok-comment"># Aggregate stats for a district (by name)</span>
-curl <a href="https://example.invalid:8000/api/v1/query?district=Bregenz&aggregate=true" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?district=Bregenz&amp;aggregate=true"</a>
-
-<span class="tok-comment"># Text search (terms are AND'd) — finds KGs matching BOTH terms</span>
-curl <a href="https://example.invalid:8000/api/v1/query?q=Bregenz+Gaissau" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?q=Bregenz+Gaissau"</a>
-
-<span class="tok-comment"># Point proximity — nearest KGs to a coordinate, sorted by distance</span>
-curl <a href="https://example.invalid:8000/api/v1/query?point=9.59,47.48" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?point=9.59,47.48"</a>
-
-<span class="tok-comment"># Spatial bbox, processed KGs only</span>
-curl <a href="https://example.invalid:8000/api/v1/query?bbox=9.55,47.46,9.62,47.50&processed_only=true" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?bbox=9.55,47.46,9.62,47.50&amp;processed_only=true"</a>
-
-<span class="tok-comment"># KGs ranked by tree coverage (by area)</span>
-curl <a href="https://example.invalid:8000/api/v1/query?type=tree&metric=area" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?type=tree&amp;metric=area"</a>
-
-<span class="tok-comment"># Hansen forest loss in a year range</span>
-curl <a href="https://example.invalid:8000/api/v1/query?hansen=true&year_from=2020&year_to=2024" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?hansen=true&amp;year_from=2020&amp;year_to=2024"</a>
-
-<span class="tok-comment"># KGs with new uncadastred buildings</span>
-curl <a href="https://example.invalid:8000/api/v1/query?new_buildings=true&processed_only=true" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?new_buildings=true&amp;processed_only=true"</a>
-
-<span class="tok-comment"># All KGs in Gaißau municipality</span>
-curl <a href="https://example.invalid:8000/api/v1/query?gemeinde=Gai%C3%9Fau" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?gemeinde=Gai%C3%9Fau"</a>
-
-<span class="tok-comment"># ── Terrain, slope, aspect, elevation filters ──</span>
-
-<span class="tok-comment"># NE-facing gentle slopes above 390m with buildings and trees</span>
-curl <a href="https://example.invalid:8000/api/v1/query?max_slope_mean=5&amp;min_elevation_mean=390&amp;min_building_count=100&amp;min_tree_count=500&amp;processed_only=true" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?max_slope_mean=5&amp;min_elevation_mean=390&amp;min_building_count=100&amp;min_tree_count=500&amp;processed_only=true"</a>
-
-<span class="tok-comment"># Low slope + lush vegetation + high NDVI</span>
-curl <a href="https://example.invalid:8000/api/v1/query?min_vegetated_fraction=0.5&amp;max_slope_mean=5&amp;min_ndvi=0.3&amp;processed_only=true" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?min_vegetated_fraction=0.5&amp;max_slope_mean=5&amp;min_ndvi=0.3&amp;processed_only=true"</a>
-
-<span class="tok-comment"># Dense settlements: 500+ buildings, multi-story, max height &gt; 20m</span>
-curl <a href="https://example.invalid:8000/api/v1/query?min_building_count=500&amp;min_building_stories=2&amp;min_building_max_height=20&amp;processed_only=true" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?min_building_count=500&amp;min_building_stories=2&amp;min_building_max_height=20&amp;processed_only=true"</a>
-
-<span class="tok-comment"># High biodiversity: Shannon &gt; 2.0, 1000+ trees, large canopy</span>
-curl <a href="https://example.invalid:8000/api/v1/query?min_shannon_diversity=2.0&amp;min_tree_count=1000&amp;min_tree_canopy_sqm=100000&amp;processed_only=true" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?min_shannon_diversity=2.0&amp;min_tree_count=1000&amp;min_tree_canopy_sqm=100000&amp;processed_only=true"</a>
-
-<span class="tok-comment"># Active landscape change + high quality classification</span>
-curl <a href="https://example.invalid:8000/api/v1/query?min_changed_segments=100&amp;min_quality_score=0.9&amp;processed_only=true" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?min_changed_segments=100&amp;min_quality_score=0.9&amp;processed_only=true"</a>
-
-<span class="tok-comment"># ── Per-parcel terrain filter (GET /api/v1/parcels/batch) ──</span>
-<span class="tok-comment"># Compound filters as flat params, parcel filters with pf_ prefix</span>
-
-<span class="tok-comment"># All east-facing level parcels — returns parcel IDs with cadastre data</span>
-curl <a href="https://example.invalid:8000/api/v1/parcels/batch?state=Vorarlberg&amp;pf_aspect=E&amp;pf_terrain_class=level&amp;limit=100" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/parcels/batch?state=Vorarlberg&amp;pf_aspect=E&amp;pf_terrain_class=level&amp;limit=100"</a>
-<span class="tok-comment"># → 125 parcels with aspect_dominant=E and terrain_class=level</span></code></pre>
-</div>
-
-<h4 style="margin-top:16px">Slow Queries (async recommended)</h4>
-<p style="font-size:13px;color:#666;margin-bottom:10px">
-  These queries scan KG JSON files on disk and can take seconds to minutes depending on how many KGs
-  are processed. Use <code>async=true</code> to avoid HTTP timeouts &mdash; you get back a <code>task_id</code>
-  immediately and poll for the result.
-</p>
-<div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">&#x1f4cb;</button>
-<pre><code><span class="tok-comment"># ── parcels_by_type: find individual parcels where a type has high RF confidence ──</span>
-<span class="tok-comment"># Scans KG JSONs → returns per-parcel results with centroid, elevation, areas</span>
-<span class="tok-comment"># Sync (fast if few KGs processed):</span>
-curl <a href="https://example.invalid:8000/api/v1/query?parcels_by_type=tree&min_confidence=0.8&min_area_sqm=1500" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?parcels_by_type=tree&amp;min_confidence=0.8&amp;min_area_sqm=1500"</a>
-
-<span class="tok-comment"># Async (recommended when many KGs are processed):</span>
-curl <a href="https://example.invalid:8000/api/v1/query?parcels_by_type=tree&min_confidence=0.8&min_area_sqm=1500&async=true" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?parcels_by_type=tree&amp;min_confidence=0.8&amp;min_area_sqm=1500&amp;async=true"</a>
-<span class="tok-comment"># → 202 {"task_id": "abc-123", "status": "running", "poll": "/api/v1/query?task_id=abc-123"}</span>
-<span class="tok-comment"># Poll until done:</span>
-curl <a href="https://example.invalid:8000/api/v1/query?task_id=abc-123" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?task_id=abc-123"</a>
-<span class="tok-comment"># → 202 while running, 200 with full result when complete</span>
-
-<span class="tok-comment"># ── top_features: cross-KG ranked features from JSON summaries ──</span>
-
-<span class="tok-comment"># Tallest trees across all processed KGs, RF confidence &gt; 90%</span>
-curl <a href="https://example.invalid:8000/api/v1/query?top_features=trees&min_confidence=0.9&async=true" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?top_features=trees&amp;min_confidence=0.9&amp;async=true"</a>
-
-<span class="tok-comment"># Tallest new (uncadastred) buildings, confidence &gt; 75%</span>
-curl <a href="https://example.invalid:8000/api/v1/query?top_features=new_buildings&min_confidence=0.75&async=true" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?top_features=new_buildings&amp;min_confidence=0.75&amp;async=true"</a>
-
-<span class="tok-comment"># Infrastructure masts only, high confidence</span>
-curl <a href="https://example.invalid:8000/api/v1/query?top_features=infrastructure&type=mast&min_confidence=0.8&async=true" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?top_features=infrastructure&amp;type=mast&amp;min_confidence=0.8&amp;async=true"</a>
-
-<span class="tok-comment"># Top objects within a spatial bbox (restricts which KGs are scanned)</span>
-curl <a href="https://example.invalid:8000/api/v1/query?top_features=objects&bbox=9.5,47.4,9.7,47.6&min_confidence=0.7&async=true" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query?top_features=objects&amp;bbox=9.5,47.4,9.7,47.6&amp;min_confidence=0.7&amp;async=true"</a>
-
-<span class="tok-comment"># ── compound filter (async): complex multi-attribute KG search ──</span>
-<span class="tok-comment"># GET with async=true — same poll mechanism via task_id</span>
-curl <a href="https://example.invalid:8000/api/v1/query/compound?type_filter=tree:0.8:800&amp;min_elevation=1000&amp;aspect=S,SW&amp;min_ndvi=0.5&amp;max_buildings=10&amp;sort=tree_canopy_sqm&amp;sort_dir=desc&amp;async=true" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query/compound?type_filter=tree:0.8:800&amp;min_elevation=1000&amp;aspect=S,SW&amp;min_ndvi=0.5&amp;max_buildings=10&amp;sort=tree_canopy_sqm&amp;sort_dir=desc&amp;async=true"</a>
-<span class="tok-comment"># → 202 {"task_id": "def-456", ...}</span>
-<span class="tok-comment"># Poll: /api/v1/query/compound?task_id=def-456</span></code></pre>
-</div>
-
-<h3 id="query-parcels">Per-Parcel Index Query <a class="anchor-link" href="#query-parcels">#</a></h3>
-<p>
-  <code>GET /api/v1/query/parcels</code> runs direct SQL against the <code>kg_parcels</code> index table.
-  Every processed parcel is indexed with terrain, vegetation, classification, Hansen, and building
-  attributes &mdash; all queries return in <strong>&lt;&thinsp;50&thinsp;ms</strong>.
-  This is the endpoint for complex cross-KG parcel searches like
-  <em>&ldquo;south-facing parcels above 900&thinsp;m with a single-storey pitched-roof building,
-  under 5&thinsp;000&thinsp;m&sup2;, and little recent deforestation.&rdquo;</em>
-</p>
-
-<div class="table-wrap">
-<table>
-  <thead><tr><th style="width:220px">Parameter</th><th style="width:100px">Type</th><th>Description</th></tr></thead>
-  <tbody>
-    <tr><td colspan="3" style="background:#f6f8fa;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Admin / spatial</td></tr>
-    <tr><td><code>kg</code></td><td>string</td><td>Filter by KG code</td></tr>
-    <tr><td><code>state</code></td><td>string</td><td>Bundesland name or code</td></tr>
-    <tr><td><code>district</code></td><td>string</td><td>Bezirk name or code</td></tr>
-    <tr><td><code>gemeinde</code></td><td>string</td><td>Gemeinde name or code</td></tr>
-    <tr><td><code>bbox</code></td><td>string</td><td>Spatial bounding box: <code>w,s,e,n</code></td></tr>
-
-    <tr><td colspan="3" style="background:#f6f8fa;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Area &amp; elevation</td></tr>
-    <tr><td><code>min_area</code> / <code>max_area</code></td><td>float</td><td>Parcel area in m&sup2;</td></tr>
-    <tr><td><code>min_elevation</code> / <code>max_elevation</code></td><td>float</td><td>Mean elevation in metres</td></tr>
-
-    <tr><td colspan="3" style="background:#f6f8fa;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Terrain</td></tr>
-    <tr><td><code>min_slope</code> / <code>max_slope</code></td><td>float</td><td>Mean slope in degrees</td></tr>
-    <tr><td><code>min_tri</code> / <code>max_tri</code></td><td>float</td><td>Terrain Roughness Index</td></tr>
-    <tr><td><code>terrain_class</code></td><td>string</td><td><code>level</code>, <code>nearly_level</code>, <code>slightly_rugged</code>, <code>rugged</code>, &hellip;</td></tr>
-    <tr><td><code>aspect</code></td><td>string</td><td>Comma-separated: <code>N,NE,E,SE,S,SW,W,NW</code></td></tr>
-
-    <tr><td colspan="3" style="background:#f6f8fa;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Vegetation &amp; land cover</td></tr>
-    <tr><td><code>dominant_type</code></td><td>string</td><td>Dominant segment type: <code>tree</code>, <code>grass</code>, <code>roof</code>, &hellip;</td></tr>
-    <tr><td><code>min_vegetated_fraction</code> / <code>max_vegetated_fraction</code></td><td>float</td><td>Vegetated fraction 0&ndash;1</td></tr>
-    <tr><td><code>min_forested_fraction</code> / <code>max_forested_fraction</code></td><td>float</td><td>Forested fraction 0&ndash;1</td></tr>
-    <tr><td><code>is_vegetated</code></td><td>bool</td><td><code>true</code> or <code>false</code></td></tr>
-
-    <tr><td colspan="3" style="background:#f6f8fa;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Height &amp; classification</td></tr>
-    <tr><td><code>min_ndsm_max</code> / <code>max_ndsm_max</code></td><td>float</td><td>Max nDSM height on parcel (m)</td></tr>
-    <tr><td><code>min_confidence</code></td><td>float</td><td>Min mean classification confidence</td></tr>
-    <tr><td><code>min_rf_confidence</code></td><td>float</td><td>Min RF model confidence</td></tr>
-
-    <tr><td colspan="3" style="background:#f6f8fa;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Hansen forest change</td></tr>
-    <tr><td><code>min_hansen_recent_5yr</code> / <code>max_hansen_recent_5yr</code></td><td>int</td><td>Recent 5-year loss pixels</td></tr>
-    <tr><td><code>min_hansen_total</code> / <code>max_hansen_total</code></td><td>int</td><td>Total loss pixels</td></tr>
-
-    <tr><td colspan="3" style="background:#f6f8fa;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Building join filters</td></tr>
-    <tr><td><code>building_roof_type</code></td><td>string</td><td><code>pitched</code> or <code>flat</code> &mdash; parcel must contain a matching building</td></tr>
-    <tr><td><code>building_min_stories</code></td><td>int</td><td>Minimum estimated building stories</td></tr>
-    <tr><td><code>building_max_stories</code></td><td>int</td><td>Maximum estimated building stories</td></tr>
-
-    <tr><td colspan="3" style="background:#f6f8fa;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Sorting &amp; pagination</td></tr>
-    <tr><td><code>sort</code></td><td>string</td><td><code>elevation_m</code> (default), <code>area_sqm</code>, <code>slope_mean_deg</code>, <code>tri_mean</code>, <code>vegetated_fraction</code>, <code>forested_fraction</code>, <code>ndsm_max_m</code>, <code>hansen_recent_5yr_pixels</code>, <code>hansen_total_pixels</code>, <code>mean_confidence</code>, <code>rf_mean_confidence</code></td></tr>
-    <tr><td><code>sort_dir</code></td><td>string</td><td><code>desc</code> (default) or <code>asc</code></td></tr>
-    <tr><td><code>limit</code></td><td>int</td><td>Max results (default 100, max 1000)</td></tr>
-    <tr><td><code>offset</code></td><td>int</td><td>Pagination offset</td></tr>
-  </tbody>
-</table>
-</div>
-
-<p style="margin-top:12px">
-  Each result includes all 27 parcel columns: <code>kg_code</code>, <code>parcel_id</code>,
-  <code>area_sqm</code>, <code>centroid_lon/lat</code>, <code>elevation_m</code> (+ min/max/range),
-  <code>slope_mean_deg</code>, <code>tri_mean</code>, <code>tpi_mean</code>, <code>terrain_class</code>,
-  <code>aspect_mean_deg</code>, <code>aspect_dominant</code>, <code>vegetated_fraction</code>,
-  <code>forested_fraction</code>, <code>dominant_type</code>, <code>ndsm_max_m</code>,
-  <code>ndsm_mean_m</code>, <code>is_vegetated</code>, classification counts + confidence,
-  and <code>hansen_total_pixels</code> / <code>hansen_recent_5yr_pixels</code>.
-  The response wraps results in <code>{"total": N, "offset": 0, "limit": 100, "results": [...]}</code>.
-</p>
-
-<h4 style="margin-top:16px">Example Queries</h4>
-<div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">&#x1f4cb;</button>
-<pre><code><span class="tok-comment"># ── &ldquo;Zeig mir alle Parzellen auf denen ein Haus mit nur einem Stockwerk und</span>
-<span class="tok-comment">#     einem Spitzdach steht, die eine S&uuml;dhangneigung von &uuml;ber 30% haben und</span>
-<span class="tok-comment">#     kleiner als 5000 Quadratmeter ab einer Seeh&ouml;he von 900 Metern, mit wenig</span>
-<span class="tok-comment">#     Entwaldung in den letzten 5 Jahren.&rdquo;</span>
-<span class="tok-comment"># (30% slope &asymp; 17&deg;)</span>
-curl <a href="https://example.invalid:8000/api/v1/query/parcels?building_roof_type=pitched&amp;building_max_stories=1&amp;aspect=S,SE,SW&amp;min_slope=17&amp;max_area=5000&amp;min_elevation=900&amp;max_hansen_recent_5yr=5&amp;sort=elevation_m&amp;sort_dir=desc&amp;limit=100" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query/parcels?building_roof_type=pitched&amp;building_max_stories=1&amp;aspect=S,SE,SW&amp;min_slope=17&amp;max_area=5000&amp;min_elevation=900&amp;max_hansen_recent_5yr=5&amp;sort=elevation_m&amp;sort_dir=desc&amp;limit=100"</a>
-
-<span class="tok-comment"># Highly forested parcels above 1500m with no recent deforestation</span>
-curl <a href="https://example.invalid:8000/api/v1/query/parcels?min_forested_fraction=0.7&amp;min_elevation=1500&amp;max_hansen_recent_5yr=0&amp;sort=forested_fraction&amp;sort_dir=desc" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query/parcels?min_forested_fraction=0.7&amp;min_elevation=1500&amp;max_hansen_recent_5yr=0&amp;sort=forested_fraction&amp;sort_dir=desc"</a>
-
-<span class="tok-comment"># Large grassy parcels in Vorarlberg</span>
-curl <a href="https://example.invalid:8000/api/v1/query/parcels?state=Vorarlberg&amp;dominant_type=grass&amp;min_area=10000&amp;sort=area_sqm&amp;sort_dir=desc" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query/parcels?state=Vorarlberg&amp;dominant_type=grass&amp;min_area=10000&amp;sort=area_sqm&amp;sort_dir=desc"</a>
-
-<span class="tok-comment"># Steep rocky terrain without vegetation (quarries, cliffs)</span>
-curl <a href="https://example.invalid:8000/api/v1/query/parcels?dominant_type=rock&amp;min_slope=25&amp;max_vegetated_fraction=0.1&amp;sort=slope_mean_deg&amp;sort_dir=desc" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query/parcels?dominant_type=rock&amp;min_slope=25&amp;max_vegetated_fraction=0.1&amp;sort=slope_mean_deg&amp;sort_dir=desc"</a>
-
-<span class="tok-comment"># Flat low-elevation parcels with high vegetation and buildings (suburban gardens)</span>
-curl <a href="https://example.invalid:8000/api/v1/query/parcels?terrain_class=level&amp;max_elevation=400&amp;min_vegetated_fraction=0.6&amp;building_min_stories=1&amp;sort=vegetated_fraction&amp;sort_dir=desc" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query/parcels?terrain_class=level&amp;max_elevation=400&amp;min_vegetated_fraction=0.6&amp;building_min_stories=1&amp;sort=vegetated_fraction&amp;sort_dir=desc"</a>
-
-<span class="tok-comment"># Parcels with significant recent Hansen forest loss (monitoring deforestation)</span>
-curl <a href="https://example.invalid:8000/api/v1/query/parcels?min_hansen_recent_5yr=20&amp;min_forested_fraction=0.3&amp;sort=hansen_recent_5yr_pixels&amp;sort_dir=desc" target="_blank" class="tok-url">"https://example.invalid:8000/api/v1/query/parcels?min_hansen_recent_5yr=20&amp;min_forested_fraction=0.3&amp;sort=hansen_recent_5yr_pixels&amp;sort_dir=desc"</a></code></pre>
-</div>
-
-<div style="background:#e8f4fd;border:1px solid #b3d9f2;border-radius:6px;padding:10px 14px;margin-top:14px;font-size:13px">
-  <strong>Speed guide:</strong>
-  <strong>Fast</strong> (&lt;50ms): <code>/query/parcels</code>, <code>segments=true</code>, <code>q=</code>, <code>bbox=</code>, <code>point=</code>, <code>state=</code>, <code>district=</code>, <code>type=</code>, <code>hansen=</code>, <code>aggregate=</code> &mdash; pure SQL index lookups.<br>
-  <strong>Medium</strong> (seconds): <code>compound</code> with <code>type_filters</code> or <code>landcover_filters</code> &mdash; joins on indexed tables.<br>
-  <strong>Slow</strong> (seconds&ndash;minutes): <code>parcels_by_type</code>, <code>top_features</code> &mdash; scan KG JSON files. Use <code>async=true</code>.
-</div>
-
-
-<!-- ==================== QUERY EXPLORER (UI) ==================== -->
-<h2 id="query-explorer">Query Explorer (UI) <a class="anchor-link" href="#query-explorer">#</a></h2>
-
-<p>
-  <a href="/query.html" target="_blank"><code>/query.html</code></a> is a side-by-side
-  <strong>map + JSON playground</strong> for every query and feedback endpoint.
-  It is the fastest way to triage flags, drill into a candidate, eyeball it on satellite
-  imagery, and submit a confirm/reject/correction without leaving the page.
-</p>
-
-<ul style="line-height:1.9">
-  <li><strong>Endpoint dropdown</strong> with one-click presets: critical flags, tallest “trees”,
-      likely-mast misclassifications, ground-typed segments with non-zero height, RF high-confidence masts.</li>
-  <li><strong>Layer switcher</strong> on the map: ESRI satellite (default), basemap.at 30 cm orthophoto for Austria,
-      OSM streets, plus a labels overlay you can toggle independently.</li>
-  <li><strong>List ↔ map sync</strong>: clicking a row pans &amp; highlights the marker; clicking a marker
-      scrolls the row into view. Severity colour-coded (critical=red, high=dark red, medium=amber, low=grey).</li>
-  <li><strong>Per-row “flag” link</strong> opens the same SrtmFlag popover used in <code>/process.html</code>.
-      The popover shows: matched candidate(s), aliases (when several refs collapse to the same physical object),
-      aggregated rule weight, the action prediction (“will this flip community-effective type?”), and a notes field.</li>
-  <li><strong>Three result tabs</strong>: <em>Results</em> (rendered list), <em>Raw JSON</em>, <em>Summary</em>
-      (depth-limited tree view of the response shape).</li>
-  <li><strong>Permalinkable URL bar</strong>: the URL above the result list mirrors what is sent;
-      copy it for share-able exact queries.</li>
-</ul>
-
-<div class="callout" style="background:#fff8e6;border-left:4px solid #d29922;padding:12px 16px;margin:16px 0;border-radius:0 6px 6px 0;">
-  <strong>Tip.</strong> Any DOM ancestor with <code>data-srtm-kg</code>, <code>data-srtm-lon</code>,
-  <code>data-srtm-lat</code> scopes selection-based flagging. The Query Explorer sets these
-  on every result row so a click on “102.2m” in the row text already finds the right object.
-</div>
 
 <!-- ==================== QUALITY FLAGS / FEEDBACK ==================== -->
 <h2 id="quality-flags">Quality Flags &amp; Feedback <a class="anchor-link" href="#quality-flags">#</a></h2>
@@ -1822,7 +1276,7 @@ curl <a href="https://example.invalid:8000/api/v1/query/parcels?min_hansen_recen
   <li><strong>Data acquisition</strong> — windowed reads from 8 independent data sources at 0.2–30 m resolution</li>
   <li><strong>Segmentation</strong> — fused multi-layer gradient → Felzenszwalb over-segmentation → RAG boundary merge</li>
   <li><strong>Feature extraction</strong> — 57 per-segment features spanning height, shape, spectral, texture, SAR, phenology, and temporal change</li>
-  <li><strong>Classification</strong> — Random Forest (trained on cadastre + OSM ground truth) with rule-based fallback and hierarchical grouping</li>
+  <li><strong>Classification</strong> — Random Forest (trained on open land-use + OSM ground truth) with rule-based fallback and hierarchical grouping</li>
 </ol>
 
 <div style="background:#f0f4f8;border:1px solid #d0d7de;border-radius:8px;padding:16px 20px;margin:20px 0;font-size:14px;line-height:1.7">
@@ -1851,8 +1305,7 @@ curl <a href="https://example.invalid:8000/api/v1/query/parcels?min_hansen_recen
     <tr><td><strong>4</strong></td><td>ESA WorldCover</td><td>10 m</td><td>AWS COG</td><td>Land cover prior (built, tree, crop, grass, water)</td></tr>
     <tr><td><strong>5</strong></td><td>Sentinel-1 SAR</td><td>10 m</td><td>openEO</td><td>VV/VH backscatter (cloud-proof ground classification)</td></tr>
     <tr><td><strong>6</strong></td><td>Hansen GFC</td><td>30 m</td><td>HTTP range</td><td>Forest cover 2000, annual loss/gain 2001–2024</td></tr>
-    <tr><td><strong>7</strong></td><td>Austrian Cadastre</td><td>mm-level</td><td>REST API</td><td>Building footprints, parcel boundaries (ground truth)</td></tr>
-    <tr><td><strong>8</strong></td><td>OpenStreetMap</td><td>varies</td><td>Overpass API</td><td>Roads, paths, waterways, landcover (ground truth)</td></tr>
+    <tr><td><strong>7</strong></td><td>OpenStreetMap</td><td>varies</td><td>Overpass API</td><td>Roads, paths, waterways, landcover (ground truth)</td></tr>
   </tbody>
 </table>
 </div>
@@ -2017,26 +1470,8 @@ curl <a href="https://example.invalid:8000/api/v1/query/parcels?min_hansen_recen
   Austria spans two tiles: <code>50N_000E</code> and <code>50N_010E</code>.
 </p>
 
-<!-- --- Cadastre --- -->
-<h3 id="ds-cadastre">7. Austrian Cadastre <a class="anchor-link" href="#ds-cadastre">#</a></h3>
-
-<p>
-  The <a href="https://example.invalid/api/v1/docs/llm.txt" target="_blank" rel="noopener">Austrian Cadastre API</a>
-  provides <strong>mm-precision</strong> vector data for all ~8,440 Katastralgemeinden (cadastral municipalities):
-</p>
-<ul>
-  <li><strong>Building footprints</strong> — used as ground truth labels for <code>roof</code> class during RF training</li>
-  <li><strong>Parcel boundaries</strong> — land-use codes (Benützungsart) mapped to landscape types via a
-    <a href="#train-ground-truth">50-code lookup table</a></li>
-  <li><strong>Parcel land-use codes</strong> — BEV BA codes (e.g. 42 = Gebäude → <code>roof</code>, 51 = Acker → <code>crop</code>, 56 = Wald → <code>tree</code>)</li>
-</ul>
-<div class="code-wrap">
-  <div class="code-header"><span>Base URL</span></div>
-  <pre><code>https://example.invalid/api/v1</code></pre>
-</div>
-
 <!-- --- OSM --- -->
-<h3 id="ds-osm">8. OpenStreetMap <a class="anchor-link" href="#ds-osm">#</a></h3>
+<h3 id="ds-osm">7. OpenStreetMap <a class="anchor-link" href="#ds-osm">#</a></h3>
 
 <p>
   <a href="https://www.openstreetmap.org/" target="_blank" rel="noopener">OpenStreetMap</a> data
@@ -2212,7 +1647,7 @@ https://overpass-api.de/api/interpreter     (fallback)</code></pre>
 
 <p>
   The primary classifier is a <strong>scikit-learn <code>RandomForestClassifier</code></strong> trained on
-  cadastre + OSM ground truth (see <a href="#methods-training">Training Pipeline</a>).
+  open land-use + OSM ground truth (see <a href="#methods-training">Training Pipeline</a>).
 </p>
 
 <div class="table-wrap">
@@ -2252,17 +1687,17 @@ https://overpass-api.de/api/interpreter     (fallback)</code></pre>
 <p>
   Since September 2026 the default per-object classifier is a <strong>LightGBM</strong> model
   (<code>data/segv2/models/model_G.joblib</code>, card at <a href="/api/v1/model/v2"><code>/api/v1/model/v2</code></a>)
-  trained on 1.23 M segments from 146 KGs with labels derived from the cadastre nutzung
+  trained on 1.23 M segments from 146 KGs with labels derived from BEV land-use (Nutzung) codes
   codes, OSM pavement/rail/water and INVEKOS field blocks matched to the ALS flight year.
   It predicts 14 classes (<code>crop garden glacier grass orchard parking rail road rock roof
   shrub tree vineyard water</code>; <code>bare_soil</code> is merged into <code>rock</code>,
   <code>earthwork</code>/<code>path</code> stay rule-only) on the v1 feature set plus
-  geometry context (<code>dist_road/rail/water/building/parcel_edge</code>, neighbour height /
+  geometry context (<code>dist_road/rail/water/building</code>, neighbour height /
   NDVI, multi-year NDVI, flight-year gaps) — 117 features. 5-fold GroupKFold by KG:
   macro-F1 0.78 / weighted-F1 0.92 / accuracy 0.925 (the v1 RF scores 0.28 macro-F1 on the same rows).
   Post-hoc NDVI class vetoes and an INVEKOS override (field-block type wins when ≥70 % of the
   segment lies in one Schlag and the segment is low vegetation) are applied before the shared
-  infrastructure / cadastre / grouping steps.
+  infrastructure / grouping steps.
 </p>
 <p>
   <code>/api/v1/segment</code> accepts <code>model=v1|v2</code> (default v2 when the model is
@@ -2376,7 +1811,7 @@ https://overpass-api.de/api/interpreter     (fallback)</code></pre>
 <h2 id="methods-training">RF Training Pipeline <a class="anchor-link" href="#methods-training">#</a></h2>
 
 <p>
-  The Random Forest is trained on ground truth from the Austrian cadastre and OpenStreetMap,
+  The Random Forest is trained on ground truth from BEV open land-use data and OpenStreetMap,
   using a continuous background training process that iterates over hundreds of randomly
   selected Katastralgemeinden (KGs).
 </p>
@@ -2387,9 +1822,9 @@ https://overpass-api.de/api/interpreter     (fallback)</code></pre>
   Training labels come from three independent sources, overlaid onto the 1 m segmentation grid:
 </p>
 
-<h4>Source A — Cadastre land-use codes</h4>
+<h4>Source A — BEV land-use (Nutzung) codes</h4>
 <p>
-  Each Austrian parcel has a Benützungsart (BA) code recording its official land use.
+  Every land-use polygon in the open BEV vector data carries a Benützungsart (BA) code.
   These are mapped to landscape types via a 50-entry lookup table:
 </p>
 <div class="table-wrap" style="max-height:260px;overflow-y:auto">
@@ -2424,7 +1859,7 @@ https://overpass-api.de/api/interpreter     (fallback)</code></pre>
 
 <h4>Source C — Hansen tree loss</h4>
 <p>
-  The <code>tree_loss</code> class has no cadastre or OSM equivalent. Labels are created
+  The <code>tree_loss</code> class has no land-use or OSM equivalent. Labels are created
   synthetically in a post-processing step:
 </p>
 <ul>
@@ -2456,7 +1891,7 @@ https://overpass-api.de/api/interpreter     (fallback)</code></pre>
   <li>Select ~300 random KGs with > 5 buildings (seed 42 for reproducibility), plus additional KGs containing known infrastructure (solar, wind, substations)</li>
   <li>For each KG:
     <ul style="margin:4px 0">
-      <li>Fetch cadastre building footprints + parcel boundaries with land-use codes</li>
+      <li>Fetch open land-use polygons with BA codes + building footprints (training only, never stored)</li>
       <li>Fetch OSM roads, waterways, and land cover polygons</li>
       <li>Read all raster data (LiDAR DTM/DSM, ortho RGBI, Sentinel-2 NDVI, WorldCover, SAR, Hansen)</li>
       <li>Run Felzenszwalb segmentation → extract 57 features per segment</li>
@@ -2597,7 +2032,7 @@ https://overpass-api.de/api/interpreter     (fallback)</code></pre>
 <p>
   The chart below shows how model quality evolves as more KGs are added to training.
   The composite score peaks at 55 KGs, then gradually declines — additional data introduces
-  label noise from cadastre/OSM misalignment faster than it adds genuinely new examples.
+  label noise from label/OSM misalignment faster than it adds genuinely new examples.
 </p>
 <div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:16px;margin:16px 0">
   <canvas id="docs-oob-chart" style="width:100%;height:220px"></canvas>
@@ -2722,7 +2157,7 @@ https://overpass-api.de/api/interpreter     (fallback)</code></pre>
     </tr>
     <tr>
       <td><code>{kg}_light.gpkg</code></td>
-      <td>Segment raster + vector, all parcels with DTM heights, all buildings with object heights, new buildings, infrastructure</td>
+      <td>Segment raster + vector, new buildings, infrastructure, tree apices / crowns, terrain_coarse</td>
       <td>~100 MB</td>
     </tr>
     <tr>
@@ -2732,19 +2167,19 @@ https://overpass-api.de/api/interpreter     (fallback)</code></pre>
     </tr>
     <tr>
       <td><code>{kg}_v2.json.gz</code></td>
-      <td><strong>v2 product</strong> (<code>kgjson/2</code>): the same document, LightGBM-classified, with <code>model</code> block and <code>parcels.details[].outline_z</code> (parcel-outline DTM/nDSM profiles), in a compact column-oriented gzip container (18–22× smaller than pretty v1). Served decoded at <code>/api/v1/kg/{kg}</code>, raw with <code>?raw=1</code>; processing history at <code>/api/v1/kg/{kg}/history</code>.</td>
+      <td><strong>v2 product</strong> (<code>kgjson/2</code>): the same document, LightGBM-classified, with <code>model</code> block, in a compact column-oriented gzip container (18–22× smaller than pretty v1). Served decoded at <code>/api/v1/kg/{kg}</code>, raw with <code>?raw=1</code>; processing history at <code>/api/v1/kg/{kg}/history</code>.</td>
       <td>~50 KB</td>
     </tr>
     <tr>
       <td><code>{kg}_light_v2.gpkg</code></td>
-      <td><strong>v2 product</strong>: light GeoPackage with v2 types + <code>parcel_outline_z</code> table. Rasters are unchanged, so no <code>_full_v2</code> exists — the v1 <code>{kg}_full.gpkg</code> stays the raster source.</td>
+      <td><strong>v2 product</strong>: light GeoPackage with v2 types, tree apices / crowns and terrain_coarse layers. Rasters are unchanged, so no <code>_full_v2</code> exists — the v1 <code>{kg}_full.gpkg</code> stays the raster source.</td>
       <td>~100 MB</td>
     </tr>
   </tbody>
 </table>
 </div>
 <p>
-  Already-processed v1 KGs are <em>upgraded</em> in place by idle cache-only peers: the peer
+  Already-processed v1 KGs are <em>upgraded</em> in place by the processor in cache-only mode: it
   downloads the KG's own full GPKG from Zenodo (no BEV / openEO traffic), re-runs
   segmentation + LightGBM, verifies the result against the v1 document (37 checks) and uploads
   <code>_light_gpkg_v2</code> then <code>_json_v2</code>. v1 files on Zenodo are never touched.
@@ -2762,7 +2197,7 @@ https://overpass-api.de/api/interpreter     (fallback)</code></pre>
 </p>
 <ul>
   <li><code>zenodo_json_url</code> — JSON summary</li>
-  <li><code>zenodo_light_gpkg_url</code> — segments + enriched parcels/buildings</li>
+  <li><code>zenodo_light_gpkg_url</code> — segments, tree apices, terrain grids</li>
   <li><code>zenodo_full_gpkg_url</code> — all raster layers + vectors</li>
 </ul>
 <p>
@@ -2898,7 +2333,6 @@ https://overpass-api.de/api/interpreter     (fallback)</code></pre>
     <tr><td><strong>3</strong></td><td>Sentinel-2 NDVI</td><td>10 m</td><td>Growing-season NDVI composite via openEO</td></tr>
     <tr><td><strong>4</strong></td><td>ESA WorldCover</td><td>10 m</td><td>Global land cover classification</td></tr>
     <tr><td><strong>5</strong></td><td>Sentinel-1 SAR</td><td>10 m</td><td>VV + VH polarisation backscatter</td></tr>
-    <tr><td><strong>6</strong></td><td>Austrian Cadastre</td><td>mm-level</td><td>Building footprint ground truth</td></tr>
   </tbody>
 </table>
 </div>
@@ -2908,13 +2342,13 @@ https://overpass-api.de/api/interpreter     (fallback)</code></pre>
 
 <p>
   The landscape classifier is a <strong>scikit-learn Random Forest</strong> trained on ground truth
-  from Austrian cadastre building footprints and OpenStreetMap features. Training runs continuously
+  from BEV open land-use data and OpenStreetMap features. Training runs continuously
   as a background service, iterating over <strong>4,000 randomly-selected Katastralgemeinden</strong> (KGs — Austrian cadastral municipalities).
 </p>
 
 <h3>How training works</h3>
 <ol style="margin:10px 0 16px 20px;line-height:1.9;">
-  <li>For each KG, the system fetches cadastre building footprints + OSM road/landcover as <strong>ground truth labels</strong></li>
+  <li>For each KG, the system fetches open land-use polygons + OSM road/landcover as <strong>ground truth labels</strong></li>
   <li>All raster data is read for that area: LiDAR DTM/DSM, orthophoto RGBI, Sentinel-2 NDVI, ESA WorldCover, Sentinel-1 SAR</li>
   <li>Felzenszwalb segmentation splits the area into objects, and <strong>44 features</strong> are extracted per segment</li>
   <li>Segments overlapping ground truth polygons are labelled → these become training samples</li>
@@ -2967,13 +2401,13 @@ https://overpass-api.de/api/interpreter     (fallback)</code></pre>
 <div class="code-wrap">
   <div class="code-header"><span>bash</span><button class="copy-btn" onclick="copyCode(this)">📋 Copy</button></div>
   <pre><code><span class="tok-comment"># Check background training progress</span>
-curl <span class="tok-url">https://example.invalid:8000/api/v1/training/status</span>
+curl <span class="tok-url">http://localhost:8000/api/v1/training/status</span>
 
 <span class="tok-comment"># Check current model quality</span>
-curl <span class="tok-url">https://example.invalid:8000/api/v1/classifier/status</span>
+curl <span class="tok-url">http://localhost:8000/api/v1/classifier/status</span>
 
 <span class="tok-comment"># Manually train on a specific area</span>
-curl <span class="tok-flag">-X</span> POST <span class="tok-url">"https://example.invalid:8000/api/v1/classifier/train?bbox=15.4,47.0,15.5,47.1"</span></code></pre>
+curl <span class="tok-flag">-X</span> POST <span class="tok-url">"http://localhost:8000/api/v1/classifier/train?bbox=15.4,47.0,15.5,47.1"</span></code></pre>
 </div>
 
 <div class="callout callout-info" style="margin-top:16px">
