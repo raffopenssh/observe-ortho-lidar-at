@@ -38,24 +38,39 @@ scope. The threat model assumes `:8100` is reachable by anyone and
   `PUBLIC_MAX_AREA_KM` (5 km²), body ≤ 32 MiB, no catch-all.
 * **Untrusted geometry input** (`geo_parse.py`, `_get_geometry`):
   GeoJSON / WKT / KML / GPX / GeoPackage / zipped Shapefile uploads are
-  parsed with fiona / shapely only, size- and feature-capped, polygons
-  repaired server-side, and validated against the Austrian bbox and the
-  area limits before any raster is touched. Request bodies are capped
-  (`SRTM_APP_MAX_BODY_MB`, 256 MiB on the operator port; 32 MiB through
-  the public relay); Shapefile ZIPs are extracted with Python's
-  `zipfile` (absolute and `..` members are stripped) into a private
-  temp dir that is deleted afterwards.
+  parsed with fiona / shapely / stdlib `xml.etree` only (no external
+  entity resolution), capped at 5 000 features and 500 000 vertices per
+  request, polygons repaired server-side, and validated against the
+  Austrian bbox and the area limits before any raster is touched.
+  Request bodies are capped (`SRTM_APP_MAX_BODY_MB`, 256 MiB on the
+  operator port; 32 MiB through the public relay); gzip / ZIP uploads
+  may not inflate beyond the same cap (≤ 200 ZIP members); Shapefile
+  ZIPs are extracted with Python's `zipfile` (absolute and `..` members
+  are stripped) into a private temp dir that is deleted afterwards.
+  KG codes in paths and `?kg=` parameters are validated
+  (`NNNNN` / `NNNNN-block`) before any file path is built from them.
 * **Outbound fetchers** go through `http_pool.py` with the host
   allow-list `config.OUTBOUND_ALLOWED_HOSTS` (BEV, Copernicus Data
   Space, Zenodo, Hansen on `storage.googleapis.com`, Overpass) plus
   `SRTM_EXTRA_ALLOWED_HOSTS`; no URL supplied by a client is ever
-  fetched. GDAL `/vsicurl/` reads use the same hosts.
+  fetched. GDAL `/vsicurl/` reads use the same hosts. The one
+  operator-supplied URL (`POST /api/v1/director/peers/add`, multi-VM only)
+  must be `https://`, resolve to a non-loopback address and is checked by
+  `app._outbound_url_ok`. Zenodo manifest entries (`link`, `bucket_url`)
+  can originate from another instance and are treated as untrusted:
+  `zenodo_client.is_zenodo_url` restricts every fetch built from them to
+  the configured Zenodo host, and the Zenodo token travels only as an
+  `Authorization` header to that host (never in a query string).
 * **Pickle / checkpoint loading**: tile checkpoints
   (`tile_checkpoints/<kg>/tile_N.pkl`), restored checkpoint archives
   from the Zenodo cache deposit and every other pickle the pipeline
-  reads go through `safe_load.py`, a whitelist unpickler (numpy, shapely,
-  a few own dataclasses, builtins) — any other global raises
-  `UnsafePickle`. Model files (scikit-learn / LightGBM joblib) cannot be
+  reads go through `safe_load.py`, a whitelist unpickler (numpy
+  reconstruction helpers and scalars, `affine.Affine`, `rasterio.crs.CRS`,
+  `object_segmentation.SegmentedObject`, stdlib containers / datetime) —
+  any other global raises `UnsafePickle`. `np.load(allow_pickle=True)` is
+  routed through the same whitelist process-wide by `safe_load.install()`.
+  Checkpoint bundles restored from Zenodo are untarred member-by-member
+  (basename only, `tile_*.pkl` only, never `extractall`). Model files (scikit-learn / LightGBM joblib) cannot be
   whitelisted, so `safe_load.load_model` only loads them from the repo's
   `data/` tree after a checksum match against `data/models_manifest.json`
   (`SRTM_REQUIRE_MODEL_CHECKSUM=1` makes a missing checksum fatal).
@@ -71,8 +86,18 @@ scope. The threat model assumes `:8100` is reachable by anyone and
   byte-bounded caches, a concurrency gate and a leaky-bucket rate limiter
   on every render, single-flight per tile, an RSS watchdog that sheds
   caches and finally restarts the worker, and systemd `MemoryMax` on
-  every unit. Public flags store an HMAC of reporter id | IP, never the
-  raw values.
+  every unit. Rate-limit buckets key on `X-Forwarded-For` only when the
+  request arrived from a loopback / private proxy address, otherwise on
+  the socket address. Public flags store an HMAC of reporter id | IP,
+  never the raw values.
+* **Dependencies** are pinned in `requirements.txt`; `pip-audit -r
+  requirements.txt` is clean as of the last audit
+  (`docs/security-audit.md`). Re-run it before each release.
+* **Telemetry egress**: the operator dashboard geolocates the host once
+  via `ipinfo.io` / `api.ipify.org` (region label only, no payload); the
+  `SRTM_BEV_VECTOR_CONTEXT` feature, when enabled, installs a pinned Go
+  binary and a pinned pip package from GitHub at first use — both off by
+  default and operator-triggered.
 * The processor runs as the service user, never root; child processes
   are spawned per KG and killed by cgroup limits on OOM.
 
