@@ -7,7 +7,7 @@ Wants=srv.service
 
 [Service]
 WorkingDirectory=%h/srtm-lidar-public
-ExecStart=%h/srtm-lidar-public/.venv/bin/gunicorn -c systemd/gunicorn_public.conf.py public_api:app
+ExecStart=%h/srtm-lidar-public/.venv/bin/python3 -m gunicorn -c systemd/gunicorn_public.conf.py public_api:app
 Restart=on-failure
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1

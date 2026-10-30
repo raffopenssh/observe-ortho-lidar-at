@@ -15,7 +15,7 @@ After=network.target
 
 [Service]
 WorkingDirectory=%h/srtm-lidar-public
-ExecStart=%h/srtm-lidar-public/.venv/bin/gunicorn -c systemd/gunicorn_app.conf.py app:app
+ExecStart=%h/srtm-lidar-public/.venv/bin/python3 -m gunicorn -c systemd/gunicorn_app.conf.py app:app
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
