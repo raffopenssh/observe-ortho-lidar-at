@@ -316,6 +316,8 @@ def _col_spec(name: str, a: np.ndarray) -> dict:
 
 def encode(hdr: dict, cols: 'OrderedDict[str, np.ndarray]', fields: list[str] | None = None, ids_enc: str = 'delta_u64') -> bytes:
     names = ['id'] + [f for f in (fields or list(cols)) if f != 'id' and f in cols]
+    if fields is not None and 'n_cells' in cols and 'n_cells' not in names:
+        names.insert(1, 'n_cells')   # always present in slices (weight for client-side rollups)
     parts = []; specs = []
     for nm in names:
         a = cols[nm]

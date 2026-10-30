@@ -47,7 +47,7 @@ def test_aggregate_matches_direct():
     hdr, c2 = cn.decode(blob)
     assert hdr['res'] == 9 and all(np.array_equal(cols[k], c2[k]) for k in cols)
     hdr, c3 = cn.decode(cn.encode(hdr, cols, ['verdict', 'bld_h_max']))
-    assert list(c3) == ['id', 'verdict', 'bld_h_max'] and hdr['fields'] == ['verdict', 'bld_h_max']
+    assert list(c3) == ['id', 'n_cells', 'verdict', 'bld_h_max'] and hdr['fields'] == ['n_cells', 'verdict', 'bld_h_max']
 
 
 def test_fields_and_route():
@@ -66,7 +66,7 @@ def test_fields_and_route():
         r = c.get('/api/v1/cells/national?res=9&fields=elev_mean,verdict', headers={'Accept-Encoding': 'gzip'})
         assert r.status_code == 200 and r.headers['Content-Encoding'] == 'gzip' and r.headers['X-Cells-Gen']
         hdr, cols = cn.decode(gzip.decompress(r.data))
-        assert hdr['res'] == 9 and list(cols) == ['id', 'elev_mean', 'verdict'] and hdr['n'] == cols['id'].size
+        assert hdr['res'] == 9 and list(cols) == ['id', 'n_cells', 'elev_mean', 'verdict'] and hdr['n'] == cols['id'].size
         r2 = c.get('/api/v1/cells/national?res=9&fields=elev_mean,verdict', headers={'If-None-Match': r.headers['ETag']})
         assert r2.status_code == 304
         r3 = c.get('/api/v1/cells/national?res=8', headers={'Accept-Encoding': 'gzip'})
