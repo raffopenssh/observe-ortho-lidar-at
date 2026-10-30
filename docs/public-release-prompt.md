@@ -4,15 +4,37 @@ Context for maintainers (review 2026-10-30): old Zenodo token in git history
 (`8912a9f`; already rotated after the eMudhra fix — verified the live token
 differs), ~20 files with hardcoded exe.xyz hosts, `/k` tier plumbing in ~15
 files, cadastre/parcel code in ~25 files, no public-tier access log. Decision:
-squash to ONE commit. Prompt below is self-contained.
+squash everything **up to and including the eMudhra commit `9c2d67d`
+(2026-10-22)** into ONE base commit, then **keep the ~85 commits after it**
+(2026-10-23 → today) as real history — we may need them for debugging.
+Caveat: `997b3f1` (2026-10-23) *removes* the old Zenodo token, so its diff
+shows the (rotated) string as a `-` line → scrub it with
+`git filter-repo --replace-text`. All 85 commits are authored
+`exedev@example.invalid` → rewrite author/committer. Prompt below is
+self-contained.
 
 ---
 
 You are preparing a clean PUBLIC fork of `/home/exedev/srtm-lidar` (Austrian
 landscape segmentation: BEV LiDAR/ortho + Sentinel + NE H3 cells, products on
-Zenodo). Work in a NEW directory `/home/exedev/srtm-lidar-public`, fresh git
-history: exactly ONE commit, author `srtm-lidar maintainers <noreply@…>`
-(the old history contains a since-rotated Zenodo token and personal emails).
+Zenodo). Work in a NEW directory `/home/exedev/srtm-lidar-public`. Git
+history rule: everything up to and including commit `9c2d67d` ("Security:
+verify TLS on peer manifest fetch … eMudhra", 2026-10-22) is squashed into ONE
+base commit; the ~85 commits after it (`git rev-list 9c2d67d..HEAD`,
+2026-10-23 onwards) are KEPT one-for-one (message + date) — they are needed
+for debugging — and your clean-up lands as additional commits on top (one
+per step 0→9 is fine). Rewrite author/committer of every commit to
+`srtm-lidar maintainers <noreply@…>` and run
+`git filter-repo --replace-text` with the old Zenodo token
+(`REDACTED_ROTATED_ZENODO_TOKEN`, since
+rotated — it appears as a removed line in `997b3f1`) plus any other
+secret the scan in step 6 finds in `git log -p 9c2d67d..HEAD`. The pre-
+eMudhra history is dropped because it contains that token live in
+`zenodo_client.py` (`8912a9f`) and personal emails. Suggested recipe:
+`git clone` the live repo → `git replace --graft 9c2d67d` (parentless) →
+`git filter-repo --force --replace-text secrets.txt --mailmap authors.txt`
+→ verify `git log --oneline | wc -l` ≈ 86 and
+`git log -p --all | grep -c 2dnLSA` = 0.
 `paxl` must keep working against the public tree: <FILL IN what paxl is / how
 to test it> — treat its interface as frozen. Never
 touch the live repo or services. Read `AGENTS.md` and `docs/api-tiers.md`,
@@ -89,7 +111,8 @@ Hard requirements:
    `make check` running the surviving `tests/` + the three grep gates.
 6. Security audit of the final tree (report as a checklist, fix what you can):
    - secret scan: `pip install detect-secrets && detect-secrets scan` (or
-     gitleaks if available) on the tree AND the single commit; also grep
+     gitleaks if available) on the tree AND on every kept commit
+     (`gitleaks git` / `detect-secrets scan` over `git log -p --all`); also grep
      for `@gmail`, `exedev@`, private IPs, `data/*_token` paths.
    - unsafe deserialisation: all `pickle`/`np.load(allow_pickle)`/`joblib`
      must go through `safe_load.py`; tile checkpoints pulled from Zenodo are
@@ -196,4 +219,5 @@ Hard requirements:
 Process: inventory first (`git ls-files`, the grep gates), post the plan as a
 table (file → keep/delete/rewrite), then execute in order 0→9, re-running the
 gates after each step. Report remaining hits you could not remove and why, plus the final `git ls-files` list.
-Do not add features. Commit once at the end.
+Do not add features. Commit per step on top of the kept history; never
+squash or drop the post-eMudhra commits.
