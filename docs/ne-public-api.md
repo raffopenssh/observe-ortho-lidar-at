@@ -1,112 +1,101 @@
-# Public cells API — spec (`cells_api.py`, public tier)
+# Public cells API (`cells_api.py`, public tier `:8100`)
 
-Status 2026-10-04: **implemented** (`cells_api.py`, commits 5971290 +
-follow-ups) — live on `https://example.invalid/api/v1/cells…`.
-See §9 for what was measured and where the implementation deviates.
-Companion to umfeld-at's H3 read path (`/k/api/v1/ne/cell|cells|chunk`,
-public version pending there). We serve **what we measured** per H3 cell;
-umfeld-at serves the statistical land-use layer. Same keys, same query
-shapes, same limits → a client zips both by cell id. Nothing here is a
-dependency on umfeld-at being fast or reachable.
+The cells API serves **what we measured** per H3 res-12 cell (≈ 300 m²):
+land-cover mix, structure cover and heights, trees, NDVI / phenology,
+terrain, multi-epoch change and a consistency verdict. It is the public,
+cell-keyed way to ask "what is here" — nothing in it is keyed by any
+property or ownership unit. Design of the cell records: `docs/ne-v24-design.md`.
 
 ## 0. Hard rules
 
 1. **Vocabulary.** Public code, docs, JSON keys, error strings and headers
-   never contain: cadastre/Kataster, parcel/Grundstück/Gst, footprint,
-   outline, GNR/EZ/Grundbuch, owner, address, "declared", "register",
-   "lu" (umfeld's layer), `kg_share`, `n_parc`, `bld_cover` (theirs).
-   Enforce with a unit test that greps `cells_api.py` + its docs block
-   (`tests/test_cells_vocab.py`, word list in `cells_api.FORBIDDEN_WORDS`).
-   Our own vocabulary: *cell, cover, structures, trees, terrain, change,
-   phenology, consistency*.
+   never use property-register terms (`cells_api.FORBIDDEN_WORDS`, enforced
+   by `tests/test_cells_vocab.py` over the source, `public_docs.CELLS_TXT`,
+   `/cells/dict`, one cell record and one public h3b header). Our
+   vocabulary: *cell, cover, structures, trees, terrain, change, phenology,
+   consistency*. Run the test before every edit.
 2. **Request path reads only `data/ne/*.h3b` + `data/ne/cells.sqlite`**
-   (+ `kg` table of `search_index.db` for code→bbox). No Zenodo, BEV,
-   umfeld, GPKG, JSON blobs. Not on disk → 404 `ready:false`.
-3. **No NEC1 bytes leave this host via the public tier.** The h3b chunk
+   (+ the `kg` table of `search_index.db` for code → bbox). No Zenodo, BEV,
+   GPKG or JSON blobs. Not on disk → 404 `ready:false`.
+3. **The reference land-use slice never leaves the host.** An h3b chunk
    holds `shuffle(NEC1)|shuffle(NEO1)|shuffle(NET1)|shuffle(NEB1)`; every
-   format we emit is rebuilt from the NEO1/NET1/NEB1 slices only
-   (`format=h3b` re-deflates without the NEC1 slice — see §4).
+   emitted format is rebuilt from the observed slices NEO1/NET1/NEB1 only
+   (`format=h3b` re-deflates without NEC1).
 4. **Standalone module.** `cells_api.py` = pure functions + one Flask
-   `Blueprint` (`cells_bp`), imports only `ne_h3`, `h3`, `numpy`, `sqlite3`,
-   `pyproj`. Mounted by `public_api.py`. No import of `app`, `peer_director`,
-   `search_index` (code→bbox goes through a 3-line sqlite read of its own).
-   This is what lets us delete `/k` later (§7) without touching this file.
+   `Blueprint` (`cells_bp`), importing only `ne_h3`, `h3`, `numpy`,
+   `sqlite3`, `pyproj`. Mounted by `public_api.py`; never imports `app`,
+   `peer_director` or `search_index`.
 
 ## 1. Data on disk
 
-* `data/ne/<parent>.h3b` — written by `ne_ingest` (exists). Header
-  `chunks[]` = one entry per res-10 cell: `r10, off, len, raw_len, cells,
-  trees, bld, first`.
-* **New** `data/ne/cells.sqlite` (WAL, `synchronous=NORMAL`), owned by
-  `ne_ingest` (insert after each successful file write / merge; `DELETE
-  WHERE kg=?` before re-insert; `cells_api --rebuild` rescans headers):
+* `data/ne/<parent>.h3b` — written by the processor (unsplit KGs) or by
+  `ne_ingest` (split parents merged from their blocks, header
+  `merged_from`, `partial_cells` until complete). Header `chunks[]` = one
+  entry per res-10 cell: `r10, off, len, raw_len, cells, trees, bld, first`.
+  Readers: `ne_h3.read_h3b_header`, `read_h3b_chunk`.
+* `data/ne/cells.sqlite` (WAL) — chunk index owned by `ne_ingest`
+  (`cells_api.index_file()` after every write / merge;
+  `python3 cells_api.py --rebuild` rescans all headers):
+
   ```sql
   CREATE TABLE chunk (r10 INTEGER NOT NULL, kg TEXT NOT NULL, off INTEGER, len INTEGER,
                       raw_len INTEGER, cells INTEGER, trees INTEGER, bld INTEGER,
                       PRIMARY KEY (r10, kg)) WITHOUT ROWID;
   CREATE TABLE file  (kg TEXT PRIMARY KEY, body_offset INTEGER, cells_n INTEGER, epoch TEXT,
                       product_version TEXT, neo1_digest TEXT, partial INTEGER, mtime REAL,
-                      w REAL, s REAL, e REAL, n REAL);          -- bbox from cell centres
-  CREATE TABLE meta  (k TEXT PRIMARY KEY, v TEXT);              -- schema=1, rebuilt_at
+                      w REAL, s REAL, e REAL, n REAL);
+  CREATE TABLE meta  (k TEXT PRIMARY KEY, v TEXT);
+  -- plus summary(kg, mtime, js) and als_kg(…) caches
   ```
-  Size: ~45 B/row × 5.6 M res-10 chunks for all of Austria ≈ 250 MB
-  (vs ~10 GB corpus). Today: 10 files → a few KB.
+  ≈ 45 B/row × 5.6 M res-10 chunks ≈ 250 MB for all of Austria (vs ~10 GB
+  corpus).
 * Resolution in the request path: `bbox → h3.polygon_to_cells(res 10)`
-  (+ `h3.grid_ring` 1 so border cells whose res-12 children poke out are
-  caught) → `SELECT … FROM chunk WHERE r10 IN (…)` (≤ 2 000 ids per
-  statement; 0.05° box ≈ 1 500 res-10 cells) → group by `kg` → one
-  `open()` per file, `seek`+`read(len)` per chunk, `zlib.decompress`,
-  `ne_h3._unshuffle`. Decode NEO1 with a numpy structured dtype mirroring
-  `ne_h3.OBS_REC` (no per-row Python); NET1/NEB1 rows via `np.frombuffer(
-  '<u4'|'<u8')` + bit ops. Filter res-12 ids to the query (`np.isin`).
+  (+ `grid_ring` 1) → `SELECT … FROM chunk WHERE r10 IN (…)` → group by
+  `kg` → one `open()` per file, `seek` + `read(len)` per chunk,
+  `zlib.decompress`, `ne_h3._unshuffle` → numpy structured decode of
+  `ne_h3.OBS_REC` (no per-row Python) → filter res-12 ids (`np.isin`).
 * **Dedupe across KGs**: a border res-12 cell appears in every KG it
-  touches. Keep the copy from the chunk with the largest `cells` for that
-  r10 (ties → lowest kg). Record `kgs[]` in meta so the client sees the
-  provenance.
-* Caches (process-local, both bounded): inflated chunk LRU 4 096 entries
-  (`(kg, r10)` → dict of numpy arrays, ~10 KB each ≈ 40 MB max);
-  header LRU 512 (`body_offset`, `epoch`, `summary`). No corpus-wide
-  structures in RAM. sqlite connection per thread.
+  touches. Priority: observed copy → larger chunk → lowest kg; `meta.kgs[]`
+  records provenance.
+* Caches (process-local, byte-bounded `mem_lru.ByteLRU`): inflated chunk
+  LRU (`CELLS_CHUNK_MB`, default 64) and header LRU (`CELLS_HEADER_MB`,
+  default 24). No corpus-wide structures in RAM; sqlite connection per
+  thread.
 
-## 2. Endpoints (all GET unless noted, all on `:8100` / `https://example.invalid`)
+## 2. Endpoints (GET unless noted)
 
 ```
 /api/v1/cells?bbox=w,s,e,n            res-12 cells in a box (span ≤ 0.05°, ≤ 16 384 cells → 413)
 /api/v1/cells?lon=&lat=[&k=0..3]      cell under a point + k rings
-/api/v1/cells?ids=h3,h3,…             ≤ 512 ids (res 12; coarser ids expand to their res-12 children)
+/api/v1/cells?ids=h3,h3,…             ≤ 512 ids (coarser ids expand to their res-12 children)
 POST /api/v1/cells {"ids":[…]}        ≤ 16 384 ids
-/api/v1/cells/<h3>                    one cell, all layers (obs + trees + structures), always JSON
+/api/v1/cells/<h3>                    one cell, all layers, always JSON (`?flags=1` adds public flags)
 /api/v1/cells/chunk/<h3>              res 9 or 10 chunk(s) for bulk clients; format=h3b|bin|json
-/api/v1/cells/dict                    field layout, units, code tables, group labels, limits, epoch pin
-/api/v1/kg/<code>/cells               whole-KG container (public product file): format=h3b (default) | json summary
-/api/v1/kgs/summary?codes=|gemeinde=|district=|state=   merged observed summary over a KG set (see §11)
-/api/v1/landscape?…&include=cells     existing endpoint gains a per-bbox roll-up block (§5)
-/api/v1/status                        gains cells{kgs_ready, cells_total, index_rebuilt_at}
+/api/v1/cells/dict                    field layout, units, code tables, group labels, limits, epoch
+/api/v1/cells/national?res=9|8        Austria-wide aggregate (§7)
+/api/v1/kg/<code>/cells               whole-KG container: format=h3b (default) | json summary
+/api/v1/kgs/summary?codes=|gemeinde=|district=|state=   merged summary over a KG set (§6)
+/api/v1/landscape?…&include=cells     per-bbox roll-up block
+/api/v1/status                        cells{kgs_ready, cells_total, index_rebuilt_at, epoch, generation}
 ```
 
 Common params: `layers=obs,trees,structures` (default `obs`; `/cells/<h3>`
-always all), `res=12|11|10` (server-side roll-up, §3), `fields=a,b,c`
-(subset of obs field names), `format=json|columns|bin|h3b|csv|geojson`,
-`centres=1` (add lon/lat of the metre-snapped EPSG:3035 cell centre),
-`pretty=1`. Cross-param limits: `geojson` ≤ 4 096 cells (hex polygons),
-`trees`/`structures` layers only at res 12, `h3b` only on `/chunk` and
-`/kg/<code>/cells`.
+always all), `res=12|11|10` (server-side roll-up), `fields=a,b,c`,
+`format=json|columns|bin|h3b|csv|geojson`, `centres=1`, `pretty=1`.
+Limits: `geojson` ≤ 4 096 cells, `trees`/`structures` only at res 12,
+`h3b` only on `/chunk` and `/kg/<code>/cells`.
 
 Not-ready answers: `404 {"ready": false, "status": "not_processed" |
-"partial", "retry_after_s": 3600, "kgs_missing": […]}` with
-`Retry-After`. A bbox that is partly covered answers 200 with
-`meta.partial:true` + `meta.kgs_missing` — never a mix of silence and data
-without saying so. Split parents still merging (`partial_cells` in the
-header) → the covered cells + `meta.partial:true`.
+"pending" | "partial", "retry_after_s": 3600, "kgs_missing": […]}` with
+`Retry-After`. A partly covered bbox answers 200 with `meta.partial:true`
+(= cells requested but not on disk) + `meta.kgs_missing` /
+`kgs_pending` / `kgs_not_processed`.
 
-Headers: `ETag` = `"c-" + sha256(sorted neo1_digests of touched files +
-canonical query)[:16]`; `If-None-Match` → 304. `Cache-Control: public,
-max-age=86400` (products are frozen per epoch; a re-upgrade changes the
-digest and therefore the ETag). `X-Cells-Source: disk`, `X-Cells-Partial:
-1` when partial, `X-Data-Attribution` + `Link rel=license` as the other
-public routes. CORS `*`. gzip ≥ 1 KiB by the existing `_common_headers`
-(not for `h3b`, already deflated). Rate hint in docs: ≤ 5 r/s sustained,
-burst 20 (no enforcement beyond the proxy's).
+Headers: `ETag` (sha256 of the touched files' digests + canonical query,
+`If-None-Match` → 304), `Cache-Control: public, max-age=86400`,
+`X-Cells-Source: disk`, `X-Cells-Partial: 1`, `X-Data-Attribution` +
+`Link rel=license`, CORS `*`, gzip ≥ 1 KiB (not for `h3b`). Please stay
+≤ 5 r/s sustained, burst 20.
 
 ## 3. Record → public JSON (one cell, res 12)
 
@@ -118,379 +107,162 @@ burst 20 (no enforcement beyond the proxy's).
  "height": {"mean": 9.5, "p90": 21.0, "max": 27.5},
  "trees": {"n": 14, "h_max": 27.5, "canopy": 0.58},
  "ndvi": {"mean": 0.71, "amp": 0.22}, "phenology": "forest",
- "change": {"dh_m": -0.25, "dtm_m": 0.0, "forest_loss_year": null, "als_years": [2022, 2024]},
- "terrain": {"elev_m": 612, "slope": 14, "slope_p90": 23, "aspect": "SE", "roughness": 1.3, "tri": 0.8, "tpi": -0.5},
+ "change": {"dh_m": -0.25, "dtm_m": 0.0, "forest_loss_year": null,
+            "als_year_newest": 2024, "als_year_oldest": 2022},
+ "terrain": {"elev_m": 612, "slope": 14, "slope_p90": 23, "aspect": "SE",
+             "roughness": 1.3, "tri": 0.8, "tpi": -0.5},
  "consistency": "consistent"}
 ```
 
-* Decode exactly `ne_h3.OBS_FIELDS` with `OBS_UNITS` (255 / -128 / 65535 →
-  `null`). `cover` = `obs_lu[9]`/255 in `ne_h3.GROUPS` order (the 9 group
-  codes are shared with umfeld-at's layer — keep the codes, label them in
-  `/dict`: geb=buildings, bau=construction & parking, acker=cropland,
-  gruen=grass/garden/orchard/vineyard/shrub/hedge, wald=trees, wasser=water,
-  verkehr=roads & paths, alpen=rock/bare/glacier, sonst=other).
-* `consistency` = `ne_h3.VERDICTS` renamed for the public surface:
+* Decoded exactly from `ne_h3.OBS_FIELDS` with `OBS_UNITS` (255 / −128 /
+  65535 → `null`). `cover` = `obs_lu[9]`/255 in `ne_h3.GROUPS` order
+  (geb = buildings, bau = construction & parking, acker = cropland, gruen =
+  grass/garden/orchard/vineyard/shrub/hedge, wald = trees, wasser = water,
+  verkehr = roads & paths, alpen = rock/bare/glacier, sonst = other).
+* `consistency` = `ne_h3.VERDICTS` mapped through `CONSISTENCY_PUBLIC`:
   `consistent, forest_loss, forest_gain, sealed_new, structure_new,
-  green_new, unknown`. `/dict` explains it as "our observation vs. the
-  statistical land-use layer of umfeld-at for the same cell (frozen
-  epoch), computed when the product was built". The name mapping lives in
-  one dict in `cells_api.py` (`CONSISTENCY_PUBLIC`).
-* `trees[]` (layer `trees`, res 12 only): `{dx, dy, lon, lat, h_m, crown_m2,
-  species, vitality, ndsm_only}` from the 4 B NET1 word (`dx:5 dy:5 h:8
-  (0.25 m) crown:6 (log2·5) species:4 vitality:3 flag:1`; codes
-  `ne_h3.SPECIES_CODES` / `VITALITY_CODES`). lon/lat = cell centre (3035,
-  metre-snapped, `ne_h3.cell_centres_3035`) + (dx, dy) → 4326. `n`
-  saturates at 255 per cell; `meta.trees_truncated_cells` counts those.
-* `structures[]` (layer `structures`): `{dx, dy, lon, lat, type, h_max_m,
-  h_robust_m, area_m2, conf, dh_m}` from the 8 B NEB1 word (`dx:5 dy:5
-  h_max:8 h_robust:8 area:16 type:4 conf:4 dh:8`; `ne_h3.BLD_TYPES`).
-  These are *our segmented objects* with LiDAR heights — same posture as
-  the existing `/buildings/bbox` (centroid + height, no outlines).
-* `format=columns`: `{"cells":[…hex], "kg":[…], "cover":[[9 × u8]…],
-  "h_mean":[…], …}` raw quantised integers + a `units` block copied from
-  `/dict` — ~40 B/cell before gzip, the format for map clients.
+  green_new, unknown` — our observation versus the reference land-use
+  layer that was available when the product was built; `unknown` when no
+  reference layer was available (the default in a fresh single-VM setup).
+* `trees[]` (res 12 only): `{dx, dy, lon, lat, h_m, crown_m2, species,
+  vitality, ndsm_only}` from the 4 B NET1 word (`dx:5 dy:5 h:8 (0.25 m)
+  crown:6 (log2·5) species:4 vitality:3 flag:1`; `ne_h3.SPECIES_CODES` /
+  `VITALITY_CODES`). `n` saturates at 255; `meta.trees_truncated_cells`.
+* `structures[]`: `{dx, dy, lon, lat, type, h_max_m, h_robust_m, area_m2,
+  conf, dh_m}` from the 8 B NEB1 word (`ne_h3.BLD_TYPES`) — our segmented
+  man-made objects with LiDAR heights (centroid + height, no outlines).
+* `format=columns`: `{"cells":[…], "kg":[…], "cover":[[9 × u8]…],
+  "h_mean":[…], …}` raw quantised integers + a `units` block — ~40 B/cell
+  before gzip, the format for map clients.
 * `format=bin`: `cells_n × 41 B` raw NEO1 rows, little-endian, sorted by
-  cell id, `Content-Type: application/octet-stream`, header
-  `X-Cells-Record: neo1/41` (+ `trees`/`structures` appended as
-  `X-Cells-Layout: neo1=N,net1=T,neb1=B` with per-cell counts derivable
-  from `tree_n`/`structures_n`). gzip by middleware.
+  cell id; `X-Cells-Record: neo1/41`, `X-Cells-Layout: neo1=N,net1=T,neb1=B`.
 * `format=h3b` (chunk / whole-KG only): `H3B1`-style container **without
-  the NEC1 slice**: header JSON (`kg, epoch, product_version, chunks[]`
-  with `cells, trees, bld, off, len`, `record_bytes{neo1,net1,neb1}`,
-  `chunk_layout: "zlib(shuffle(NEO1)|shuffle(NET1)|shuffle(NEB1))"`,
-  `neo1_digest`) + re-deflated chunks (level 6, ~1 ms/chunk; cached per
-  `(kg, r10)` in the chunk LRU as bytes). Whole-KG answers are built once
-  per `(kg, neo1_digest)` into `data/ne/pub/<kg>.h3b` on first request
-  (≤ 1 MB, ~200 ms) and then `send_file`d with Range support —
-  the public download of the product without the third-party layer.
-* `res=11|10` roll-up (obs only): weighted by res-12 cell count — `cover`,
-  `structures_cover`, `ndvi.*`, `terrain.*` (except `aspect` → mode),
-  `height.mean` mean; `height.p90` mean of p90s (documented); `height.max`,
-  `trees.h_max` max; `trees.n`, `structures_n` sum; `trees.canopy` mean;
-  `phenology`/`consistency` → mode + `consistency_hist[7]`; `als_years`
-  union; `change.dh_m` mean; `forest_loss_year` max. Returns `n_children`.
-  Implemented with `np.add.reduceat` on parent-sorted arrays — one pass.
-  `als_year_newest` max, `als_year_oldest` min (see below).
+  the NEC1 slice**. Whole-KG answers are built once per `(kg, neo1_digest)`
+  into `data/ne/pub/<kg>-<digest>.h3b` (≤ 1 MB, ~200 ms) and then served
+  with Range support — the public download of the product.
+* `res=11|10` roll-up (obs only): count-weighted means for `cover`,
+  `structures_cover`, `ndvi.*`, `terrain.*` (aspect → mode); `height.max` /
+  `trees.h_max` max; `trees.n` / `structures_n` sum; `phenology` /
+  `consistency` → mode + `consistency_hist[7]`; `als_year_newest` max,
+  `als_year_oldest` min; returns `n_children`. One `np.add.reduceat` pass.
 
-### ALS acquisition year (`als_years.py`, 2026-10-29)
+### ALS acquisition year (`als_years.py`)
 
-The row's `als_years` (`flight_years` bitmask, bit i = ALS 2020+i) is
-frozen and is 0 wherever the last flight was ≤ 2019 (~60 % of KGs), which
-conflates "old flight" with "no data". umfeld-at needs the real year for
-the declared-vs-observed diff, so the BEV flight-block overlay
-(`data/als_acquisition/flight_blocks_<mosaic>.geojson`, `Flugjahr` per
-block, DSM year when DTM/DSM differ — the series record on data.gv.at is
-`5ce253fc-b7c5-4362-97af-6556c18a45d9`, file
-`Metadatenuebersicht_SHP_DTM_DSM_20240915.zip`) is evaluated **at read
-time, at the cell centre** — the 41 B row never changes, nothing is
-re-posted.
+The frozen row's `flight_years` bitmask is 0 wherever the last flight was
+≤ 2019, which conflates "old flight" with "no data". The BEV flight-block
+overlay (`data/als_acquisition/flight_blocks_<mosaic>.geojson`, `Flugjahr`
+per block; series `5ce253fc-b7c5-4362-97af-6556c18a45d9` on data.gv.at) is
+therefore evaluated **at read time, at the cell centre**. v2.4 observed
+values come from the `20240915` mosaic → `als_year_newest`; `dh_m` /
+`dtm_m` are newest − oldest (`20220915`) → `als_year_oldest`. Equal years
+⇒ not re-flown, `dh_m` is noise (`reflown_share` per KG).
 
-What v2.4 uses: every observed value comes from the `20240915` mosaic
-(`tile_index.DEFAULT_DATASET`) → `als_year_newest`; `dh_m` / `dtm_m` are
-newest − oldest mosaic (`20220915`) → `als_year_oldest`. Equal years ⇒ not
-re-flown, `dh_m` is noise (`reflown_share` per KG). The vendored 20250915
-overlay is not used (no product was built from it).
-
-| surface | field | notes |
-|---|---|---|
-| `/api/v1/cells` json / csv | `change.als_year_newest`, `change.als_year_oldest` | int or null; roll-up max / min |
-| `/api/v1/cells?format=columns` | `als_year_newest`, `als_year_oldest` | u16 lists, **65535 = null** |
-| `format=bin`, `/chunk`, `/kg/<code>/cells?format=h3b` | — | frozen rows, unchanged |
-| `/api/v1/cells/dict` | `derived_fields`, `als{…}` | contract |
-| `/api/v1/kg/<code>` and `/kg/<code>/cells?format=json` | `als{years, newest, oldest, dominant, dominant_share, coverage, reflown_share, newest_hist, oldest_hist, cells_known, precision, source, source_url, mosaics}` | `coverage` = share of the KG's cells under `newest` |
-| `/api/v1/status` | `als{kgs_with_als_year, year_hist, year_hist_cells, newest_min/max, oldest_min, coverage_mean, precision, backfill}` | 5-min cached per worker |
-| `/landscape?include=cells` | `change.als_year_newest/oldest`, `als_source` | max / min over the bbox |
-| NEO1 header on `/obs` POST | `als_years{newest, oldest, dominant, coverage, years, source, mosaics}` | header only, digest-neutral (`ne_h3.build_observed`, `neo1_section_from_h3b`) |
-
-Cost model (disk / bandwidth): the two overlays are in-memory STRtrees
-(~450 polygons); per-cell years are computed once per inflated chunk
-(`Chunk.als()`) from the chunk's cached centres and ride the chunk LRU —
-no file reads per request. The per-KG block lives in `cells.sqlite`
-(`als_kg`, keyed on `neo1_digest`, `ALGO` bump = recompute). Two
-precisions: `chunk` (res-10 chunk centres weighted by cell count from the
-`chunk` table — the whole corpus in ~75 s with zero file reads, coverage
-within ±0.5 % of exact) for the backfill and on-demand misses; `exact`
-(every cell) at ingest time via `cells_api.index_file` while the new file
-is hot. Two u16 columns add ~0.1 B/cell gzipped. Progress / histogram:
-the `als_years:` line of `/process.txt`; CLI `python3 als_years.py
---status|--backfill|--kg <code>`.
-
-## 4. Performance / resource targets (measure before merging)
-
-| metric | target | how |
-|---|---|---|
-| point, k=0, obs | p50 < 4 ms | 1 sqlite PK read + 1 chunk inflate (cached after) |
-| bbox 0.01°×0.01° (~330 cells) json | p50 < 12 ms | ~7 chunks |
-| bbox 0.05° (~16 k cells) columns | p50 < 80 ms, body < 350 KB gz | ~340 chunks, numpy decode |
-| 16 k cells + trees + structures json | < 250 ms, < 2.5 MB gz | — |
-| whole-KG h3b | < 5 ms after first build | file send |
-| RSS of `srv_public` | +≤ 60 MB over today | bounded LRUs only |
-| disk | `cells.sqlite` ≤ 250 MB at 8 440 KGs; `data/ne/pub/` ≤ 1.5 GB (LRU 1 000 files) | — |
-| primary egress | h3b/columns default in docs; json capped 16 384 cells | — |
-
-Benchmark script `tools/bench_cells_api.py` (hits localhost:8100, prints
-p50/p95 + bytes for the table above). CPU: no Python loop over cells in
-any format except `geojson` boundary generation (h3 vectorised
-`cells_to_h3shape` where available).
-
-## 5. Integration with existing public routes
-
-* `/api/v1/landscape?include=cells`: block `cells{n, res:12, cover{…mean},
-  structures_n, trees_n, canopy, height{mean,p90,max}, consistency_hist,
-  phenology_hist, change{dh_m, forest_loss_cells}, partial}` — the res-10
-  roll-up code path over the bbox cells. Cheap, answers "what is HERE"
-  at cell fidelity (today's block is 25 m grid + sampled trees).
-* `/api/v1/kg/<code>`: add `cells: {ready, cells_n, epoch, summary}` from
-  the h3b header `summary` (already computed by the processor).
-* `/api/v1/trees/bbox` and `/buildings/bbox`: **unchanged** now; once
-  `data/ne` covers a KG, these may be answered from NET1/NEB1 (complete
-  apex set h ≥ 3 m instead of sampled `kg_trees`) — flag `source:
-  "cells"` in meta. Phase 2, behind `cells_api.has_kg(code)`.
-* `public_docs.LLM_TXT`: new section "Cells (H3 res 12, ~300 m²)" — a
-  copy of §2 + §3 condensed; vocabulary test covers it.
-
-## 6. What this gives siedler / umfeld-at
-
-* siedler (viewport tiles ≈ 0.02°): one `columns` call per tile for a
-  heat layer (canopy, structure heights, change, consistency), one
-  `/cells/<h3>` on click for the full dossier incl. every tree and
-  structure with heights; `k`-rings for "around this point". Join to its
-  own lot geometry client-side by cell id — nothing lot-shaped is needed
-  from us.
-* umfeld-at: its `/context?include=ne` can call `/api/v1/cells?lon&lat`
-  (or ingest the posted NEO1 it already has) — identical semantics, so
-  `obs` served by either side decodes with the same `/dict`.
-* Both: `/kg/<code>/cells` h3b for bulk/offline use (the Zenodo product
-  minus the third-party layer; CC BY 4.0, attribution in header).
-
-## 7. Retiring `/k` — DONE 2026-10-13
-
-> Record: `docs/kataster-purge.md`.
-
-Every *landscape* question the hidden tier answered has a public,
-cell-keyed equivalent (the handlers in the left column are deleted;
-`api_tiers.landscape_route_retired` answers 410 with `see:
-/api/v1/docs/llm.txt#cells`):
-
-| former `/k` route | public replacement |
+| surface | field |
 |---|---|
-| `/api/v1/parcel/<id>`, `/parcel/<id>/detail` | `/api/v1/cells?lon&lat&k=1` or ids of the client's own geometry |
-| `/api/v1/query/parcels?bbox` | `/api/v1/cells?bbox&layers=obs,trees` |
-| `/api/v1/parcels/batch`, `/parcels/landscape`, `/query/nature`, `/query/compound` | client-side over `columns` (all filter fields are per cell); `consistency` replaces `new_buildings` |
-| `/api/v1/kg/<c>/buildings`, `/kg/<c>/new_buildings`, `/kg/<c>/infrastructure` | `/api/v1/cells?bbox=<kg bbox>&layers=structures` / `/kg/<c>/cells` |
-| `/api/v1/kg/<c>/profile` | `/api/v1/kg/<c>` (`cells.summary`) |
-| `/llm/kg/<c>?parcels=1`, `/api/v1/flags` | gone |
-| `/api/v1/lookup`, `/cadastre/*` relays | clients call umfeld-at directly |
+| `/cells` json / csv | `change.als_year_newest`, `change.als_year_oldest` (roll-up max / min) |
+| `/cells?format=columns` | `als_year_newest`, `als_year_oldest` u16, **65535 = null** |
+| `bin`, `/chunk`, `h3b` | frozen rows, unchanged |
+| `/cells/dict` | `derived_fields`, `als{…}` |
+| `/kg/<code>`, `/kg/<code>/cells?format=json` | `als{years, newest, oldest, dominant, dominant_share, coverage, reflown_share, …}` |
+| `/status` | `als{kgs_with_als_year, year_hist, …, backfill}` |
 
-`cells_api` never imports from `app.py`; `landscape_query.py` is the only
-shared helper. `public_docs.LLM_TXT` is the only client-facing doc.
+Per-cell years are computed once per inflated chunk (`Chunk.als()`) from
+the cached centres (two in-memory STRtrees, ~450 polygons); the per-KG
+block lives in `cells.sqlite.als_kg`. CLI: `python3 als_years.py
+--status|--backfill|--kg <code>`; test `tests/test_als_years.py`.
 
-## 8. Not in scope / later
+## 4. Performance (measured, 2 workers × 24 threads)
 
-* HA: `data/ne/` + `cells.sqlite` are primary-only today (shadow does not
-  replicate them; `director_ha.SNAPSHOT_FILES`). Add `data/ne/` to the
-  shadow sync once the corpus is > a few GB — separate task.
-* PNG hex tiles, vector tiles (MVT) of cells — `columns` + client h3 is
-  enough for siedler's Leaflet; revisit on request.
-* Serving NET1/NEB1 through umfeld-at — stays on our side (their
-  contract).
+| request | p50 |
+|---|---|
+| point k=0 obs json | 2–3 ms |
+| 0.01° × 0.01° box json (≈ 2 700 cells) | 24 ms |
+| 7.2 k cells `columns` | 31 ms, 170 KB wire |
+| 7.2 k cells + trees + structures json | 193 ms, 0.8 MB wire |
+| res=11 roll-up json | 30 ms |
+| `/cells/<h3>` all layers | 2 ms |
+| whole-KG h3b after first build | 1 ms |
 
-## 9. Implementation notes (2026-10-04)
+Per-cell cost ≈ 8 µs json / 3 µs columns / 2 µs bin. Per-cell JSON builds
+pause the cyclic GC (`_NoGC`, ≥ 1 000 cells); `orjson` is used when
+importable. Benchmark: `python3 tools/bench_cells_api.py` against
+`localhost:8100`.
 
-* Files: `cells_api.py` (blueprint + index + formats), `tests/test_cells_vocab.py`
-  (vocabulary grep over source, `public_docs.CELLS_TXT`, `/cells/dict`, one cell
-  record, one public h3b header), `tools/bench_cells_api.py` (§4 table against
-  `:8100`). Index maintenance: `python3 cells_api.py --rebuild` or
-  `python3 ne_ingest.py --rebuild`; `ne_ingest` calls `cells_api.index_file()`
-  after every parent write / merge (`_index_cells`, best-effort).
-* **Measured on the primary** (`srv_public`, gunicorn 2×24, 19 KGs on disk):
+## 5. Publication invariant: `product_version == "v2.4"` ⇒ cells served
 
-  | metric | target | measured p50 |
-  |---|---|---|
-  | point k=0 obs json | < 4 ms | 2–3 ms |
-  | 307-cell box json (0.0035°) | — | 7 ms |
-  | 0.01°×0.01° box json (**2 733 cells**, not ~330: 0.84 km² / 307 m²) | < 12 ms | 24 ms (gzip incl.) |
-  | 7.2 k cells columns | < 80 ms | 31 ms, 170 KB wire |
-  | 7.2 k cells + trees + structures json | < 250 ms | 193 ms, 0.8 MB wire |
-  | 7.2 k cells bin all layers | — | 39 ms, 204 KB |
-  | res=11 roll-up json | < 80 ms | 30 ms |
-  | `/cells/<h3>` all layers | < 4 ms | 2 ms |
-  | chunk res 9 h3b | — | 1 ms |
-  | whole-KG h3b (after first build, 153 ms for 52 k cells) | < 5 ms | 1 ms |
-  | `/landscape?include=cells` (7 k cells) | — | 72 ms |
-  | `srv_public` RSS | +≤ 60 MB | 213 MB total after the bench (was ~180 MB) |
-
-  The §4 cell counts were under-estimated ~8× (0.05° span ≈ 68 k res-12
-  cells); the hard caps (span ≤ 0.05° **and** ≤ 16 384 cells → 413) govern,
-  so a 16 k-cell box is ~0.023° square. Per-cell cost ≈ 8 µs json / 3 µs
-  columns / 2 µs bin.
-* Deviations / decisions:
-  - `meta.partial` means *cells requested but not on disk* (`cells_missing`),
-    not "a KG bbox intersects the query" — KG bboxes overlap so much that the
-    latter would flag nearly every border point. `kgs_missing` (intersecting
-    KGs without a product) is still reported, informationally.
-  - Dedupe priority is *observed copy → larger chunk → lowest kg* (the spec's
-    rule plus an observed-first tie-break, so a border cell that one product
-    saw and another did not never comes back as nodata).
-  - `format=columns` at res 11/10 carries aggregated floats (not u8) + `n_children`.
-  - Per-cell JSON builds pause the cyclic GC (`_NoGC`, ≥ 1 000 cells) — 3×
-    faster; `public_api` gzips bodies ≥ 512 KiB at level 1.
-  - `orjson` is used when importable (added to `requirements.txt`), stdlib
-    `json` otherwise.
-  - Header LRU holds the slim header (no `chunks[]`); whole-KG builds read the
-    full header once. Pub files are named `<kg>-<neo1_digest>.h3b` so a
-    re-ingested product is rebuilt on first request and the stale file dropped.
-  - `/kg/<code>` gains `cells{ready, cells_n, epoch, partial, summary, url}` and
-    `links.cells`; `/status` gains `cells{kgs_ready, cells_total, index_rebuilt_at, epoch}`.
-  - §7 hook: `api_tiers.PRIVATE_ROUTES_LANDSCAPE` + `PRIVATE_KG_SUBROUTES_LANDSCAPE`
-    + `landscape_route_retired(path)`; `touch data/k_landscape_off` → those `/k`
-    paths answer 410 `{"gone":true,"see":"/api/v1/docs/llm.txt#cells"}` even
-    with a valid token (verified; director/processing/admin paths unaffected).
-
-## 10. Publication invariant: `product_version == "v2.4"` ⇒ cells served (2026-10-07)
-
-Siedler bug report: `/api/v1/kg/19454` said `v2.4 / ready:true` while
-`/api/v1/cells` listed 19454 in `kgs_missing`. Root cause is structural —
-the KG list flips to v2.4 when the peer commits `_json_v2`, but the cells
-file reaches `data/ne/` only through `ne_ingest` (metered, `ne_ingest_mb_per_h`
-= 15 MB/h → a 470 MB backlog drains in ~30 h; split parents stay `partial`
-until every block is pulled). Audit at fix time: 1846 v2.4 rows, 274 with
-no cells file, 90 with a partial file.
-
-Fix (public tier only, the index / director telemetry is untouched):
+The KG list flips to v2.4 when `_json_v2` is committed, but the cells
+file reaches `data/ne/` only through ingest (split parents stay `partial`
+until every block is merged). To keep the two surfaces consistent:
 
 * `cells_api.ne_state(code, pv)` → `ne_ready`, `ne_status`
-  (`served | partial | pending | not_processed`), `ne_cells_published_at`
-  (file mtime), `retry_after_s`. `pending` = KG list has a `v2.4*` product,
-  no file yet. `partial` = file present with `partial_cells`.
+  (`served | partial | pending | not_processed`), `ne_cells_published_at`,
+  `retry_after_s`.
 * `landscape_query.kg_public` emits `product_version` **`v2.4-pending`**
   instead of `v2.4` while `ne_ready` is false (raw value in
-  `product_version_registry`), adds the `ne_*` fields and bumps `updated_at`
-  to `ne_cells_published_at` → the md5 ETag of `/kgs`, `/llm/manifest.json`,
-  `/kg/<code>` changes when cells go live. `v2.4-partial` rows are never
-  promoted (they don't claim cells).
-* `cells_api.cells_generation()` (`c<files>-<partial>-<newest mtime>-<cells>`)
-  → `/status.cells_generation`, `manifest_generation`, `kgs_ne_served`;
-  `/kgs` carries the same. `index_status.kgs_ready` excludes partial files.
-* `/cells` meta + 404 body: `kgs_missing` (unchanged, union) +
-  `kgs_pending` / `kgs_not_processed` + `retry_after_s`; 404 `status:
-  "pending"` when only pending KGs intersect.
-* Per-row cost: `_files()` is cached 30 s; `ne_state` with `pv` supplied
-  does no extra sqlite read, so `/kgs?limit=5000` stays ~90 ms.
+  `product_version_registry`) and bumps `updated_at` so ETags change when
+  cells go live. `v2.4-partial` rows are never promoted.
+* `cells_api.cells_generation()` → `/status.cells_generation`; `/cells`
+  404 bodies carry `kgs_pending` / `kgs_not_processed` + `retry_after_s`.
 
-## Green-ground override (`ne_green_fix.py`, 2026-10-26)
+### Green-ground override (`ne_green_fix.py`)
 
-The segv2 classifier labels dull-ortho meadows `parking` / `rock` (NE groups
-`bau` / `alpen`) although the fused S2 NDVI says vegetation (KG 63330 cell
-`8c1e108e86e1bff`; fleet-wide median 26 % of bau cells). Until the model is
-retrained the correction is applied **at read time only — no `.h3b`, Zenodo
-product or JSON is rewritten**:
+The segv2 classifier labels some dull-ortho meadows `parking` / `rock`
+(groups `bau` / `alpen`) although the fused Sentinel-2 NDVI says
+vegetation. Until the model is retrained the correction is applied **at
+read time only** — no `.h3b`, Zenodo product or JSON is rewritten: cell
+`ndvi_mean ≥ 0.5` and phenology ≠ `road_or_bare` → `obs_lu[bau] +
+obs_lu[alpen]` moves to `obs_lu[gruen]`, verdict recomputed. Applied in
+`cells_api._load_chunk` (chunk LRU / pub container / ETags keyed on
+`FIX_ID`) and `ne_h3.neo1_section_from_h3b`. `summary.observed_ha` in
+headers is pre-fix (documented). Test `tests/test_ne_green_fix.py`; audit
+one file: `python3 ne_green_fix.py data/ne/63330.h3b`.
 
-* rule: cell `ndvi_mean` (fused S2) ≥ 0.5 and phenology ≠ `road_or_bare` →
-  `obs_lu[bau] + obs_lu[alpen]` → `obs_lu[gruen]`, verdict recomputed with
-  the `build_observed` rules (`unknown` stays). Idempotent, deterministic.
-* where: `cells_api._load_chunk` (public cells API, chunk LRU / pub container
-  / ETags keyed on `FIX_ID`), `ne_h3.neo1_section_from_h3b` (what the primary
-  POSTs to umfeld-at; section header carries `green_fix*`).
-* propagation: `ne_ingest._our_digest` returns the *fixed* digest (cached in
-  `data/ne/index.json` under `green_fix`, ≤ `ne_green_fix_compute_per_tick`
-  (400) fresh computations per tick), so `confirm_umfeld` sees a mismatch and
-  re-POSTs every parent at `ne_post_max_per_tick` (knob, 15 → ~180/h, ~0.3 MB
-  each) — ~1.5 days for the corpus. Knob `ne_green_fix=false` turns it off.
-* the fixed export is labelled `source: srtm-lidar-at@2.4.1` (epoch stays
-  `2026-10`; `ne_h3.OBS_SOURCE_FIXED`) so umfeld's `/ne/manifest`
-  `kgs[kg].obs.source` shows which KGs carry it. Bytes served by umfeld
-  (`GET example.invalid/api/v1/ne/cell/{h3}`) == bytes from `/api/v1/cells`
-  once the resync has reached the KG.
-* **standing rule — resync by digest, never blindly**: `confirm_umfeld`
-  compares `kgs[kg].obs.digest` with our fixed digest and re-POSTs only on
-  mismatch (`replaced:true`; `unchanged:true` is free). Limits honoured:
-  ≥0.6 s between POSTs (`POST_MIN_GAP_S`), `ne_post_gib_per_day` (2 GiB default, 5 GiB set 2026-10-28,
-  umfeld's token limit is 4 GiB/day) tracked in `index.json → stats.post_day`
-  (`DAY-CAP-HOLD` on the `resync(by digest)` line). When our digest for a KG
-  changes the retry ladder (`post_attempts`/`post_next`) resets.
-* **which index row describes the file on disk** (`ne_ingest._disk_row`): a
-  whole-parent product ingested *after* the last block merge overwrites the
-  merged file — its `files` row wins over the stale `parents` row. Before
-  this (03212, 01806, 2026-10-26) a bevdirect-cell NEO1 was POSTed bare →
-  409 "cell set ≠ our NEC1 lu cell set" every 30 min; now NEC1+NEO1.
-* a *genuinely* lu-declared file that 409s on cell set while umfeld has
-  `bev == null` is parked (`needs_bevdirect`, shown on the resync line) until
-  its digest changes — it has to be reprocessed on a bev-mode peer.
-* `/process.txt` → `ne_ingest:` block, lines `green_fix(green-1): umfeld_confirmed=…`
-  and `resync(by digest): today N POSTs M MiB …`.
-* `summary.observed_ha` in headers is still pre-fix (documented in the pub header).
-* test: `python3 tests/test_ne_green_fix.py`; audit one file:
-  `python3 ne_green_fix.py data/ne/63330.h3b`.
+## 6. Multi-KG summary `/api/v1/kgs/summary`
 
-## 11. Multi-KG summary `/api/v1/kgs/summary` (2026-10-29)
+Scope (exactly one): `codes=63330,63331,…` (≤ 500), `gemeinde=61630`
+(5-digit GKZ), `district=616` (3), `state=6` (1). Vienna's districts
+(`district=901…923`) are unsupported (400); Vienna as a whole is
+`district=900` / `gemeinde=90001`. Unknown filter value → 404; unknown KG
+codes → `kgs_unknown`.
 
-For umfeld-at's landing glyph (selection card over Gemeinde / Bezirk /
-Bundesland / Natura-2000 masks). Public, tokenless, CORS `*`, ETag +
+Response: `{scope, kgs, kgs_processed, incomplete, kgs_pending_n,
+kgs_not_processed_n, kgs_partial_n, summary, meta}`; `summary` has the
+keys of the per-KG `/kg/<code>/cells?format=json → summary` block merged
+by `cells_api.merge_summaries` (sums for counts / hectares, min / max for
+elevation, weighted slope mean, newest `epoch`). Header-only cost:
+per-KG summaries persist in `cells.sqlite.summary`, with a 256-entry
+response cache keyed on `(scope, codes, cells_generation())`. ETag +
 `Cache-Control: public, max-age=600`.
 
-Scope (exactly one): `codes=63330,63331,…` (≤ 500, else 400),
-`gemeinde=61630` (5-digit GKZ), `district=616` (3), `state=6` (1).
-Wien Gemeindebezirke (`district=901…923`, `gemeinde=9xx01` other than
-90001) → `400 {"error":"unsupported_filter", …supported}`; Wien as a whole
-is `district=900` / `gemeinde=90001`. Unknown filter value → 404
-`not_found`; malformed → 400 `bad_filter`. Unknown KG codes in `codes=`
-are listed in `kgs_unknown` and not counted in `kgs`.
+## 7. National aggregate `/api/v1/cells/national` (`cells_national.py`)
 
-Response: `{scope{type, code|n}, kgs, kgs_processed, incomplete,
-kgs_pending_n/kgs_not_processed_n/kgs_partial_n (+ lists ≤ 500),
-kgs_unknown?, summary, meta{generation, per_kg, max_codes, …}}`.
-`summary` has exactly the keys of the per-KG
-`/kg/<code>/cells?format=json → summary` block (`cells_api.public_summary`)
-merged by `cells_api.merge_summaries`: sums for `cells_observed`,
-`trees_n`, `structures_n`, `cover_ha{group}`, `consistency_n{}`,
-`consistency_ha{}`, `terrain.cells_with_terrain`, `terrain.hansen_loss_cells`;
-min / max for `terrain.elev_min_m` / `elev_max_m`; `terrain.slope_mean_deg`
-weighted by `cells_with_terrain`; `epoch` = newest + `epochs[]`. KGs
-without a published cells file are skipped (`kgs - kgs_processed`),
-split into `kgs_pending` / `kgs_not_processed` like the cells routes;
-`incomplete:true` when any KG is missing or has `partial_cells`.
+One row per res-9 H3 parent (~1.05 M rows; `res=8` ≈ 150 k), Austria-wide,
+for overview tiles: per field the mean over the res-12 children where the
+field is non-null (`*_top` = max), `verdict` = u16 counts per consistency
+class, `n_cells` / `n_obs`. Same container / dtypes / units / nodata as
+the 0.025° bins (`cells_bins.py`, `format=bin&fields=`).
 
-Cost: header-only. Per-KG public summaries are persisted in
-`cells.sqlite.summary(kg, mtime, js)` (written by `index_file` on ingest,
-lazily back-filled by `kg_summary()` when the mtime differs), with a
-process-local dict in front and a 256-entry response cache keyed on
-`(scope, codes, cells_generation())`. `state=6` (1 596 KGs) is ~3 s on a
-cold sqlite, ~10 ms warm.
-
-## 12. National aggregate `/api/v1/cells/national` (`cells_national.py`, 2026-10-30)
-
-umfeld-at renders zooms 9–11 of its cell tile layer (res 7–9 polygons) and
-the all-Austria PMTiles archive from one in-RAM national table; the per-cell
-0.025° bins (`cells_bins.py`, `format=bin&fields=`) only feed z ≥ 12. The
-national aggregate gives those overview tiles LiDAR columns with **one fetch
-per generation** (~20 MB gz), never per tile.
-
-* **What**: one NEX1 row per res-9 H3 parent (~1.05 M rows; `res=8` ≈ 150 k),
-  Austria-wide. Per field the **mean over the res-12 children where the field
-  is non-null** (`bld_*` / `canopy_h_*` over object-holding children;
-  `*_top` = max), `verdict` = u16 counts per consistency class, `n_cells` /
-  `n_obs`. Same container / dtypes / units / nodata as the bins
-  (`cells_national.FIELDS`; header `res`, no `ij`/`bbox`). `u32` added to the
-  NEX1 dtype set for count/area sums.
-* **Source**: observation rows + NET1 + NEB1 of every `data/ne/<kg>.h3b` —
-  no grid25 fallback, no roof hints (bin-only). Border cells deduplicated like
-  `cells_api.gather`: chunks whose res-10 id is unique to one product are
-  aggregated per KG (pass A), the ~10 % duplicated res-10 chunks in batches
-  across products (pass B). Parent ids via bit arithmetic
-  (`parent_ids`, verified against `h3.cell_to_parent`).
-* **Build**: `python3 cells_national.py --build` — ~10 min / ~1 GB over
-  5.4 M chunks → `data/ne/national/r9.nex.gz`, `r8.nex.gz`, `meta.json`.
-  `cells-national.timer` (primary only, 10:00 Europe/Vienna daily, installed by
-  `deploy.sh` when `is_director` exists) — skipped when
+* **Build**: `python3 cells_national.py --build` (~10 min, ~1 GB RAM over
+  5.4 M chunks) → `data/ne/national/r9.nex.gz`, `r8.nex.gz`, `meta.json`.
+  `cells-national.timer` runs it daily; skipped when
   `gen = sha(ALGO | green_fix | cells_generation())` is unchanged. **Never
   build inside gunicorn.**
-* **Serve**: no `fields=` → the stored gz as is (`Content-Encoding: gzip`);
-  `fields=` → decode + slice + gzip once, cached under
-  `data/ne/national/cache/r<res>-<gen>-<hash>.nex.gz` (LRU 24, single-flight).
-  ETag `"n-r<res>-<gen>-<fields>"`, `X-Cells-Gen`, `X-Cells-Epoch`,
-  `X-Cells-Built`, `Cache-Control max-age=86400`; `format=json` / `meta=1` →
-  build meta; 404 + `Retry-After` before the first build. Aliases
-  `elev_m→elev_mean`, `slope→slope_mean`, `consistency→verdict`.
-* **Test**: `python3 tests/test_cells_national.py` (parent arithmetic,
-  aggregate vs. direct per-KG numbers, codec round-trip, route headers).
+* **Serve**: no `fields=` → the stored gz as is; `fields=` → decode + slice
+  + gzip once, cached under `data/ne/national/cache/` (LRU 24,
+  single-flight). ETag `"n-r<res>-<gen>-<fields>"`, `X-Cells-Gen`,
+  `X-Cells-Epoch`, `X-Cells-Built`, `max-age=86400`; 404 + `Retry-After`
+  before the first build.
+* Test: `python3 tests/test_cells_national.py`.
+
+## 8. Operations
+
+```bash
+python3 tests/test_cells_vocab.py                  # before every edit
+python3 cells_api.py --rebuild                     # if /status.cells disagrees with ls data/ne/*.h3b
+curl -s 'localhost:8100/api/v1/cells?lon=15.60&lat=48.41&k=1' | python3 -m json.tool
+curl -s localhost:8100/api/v1/cells/dict | python3 -m json.tool | head
+```
+
+Split-parent ingest and merge mechanics: `ne_ingest.py` (thread in
+`app.py`; `ne_ingest:` line in `/process.txt`; knob
+`POST /api/v1/director/config {"ne_ingest_enabled": false}` stops pulls).
