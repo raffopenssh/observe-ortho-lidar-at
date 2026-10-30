@@ -138,7 +138,7 @@ Runs as systemd service (rf_train.service). Iterates ~300 random KGs (seed 42, >
 4. Dominant classes downsampled to 5× median class count to reduce imbalance
 
 ### Model Selection
-- evaluate_checkpoints.py trains RF at every 5-KG increment, multiple seeds
+- Learning-curve evaluation (training/evaluate route, not shipped as a script) trains RF at every 5-KG increment, multiple seeds <!-- VERIFY: evaluate_checkpoints.py not in repo -->
 - Composite score: 0.4×OOB + 0.35×mean_per_class_accuracy + 0.25×worst_class_accuracy
 - Best checkpoint+seed saved to data/best_model/ — API prefers this over live model
 - Training Monitor dashboard: /training.html (live OOB curve, per-class accuracy, convergence)
