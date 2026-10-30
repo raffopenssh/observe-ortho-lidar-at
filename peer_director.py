@@ -4103,11 +4103,11 @@ class PeerDirector:
             import copernicus as _cop_smoke
             n_creds = len(_cop_smoke.list_credentials() or [])
             if n_creds == 0:
-                log.critical(
-                    'CRITICAL: director starting with 0 Copernicus '
-                    'credentials. Frontier KGs will fail. Add via '
-                    'POST /api/v1/credentials or set '
-                    'COPERNICUS_BOOTSTRAP_CREDS env on srv.service.')
+                log.warning(
+                    'director starting with 0 Copernicus credentials — '
+                    'Sentinel-based steps will fail. Add via POST '
+                    '/api/v1/credentials, COPERNICUS_CREDENTIALS_FILE or '
+                    'COPERNICUS_BOOTSTRAP_CREDS (see .env.example).')
             else:
                 log.info('Director credential pool: %d entries', n_creds)
         except Exception as _e:
