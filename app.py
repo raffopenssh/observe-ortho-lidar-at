@@ -402,8 +402,8 @@ def _public_params(params: dict) -> dict:
 
 @app.before_request
 def _cors_preflight():
-    # Browser cross-origin preflight for the public read endpoints
-    # (siedler game). Answer before the admin-token gate.
+    # Browser cross-origin preflight for the public read endpoints.
+    # Answered before the operator gate.
     if request.method == 'OPTIONS' and _llm_api.cors_path(request.path or ''):
         return _llm_api.add_cors(Response(status=204))
     return None
@@ -2765,6 +2765,65 @@ _PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
 _RESULTS_DIR = Path('/tmp/segment_results')
 _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _safe_child(root, name: str, suffix: str = '') -> Path:
+    """``root/<secure_filename(name)><suffix>`` with a resolved-prefix check.
+    Raises ValueError when the name is empty after sanitising or the resolved
+    path escapes ``root`` (symlinks included)."""
+    from werkzeug.utils import secure_filename
+    safe = secure_filename(str(name or ''))
+    if not safe or safe != str(name):
+        raise ValueError('invalid name')
+    root_r = Path(root).resolve()
+    p = (root_r / f'{safe}{suffix}').resolve()
+    if p.parent != root_r:
+        raise ValueError('path escapes root')
+    return p
+
+
+def _outbound_url_ok(url: str, allow_private: bool = False, allow_list=None) -> tuple[bool, str]:
+    """SSRF guard for URLs that come from request parameters: http(s) only,
+    hostname on ``allow_list`` (default ``config.OUTBOUND_ALLOWED_HOSTS``;
+    ``None`` → any public host), and every resolved address must be global
+    (no loopback / private / link-local / multicast).  ``allow_private``
+    permits RFC1918 addresses (LAN peers) but never loopback.
+    Returns ``(ok, reason)``."""
+    import ipaddress as _ipa
+    import socket as _socket
+    from urllib.parse import urlsplit
+    try:
+        u = urlsplit(url)
+    except Exception:
+        return False, 'unparseable url'
+    if u.scheme not in ('http', 'https') or not u.hostname:
+        return False, 'scheme must be http(s)'
+    host = u.hostname.lower().rstrip('.')
+    if allow_list is not None and host not in {h.lower() for h in allow_list}:
+        return False, f'host {host} not allowed'
+    try:
+        infos = _socket.getaddrinfo(host, u.port or (443 if u.scheme == 'https' else 80),
+                                    proto=_socket.IPPROTO_TCP)
+    except Exception:
+        return False, f'cannot resolve {host}'
+    if not infos:
+        return False, f'cannot resolve {host}'
+    for info in infos:
+        ip = _ipa.ip_address(info[4][0])
+        if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved:
+            return False, f'{host} resolves to a forbidden address'
+        if ip.is_private and not allow_private:
+            return False, f'{host} resolves to a private address'
+    return True, ''
+
+
+def _safe_send_file(path, root, **kw):
+    """send_file() restricted to files below ``root`` (resolved-prefix check)."""
+    root_r = Path(root).resolve()
+    p = Path(path).resolve()
+    if root_r not in p.parents:
+        return jsonify({'error': 'not_found'}), 404
+    return send_file(str(p), **kw)
+
 def _progress_set(task_id: str, step: str, detail: str = "", fetch: dict | None = None,
                   progress: float | None = None):
     """Update progress for a running segment task.
@@ -4062,7 +4121,7 @@ def processing_product():
     p = next((c for c in cands if c.exists()), None)
     if p is None:
         return jsonify({'error': 'not_found', 'code': code}), 404
-    resp = send_file(str(p), mimetype=mt, conditional=True)
+    resp = _safe_send_file(p, 'data/austria_processor', mimetype=mt, conditional=True)
     resp.headers['X-Product-Key'] = pkey
     resp.headers['X-Product-Size'] = str(p.stat().st_size)
     return resp
@@ -7167,6 +7226,9 @@ def director_add_peer():
         return jsonify({'error': 'id and url are required'}), 400
     if not peer_url.startswith('https://'):
         return jsonify({'error': 'url must start with https://'}), 400
+    _ok, _why = _outbound_url_ok(peer_url, allow_private=True, allow_list=None)
+    if not _ok:
+        return jsonify({'error': f'url rejected: {_why}'}), 400
 
     cfg = pd.load_peers_config()
     # Explicit re-add clears any removal tombstone (see
@@ -10773,7 +10835,7 @@ def api_kg_heightfield(kg_code):
     Interpolates (IDW, k nearest) the pre-indexed sample points from
     `kg_buildings` (centroid_dtm_m — dense in settlements) onto a regular
     lon/lat grid covering the KG bbox. Meant for game-style 2.5D relief
-    (e.g. siedler-oesterreich), NOT survey use: coarse accuracy.
+    (browser map clients), NOT survey use: coarse accuracy.
 
     Params: cell=N   grid spacing in metres (default 50, min 20, max 500)
             k=N      IDW neighbours (default 8; IDW path only)
@@ -11640,17 +11702,17 @@ def _segment_worker(task_id: str, features: list, params: dict, geometry_text: s
 def _unique_share_id(base_name: str, public: bool = False) -> str:
     """Return base_name if unused, otherwise append date + counter (e.g. MyArea-0415-2)."""
     candidate = base_name
-    if not (_share_dir(public) / f"{candidate}.json.gz").exists():
+    if not (_share_path(candidate, public)).exists():
         return candidate
     # Collision — append date stamp
     date_suffix = time.strftime('%m%d')
     candidate = f"{base_name}-{date_suffix}"
-    if not (_share_dir(public) / f"{candidate}.json.gz").exists():
+    if not (_share_path(candidate, public)).exists():
         return candidate
     # Still collides — add counter
     for i in range(2, 100):
         candidate = f"{base_name}-{date_suffix}-{i}"
-        if not (_share_dir(public) / f"{candidate}.json.gz").exists():
+        if not (_share_path(candidate, public)).exists():
             return candidate
     # Fallback
     return f"{base_name}-{date_suffix}-{int(time.time()) % 10000}"
@@ -11717,7 +11779,7 @@ def _auto_save_share(task_id: str, result: dict, geometry_text: str, params: dic
         data = gzip.compress(data_json.encode())
 
         _share_dir(public).mkdir(parents=True, exist_ok=True)
-        (_share_dir(public) / f'{share_id}.json.gz').write_bytes(data)
+        (_share_path(share_id, public)).write_bytes(data)
         _share_evict()
         log.info("auto-save: saved share %s (%d KB)", share_id, len(data) // 1024)
         return share_id
@@ -12824,7 +12886,10 @@ def download_gpkg(task_id):
     """Download a completed async GeoPackage export."""
     if not task_id or not re.match(r'^[a-f0-9\-]+$', task_id):
         return _error('Invalid task_id', 400)
-    dest = _RESULTS_DIR / f"{task_id}.gpkg"
+    try:
+        dest = _safe_child(_RESULTS_DIR, task_id, '.gpkg')
+    except ValueError:
+        return _error('Invalid task_id', 400)
     if not dest.exists() or not _task_visible(task_id):
         return _error('GeoPackage not found or not ready yet', 404)
     try:
@@ -13799,10 +13864,14 @@ def _mbtiles_worker(task_id, features, params, layer):
 def download_mbtiles(task_id):
     if not task_id or not re.match(r'^[a-f0-9\\-]+$', task_id):
         return _error('Invalid task_id', 400)
-    dest = _RESULTS_DIR / f"{task_id}.mbtiles"
+    try:
+        dest = _safe_child(_RESULTS_DIR, task_id, '.mbtiles')
+    except ValueError:
+        return _error('Invalid task_id', 400)
     if not dest.exists() or not _task_visible(task_id):
         return _error('MBTiles not found or not ready yet', 404)
-    layer_name = request.args.get('layer', 'layer')
+    from werkzeug.utils import secure_filename as _sfn
+    layer_name = _sfn(request.args.get('layer', 'layer')) or 'layer'
     resp = send_file(str(dest), mimetype='application/x-sqlite3',
                     as_attachment=True, download_name=f'{layer_name}.mbtiles')
     @resp.call_on_close
@@ -17130,7 +17199,7 @@ def _onestop_check(task_id: str, fmt: str, url_params: dict):
     if not result:
         if auto_share_id:
             # Load from auto-save share
-            share_path = _share_dir() / f"{auto_share_id}.json.gz"
+            share_path = _share_path(auto_share_id)
             if share_path.exists():
                 share_data = json.loads(gzip.decompress(share_path.read_bytes()))
                 result = share_data.get('result')
@@ -17886,16 +17955,21 @@ def _share_dir(public: bool | None = None) -> Path:
     if public is None:
         public = _public_request()
     return PUBLIC_SHARE_DIR if public else SHARE_DIR
-SHARE_MAX_BYTES = 2_000_000_000  # 2 GB
+SHARE_MAX_BYTES = _config.SHARE_CAP_BYTES  # SRTM_SHARE_CAP_MB (default 1 GB)
 
 _SHARE_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,80}$')  # hex hashes or named slugs
 def _valid_share_id(s):
     return bool(s and _SHARE_ID_RE.match(s))
 
+
+def _share_path(share_id: str, public: bool | None = None) -> Path:
+    """``<share dir>/<id>.json.gz`` via _safe_child (secure_filename + prefix check)."""
+    return _safe_child(_share_dir(public), share_id, '.json.gz')
+
 def _resolve_share(share_id):
     """Resolve a share ID, following redirect stubs from renames.
     Returns (resolved_id, path) or (None, None) if not found."""
-    p = _share_dir() / f'{share_id}.json.gz'
+    p = _share_path(share_id)
     if not p.exists():
         return None, None
     # Check for redirect alias (small file left after rename)
@@ -17904,7 +17978,7 @@ def _resolve_share(share_id):
             stub = json.loads(gzip.decompress(p.read_bytes()))
             if 'redirect' in stub:
                 new_id = stub['redirect']
-                new_p = _share_dir() / f'{new_id}.json.gz'
+                new_p = _share_path(new_id)
                 if new_p.exists():
                     return new_id, new_p
                 return None, None
@@ -18101,7 +18175,7 @@ def share_save():
         
         # Check if client wants to reuse an existing share ID (update in-place)
         if reuse_id and _valid_share_id(reuse_id):
-            existing = _share_dir() / f'{reuse_id}.json.gz'
+            existing = _share_path(reuse_id)
             if existing.exists():
                 # Merge: keep existing result/overlays if not provided in new payload
                 try:
@@ -18154,7 +18228,7 @@ def share_save():
         
         # New share
         share_id = uuid.uuid4().hex[:12]
-        (_share_dir() / f'{share_id}.json.gz').write_bytes(data)
+        (_share_path(share_id)).write_bytes(data)
         _share_evict()
         ovl_count = len(payload.get('overlays', {}))
         url = f'{proto}://{host}{_share_page()}?share={share_id}'
@@ -18326,10 +18400,10 @@ def share_rename(old_id):
         new_id = re.sub(r'[^A-Za-z0-9_-]+', '-', new_id).strip('-')[:80]
         if not _valid_share_id(new_id):
             return _error('Invalid new ID', 400)
-        old_path = _share_dir() / f'{old_id}.json.gz'
+        old_path = _share_path(old_id)
         if not old_path.exists():
             return _error('Share not found', 404)
-        new_path = _share_dir() / f'{new_id}.json.gz'
+        new_path = _share_path(new_id)
         if new_path.exists() and new_id != old_id:
             return _error('Name already taken', 409)
         # Update the name field inside the JSON to match the new ID
@@ -18353,7 +18427,7 @@ def share_rename(old_id):
         if old_id != new_id:
             try:
                 alias_data = json.dumps({'redirect': new_id}, separators=(',', ':'))
-                (_share_dir() / f'{old_id}.json.gz').write_bytes(
+                (_share_path(old_id)).write_bytes(
                     gzip.compress(alias_data.encode()))
             except Exception:
                 pass  # best-effort

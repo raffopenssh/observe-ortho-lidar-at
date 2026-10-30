@@ -263,7 +263,7 @@ what you expect, and send `looks_right` too: a confirmation is as useful as a co
   Recipe (map glyph / cell card): on the card, one tap = POST {{cell, layer:"cells.cover", claim:"wrong_type",
   expected:{{group}}, source, reporter}} (we snapshot what we served); paint /flags/heat?res=7 as a "disputed"
   tint; per viewport tile GET /flags?bbox=&format=columns to mark disputed cells; show tally.claims on the card
-  from /cells/<h3>?flags=1. Giant trees / heights (siedler pattern): POST {{lon, lat, layer:"trees",
+  from /cells/<h3>?flags=1. Giant trees / heights (game-client pattern): POST {{lon, lat, layer:"trees",
   claim:"too_tall", observed:{{h_m}}}} straight from the tree symbol.
 
 """
@@ -449,7 +449,7 @@ The set of Katastralgemeinden (BEV, 7 850 codes) is pinned per epoch:
   analyses per worker (503 + Retry-After when the gate is full). Results carry the same object
   vocabulary as the rest of this API; no property-boundary geometry is served or stored.
 
-## Recipe: a map client with its own vector geometry (siedler-oesterreich pattern)
+## Recipe: a map client with its own vector geometry
 
   1. Draw your lot / building outlines from your own source.
   2. Per feature (on click or when it enters the viewport), send ITS bbox:

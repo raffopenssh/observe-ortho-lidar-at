@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 
 bp = Blueprint('llm_api', __name__)
 
-# Paths that browsers may call cross-origin (game runs in the browser).
+# Read-only paths that browsers may call cross-origin (GET/HEAD/OPTIONS only).
 CORS_PREFIXES = ('/api/v1/trees', '/api/v1/kg/', '/api/v1/prewarm', '/tiles/',
                  '/api/v1/index/status')
 
@@ -40,8 +40,10 @@ def cors_path(path: str) -> bool:
 
 
 def add_cors(resp):
+    if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+        return resp
     resp.headers['Access-Control-Allow-Origin'] = '*'
-    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    resp.headers['Access-Control-Allow-Methods'] = 'GET, HEAD, OPTIONS'
     resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, If-None-Match'
     resp.headers['Access-Control-Expose-Headers'] = 'ETag, X-Cache, X-Resolution-M'
     resp.headers['Access-Control-Max-Age'] = '86400'

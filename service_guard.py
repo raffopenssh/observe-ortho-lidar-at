@@ -181,6 +181,8 @@ class MemoryWatchdog:
         self.sheds = 0
         self.recycling = False
         self._last_shed = 0.0
+        self._shed_backoff = 30.0   # grows while shedding frees nothing
+        self._above_soft = False    # last known state (for state-change logging)
 
     def check(self, force: bool = False) -> None:
         now = time.monotonic()
@@ -202,17 +204,36 @@ class MemoryWatchdog:
                 pass
             # gunicorn worker: SIGTERM → stop accepting, drain in-flight, exit; arbiter re-spawns
             threading.Timer(0.5, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
-        elif rss >= self.soft_mb and now - self._last_shed > 30:
+        elif rss >= self.soft_mb:
+            if now - self._last_shed < self._shed_backoff:
+                return
             self._last_shed = now
-            self.sheds += 1
             try:
                 import mem_lru
                 dropped = mem_lru.clear_all()
             except Exception:  # noqa: BLE001
                 dropped = {}
-            gc.collect()
-            log.warning('memory watchdog: rss %.0f MB ≥ soft %.0f MB — shed caches %s → rss %.0f MB',
-                        rss, self.soft_mb, dropped, rss_mb())
+            dropped = {k: v for k, v in dropped.items() if v}
+            if dropped:
+                # actual shedding: log it and reset the back-off
+                self.sheds += 1
+                gc.collect()
+                self._shed_backoff = 30.0
+                log.warning('memory watchdog: rss %.0f MB ≥ soft %.0f MB — shed caches %s → rss %.0f MB',
+                            rss, self.soft_mb, dropped, rss_mb())
+            else:
+                # nothing left to shed (all caches already empty): only log the
+                # state change, then back off exponentially (30 s → 10 min)
+                if not self._above_soft:
+                    log.warning('memory watchdog: rss %.0f MB ≥ soft %.0f MB with empty caches — '
+                                'nothing to shed; next check in %.0f s',
+                                rss, self.soft_mb, self._shed_backoff)
+                self._shed_backoff = min(self._shed_backoff * 2, 600.0)
+            self._above_soft = True
+        elif self._above_soft:
+            self._above_soft = False
+            self._shed_backoff = 30.0
+            log.info('memory watchdog: rss %.0f MB back below soft %.0f MB', rss, self.soft_mb)
 
     def stats(self) -> dict:
         return {'rss_mb': round(self.last_rss_mb or rss_mb()), 'soft_mb': self.soft_mb, 'hard_mb': self.hard_mb,
