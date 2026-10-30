@@ -1,287 +1,191 @@
-# Zenodo Persistent Cache (`zenodo_cache.py`)
+# Zenodo persistent tile cache (`zenodo_cache.py`, `zenodo_tiles.py`)
 
-Local Copernicus/Hansen tile caches get evicted when disk approaches 5GB.
-The Zenodo cache module persists these tiles on Zenodo so they survive eviction.
+Local Copernicus / Hansen tile caches (`tile_cache.py`, grid-snapped 0.1°
+cells under `/tmp/copernicus_cache/`, `/tmp/hansen_cache/`) are evicted
+when the disk gets tight. The Zenodo cache persists those tiles in a
+Zenodo deposit so that they survive eviction and can be shared between
+machines: a tile that was fetched from openEO once (and cost credits) is
+never fetched again.
 
-**Architecture**: Each local NPZ tile has a `.meta.json` sidecar (written by
-`tile_cache._write_tile_meta()`) that records product type and grid coordinates.
-The uploader uses these sidecars to group tiles into ZIP archives by product ×
-0.5° latitude strip, then uploads to a single Zenodo deposit (depo 19650075).
+## Read-only vs. read-write
 
-**Upload flow** (`ZenodoCache.upload_all()`):
-1. `_build_reverse_index()` reads `.meta.json` sidecars (+ fallback from `tile_bbox_index.json`)
-2. Groups tiles by (product, lat strip)
-3. For each group, compares local entry names vs cached remote ZIP central directory
-4. If local ⊆ remote → skip. Otherwise, merge local + remote-only into new ZIP and upload.
-   If the remote central directory can't be listed for a *non-404* reason (5xx/timeout)
-   the ZIP is **deferred**, never rebuilt local-only (that would overwrite and lose every
-   remote-only tile).
-5. Invalidates cached ZIP index after upload.
+* `config.ZENODO_CACHE_DEPOSIT` (default **19650075**, the project's
+  public tile-cache deposit) is where the fetchers look on a local cache
+  miss. Reading needs no credentials when the deposit's files are
+  publicly accessible. <!-- VERIFY: confirm anonymous range reads against
+  the deposit files work; Zenodo draft buckets need a token -->
+* Writing (uploading new tiles, creating shards, reconciling) needs
+  `ZENODO_TOKEN` (or `$SRTM_SECRETS_DIR/zenodo_token`). Without it
+  `config.uploads_enabled()` is false and every upload path is a no-op —
+  the processor still works, it just does not persist its tiles beyond the
+  local disk. Point `ZENODO_CACHE_DEPOSIT` at your own deposit if you want
+  to write.
+* All Zenodo writes serialise through `zenodo_lock.zenodo_upload_lock()`
+  — a local lock in single-VM mode, the broker at `ZENODO_LOCK_URL`
+  otherwise (`docs/app.md`).
 
-## Upload failure semantics (2026-09-20)
+## Two manifests (don't confuse them)
 
-`_upload_file` is **PUT-in-place → verify via deposit listing**. There is no
-delete-old step: Zenodo's bucket API replaces a same-name object atomically
-(probed 2026-09-20 on depo 19650075: `PUT bucket/<existing-name>` → 201, new
-`version_id`, `is_head=true`, deposit file count unchanged). A failed PUT
-therefore leaves the previous copy — and the manifest entry pointing at it —
-intact. The old delete-then-PUT cycle turned every transient 5xx into
-permanent cache loss (18 tombstones during the Sep 2026 weekend maintenance,
-10 of them Copernicus cells that cost openEO credits to rebuild).
+| File | Contents |
+|---|---|
+| `data/austria_processor/cache_manifest.json` | the tile-cache deposit: `files{name → size, tile_count, updated_at, depo_id, kind …}`, `shards{}` (tile store v2), tile-checkpoint entries (`chkpt_*`) |
+| `data/austria_processor/zenodo_manifest.json` | KG **product** uploads (`<code>_full_gpkg`, `_light_gpkg_v2`, `_ne_h3b`, `_json_v2`, `_json`) — `zenodo_client.Manifest` |
 
-After **any** PUT failure the deposit is re-listed once (`_list_deposit_files`,
-one GET) and `_handle_upload_failure` decides:
+Every writer of `cache_manifest.json` holds
+`zenodo_cache.cache_manifest_write_lock()` (fcntl on `cache_manifest.lock`,
+30 s bounded wait) across read → modify → `os.replace` and **re-reads inside
+the lock**. Atomic replace protects against torn files, not against lost
+updates. `CacheManifest` additionally tracks dirty entries
+(`_dirty_files` / `_dirty_shards` / `_dirty_top`) so a reload from disk
+never drops an unsaved mutation (newest `updated_at` wins).
+
+## v1 layout — ZIP per product × latitude strip (Hansen, frozen Copernicus)
+
+Each local `.npz` tile has a `.meta.json` sidecar (written by
+`tile_cache._write_tile_meta()`) recording product and grid coordinates.
+**Every `.npz` MUST have a sidecar** — orphans are invisible to the
+uploader; `cleanup_orphan_tiles()` deletes them at processor start.
+
+`ZenodoCache.upload_all()`:
+
+1. `_build_reverse_index()` reads the sidecars (fallback
+   `tile_bbox_index.json`);
+2. groups tiles by (product, 0.5° lat strip);
+3. compares local entry names with the cached remote ZIP central
+   directory;
+4. local ⊆ remote → skip; otherwise merge local + remote-only into a new
+   ZIP and upload. If the remote directory cannot be listed for a non-404
+   reason the ZIP is **deferred**, never rebuilt local-only (that would
+   lose every remote-only tile);
+5. invalidates the cached ZIP index.
+
+**Download**: on a local miss `tile_cache` calls
+`ZenodoCache.fetch_copernicus()` / `fetch_hansen()`, which read individual
+NPZ members with 2–3 HTTP range requests using the cached central
+directory (`data/austria_processor/zenodo_zip_index/*.json`, keyed by MD5
+of the URL). Stale indices cause false "local ⊆ remote" skips — delete the
+directory to force a re-fetch.
+
+**When uploads happen**: after each completed tile in the KG subprocess
+(throttled to 30 min), after KG completion (forced), before disk eviction
+of expensive tiles (forced), before each KG in the parent (throttled).
+
+### Upload failure semantics
+
+`_upload_file` is **PUT-in-place → verify via deposit listing**. Zenodo's
+bucket API replaces a same-name object atomically, so a failed PUT leaves
+the previous copy and its manifest entry intact (a delete-then-PUT cycle
+would turn every transient 5xx into permanent cache loss). After any PUT
+failure the deposit is re-listed once and `_handle_upload_failure`
+decides:
 
 | listing says | error class | action |
 |---|---|---|
-| target present, size == what we sent | anything | **success** (504-after-landing) — manifest updated from listing |
-| target present, other size (`present_old`) | anything | keep entry untouched, WARN |
-| absent / listing failed | 5xx, 429, timeout, SSL, connection | `unverified: true, unverified_since, last_error` — size/url kept, readers still serve it, local tiles kept for retry |
-| absent | definitive 4xx (not 408/429), **first** attempt | `unverified` + `upload_4xx_history` |
-| absent | definitive 4xx, second attempt ≥10 min after an earlier one | **tombstone** (`prev_size/prev_checksum/prev_tile_count` preserved) |
-| any | fleet `zenodo_circuit.degraded` set | never tombstone → `unverified` |
+| target present, size == sent | anything | **success** (timeout after landing) — manifest updated from the listing |
+| target present, other size | anything | keep entry untouched, WARN |
+| absent / listing failed | 5xx, 429, timeout, SSL, connection | mark `unverified: true` (+ `unverified_since`, `last_error`); readers still serve it, local tiles kept |
+| absent | definitive 4xx, first attempt | `unverified` + `upload_4xx_history` |
+| absent | definitive 4xx, second attempt ≥ 10 min later | **tombstone** (`prev_size/prev_checksum/prev_tile_count` preserved) |
+| any | Zenodo-degraded circuit set | never tombstone → `unverified` |
 
-A read-side 404 on the ZIP index (`_confirm_404_then_tombstone`) also re-lists
-first: present → invalidate the cached index and defer; absent → tombstone
-("…confirmed absent by deposit listing"). The legitimate "deposit is at the
-100-file cap → 400 on a *new* name" case still works: there's no live entry to
-act on, the failure is logged and retried next flush (the `_live_files >= 90`
-guard defers new names anyway). `access_token=` is scrubbed from every stored
-reason (`_scrub_secret`).
+A read-side 404 on a ZIP index (`_confirm_404_then_tombstone`) also
+re-lists first. `CacheManifest.get_file` hides tombstones (`size == 0`)
+but returns `unverified` entries — a stale-but-existing ZIP beats a cache
+miss. Any `access_token=` is scrubbed from stored error reasons.
 
-`CacheManifest.get_file` hides tombstones (`size == 0`) but **returns
-`unverified` entries** — a stale-but-existing ZIP beats a cache miss.
+## Tile store v2 (`zenodo_tiles.py`) — Copernicus products
 
-## Reconcile manifest ↔ deposit (`reconcile_manifest`)
+Second-generation layout for `ndvi`, `sar`, `worldcover`, `harmonics`
+(Hansen stays on v1). v1 had to rebuild and re-upload a whole ZIP on every
+flush; a transient read error during the merge could silently drop remote
+tiles.
 
-```bash
-python3 zenodo_cache.py reconcile           # dry run, prints diff
-python3 zenodo_cache.py reconcile --apply   # takes the fleet Zenodo lease (purpose=reconcile), writes atomically
-```
-
-Lists the deposit and, ignoring `chkpt_*` (tile-checkpoint registry) and
-non-`.zip` keys:
-
-* live entry absent from deposit → tombstone `reconcile: missing from deposit`
-* tombstoned entry present → `_probe_zip_usable` (fresh central directory,
-  count entries matching `<product>_<S>_<W>_<N>_<E>[_<year>].npz`, range-read
-  the last member's local header: `PK\x03\x04` magic + ends inside the file).
-  Usable → `restore` (size/md5 from listing, `tile_count` from the central
-  directory, `updated_at=now`, `restored_from_tombstone:{reason,at,tombstoned_at}`,
-  `tombstone_reason` dropped). Corrupt → stays tombstoned, reason retagged
-  `reconcile: present but corrupt (<why>)`, WARNING.
-* `unverified` live entries present → flag cleared, size/md5 adopted; size drift
-  fixed likewise.
-* deposit files unknown to the manifest → logged only.
-
-Summary persisted to `data/austria_processor/cache_reconcile_last.json`
-(`cache_reconcile:` line in `/process.txt`). The director runs it hourly
-(`_reconcile_cache_manifest_if_due`) and immediately when the Zenodo-degraded
-circuit clears. Restores propagate to peers through the normal 5-min
-`cache_manifest` sync because both merge paths are "newest `updated_at` wins"
-with no tombstone preference — a restore stamped `now` beats the older
-tombstone on every peer.
-
-## Zenodo-degraded circuit (peer side)
-
-`zenodo_degraded()` reads `cache_manifest.json → zenodo_circuit.degraded`
-(director-written, rides the manifest sync like `prewarm`; 30 s TTL). While
-set, `upload_all` skips *replacement* uploads of ZIPs that already have a live
-entry (`zips_deferred_degraded`), still performs first-time uploads, and no
-code path tombstones. KG product uploads (`zenodo_client`) are unaffected.
-
-**Download**: On local cache miss, `tile_cache` calls `ZenodoCache.fetch_copernicus()`
-or `fetch_hansen()`. Uses 2-3 HTTP range requests to read individual NPZ entries
-from remote ZIP files via the cached central directory index.
-
-**When uploads happen**:
-- After each completed tile in the child subprocess (throttled to 30 min)
-- After KG completion (forced)
-- Before disk eviction of expensive tiles (forced)
-- Before each KG in the parent process (throttled to 30 min)
-
-**Key invariant**: Every `.npz` tile file MUST have a `.meta.json` sidecar.
-Orphan tiles (no sidecar) are invisible to the uploader and waste disk.
-`cleanup_orphan_tiles()` runs at processor startup to delete them.
-
-**Manifest files** (don't confuse them):
-- `data/austria_processor/cache_manifest.json` — Zenodo cache deposit (tiles)
-- `data/austria_processor/zenodo_manifest.json` — KG product uploads (GPKGs, JSONs)
-
-**Cached ZIP indices**: `data/austria_processor/zenodo_zip_index/*.json` — cached
-central directories of remote ZIPs, keyed by MD5 of download URL. Invalidated
-automatically after each upload. Stale indices cause false "local ⊆ remote" and
-skip uploads — delete the directory to force re-fetch.
-
-**Why not BEV/ortho?** BEV DTM/DSM/ortho are already COGs with efficient HTTP range
-reads. At 1m resolution, all Austria = ~4TB (infeasible for Zenodo).
-
-```bash
-python3 zenodo_cache.py status      # show local + Zenodo tile counts
-python3 zenodo_cache.py dry-run     # build ZIPs without uploading
-python3 zenodo_cache.py upload       # upload local tiles to Zenodo
-```
-
-**Troubleshooting**:
-- `Upload complete: 0 ZIPs, 0 tiles` — either no new tiles (normal when same
-  Copernicus cells are reused across KGs), or all local tiles already on Zenodo.
-  Check `python3 zenodo_cache.py status` for local vs remote counts.
-- Tiles not uploading — check `.meta.json` sidecars exist alongside `.npz` files.
-  Missing sidecars = orphans. Run `python3 -c "from zenodo_cache import cleanup_orphan_tiles; cleanup_orphan_tiles()"`
-- Stale indices — `rm -rf data/austria_processor/zenodo_zip_index/` and re-flush.
-
-
-## Tile store v2 (`zenodo_tiles.py`, 2026-09-23)
-
-Second-generation layout for the **Copernicus** products (`ndvi`, `sar`,
-`worldcover`, `harmonics`). Hansen stays on the v1 ZIP path.
-
-**Why.** v1 bundled a 1°×2° cell into one ZIP that had to be rebuilt
-(download remote-only tiles, re-zip, re-upload ≈1 GB for harmonics) on
-every flush, serialised behind the fleet lock, and a transient read error
-during the merge silently dropped remote tiles from the rebuilt ZIP. Net
-result: ~43 harmonics tiles cached for all of Austria and 986 partial
-products (see `docs/product-repair.md`).
-
-**Rules.**
-* One tile = one immutable object `<product>_<S>_<W>_<N>_<E>[_<year>].npz`,
-  PUT once (idempotent). Nothing is ever rebuilt or merged.
-* Sharded draft deposits keyed `(product, 0.5° lat, 1° lon)` (≤50 tiles
-  each, Zenodo caps deposits at 100 files). Registry in
+* One tile = one immutable object
+  `<product>_<S>_<W>_<N>_<E>[_<year>].npz`, PUT once (idempotent). Nothing
+  is rebuilt or merged.
+* Sharded draft deposits keyed `(product, 0.5° lat, 1° lon)` (≤ 50 tiles
+  each — Zenodo caps deposits at 100 files). Registry in
   `cache_manifest.json → shards` (`{key: {depo_id, bucket_url,
   checked_at, files}}`); every tile entry also carries its own `depo_id`
-  so readers never depend on the registry or on `url` (older peers
-  rewrite `url` to the main deposit — `app.py` never URL-rewrites
-  `kind == 'tile'` entries and merges `shards` by union).
-* Parallel PUTs (`ZENODO_TILE_UPLOAD_WORKERS`, default 3); the fleet
-  lease is only taken around shard *creation*
-  (`zenodo_upload_lock(purpose='cache_shard')`). 429s ride
-  `_upload_file`'s backoff.
+  so readers never depend on the registry.
+* Parallel PUTs (`ZENODO_TILE_UPLOAD_WORKERS`, default 3); the write lock
+  is only taken around shard *creation*.
 * Read-through: `fetch_copernicus` → `tiles.fetch` first, then the frozen
   v1 ZIP indices. `tile_cache.has_cached` checks `tiles.has_tile` first.
-  No migration; v1 ZIPs are frozen read-only (`upload_all` routes
-  Copernicus tiles to `tiles.upload_local`).
-* `reconcile_manifest` also runs `tiles.reconcile` (lists ≤20 shard
-  deposits per pass, round-robin by `checked_at`): live-but-absent →
-  tombstone, tombstoned-but-present → restore, unknown deposit file →
-  **adopt**. Adoption is the safety net for manifest entries lost between
-  a PUT and a manifest save.
+* `reconcile_manifest` also runs `tiles.reconcile` (≤ 20 shard deposits
+  per pass, round-robin by `checked_at`): live-but-absent → tombstone,
+  tombstoned-but-present → restore, unknown deposit file → **adopt**
+  (safety net for entries lost between a PUT and a manifest save).
 
-**Manifest dirty tracking** (`CacheManifest`, same commit). `save()` did
-not bump `_last_mtime`, so the next `reload_if_changed()` (our own
-previous save, or the srv sync thread rewriting the file) replaced
-`_data` wholesale and dropped every unsaved mutation — 3 of 18 tile PUTs
-vanished from the manifest in the live test. All mutators now record the
-entry in `_dirty_files` / `_dirty_shards` / `_dirty_top`; reloads
-re-overlay them (a disk entry with a newer `updated_at` wins), `save()`
-merges disk + dirty and clears the set. Applies to the v1 `set_file` /
-`tombstone` / `restore` paths as well.
+## Reconcile manifest ↔ deposit
 
-**Ops.**
 ```bash
-# stats (also the `tile_store:` tail of the zen_cache: line in /process.txt)
-python3 -c 'import zenodo_cache as z; print(z.ZenodoCache().tiles.status())'
-# upload every local Copernicus tile the manifest lacks (idempotent)
-python3 -c 'import zenodo_cache as z, zenodo_lock as l; zc=z.ZenodoCache(); print(zc.tiles.upload_local(lock_factory=lambda n: l.zenodo_upload_lock(purpose="cache_shard", kg=n)))'
-# settle shards (dry → apply)
-python3 -c 'import zenodo_cache as z; print(z.ZenodoCache().tiles.reconcile(dry_run=False))'
+python3 zenodo_cache.py reconcile           # dry run, prints the diff
+python3 zenodo_cache.py reconcile --apply   # takes the Zenodo write lock, writes atomically
 ```
-Peer-side Copernicus caches are tiny (≤50 MB, 26 GB disks evict fast), so
-there is no fleet backfill sweep — durability comes from every frontier
-flush now going through idempotent per-tile PUTs.
 
-Live test 2026-09-23 (primary): 23 tiles / 12 shards, 0 failed, 718 s
-for 194 MB (3 workers, several SSL retries), read-back validated.
+Ignoring `chkpt_*` and non-`.zip` keys: live entry absent from the
+deposit → tombstone; tombstoned entry present → `_probe_zip_usable`
+(fresh central directory, count members, range-read the last member's
+local header) → restore or keep tombstoned as corrupt; `unverified`
+entries present → flag cleared and size/md5 adopted; unknown deposit
+files → logged. Summary in
+`data/austria_processor/cache_reconcile_last.json` (`cache_reconcile:`
+line in `/process.txt`). The director runs it hourly when uploads are
+enabled.
 
----
+## Zenodo-degraded circuit
 
-*See `AGENTS.md` for the project map.*
+`zenodo_degraded()` reads `cache_manifest.json → zenodo_circuit.degraded`
+(written by the director after repeated PUT failures). While set,
+`upload_all` skips *replacement* uploads of ZIPs that already have a live
+entry, still performs first-time uploads, and no code path tombstones.
+Small ZIPs (≤ 128 MB) bypass the deferral so Hansen strips keep flushing.
+KG product uploads (`zenodo_client`) are unaffected.
 
-### `cache_manifest.json` write discipline (2026-09-24)
+## Hansen coverage (`hansen_coverage.py`)
 
-`cache_manifest.json` has **six writers on one host**: the processor's
-`CacheManifest.save()` (tile-store PUTs, chkpt mirror), both gunicorn
-workers' `PUT /api/v1/processing/cache_manifest` handler, the srv
-peer-sync thread (`app._sync_peer_data`), and the director's `prewarm` /
-`zenodo_circuit` publishers. All of them did an unlocked
-read → modify → `os.replace`. Atomic replace protects against torn
-files, **not** against lost updates: the peer-sync thread read its copy,
-spent seconds GETting ~50 peer manifests, then wrote the stale copy back.
+Hansen tiles are 0.5° NPZs bundled into `hansen_*.zip`. `hansen_coverage.py`
+computes **needed** (every 0.5° cell intersected by a KG bbox in the
+search index, with `kgs=` touching and `todo=` unprocessed) versus
+**have** (cells contained by a live ZIP member) and writes
+`data/austria_processor/hansen_coverage.json` (refreshed hourly,
+`first_missing` persists). `/process.txt` shows the `hansen_cover:` line
+and raises `HANSEN-GAPS` once a cell has been missing ≥ 24 h.
 
-Observed: at214, 09-23 14:32:56–14:33:04 created six shard deposits
-(`ndvi/sar/worldcover_48.5_15.0|16.0`), saved them, and ten seconds later
-found none of them in its manifest — it created five duplicates
-(22920008…22920020). The director kept the first registrations ("first
-writer wins"), so the duplicates' tiles were fetchable (entries carry
-their own `depo_id`) but lived in deposits no shard row referenced —
-invisible to `reconcile`, and the registered `*_48.5_15.0` drafts stayed
-empty. (Migrated back + duplicate drafts deleted the same day; the
-`CacheManifest` dirty-overlay added on 09-23 for "3 of 18 PUTs lost"
-was treating the same bug's symptom.)
+```
+hansen_cover: zenodo=60/68 cells zips=11 missing=8 (oldest 3m)
+    missing lon/lat(SW corner, 0.5°): 15.5/46.5(kgs=298/todo=251,3m) …
+```
 
-Rules now:
-* Every writer holds `zenodo_cache.cache_manifest_write_lock()` (fcntl on
-  `cache_manifest.lock`, 30 s bounded wait, proceeds unlocked on timeout
-  with a warning) across read → modify → replace, and **re-reads inside
-  the lock** — never writes a copy taken before a network round-trip.
-* `zenodo_tiles.TileStore.shard()` asks the director's manifest
-  (`GET …/cache_manifest?since=9999` — top-level `shards` only) before
-  falling back to Zenodo draft search and finally creating a deposit.
-* The ZIP-index cache is cleared only when a **ZIP** (non-tile) entry
-  changed. Tile entries land ~10/h fleet-wide; previously every 5-min
-  merge wiped every peer's `zenodo_zip_index/` and re-fetched central
-  directories for nothing.
+`todo>0` → the processor will request the tile when it reaches those KGs
+(a gap lasting days means a UMD egress problem); `todo=0` → only
+`product_repair` asks for it; `on-primary-disk` → the tile is local but
+not flushed: `python3 hansen_coverage.py --flush`. `HansenTileCache`
+writes a `.fail` sidecar after an exhausted UMD retry ladder and skips
+remote retries for `HANSEN_REMOTE_FAIL_COOLDOWN` (2 h).
 
-Quick audit — tiles in deposits no shard row knows about should be 0:
+## Why not BEV / ortho?
+
+BEV DTM/DSM/ortho are already COGs with efficient HTTP range reads, and
+all of Austria at 1 m is ~4 TB — not something to mirror.
+
+## Operations
+
 ```bash
+python3 zenodo_cache.py status       # local + Zenodo tile counts
+python3 zenodo_cache.py dry-run      # build ZIPs without uploading
+python3 zenodo_cache.py upload       # upload local tiles (needs ZENODO_TOKEN)
+python3 -c 'import zenodo_cache as z; print(z.ZenodoCache().tiles.status())'
+python3 -c 'import zenodo_cache as z; print(z.ZenodoCache().tiles.reconcile(dry_run=True))'
+# tiles in deposits no shard row knows about (should be empty):
 python3 -c "
 import json;m=json.load(open('data/austria_processor/cache_manifest.json'))
-d={v['depo_id'] for v in m['shards'].values()}
+d={v['depo_id'] for v in m.get('shards',{}).values()}
 print([k for k,v in m['files'].items() if isinstance(v,dict) and v.get('kind')=='tile' and v.get('size') and v['depo_id'] not in d])"
 ```
 
-## Hansen gaps (`hansen_cover:` line, `hansen_coverage.py`, 2026-10-18)
-
-Hansen tiles are 0.5° NPZs bundled into `hansen_*.zip` on the main cache
-deposit (new 1° cells are dumped into whichever legacy 0.5° strip ZIP
-already exists — see `_legacy_strip_zips_for_cell`). Nothing on the
-dashboard used to say *which* tiles were missing: on 2026-10-18 GCS
-egress to `storage.googleapis.com/earthenginepartners-hansen` collapsed
-to ~10–40 KB/s fleet-wide, frontiers burned ~10 min/KG on the same
-uncached Tyrol tiles, and the gap was only visible by grepping
-`bev_retry: Hansen treecover2000: all 8 attempts exhausted` warnings.
-
-`hansen_coverage.py` closes that:
-
-* **needed** = every 0.5° cell intersected by a KG bbox in
-  `search_index.db` (exactly what `HansenTileCache` requests), with
-  `kgs=` (touching KGs) and `todo=` (of those, not yet processed).
-* **have** = cells contained by an NPZ entry of a live `hansen_*.zip`
-  (ZIP indices from `zenodo_zip_index/`, only uncached ones hit Zenodo).
-* **state** `data/austria_processor/hansen_coverage.json`, refreshed at
-  most hourly (`HANSEN_COVERAGE_TTL_S`); `first_missing` per cell
-  persists so the line can say how long a gap has existed; `healed`
-  lists cells that closed since the previous refresh.
-* **banner flag** `HANSEN-GAPS(n cells, oldest Xd)` once any cell has
-  been missing ≥ `HANSEN_COVERAGE_GAP_FLAG_H` (24 h).
-
-```
-hansen_cover: zenodo=60/68 cells zips=11 missing=8 (oldest 3m) · as_of=19:16Z
-    missing lon/lat(SW corner, 0.5°): 15.5/46.5(kgs=298/todo=251,3m) 12.0/46.5(kgs=18/todo=0,3m,on-primary-disk) …
-```
-
-How to read a row and what to do:
-
-| row says | meaning | action |
-|---|---|---|
-| `todo>0` | some frontier will request the tile when it reaches those KGs | nothing, unless the gap persists for days → UMD egress problem; check `?warn=1&q=Hansen` |
-| `todo=0` | every KG touching the cell is done; only `product_repair` re-upgrades ask for it | only matters if `repair: by_defect[hansen=…]` is non-zero |
-| `on-primary-disk` | the primary holds the tile (`hansen_tiles/*.meta.json`) but its processor is parked, so it never flushes | `python3 hansen_coverage.py --flush` (hansen-only `ZenodoCache.upload_all(only_products={"hansen"})`, takes the fleet lease per ZIP) |
-| missing everywhere | `python3 hansen_coverage.py --peers` asks every peer's `/api/v1/processing/tiles`; if nobody has it, the only source is UMD | wait for GCS, or seed from the 10°×10° source GeoTIFF manually |
-
-Peer side: `tile_cache.HansenTileCache` writes a `.fail` sidecar after
-an exhausted UMD ladder and skips remote retries for
-`HANSEN_REMOTE_FAIL_COOLDOWN` (2 h); `_repair_cells_fill` no longer
-counts a `None` Hansen result as filled (40f6d37). Cache ZIPs ≤ 128 MB
-bypass the degraded-circuit deferral so Hansen strips still flush while
-Zenodo is `LOSSY` (1e349a4).
+Troubleshooting: `Upload complete: 0 ZIPs, 0 tiles` is normal when the
+same cells are reused across KGs or everything is already remote; tiles
+not uploading → check `.meta.json` sidecars; stale indices →
+`rm -rf data/austria_processor/zenodo_zip_index/`.
