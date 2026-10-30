@@ -70,9 +70,9 @@ except Exception:
 # === SECTION: Credentials & configuration (multi-account rotation) ===
 # Credentials — multiple accounts for rotation when rate-limited (429) or overloaded.
 #
-# All credentials live in data/austria_processor/copernicus_credentials.json
-# (gitignored). They are added/managed at runtime via /api/v1/credentials
-# and synced to peers via the HA snapshot mechanism (director_ha.py).
+# All credentials live in ``config.COPERNICUS_CREDENTIALS_FILE`` (default
+# ``$SRTM_SECRETS_DIR/copernicus_credentials.json``, outside the repo).
+# They are added/managed at runtime via /api/v1/credentials.
 # Nothing is hardcoded here — the repo is public.
 #
 # Optional bootstrap seed (env-only, never committed): set
@@ -120,11 +120,12 @@ def _canonical_sort(creds: list) -> list:
     return sorted(creds, key=lambda c: c[0])
 
 
-# Credentials store path (instance-local; not in git)
-_CRED_STORE = pathlib.Path("data/austria_processor/copernicus_credentials.json")
+# Credentials store path (instance-local; outside the repo — config.py)
+import config as _config
+_CRED_STORE = pathlib.Path(_config.COPERNICUS_CREDENTIALS_FILE)
 # Per-credential usage stats (success/error counts + per-minute buckets).
 # Written by every process that uses Copernicus, read by the dashboard.
-_USAGE_STORE = pathlib.Path("data/austria_processor/copernicus_credential_usage.json")
+_USAGE_STORE = _config.PROCESSOR_DIR / "copernicus_credential_usage.json"
 _USAGE_BUCKET_HOURS = 24 * 7  # keep last 7 days of per-hour buckets
 # Per-credential metadata: label, added_at, last_validated_at, last_status,
 # notes. Indexed by client_id.
