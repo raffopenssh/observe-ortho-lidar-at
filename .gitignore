@@ -45,3 +45,15 @@ data/secrets.json
 data/secret_leases.json
 data/secrets_deny
 data/process_txt_pwd
+
+# local config / runtime
+.env
+out/
+data/austria_processor/*
+!data/austria_processor/kg_list.json
+data/best_model/rf_model.joblib.xz
+data/segv2/models/*.joblib
+data/ne/
+data/*.db
+data/*.sqlite*
+.venv/
