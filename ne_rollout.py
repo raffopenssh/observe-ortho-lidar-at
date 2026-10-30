@@ -240,7 +240,7 @@ def audit_removed(max_checks: int = 20, entries: dict | None = None, timeout: fl
     against the deposition API.  Returns {checked, gone, present, pending}.
     Cheap: one small GET per record, ≤ 20 per director tick."""
     import requests
-    from zenodo_client import DEFAULT_TOKEN
+    from zenodo_client import auth_headers as _zauth
     if entries is None:
         try:
             raw = json.loads(MANIFEST_PATH.read_text())
@@ -261,7 +261,7 @@ def audit_removed(max_checks: int = 20, entries: dict | None = None, timeout: fl
             continue
         try:
             r = requests.get(f"https://zenodo.org/api/deposit/depositions/{depo}",
-                             headers={"Authorization": f"Bearer {DEFAULT_TOKEN}"}, timeout=timeout)
+                             headers=_zauth(), timeout=timeout)
         except Exception as ex:  # noqa: BLE001
             log.debug("legacy audit %s: %s", k, ex)
             break

@@ -4996,8 +4996,7 @@ class PeerDirector:
         """URL of the currently-authoritative director.
 
         On the director itself this returns its own URL (self_url).
-        On a peer it returns the pointer in ``self.json:director_url``
-        (mirrored from ``zenodo_lock_url.txt``). Used by the dashboard
+        On a peer it returns ``config.PRIMARY_URL``. Used by the dashboard
         to render a link to the director's process.html so users
         opening a peer dashboard can navigate to the live
         orchestration view in one click.

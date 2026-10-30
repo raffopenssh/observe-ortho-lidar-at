@@ -4,7 +4,7 @@
 #   make check         unit tests + release grep gates + pip-audit (if installed)
 #   make run-app       app.py on SRTM_APP_BIND:SRTM_APP_PORT (operator tier, loopback)
 #   make run-public    public_api.py on SRTM_PUBLIC_BIND:SRTM_PUBLIC_PORT
-#   make fetch-models  download classifier models (tools/fetch_models.py)
+#   make fetch-models  download classifier models listed in data/models_manifest.json (tools/fetch_models.py)
 
 PY      ?= python3
 VENV    ?= .venv
@@ -50,5 +50,5 @@ run-app:
 run-public:
 	$(PY) public_api.py
 
-fetch-models:
+fetch-models:  ## entries from data/models_manifest.json → data/models/
 	$(PY) tools/fetch_models.py

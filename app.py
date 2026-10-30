@@ -2156,9 +2156,8 @@ def _peer_status_push_loop():
                     status['vct_pilot'] = _vct.summary()
                 else:
                     # ~40 B stub: ``ne_source`` present == this code knows
-                    # the NEC1+NEO1 path.  vct_fleet._bev_code() keys the
-                    # ramp on it, so without this no never-piloted peer
-                    # was ever ramp-eligible (eligible=0/50, Oct 2026).
+                    # the NEC1+NEO1 path (the director keys peer
+                    # eligibility on it).
                     import ne_h3 as _neh2
                     status['vct_pilot'] = {'enabled': False, 'n_24h': 0, 'ok_24h': 0,
                                            'ne_source': _neh2.ne_source(),
@@ -2261,8 +2260,7 @@ def _peer_status_push_loop():
                     # denominator for as long as they stay idle (at202
                     # made the fleet read 49, not 50, Oct 2026).
                     'ne_tooling': status.get('ne_tooling'),
-                    # ~40 B stub (ne_source marker) so idle peers stay
-                    # ramp-eligible in vct_fleet._bev_code()
+                    # ~40 B stub (ne_source marker) so idle peers stay eligible
                     'vct_pilot': ({k: (status.get('vct_pilot') or {}).get(k)
                                    for k in ('enabled', 'ne_source', 'tooling')}
                                   if status.get('vct_pilot') else None),
@@ -4170,8 +4168,9 @@ def processing_start():
                 app.logger.warning('vct_pilot requested but tooling not ready (%s) — installing, staying off', _bd)
                 _ne_tooling_install_async()
                 _want = False
-        if _vct.set_enabled(_want):
-            app.logger.info('vct_pilot %s via processing/start', 'ON' if _want else 'OFF')
+        if _want != _vct.enabled():
+            app.logger.info('vct_pilot flag %s requested but the switch is SRTM_BEV_VECTOR_CONTEXT (currently %s)',
+                            'ON' if _want else 'OFF', 'ON' if _vct.enabled() else 'OFF')
     except Exception as e:
         app.logger.warning('vct_pilot start flag: %s', e)
     _v2_marker = Path('data/austria_processor/v2_upgrade_mode')
@@ -8897,9 +8896,9 @@ def admin_vct_pilot():
                 want = False
                 _src = ''
         if 'on' in body or _src == 'bevdirect':
-            out['changed'] = _vct.set_enabled(want)
-            if out['changed']:
-                app.logger.info('vct_pilot %s via admin/vct_pilot', 'ON' if want else 'OFF')
+            out['changed'] = False
+            if want != _vct.enabled():
+                out['note'] = 'switch is SRTM_BEV_VECTOR_CONTEXT in the environment; restart to change'
         if _src:
             _p = Path('data/austria_processor/ne_source')
             _cur = _neh.ne_source()
