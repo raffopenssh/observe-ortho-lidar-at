@@ -397,6 +397,27 @@ def _public_params(params: dict) -> dict:
     return params
 
 
+# KG codes reach file paths (``data/austria_processor/json/<kg>.json`` etc.).
+# Accept only ``NNNNN`` or a split block ``NNNNN-<suffix>``; anything else is
+# rejected before a view can build a path from it.
+_KG_CODE_RE = re.compile(r'^[0-9]{5}(-[a-z]+[0-9]*)?$')
+_KG_QUERY_RE = re.compile(r'^[A-Za-z0-9_-]{0,40}$')   # ``?kg=`` may be a partial filter
+
+
+@app.before_request
+def _validate_kg_codes():
+    try:
+        for k, v in (request.view_args or {}).items():
+            if k in ('kg', 'kg_code', 'code') and not _KG_CODE_RE.match(str(v)):
+                return jsonify({'error': 'invalid KG code (expected NNNNN or NNNNN-block)'}), 400
+        q = request.args.get('kg')
+        if q and not _KG_QUERY_RE.match(q):
+            return jsonify({'error': 'invalid kg parameter'}), 400
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 @app.before_request
 def _cors_preflight():
     # Browser cross-origin preflight for the public read endpoints.
@@ -3496,7 +3517,7 @@ def _processing_status_compute():
                 data['cred_indices'] = [int(x) for x in _ci.split(',') if x.strip()]
             # Fallback: /proc/<pid>/environ is unreadable when the
             # visible pid is the root-owned sudo/systemd-run wrapper
-            # (EACCES for the exedev-owned gunicorn). Use the sidecar
+            # (EACCES for the service-user gunicorn). Use the sidecar
             # written by the start route — authoritative for the
             # current run since it's rewritten/cleared on every start.
             if not data.get('cred_indices') and data.get('state') in (
@@ -4309,7 +4330,7 @@ def processing_start():
             cgroup_props += ['-p', p]
         else:
             log.warning('systemd-run does not accept %s on this host — dropping', p)
-    # Drop privileges back to the exedev user so the subprocess can
+    # Drop privileges back to the service user so the subprocess can
     # import packages installed under ~/.local (e.g. pyproj). sudo +
     # systemd-run --scope otherwise spawns the processor as root with
     # HOME=/root, which fails to discover user-site packages and dies
@@ -4324,10 +4345,10 @@ def processing_start():
         _user_name, _user_home = os.environ.get('USER', 'nobody'), str(Path.home())
     # NOTE: `-p User=` is silently ignored by systemd-run --scope (it only
     # applies to --service units). The processor was running as root,
-    # which made /proc/<pid>/environ unreadable from gunicorn (uid=exedev)
+    # which made /proc/<pid>/environ unreadable from gunicorn (service uid)
     # and required sudo escalation just to kill it. Fix: drop privileges
     # explicitly inside the scope, so all -E env vars reach the python
-    # child but uid is exedev.
+    # child but uid is the service user.
     #
     # We use ``setpriv`` (util-linux), NOT ``runuser``/``su``. Both
     # ``runuser`` and ``su`` stay resident as the python's parent and, on
@@ -4640,7 +4661,7 @@ def processing_stop():
     # --scope`, which puts the python child in its own systemd cgroup
     # owned by root. Plain SIGKILL from the gunicorn user fails with
     # EPERM on a few processes (the scope wrapper) even though the
-    # python child is exedev-owned. Killing the entire scope cgroup via
+    # python child is service-user-owned. Killing the entire scope cgroup via
     # sudo systemctl kill is the only thing that reliably reaches
     # everything (parent + multiprocessing children + any sudo wrapper).
     if _proc_alive():

@@ -3350,7 +3350,9 @@ def _zenodo_url(entry):
         return f"https://zenodo.org/api/records/{depo_id}/draft/files/{filename}/content"
     # Fallback to bucket_url if depo_id unavailable
     if entry.get('bucket_url') and filename:
-        return f"{entry['bucket_url']}/{filename}"
+        url = f"{entry['bucket_url']}/{filename}"
+        from zenodo_client import is_zenodo_url
+        return url if is_zenodo_url(url) else None   # manifest may be peer-supplied
     return None
 
 

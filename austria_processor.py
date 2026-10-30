@@ -3874,7 +3874,7 @@ def _purge_stale_gpkg(path: str) -> None:
 
     Earlier processor runs (uid=root, pre-runuser fix) sometimes left
     behind ``.gpkg-wal``/``.gpkg-shm``/``.gpkg-journal`` files owned by
-    root.  When the new uid=exedev subprocess opens the GPKG, SQLite sees
+    root.  When the new unprivileged subprocess opens the GPKG, SQLite sees
     the unwritable journal, falls back to read-only mode, and segment-
     vector inserts then fail with ``attempt to write a readonly database``.
     Plain ``os.unlink(path)`` of just the .gpkg leaves the sidecars in
@@ -10757,7 +10757,8 @@ def _zenodo_probe(token: str = None) -> tuple[bool, str]:
     tok = token or _zenodo_token()
     try:
         r = _requests.get("https://zenodo.org/api/deposit/depositions",
-                          params={"access_token": tok, "size": 1},
+                          params={"size": 1},
+                          headers={"Authorization": f"Bearer {tok}"} if tok else None,
                           timeout=20)
         if r.status_code < 300:
             return True, "ok"

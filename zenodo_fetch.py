@@ -260,6 +260,13 @@ def _auth_headers(url: str, headers: Optional[dict]) -> dict:
             pass
     if headers:
         hdr.update(headers)
+    if 'Authorization' in hdr:
+        try:
+            import zenodo_client as _zc
+            if not _zc.is_zenodo_url(url):
+                hdr.pop('Authorization', None)   # never leak the token off-Zenodo
+        except Exception:  # noqa: BLE001
+            hdr.pop('Authorization', None)
     return hdr
 
 

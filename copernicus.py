@@ -399,8 +399,11 @@ _CDSE_TOKEN_URL = ("https://identity.dataspace.copernicus.eu/auth/realms/CDSE"
 
 # Permanent cache survives /tmp cleanup and service restarts.
 # LRU eviction keeps total size under CACHE_MAX_BYTES.
-CACHE_DIR = pathlib.Path("/home/exedev/srtm-lidar/rf_training_data/copernicus_cache")
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR = pathlib.Path(_config.env("COPERNICUS_CACHE_DIR") or (_config.DATA_DIR / "copernicus_cache"))
+try:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+except OSError as _e:  # read-only checkout etc. — fetches fail loudly later
+    logging.getLogger(__name__).warning("copernicus cache dir %s unavailable: %s", CACHE_DIR, _e)
 CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
 # Maximum bbox extent in degrees.  The tile_cache grid snaps outward

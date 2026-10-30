@@ -295,6 +295,10 @@ def _link(entry: dict) -> tuple[str, dict]:
         link = (f"https://zenodo.org/api/records/{entry['depo_id']}/draft/files/"
                 f"{entry['filename']}/content")
         hdr = _zc.auth_headers()
+    # Manifest entries can come from another instance (multi-VM sync): only
+    # Zenodo URLs are ever fetched, and the token only travels there.
+    if link and not _zc.is_zenodo_url(link):
+        return "", {}
     return link, hdr
 
 

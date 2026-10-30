@@ -1494,8 +1494,9 @@ class ZenodoCache:
         Non-retryable status codes (4xx other than 429) raise immediately.
         """
         url = f"{self.base_url}{path}"
-        if self.token:
-            kwargs.setdefault("params", {})["access_token"] = self.token
+        if self.token:   # header, never the query string (proxy / access logs)
+            kwargs.setdefault("headers", {})
+            kwargs["headers"] = dict(kwargs["headers"], Authorization=f"Bearer {self.token}")
         kwargs.setdefault("timeout", 60)
         last_exc: Optional[Exception] = None
         max_attempts = 7
@@ -1648,7 +1649,7 @@ class ZenodoCache:
                     resp = self._session.put(
                         f"{bucket_url}/{filename}",
                         data=fh,
-                        params={"access_token": self.token} if self.token else None,
+                        headers={"Authorization": f"Bearer {self.token}"} if self.token else None,
                         timeout=600,
                     )
                 last_status = resp.status_code
@@ -1839,7 +1840,7 @@ class ZenodoCache:
 
         For published records uses /records/{id}/files/{name}.
         For draft deposits uses /api/records/{id}/draft/files/{name}/content
-        (requires access_token, which is appended by _authed_session()).
+        (requires the token, sent as a header by _authed_session()).
         """
         rid = self.manifest.record_id
         did = self.manifest.depo_id
@@ -1856,10 +1857,12 @@ class ZenodoCache:
         return None
 
     def _authed_session(self) -> requests.Session:
-        """Return a session with the access_token as a default query param."""
+        """Return a session carrying the token as an Authorization header
+        (never as a query parameter — URLs end up in proxy / access logs)."""
         s = requests.Session()
         s.headers["User-Agent"] = "observe-ortho-lidar-at/1.0 (+https://github.com/raffopenssh/observe-ortho-lidar-at)"
-        s.params = {"access_token": self.token} if self.token else {}  # type: ignore[assignment]
+        if self.token:
+            s.headers["Authorization"] = f"Bearer {self.token}"
         return s
 
     # --- Upload ---

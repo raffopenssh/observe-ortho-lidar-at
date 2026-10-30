@@ -63,9 +63,41 @@ def default_token(required: bool = True) -> str:
     return config.zenodo_token(required=required)
 
 
-def auth_headers() -> dict:
+def is_zenodo_url(url: str) -> bool:
+    """True iff *url* is an https URL on the configured Zenodo host
+    (``config.ZENODO_BASE_URL``, default zenodo.org) or ``sandbox.zenodo.org``.
+
+    Manifest entries (``link`` / ``bucket_url``) may originate from another
+    instance in a multi-VM roster and are therefore untrusted: every fetch
+    that is built from them — and in particular every fetch that carries the
+    Zenodo token — must pass this check first (SSRF / token-exfiltration
+    guard)."""
+    from urllib.parse import urlsplit
+    try:
+        u = urlsplit(str(url or ""))
+    except Exception:  # noqa: BLE001
+        return False
+    if u.scheme != "https" or not u.hostname:
+        return False
+    host = u.hostname.lower().rstrip(".")
+    allowed = {"zenodo.org", "sandbox.zenodo.org"}
+    try:
+        import config
+        bh = urlsplit(config.ZENODO_BASE_URL).hostname
+        if bh:
+            allowed.add(bh.lower())
+    except Exception:  # noqa: BLE001
+        pass
+    return host in allowed
+
+
+def auth_headers(url: str | None = None) -> dict:
     """``{'Authorization': 'Bearer …'}`` toward zenodo.org, or ``{}`` without
-    a token (published records are readable anonymously)."""
+    a token (published records are readable anonymously).  When *url* is
+    given the header is only produced for a Zenodo URL (:func:`is_zenodo_url`)
+    so the token can never be sent to a host named in an untrusted manifest."""
+    if url is not None and not is_zenodo_url(url):
+        return {}
     tok = default_token(required=False)
     return {"Authorization": f"Bearer {tok}"} if tok else {}
 
