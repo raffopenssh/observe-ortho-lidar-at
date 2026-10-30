@@ -1655,8 +1655,63 @@ def _render_inner(t: Table, hdrs: dict, meta: dict, *, fmt: str, res: int, layer
     return _resp({'cells': rows, 'meta': _meta(meta, n_out, res, layers, t)}, etag=etag, partial=partial)
 
 
+def _bin_request():
+    """``format=bin`` on an exactly 0.025°-aligned bbox with ``fields=`` (or
+    ``nex=1``) → the columnar NEX1 bin (``cells_bins``), else None."""
+    a = _args()
+    if request.method != 'GET' or (a.get('format') or '').lower() != 'bin' or not a.get('bbox'):
+        return None
+    if not (a.get('fields') or _flag('nex')):
+        return None
+    try:
+        bb = [float(x) for x in a['bbox'].split(',')]
+    except ValueError:
+        return None
+    if len(bb) != 4:
+        return None
+    import cells_bins
+    ij = cells_bins.bin_of(*bb)
+    if ij is None:
+        raise CellsError(400, f'format=bin&fields= needs a {cells_bins.BIN_DEG}°-aligned bin: w=i·{cells_bins.BIN_DEG}, '
+                              f's=j·{cells_bins.BIN_DEG}, e=w+{cells_bins.BIN_DEG}, n=s+{cells_bins.BIN_DEG}',
+                         bins='/api/v1/cells/bins')
+    fields = cells_bins.parse_fields(a.get('fields'))
+    ids_enc = 'u64' if (a.get('ids') or '').lower() == 'u64' else 'delta_u64'
+    etag, inp = cells_bins.quick_etag(*ij, fields, ids_enc)
+    inm = request.headers.get('If-None-Match') or ''
+    if not _flag('rebuild') and (etag in [x.strip() for x in inm.split(',')] or inm.strip() == '*'):
+        return Response(status=304, headers={'ETag': etag, 'Cache-Control': f'public, max-age={CACHE_MAX_AGE}',
+                                             'X-Cells-Gen': inp['gen']})
+    body, hx, etag = cells_bins.serve(*ij, fields, ids_enc, rebuild=_flag('rebuild'))
+    return _resp(body, mimetype='application/octet-stream', headers=hx, etag=etag,
+                 partial=bool(inp['missing'] or inp['partial_files']))
+
+
+@cells_bp.route('/api/v1/cells/bins')
+def cells_bins_manifest():
+    import cells_bins
+    m = cells_bins.manifest()
+    etag = f'"bins-{m["generation"]}"'
+    fmt = _format(('json', 'columns'), default='columns')
+    key = (etag, fmt)
+    body = _bins_body_cache.get(key)
+    if body is None:
+        if fmt == 'json':
+            b = m['bins']
+            m = dict(m); m['bins'] = [dict(zip(b.keys(), row)) for row in zip(*b.values())]
+        body = _dumps(m)
+        _bins_body_cache.clear(); _bins_body_cache[key] = body
+    return _resp(body, etag=etag)
+
+
+_bins_body_cache: dict = {}
+
+
 @cells_bp.route('/api/v1/cells', methods=['GET', 'POST'])
 def cells():
+    r = _bin_request()
+    if r is not None:
+        return r
     want, bbox, kind = _want_ids_from_request()
     layers = _layers(); fmt = _format(('json', 'columns', 'bin', 'csv', 'geojson')); res = _res()
     fields = _fields(); centres = _flag('centres')
@@ -1697,6 +1752,7 @@ def cells_dict():
         'limits': {'bbox_span_deg': MAX_BBOX_SPAN_DEG, 'cells': MAX_CELLS, 'ids_get': MAX_IDS_GET, 'ids_post': MAX_IDS_POST,
                    'geojson_cells': MAX_GEOJSON_CELLS, 'k': MAX_K, 'rate_hint': '≤ 5 r/s sustained, burst 20'},
         'formats': list(FORMATS), 'epoch': _epoch_pin(),
+        'bins': __import__('cells_bins').dict_block(),
         'dedupe': 'a border cell present in several KG products is served once: observed copy first, then the '
                   'larger chunk, then the lowest kg; meta.kgs lists the products touched',
         'rollup': {'res': [11, 10], 'mean': ['cover', 'structures_cover', 'canopy', 'ndvi.*', 'terrain.* (aspect → mode)',

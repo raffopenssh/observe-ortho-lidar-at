@@ -57,7 +57,8 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
   POST /api/v1/cells {"ids":[…]}                  ≤ 16 384 ids
   GET  /api/v1/cells/<h3>                         one res-12 cell, all layers (obs + trees + structures), JSON
   GET  /api/v1/cells/chunk/<h3>                   one res-10 (or res-9 = 7 chunks) chunk for bulk clients; format=h3b|bin|json
-  GET  /api/v1/cells/dict                         fields, units, code tables, group labels, limits, epoch
+  GET  /api/v1/cells/dict                         fields, units, code tables, group labels, limits, epoch, bins
+  GET  /api/v1/cells/bins                         every 0.025° bin with a published product + its generation (see format=bin)
   GET  /api/v1/kg/<code>/cells                    whole-KG container: format=h3b (default, downloadable) | json (summary)
   GET  /api/v1/kgs/summary?codes=a,b,…             merged observed summary over a KG SET (≤ 500 codes, else 400);
        …?gemeinde=61630 | district=616 | state=6    or by Statistik Austria GKZ prefix (5 / 3 / 1 digits).
@@ -120,6 +121,23 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
     integers at res 12 (~20 B/cell gzipped), the format for map heat layers; res 11/10 → aggregated floats.
   format=bin      cells_n × 41 B NEO1 rows (little-endian, sorted by cell id), X-Cells-Record: neo1/41,
     X-Cells-Layout: neo1=N[,net1=T][,neb1=B] with trees (u32) / structures (u64) rows appended.
+  format=bin + fields= on a 0.025°-aligned bbox (w=i·0.025, s=j·0.025, e=w+0.025, n=s+0.025, half-open)
+    → the columnar NEX1 BIN: every local product joined per cell — observation rows (all fields),
+    tree apices → canopy_h_p90/p50, man-made objects → bld_n / bld_h_max / bld_h_p50 / bld_area_sum /
+    stories_max / struct_h_max, product roof hints → roof_dom (0 unknown 1 flat 2 pitched), 25 m DTM /
+    landcover grid → elev_mean / slope_mean / slope_p90 / aspect_deg (u8 ×2°, 255 flat, 254 unknown) for
+    EVERY cell under a product raster (terrain_src 1 = row, 2 = 25 m grid), lc25 / canopy25 / woody25.
+    Container: 'NEX1' | u32 header_len | header JSON {{n, gen, epoch, kgs[], fields[], columns[{{name,
+    dtype, bytes, shape?, nodata?}}], ids: delta_u64|u64, complete, lc25_legend}} | column bytes in header
+    order, rows sorted by cell id (ids delta-coded: first absolute, then differences; ids=u64 for raw).
+    u8 half-metre columns: 0 = none in this observed cell, 1..254 ×0.5 m, 255 = cell never observed.
+    fields=* for everything, ~17 k cells per bin, ≤ ~60 KB gz for the 9-field terrain+building set.
+    Headers: ETag "b-<gen>-<fields>" (strong; If-None-Match → 304 without touching the blob),
+    X-Cells-Gen = the bin generation — KEY YOUR COPY ON THIS (changes iff a contributing product changed;
+    X-Cells-Epoch is the product epoch, informational only), X-Cells-Partial 1 when header.kgs_missing.
+    Discovery: GET /api/v1/cells/bins → columns {{i, j, gen, epoch, complete, kgs_n, stored}} for every
+    bin touching a published product (ETag "bins-<generation>"); diff gen against your copy, pull only
+    changed bins, ≤ 4 in flight. Field table + semantics: /api/v1/cells/dict → bins.
   format=h3b      H3B1 container: magic | ver u8 | hdr_len u32 | header JSON | zlib chunks of
     shuffle(NEO1)|shuffle(NET1)|shuffle(NEB1) per res-10 cell (header.chunks[] has off/len/cells/trees/bld).
     The whole-KG file is the public product download (CC BY 4.0, attribution in the header).

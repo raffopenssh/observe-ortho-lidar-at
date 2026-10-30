@@ -37,6 +37,12 @@ def test_source_vocabulary():
     assert not hits, f'forbidden words in cells_api.py: {hits}'
 
 
+def test_bins_source_vocabulary():
+    src = (ROOT / 'cells_bins.py').read_text()
+    hits = _hits(src)
+    assert not hits, f'forbidden words in cells_bins.py: {hits}'
+
+
 def test_docs_vocabulary():
     hits = _hits(public_docs.CELLS_TXT)
     assert not hits, f'forbidden words in public_docs.CELLS_TXT: {hits}'
