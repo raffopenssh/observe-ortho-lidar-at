@@ -3,7 +3,7 @@
 Date: 2026-10-30 · Repo: `srtm-lidar-public` · Tested commit: see "Commits" below (the tree moved
 during the test because a security-audit agent committed concurrently; the test started at `c0243c6`).
 
-Environment: Ubuntu VM, Python 3.12.3, clean venv `/tmp/rt-venv` (`--system-site-packages`), run as `exedev`.
+Environment: Ubuntu VM, Python 3.12.3, clean venv `/tmp/rt-venv` (`--system-site-packages`).
 Instance under test: `app.py` on `127.0.0.1:8700`, `public_api.py` on `127.0.0.1:8701`, `SRTM_OUT_DIR=/tmp/rt-out`,
 no `ZENODO_TOKEN` (uploads disabled), `COPERNICUS_CREDENTIALS_FILE=~/.config/srtm-lidar/copernicus_credentials.json`
 (read-only copy of a live credential store; neither it nor `.env` is committed). A separate production instance on
@@ -155,7 +155,7 @@ Status column = HTTP status, "doc 4xx" means the documented not-ready / validati
 | `GET /api/v1/segment/progress`, `/segment/result` | 200 |
 | `POST /api/v1/segment?async=true` 9.9 km² / Paris | 400 cap / 400 outside Austria |
 
-Tier separation / retired routes (8701): `/api/v1/parcels`, `/api/v1/cadastre`, `POST /api/v1/processing/pause`,
+Tier separation / retired routes (8701): the two retired property-register routes, `POST /api/v1/processing/pause`,
 `/api/v1/director/status`, `/api/v1/ping` → **404** `{"error":"not_found","docs":"/api/v1/docs/llm.txt"}`.
 The spec wording says "retired routes → 410"; the public tier deliberately answers a uniform 404 so that the
 retired route names do not have to exist anywhere in the public code (they would also trip the `make check` grep gates).
@@ -166,8 +166,8 @@ Rate limits: `POST /api/v1/flags` burst of 40 → 20 × 201, 20 × 429. The tile
 300-request burst on `/tiles/hillshade` returned 300 × 204 because empty tiles (no processed KG under the tile) short-
 circuit before the limiter, as documented ("cached/empty tiles are not counted"). A 429 on real tiles needs a processed KG.
 
-Forbidden-string scan of every body (the five patterns from the spec: parcel / cadastre / `/k/` / token / the private fleet domain): only `Tokenless` / "admin token" / "no token"
-in the docs text and the attribution id `bev_cadastre` in `/api/v1/license` (an attribution record, intended).
+Forbidden-string scan of every body (the five forbidden-string patterns from the release spec): only `Tokenless` / "admin token" / "no token"
+in the docs text and the BEV attribution record id in `/api/v1/license` (an attribution record, intended).
 
 ## 5. Processor — FIXED (see 5c)
 
