@@ -1646,6 +1646,12 @@ def _pick_next_credential_index(current: int) -> int | None:
         candidates = [i for i in candidates if i in _ALLOWED_CRED_INDICES]
     if not candidates:
         return None
+    # Skip credentials whose last probe said "invalid" (401 invalid_client —
+    # a rotated / deleted client) as long as something else is left.
+    live = [i for i in candidates
+            if (_cred_meta.get(_CREDENTIALS[i][0]) or {}).get('last_status') != 'invalid']
+    if live:
+        candidates = live
     weights: list[float] = []
     for i in candidates:
         cid = _CREDENTIALS[i][0]
@@ -1710,14 +1716,30 @@ def _get_connection() -> Any:
         raise ImportError("The 'openeo' package is required. Install with: pip install openeo")
 
     logger.info("Connecting to openEO backend at %s", OPENEO_URL)
-    conn = openeo.connect(OPENEO_URL)
-    conn.authenticate_oidc_client_credentials(
-        client_id=CLIENT_ID,
-        client_secret=CLIENT_SECRET,
-    )
-    logger.info("Authenticated successfully (client_id=%s)", CLIENT_ID[:16] + "...")
-    _connection = conn
-    return conn
+    # A 401 ``invalid_client`` means this credential was rotated or deleted
+    # upstream; try the other credentials in the pool before giving up
+    # (otherwise every Sentinel layer silently fails for the whole process).
+    for _attempt in range(max(1, min(len(_CREDENTIALS), 5))):
+        conn = openeo.connect(OPENEO_URL)
+        try:
+            conn.authenticate_oidc_client_credentials(
+                client_id=CLIENT_ID,
+                client_secret=CLIENT_SECRET,
+            )
+        except Exception as exc:
+            msg = str(exc)
+            if ('401' in msg or 'invalid_client' in msg) and len(_CREDENTIALS) > 1:
+                with _cred_lock:
+                    _cred_meta.setdefault(CLIENT_ID, {})['last_status'] = 'invalid'
+                logger.warning("Credential %d/%d rejected (401 invalid_client) — rotating",
+                               _credential_index + 1, len(_CREDENTIALS))
+                if rotate_credentials():
+                    continue
+            raise
+        logger.info("Authenticated successfully (client_id=%s)", CLIENT_ID[:16] + "...")
+        _connection = conn
+        return conn
+    raise RuntimeError("no Copernicus credential accepted by the identity service")
 
 
 def _get_connection_for_cred(cred_index: int) -> Any:
