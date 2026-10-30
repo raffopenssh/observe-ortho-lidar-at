@@ -1125,8 +1125,17 @@ class SearchIndex:
         jdir = _P(json_dir)
         manifest = manifest or {}
 
+        def _removed(e) -> bool:
+            # status=removed records (stale_blocks / legacy clean-up) keep a
+            # fresh uploaded_at so they win the manifest merge — they are
+            # NOT evidence of a committed product.
+            return isinstance(e, dict) and (str(e.get('status') or '') == 'removed'
+                                            or not int(e.get('size') or 0))
+
         def _ts_for(code, path, data):
             entry = manifest.get(f'{code}_json') if manifest else None
+            if _removed(entry):
+                return ''
             if isinstance(entry, dict):
                 ua = entry.get('uploaded_at') or ''
                 if ua:
@@ -1147,7 +1156,7 @@ class SearchIndex:
         # error (`<code>_error`).
         def _has_good_json_entry(code):
             e = manifest.get(f'{code}_json') if manifest else None
-            if not isinstance(e, dict):
+            if not isinstance(e, dict) or _removed(e):
                 return False
             if 'error' in (e.get('status') or ''):
                 return False
@@ -3227,7 +3236,8 @@ def _product_version(zj, zj2) -> str | None:
     if isinstance(zj2, dict) and zj2.get('size') \
             and 'error' not in str(zj2.get('status') or ''):
         return _norm_version(zj2.get('version'))
-    if isinstance(zj, dict) and zj:
+    if isinstance(zj, dict) and zj and int(zj.get('size') or 0) > 0 \
+            and str(zj.get('status') or '') != 'removed':
         from product_repair import base_version as _bv
         return 'v2' if _bv(zj.get('version')) == 'v2' else 'v1'
     return None
@@ -3319,8 +3329,9 @@ def _write_zenodo_links(c, target_code, codes, manifest):
         best_ts = ''
         for cc in codes:
             e = manifest.get(f'{cc}{suffix}')
-            if not isinstance(e, dict):
-                continue
+            if not isinstance(e, dict) or not int(e.get('size') or 0) \
+                    or str(e.get('status') or '') == 'removed':
+                continue  # status=removed records (stale_blocks) are not links
             ts = e.get('uploaded_at') or ''
             if best is None or ts > best_ts:
                 best, best_ts = e, ts
@@ -3339,7 +3350,8 @@ def _write_zenodo_links(c, target_code, codes, manifest):
     # counts codes at the parent's (min) version, so a 2.1→2.2 re-upgrade
     # moves the timestamp forward once every block is at 2.2.
     j_ts = max((str((manifest.get(f'{cc}_json') or {}).get('uploaded_at') or '')
-                for cc in codes if isinstance(manifest.get(f'{cc}_json'), dict)),
+                for cc in codes if isinstance(manifest.get(f'{cc}_json'), dict)
+                and str(manifest[f'{cc}_json'].get('status') or '') != 'removed'),
                default='')
     j2_ts = ''
     if pv and pv not in ('v1',) and any(

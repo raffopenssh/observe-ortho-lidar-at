@@ -189,6 +189,39 @@ def consume_ne_journal(idx: dict, entries: dict) -> list[str]:
     return done
 
 
+def reconcile_pushes(codes: list[str], manifest=None, rounds: int = 4) -> list[str]:
+    """Re-push ``status=removed`` records for *codes* whose live manifest
+    entry is still live (lost to the peer-sync RMW race).  The Zenodo files
+    are already gone, so only the record is re-sent (fresh ``uploaded_at``
+    so it wins the timestamp merge)."""
+    from zenodo_client import Entry
+    from datetime import datetime, timezone
+    repushed = []
+    for _ in range(rounds):
+        time.sleep(2.0)
+        live = _entries()
+        todo = [k for c in codes for s in PRODUCT_SUFFIXES
+                for k in (f"{c}_{s}",) if _live(live.get(k))]
+        if not todo:
+            break
+        for key in todo:
+            cur = live[key]
+            now = datetime.now(timezone.utc).isoformat()
+            rec = Entry.from_dict(dict(cur, size=0, status="removed", removed_at=now,
+                                       uploaded_at=now, prev_uploaded_at=cur.get("prev_uploaded_at") or cur.get("uploaded_at")))
+            if manifest is not None:
+                manifest.set(key, rec)
+            r = _post("/api/v1/manifest/push", {"key": key, "entry": rec.to_dict()}, admin=False)
+            log.info("stale_blocks: re-push %s -> %s", key, r.get("status"))
+            repushed.append(key)
+    if manifest is not None:
+        try:
+            manifest.save()
+        except Exception:  # noqa: BLE001
+            pass
+    return repushed
+
+
 def apply(codes: list[str] | None = None, limit: int = 50, dry_run: bool = False) -> dict:
     import shutil
     import kg_v2_store
@@ -247,6 +280,10 @@ def apply(codes: list[str] | None = None, limit: int = 50, dry_run: bool = False
         except Exception as ex:  # noqa: BLE001
             out["errors"][code] = str(ex)[:300]
             log.warning("stale_blocks: %s failed: %s", code, ex)
+    # The live manifest is also rewritten by the peer-sync merge (read-
+    # modify-write, no lock across gunicorn workers), so a push can be lost
+    # in that window.  Re-read and re-push whatever did not stick.
+    out["repushed"] = reconcile_pushes([x["code"] for x in out["done"]], manifest)
     # label_mix: a requeue that only targeted retired blocks is settled
     try:
         import label_mix
@@ -324,6 +361,11 @@ if __name__ == "__main__":
         for r in rep["stale"]:
             print(f"  {r['parent']}: {' '.join(r['codes'])}   layout={'unsplit' if r['layout'] == [r['parent']] else len(r['layout'])}")
         print(f"DRIFT parents={len(rep['drift'])} (left alone)")
+    elif cmd == "reconcile":
+        # re-push removed records for codes whose Zenodo files are gone
+        # but whose manifest entry reverted (peer-sync RMW race)
+        codes = [a for a in args[1:] if re.match(r"^\d{5}(-[a-z][-a-z0-9]*)?$", a)]
+        print(json.dumps(reconcile_pushes(codes), indent=1))
     elif cmd == "apply":
         limit = 50
         dry = "--dry-run" in args
