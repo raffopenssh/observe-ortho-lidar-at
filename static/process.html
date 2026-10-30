@@ -5769,7 +5769,7 @@ async function setPeerPin(peerId, role) {
     const body = role ? {pinned_role: role} : {pinned_role: null};
     const r = await fetch('/api/v1/director/peers/' + encodeURIComponent(peerId) + '/pin', {
       method:'POST', headers:{'Content-Type':'application/json',
-                              /* token added by interceptor */},
+                              },
       body: JSON.stringify(body),
     });
     if (!r.ok) {
@@ -5789,7 +5789,7 @@ async function showAddCredModal() {
   try {
     const r = await fetch('/api/v1/credentials', {
       method:'POST', headers:{'Content-Type':'application/json',
-                              /* token added by interceptor */},
+                              },
       body: JSON.stringify({client_id: cid.trim(), client_secret: csec.trim(),
                             label: label.trim(), validate: true}),
     });
@@ -5809,7 +5809,7 @@ async function removeCred(clientId) {
   if (!confirm('Remove credential ' + clientId + '?')) return;
   try {
     const r = await fetch('/api/v1/credentials/' + encodeURIComponent(clientId), {
-      method:'DELETE', headers:{/* token added by interceptor */},
+      method:'DELETE', headers:{},
     });
     if (!r.ok) {
       const e = await r.json().catch(() => ({}));
@@ -5823,7 +5823,7 @@ async function revalidateCreds() {
   try {
     const r = await fetch('/api/v1/credentials/validate', {
       method:'POST', headers:{'Content-Type':'application/json',
-                              /* token added by interceptor */},
+                              },
       body: '{}',
     });
     if (!r.ok) {
