@@ -209,3 +209,55 @@ tile-cache flush and the checkpoint registry still contacted Zenodo although upl
 own private helper). Fix: `config.uploads_enabled()` honours both variables, the processor's `_uploads_enabled()`
 delegates to it, and both call sites return early when uploads are disabled. `make check` green.
 
+### 5b. >28-tile KG with kill/resume — NOT COMPLETED
+
+`--kg 05220` (Schwechat, 30 tiles) was started and correctly split by `kg_splitter` into `05220-west` (18 tiles) and
+`05220-east` (`Total KGs: 1 … pending: 2`, block mode with fixed bbox). The test was stopped by request about three
+minutes in, before the first tile completed, so **checkpoint resume ("restored from checkpoint") was not exercised**.
+Noted while stopping: a SIGHUP is logged as "will finish current KG then exit" (graceful), SIGTERM/KILL ends the run
+at once; the per-tile pickles in `data/austria_processor/tile_checkpoints/` are what a restart picks up
+(`_load_tile_checkpoint`, `austria_processor.py` ≈ l. 7245). Budget for a full re-run: ≈ 15 min Copernicus per 0.1°
+cell + ≈ 10 min per tile on this 8 GB host.
+
+## 6. Director single-VM mode — PARTIAL
+
+Verified: `GET /api/v1/director/status` on a fresh instance shows the single local peer (`peers: [["primary", null]]`),
+mode `auto` autostarts the local processor at boot via `systemd-run --user` scope, `POST /api/v1/director/mode`
+(`paused`) and `POST /api/v1/processing/stop` work from loopback, `POST /api/v1/processing/pause` answers 404
+"Processor not running" (not 403) when idle, the log contains no outbound peer calls (the local peer is driven through
+`config.APP_URL` loopback, `peer_director.start_peer_processor(None)`). Not run (stopped by request):
+`POST /api/v1/director/activate {"peer":"primary"}` → pause → resume → stop → deactivate cycle while a processor
+run is live.
+
+## 7. Residual limitations
+
+- **No NE cells** without `SRTM_BEV_VECTOR_CONTEXT` / `NE_SERVER_URL`: every KG is produced as `-partial`
+  (`ne_cells: no NE product`); the public `cells/*`, `cells/national`, `heightfield`, `tiles/*` endpoints stay 404/204
+  until products exist.
+- **Degraded segmentation context in public mode**: no building footprints, OSM roads/rail/water or INVEKOS
+  (`NE_SERVER_URL` / `INVEKOS_API_URL` empty) → buildings tend to classify as *parking*, bare urban ground as *rock*;
+  `quality: missing=building_context,infrastructure`.
+- Zenodo deposit for the public cache/products is unpublished; without `ZENODO_TOKEN` everything is local-only
+  (now really local-only, see 5c).
+- No training tooling for the v2 model shipped (`docs/rf-training.md` describes the legacy RF only).
+- Copernicus credential store must be supplied by the operator; 19/107 of the sample store were already invalid.
+- Retired routes answer 404 (not 410) on the public tier — intentional, see §4.
+- Operator `processing/stop` uses `pkill -f austria_processor.py` (kills unrelated shells matching the string).
+- Memory: app.py worker reached 1.25 GB RSS after one segmentation + overlay smoke; a HUP reload freed it. Processor
+  child 1.1 GB at 10 k segments/tile. 8 GB is the practical minimum for one instance plus a processor.
+
+## Commits in this step
+
+| Commit | Change |
+|--------|--------|
+| `d55a888` | gunicorn conf files no longer shadow gunicorn's `config`; units use `python -m gunicorn` |
+| `63fffaa` | `copernicus.py` reads `config.COPERNICUS_CREDENTIALS_FILE` |
+| `f34666a` | per-tier gunicorn control socket |
+| `cbb7714` | per-instance `net_meter` dir; skip Zenodo cache reconcile when uploads disabled |
+| `88c1a26` | `config.RUNTIME_DIR` for app.py scratch state (per uid+port) |
+| `2dd7174` | Copernicus: rotate credentials on 401 `invalid_client`, skip invalid ones |
+| `31f3752` | no Zenodo calls when uploads disabled; `--no-upload` honoured by `config.uploads_enabled()` |
+| `ce71c6f`, later | this report + `docs/img/release-test-segmentation.png` |
+
+All test processes were stopped at the end (nothing left on 8700/8701, no processor); `/tmp/rt-venv`, `/tmp/rt-out/12115`
+and `/tmp/rt-logs/*` were left for inspection. The production instance (8000/8100) was not touched.
