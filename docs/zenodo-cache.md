@@ -13,7 +13,7 @@ never fetched again.
   public tile-cache deposit) is where the fetchers look on a local cache
   miss. Reading needs no credentials when the deposit's files are
   publicly accessible. <!-- VERIFY: confirm anonymous range reads against
-  the deposit files work; Zenodo draft buckets need a token -->
+  the deposit files work; Zenodo draft buckets need the owner secret -->
 * Writing (uploading new tiles, creating shards, reconciling) needs
   `ZENODO_TOKEN` (or `$SRTM_SECRETS_DIR/zenodo_token`). Without it
   `config.uploads_enabled()` is false and every upload path is a no-op —
