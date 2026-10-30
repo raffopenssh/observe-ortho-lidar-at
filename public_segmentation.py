@@ -255,7 +255,7 @@ def relay():
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _STRIP_IN}
     headers[PUBLIC_HDR] = '1'
     headers['X-Public-Client'] = key
-    # The relay carries the client's address so app.py never treats a relayed
+    # The relay carries the client IP so app.py never treats a relayed
     # request as loopback (its loopback rule is what gates mutating routes).
     headers['X-Forwarded-For'] = key
     headers['X-Forwarded-Proto'] = request.headers.get('X-Forwarded-Proto', 'https')

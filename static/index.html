@@ -349,7 +349,6 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
         </div>
       </div>
       <div class="cb-row">
-        <label title="Buildings + property boundaries from the public BEV vector tiles (vtcseamless, local bevdirect-serve) as run-time model context for v1 masks and v2 distance features. Never part of the output."><input id="include_cadastre" type="checkbox" checked> BEV context</label>
         <label><input id="include_hansen" type="checkbox" checked> Hansen</label>
         <label><input id="include_infra" type="checkbox" checked> Infra</label>
         <label><input id="mark_uncertain" type="checkbox" checked> Mark uncertain</label>
@@ -1137,10 +1136,6 @@ function updateModalContent(){
   html+='</div>';
 
   // Evaluation metrics
-  /*PRIVATE*/if(data.cadastre_evaluation){
-    const ev=data.cadastre_evaluation;
-    html+=`<div style="margin:8px 0;padding:8px 10px;background:#f0f8ff;border-radius:6px;font-size:12px"><b>Cadastre:</b> P=${ev.precision} R=${ev.recall} F1=${ev.f1}</div>`;
-  }/*/PRIVATE*/
   if(meta.source==='product'){
     html+=`<div style="margin:8px 0;padding:8px 10px;background:#f3f0ff;border-radius:6px;font-size:12px"><b>Source:</b> precomputed product ${meta.product_version||''} (${(meta.product_codes||[]).join(', ')})${meta.product_obs_year?' · ALS '+meta.product_obs_year:''}</div>`;
   }else if(meta.source==='bev'){
@@ -1740,7 +1735,6 @@ async function loadRasterOverlay(typeFilter, shareId){
   if(!args)return null;
   let url='/api/v1/segment/overlay?include_ortho=true&color_mode='+colorMode;
   if(document.getElementById('include_copernicus').checked)url+='&include_copernicus=true';
-  if(document.getElementById('include_cadastre').checked)url+='&include_cadastre=true';
   url+='&source='+encodeURIComponent(getSource());
   url+='&model='+encodeURIComponent(getModel());
   if(document.getElementById('include_hansen').checked)url+='&include_hansen=true';
@@ -1832,7 +1826,6 @@ function getShareState(){
     ortho:document.getElementById('include_ortho').checked,
     temporal:document.getElementById('include_temporal').checked,
     copernicus:document.getElementById('include_copernicus').checked,
-    ctx_bev:document.getElementById('include_cadastre').checked,
     source:getSource(),
     model:getModel(),
     hansen:document.getElementById('include_hansen').checked,
@@ -1883,8 +1876,6 @@ function restoreShareState(s){
   if(s.ortho!==undefined) document.getElementById('include_ortho').checked=s.ortho;
   if(s.temporal!==undefined) document.getElementById('include_temporal').checked=s.temporal;
   if(s.copernicus!==undefined) document.getElementById('include_copernicus').checked=s.copernicus;
-  if(s.ctx_bev!==undefined) document.getElementById('include_cadastre').checked=s.ctx_bev;
-  /*PRIVATE*/else if(s.cadastre!==undefined) document.getElementById('include_cadastre').checked=s.cadastre;/*/PRIVATE*/
   if(s.source) document.getElementById('source').value=s.source;
   if(s.model) document.getElementById('model').value=s.model;
   if(s.hansen!==undefined) document.getElementById('include_hansen').checked=s.hansen;
@@ -2851,7 +2842,6 @@ document.getElementById('btn-run').onclick=async()=>{
   if(document.getElementById('include_ortho').checked)params.set('include_ortho','true');
   if(document.getElementById('include_temporal').checked)params.set('include_temporal','true');
   if(document.getElementById('include_copernicus').checked)params.set('include_copernicus','true');
-  if(document.getElementById('include_cadastre').checked)params.set('include_cadastre','true');
   if(isSeg)params.set('source',getSource());
   if(isSeg)params.set('model',getModel());
   if(document.getElementById('include_hansen').checked)params.set('include_hansen','true');
@@ -3047,7 +3037,6 @@ function buildSummary(data){
     let totalA=0,mmA=0;
     for(const f of data.features){const a=f.properties.area_sqm||0;totalA+=a;if(f.properties.is_manmade)mmA+=a;}
     html=`<b>${n}</b> objects &nbsp; <b>${totalA>0?(mmA/totalA*100).toFixed(1):'0'}%</b> manmade`;
-    /*PRIVATE*/const ev=data.cadastre_evaluation;if(ev)html+=`<br><b>Cadastre:</b> P=${ev.precision} R=${ev.recall} F1=${ev.f1}`;/*/PRIVATE*/
     if(data.meta&&data.meta.source==='product')html+=`<br><b>Source:</b> product ${data.meta.product_version||''}`;
     if(data.hansen_evaluation){const h=data.hansen_evaluation;html+=`<br><b>Hansen:</b> P=${h.precision} R=${h.recall} F1=${h.f1}`;}
   }

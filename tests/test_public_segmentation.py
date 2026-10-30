@@ -72,22 +72,14 @@ def test_allow_list():
     assert ps.route_kind('GET', '/api/v1/segment') is None   # GET not allowed on POST-only route
 
 
-def test_primary_only():
-    ps._PRIMARY.update(t=0.0)
-    import director_ha
-    orig = director_ha.self_id
-    try:
-        director_ha.self_id = lambda: 'at42'
-        ps._PRIMARY['t'] = 0.0
-        assert ps.is_primary() is False
-        director_ha.self_id = lambda: 'primary'
-        ps._PRIMARY['t'] = 0.0
-        assert ps.is_primary() is True
-    finally:
-        director_ha.self_id = orig
-        ps._PRIMARY['t'] = 0.0
+def test_primary_only(monkeypatch):
+    import config
+    monkeypatch.setattr(config, 'PRIMARY_URL', 'http://director.example.net:8000')
+    assert ps.is_primary() is False
+    monkeypatch.setattr(config, 'PRIMARY_URL', '')
+    assert ps.is_primary() is True
 
 
 if __name__ == '__main__':
-    test_page_vocabulary(); test_module_and_docs_vocabulary(); test_scrub(); test_allow_list(); test_primary_only()
+    test_page_vocabulary(); test_module_and_docs_vocabulary(); test_scrub(); test_allow_list()
     print('ok')
