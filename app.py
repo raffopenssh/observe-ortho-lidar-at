@@ -8451,7 +8451,16 @@ threading.Thread(target=_combined_log_ticker, daemon=True,
 
 
 # === SECTION: srv memory sampler ===
-_SRV_MEM_CG = Path('/sys/fs/cgroup/system.slice/srv.service')
+def _own_cgroup_dir() -> Path:
+    """cgroup-v2 directory of this process (works for system and --user units)."""
+    try:
+        rel = open('/proc/self/cgroup').read().strip().split(':', 2)[2]
+        return Path('/sys/fs/cgroup' + rel)
+    except Exception:
+        return Path('/sys/fs/cgroup/system.slice/srv.service')
+
+
+_SRV_MEM_CG = _own_cgroup_dir()
 _SRV_MEM_WARN_RSS_MB = int(os.environ.get('SRV_MEM_WARN_RSS_MB', '1500'))
 
 
@@ -16578,7 +16587,7 @@ def classifier_status():
 def ping():
     """Cheap liveness probe — NEVER blocks on disk/network.
 
-    Used by the local watchdog (`srv_watchdog.sh`) and the director to
+    Used by the local watchdog (`systemd/srv_watchdog.sh`) and the director to
     distinguish 'gunicorn is alive' from 'gunicorn is wedged'.  Must stay
     fast (no FS I/O, no subprocess, no requests).
     """
@@ -21406,4 +21415,4 @@ threading.Thread(target=_orphan_sweep_thread, daemon=True, name='task-orphan-swe
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000, debug=False)
+    app.run(host=_config.APP_BIND, port=_config.APP_PORT, debug=False, threaded=True)

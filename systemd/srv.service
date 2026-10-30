@@ -1,0 +1,30 @@
+# app.py — operator API, director, processor control.  Loopback-only by
+# default (SRTM_APP_BIND); mutating routes need X-Operator-Token elsewhere.
+#
+# User install:   mkdir -p ~/.config/systemd/user && cp systemd/*.service systemd/*.timer ~/.config/systemd/user/
+#                 systemctl --user daemon-reload && systemctl --user enable --now srv srv_public
+#                 (loginctl enable-linger $USER so it survives logout)
+# System install: replace %h with the service user's home, add User=<user>,
+#                 copy to /etc/systemd/system/ and use WantedBy=multi-user.target.
+#
+# Configuration is read from %h/srtm-lidar-public/.env by config.py itself
+# (inline comments allowed there — systemd's EnvironmentFile= would not strip them).
+[Unit]
+Description=observe-ortho-lidar-at operator API (app.py)
+After=network.target
+
+[Service]
+WorkingDirectory=%h/srtm-lidar-public
+ExecStart=%h/srtm-lidar-public/.venv/bin/gunicorn -c systemd/gunicorn_app.conf.py app:app
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+# all-options-on analysis of large areas needs ~3.5 GB
+MemoryMax=4200M
+MemoryHigh=3800M
+OOMScoreAdjust=500
+OOMPolicy=continue
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

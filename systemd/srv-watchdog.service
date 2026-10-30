@@ -1,0 +1,9 @@
+# Liveness probe for srv / srv_public (see systemd/srv_watchdog.sh).
+[Unit]
+Description=srv liveness watchdog (restarts gunicorn when the API stops answering)
+After=srv.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/srtm-lidar-public
+ExecStart=%h/srtm-lidar-public/systemd/srv_watchdog.sh

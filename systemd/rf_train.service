@@ -1,0 +1,21 @@
+# Optional: retrain the random-forest classifier (train_rf_4000kg.py).
+[Unit]
+Description=observe-ortho-lidar-at RF training
+After=network.target
+
+[Service]
+WorkingDirectory=%h/srtm-lidar-public
+ExecStart=%h/srtm-lidar-public/.venv/bin/python3 train_rf_4000kg.py
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGINT
+TimeoutStopSec=60
+TimeoutStartSec=infinity
+Environment=PYTHONUNBUFFERED=1
+MemoryMax=6G
+MemoryHigh=5G
+OOMScoreAdjust=-200
+OOMPolicy=continue
+
+[Install]
+WantedBy=default.target

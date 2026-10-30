@@ -1,0 +1,21 @@
+# austria_processor.py — the per-KG processing worker (started/stopped by the
+# director in app.py; enable this unit only if you want it always running).
+# See srv.service for user/system install notes.
+[Unit]
+Description=observe-ortho-lidar-at landscape processor
+After=network.target srv.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/srtm-lidar-public
+ExecStart=%h/srtm-lidar-public/.venv/bin/python3 austria_processor.py --mark-uncertain
+Restart=on-failure
+RestartSec=60
+MemoryMax=8G
+MemoryHigh=7G
+OOMScoreAdjust=100
+OOMPolicy=stop
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

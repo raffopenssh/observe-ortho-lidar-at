@@ -1,0 +1,13 @@
+# Rebuilds the Austria-wide res-8/9 cells aggregate (cells_national.py).
+[Unit]
+Description=observe-ortho-lidar-at: rebuild the national cells aggregate
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/srtm-lidar-public
+ExecStart=%h/srtm-lidar-public/.venv/bin/python3 cells_national.py --build --quiet
+Nice=15
+IOSchedulingClass=idle
+MemoryMax=2500M
+TimeoutStartSec=2h

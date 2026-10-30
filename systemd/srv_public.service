@@ -1,0 +1,29 @@
+# public_api.py — read-only public tier (relays to app.py over loopback).
+# See srv.service for user/system install notes.
+[Unit]
+Description=observe-ortho-lidar-at public API (public_api.py)
+After=network.target srv.service
+Wants=srv.service
+
+[Service]
+WorkingDirectory=%h/srtm-lidar-public
+ExecStart=%h/srtm-lidar-public/.venv/bin/gunicorn -c systemd/gunicorn_public.conf.py public_api:app
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+# 2 workers × PUBLIC_RSS_HARD_MB stays under MemoryHigh so the kernel
+# reclaim-throttle never engages before a worker recycles itself.
+MemoryHigh=2400M
+MemoryMax=2800M
+Environment=PUBLIC_RSS_SOFT_MB=850
+Environment=PUBLIC_RSS_HARD_MB=1100
+Environment=HILLSHADE_GRID_MB=96
+Environment=LQ_GRID_MB=128
+Environment=TILE_PNG_MB=32
+Environment=TILE_DISK_CACHE_MB=2048
+Environment=TILE_MAX_CONCURRENT=3
+Environment=TILE_RATE_PER_S=25
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target
