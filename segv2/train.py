@@ -84,7 +84,7 @@ MAX_PER_CLASS_TRAIN = 0       # 0 = no cap (operator OK'd full machine use); --c
 # labels.MIN_NDVI — the parquet distribution is already left-truncated there, so
 # the quantile is an upper-tail-of-noise trim, not a mode cut); sealed / bare
 # classes lose their top VETO_SEALED_Q quantile (roof/road/rock labelled on
-# canopy overhang, re-greened cadastre-84 spoil, alpine grass in "rock" parcels).
+# canopy overhang, re-greened spoil heaps, alpine grass on "rock" land).
 # Rows with no real NIR (NaN ndvi_mean) are exempt.  --ndvi-veto fixed|derived|none.
 VETO_VEG = ["grass", "tree", "shrub", "orchard", "wetland"]
 VETO_SEALED = ["roof", "road", "parking", "rail", "water", "rock", "glacier", "bare_soil", "earthwork"]
@@ -102,7 +102,7 @@ MAX_NDVI_SEG = {"roof": 0.11, "road": 0.19, "parking": 0.20, "rail": 0.14, "wate
 NIR_KEYS = ["ndvi_mean", "ndvi_std", "ndvi_max", "ndvi_p10", "ndvi_p90", "nir_mean", "nir_std",
             "nir_brightness_ratio", "nir_red_ratio", "ndwi_mean", "savi_mean", "ndvi_ndsm_coherence"]
 CLASS_WEIGHT = "sqrt"        # "balanced" (LGBM built-in) or "sqrt" (tempered: w_c ∝ (n_max/n_c)^0.5)
-# ALL_KEYS minus the OSM/cadastre distance features — the honest "recognition
+# ALL_KEYS minus the OSM/building-context distance features — the honest "recognition
 # only" ablation (dist_* share geometry with the road/rail/water/roof labels).
 NODIST_KEYS = [k for k in ALL_KEYS if not k.startswith("dist_")]
 NOHARM_KEYS = [k for k in ALL_KEYS if not k.startswith("harm_")]

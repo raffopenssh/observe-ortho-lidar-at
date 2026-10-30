@@ -65,6 +65,13 @@ class FullGpkg:
                 arr = arr[:1]
         return arr[0] if arr.shape[0] == 1 else arr
 
+    def valid_mask(self) -> np.ndarray:
+        """bool (h, w): pixels with a DTM value (the KG's coverage mask)."""
+        dtm = self.read("DTM")
+        if dtm is None:
+            return np.ones(self.shape, bool)
+        return np.isfinite(dtm)
+
     def ortho_years(self) -> list[int]:
         return self.years("Ortho")
 

@@ -41,8 +41,7 @@ CHUNK = 1 << 20
 
 EXPECTED_FULL_LAYERS = {"DTM", "DSM", "nDSM", "segment_type", "segment_height",
                         "segments", "segment_points"}
-EXPECTED_LIGHT_LAYERS = {"segments", "segment_points", "parcels", "buildings",
-                         "new_buildings", "infrastructure", "segment_type",
+EXPECTED_LIGHT_LAYERS = {"segments", "segment_points", "new_buildings", "infrastructure", "segment_type",
                          "segment_height"}
 
 _MANIFEST_CACHE: tuple[float, dict] | None = None
@@ -68,7 +67,9 @@ def product_codes(product: str = "full_gpkg") -> list[str]:
 
 
 def _headers():
-    return {"Authorization": f"Bearer {zenodo_client.DEFAULT_TOKEN}"}
+    # toward zenodo.org only; published records need no token
+    tok = zenodo_client.default_token(required=False)
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
 
 
 def stored_meta(entry: dict) -> tuple[str, int]:

@@ -2,34 +2,37 @@
 
 Sources, in *decreasing* priority (later sources never overwrite earlier ones):
 
-  1. cadastre building footprints (B(Geb) 41)            → roof   (needs nDSM ≥ 2 m)
+  1. building footprints (in-RAM building context, optional)  → roof   (needs nDSM ≥ 2 m)
   2. OSM road centrelines buffered by fclass              → road / path
   3. OSM rail centrelines buffered                        → rail
   4. OSM water areas + waterway lines buffered            → water
-  5. INVEKOS Schläge 2024-1 (AMA) crop-type polygons      → crop / grass / vineyard /
+  5. INVEKOS Schläge (AMA) crop-type polygons             → crop / grass / vineyard /
                                                             orchard / hedge / shrub /
                                                             water / garden …
-  6. cadastre NFL landuse polygons (BEV NS codes, corrected Aug-2026 table)
-     – cadastre 95 Straße *minus* OSM road buffer         → grass  (verge)
-     – cadastre 59/60/64 Gewässer *minus* OSM water       → grass/shrub (riparian)
-     – others per NS_CODE_TO_TYPE
 
 Every pixel also gets a *source id* (LABEL_SOURCE) so the training harness can
-weight / ablate sources, and the per-source height + NDVI vetoes from v1
-(`train_rf_4000kg`) are kept: e.g. a 'grass' pixel with nDSM > 2 m is unlabelled
-(tree canopy over a legal meadow), a 'road' pixel with NDVI > 0.3 is unlabelled.
+weight / ablate sources, and the per-source height + NDVI vetoes from v1 are
+kept: e.g. a 'grass' pixel with nDSM > 2 m is unlabelled (tree canopy over a
+legal meadow), a 'road' pixel with NDVI > 0.3 is unlabelled.
 
-Cadastre (parcels, footprints, NS landuse polygons) comes from the local bevdirect-serve
-(BEV Katastralmappe tiles, ``vct_pilot._viewport``); OSM from umfeld-at's public
-``/api/v1/osm/geometry?bbox=`` (see umfeld.py) and the
-local INVEKOS GPKG (`data/invekos/INSPIRE_SCHLAEGE_2024-1_POLYGON.gpkg`,
-EPSG:31287). No BEV / openEO traffic.
+Public release
+--------------
+The original training stack also painted BEV land-use (NS code) polygons
+(``SOURCES`` 6/7).  Those are property-level layers
+and were removed; the ``SOURCES`` ids are kept so existing training
+artefacts still decode.  Building footprints are only used when the caller
+passes them (``LabelContext(footprints=...)``, in RAM, from the optional
+``config.BEV_VECTOR_CONTEXT`` path); OSM geometry needs ``config.UMFELD_URL``
+and INVEKOS needs ``config.INVEKOS_API_URL`` or the local GPKG
+(``data/invekos/INSPIRE_SCHLAEGE_2024-1_POLYGON.gpkg``, EPSG:31287).  With
+none configured the label raster is empty and the ``dist_*`` context
+features fall back to their 500 m cap.
 """
 from __future__ import annotations
 
 import logging
-import os
 import re
+import sys as _sys
 import time
 from pathlib import Path
 
@@ -43,24 +46,20 @@ from shapely.ops import transform as shp_transform
 log = logging.getLogger("segv2.labels")
 
 ROOT = Path(__file__).resolve().parent.parent
-# Cadastre upstream = example.invalid /k tier (token-gated) since Oct 2026;
-# ``umfeld.py`` is the single source of truth for base URL + token.
-try:
-    import sys as _sys
-    if str(ROOT) not in _sys.path:
-        _sys.path.insert(0, str(ROOT))
-    import umfeld as _umfeld
-    CADASTRE_BASE = _umfeld.CADASTRE_BASE
-    OSM_GEOMETRY_URL = _umfeld.OSM_GEOMETRY_URL
-except Exception:  # noqa: BLE001  (standalone checkout without umfeld.py)
-    _umfeld = None
-    CADASTRE_BASE = "https://example.invalid/k/api/v1"
-    OSM_GEOMETRY_URL = "https://example.invalid/api/v1/osm/geometry"
+if str(ROOT) not in _sys.path:
+    _sys.path.insert(0, str(ROOT))
+import config as _config  # noqa: E402
+import http_pool as _http_pool  # noqa: E402
+
+# OSM geometry service: umfeld's public, key-less ``GET /api/v1/osm/geometry
+# ?bbox=W,S,E,N&cat=road,rail,water,water_area&limit=`` (ODbL, see
+# ``/api/v1/docs/llm.txt`` on that host); '' = no OSM context
+OSM_GEOMETRY_URL = f"{_config.UMFELD_URL}/api/v1/osm/geometry" if _config.UMFELD_URL else ""
 INVEKOS_GPKG = ROOT / "data/invekos/INSPIRE_SCHLAEGE_2024-1_POLYGON.gpkg"
-# INVEKOS Schläge API (farm-subsidies-austria VM; years 2022-2026, stored EPSG:3035,
-# `nearest_to=<flight year>` picks the release closest to the LiDAR flight).
-# Spec: segv2/INVEKOS_API_SPEC.md.  Local GPKG above is the offline fallback.
-INVEKOS_API = os.environ.get("INVEKOS_API", "https://example.invalid/api/v1/invekos")
+# INVEKOS Schläge API (years 2022-2026, EPSG:3035, ``nearest_to=<flight year>``
+# picks the release closest to the LiDAR flight); '' = disabled.  Spec:
+# segv2/INVEKOS_API_SPEC.md.  Local GPKG above is the offline fallback.
+INVEKOS_API = _config.INVEKOS_API_URL
 
 _T_4326_3035 = Transformer.from_crs(4326, 3035, always_xy=True)
 _T_31287_3035 = Transformer.from_crs(31287, 3035, always_xy=True)
@@ -80,46 +79,20 @@ TYPES = [
 TYPE_ID = {t: i + 1 for i, t in enumerate(TYPES)}
 ID_TYPE = {v: k for k, v in TYPE_ID.items()}
 
-SOURCES = ["footprint", "osm_road", "osm_rail", "osm_water", "invekos", "cadastre", "cadastre_verge"]
+SOURCES = ["footprint", "osm_road", "osm_rail", "osm_water", "invekos", "landuse", "landuse_verge"]  # 6/7 unused (legacy ids)
 SOURCE_ID = {s: i + 1 for i, s in enumerate(SOURCES)}
 
-# BEV Katastralmappe SHP V2.9, Tabelle 8 (Nutzungssymbole) — CORRECT table.
+# BEV land-use symbol (Nutzungssymbol, Tabelle 8) → type.  Kept as a reference
+# table for the v1 LANDUSE_CODE_TO_TYPE cross-checks; no label source paints
+# it in the public release (property-level layer removed).
 NS_CODE_TO_TYPE = {
-    40: "orchard",     # Dauerkulturanlagen / Erwerbsgärten (LN(Dk))
-    41: "roof",        # Gebäude
-    42: "parking",     # Parkplätze
-    48: "grass",       # Äcker, Wiesen oder Weiden — ambiguous crop/grass; INVEKOS decides,
-                       # cadastre-only fallback labelled 'grass' with low weight (see WEIGHT)
-    52: "garden",      # Gärten
-    53: "vineyard",    # Weingärten
-    54: "grass",       # Alpen
-    55: "shrub",       # Krummholzflächen
-    56: "tree",        # Wälder
-    57: "shrub",       # Verbuschte Flächen
-    58: "path",        # Forststraßen
-    59: "water",       # Fließende Gewässer (legal parcel incl. banks → OSM water refines)
-    60: "water",       # Stehende Gewässer
-    61: "wetland",     # Feuchtgebiete
-    62: "bare_soil",   # Vegetationsarme Flächen
-    63: "parking",     # Betriebsflächen (industrial yards — mostly sealed)
-    64: "grass",       # Gewässerrandflächen (riparian strip)
-    65: "grass",       # Verkehrsrandflächen (verge)
-    72: "grass",       # Friedhöfe (mixed; low weight)
-    83: "parking",     # Gebäudenebenflächen (yards/driveways)
-    84: "earthwork",   # Abbauflächen, Halden, Deponien
-    87: "rock",        # Fels- und Geröllflächen
-    88: "glacier",     # Gletscher
-    92: "rail",        # Schienenverkehrsanlagen
-    95: "road",        # Straßenverkehrsanlagen (legal incl. shoulder → OSM refines)
-    96: "grass",       # Freizeitflächen (sports grounds, parks)
+    40: "orchard", 41: "roof", 42: "parking", 48: "grass", 52: "garden", 53: "vineyard",
+    54: "grass", 55: "shrub", 56: "tree", 57: "shrub", 58: "path", 59: "water", 60: "water",
+    61: "wetland", 62: "bare_soil", 63: "parking", 64: "grass", 65: "grass", 72: "grass",
+    83: "parking", 84: "earthwork", 87: "rock", 88: "glacier", 92: "rail", 95: "road", 96: "grass",
 }
-# codes whose *legal* polygon is much wider than the physical surface — the
-# OSM-buffer remainder becomes verge/riparian instead of the nominal type.
-_CADASTRE_WIDE = {95: "grass", 59: "grass", 60: "water", 64: "grass", 92: "grass"}
-# codes labelled with reduced sample weight (ambiguous / mixed)
-LOW_WEIGHT_CODES = {48, 72, 96, 63, 83}
 
-# Height vetoes (m nDSM) — above this the cadastre/OSM/INVEKOS label is probably
+# Height vetoes (m nDSM) — above this the footprint/OSM/INVEKOS label is probably
 # under a canopy or structure and gets unlabelled.
 MAX_H = {
     "road": 1.5, "path": 1.5, "parking": 1.5, "rail": 1.5, "water": 1.0, "wetland": 1.5,
@@ -130,7 +103,7 @@ MIN_H = {"roof": 2.0, "tree": 3.0}
 # NDVI vetoes — sealed surfaces must not be green (BEV ortho NDVI, 1 m)
 MAX_NDVI = {"road": 0.30, "path": 0.35, "parking": 0.30, "rail": 0.35, "bare_soil": 0.30,
             "roof": 0.35, "water": 0.20, "glacier": 0.15, "rock": 0.30}
-# Vegetation must be green. Alpine INVEKOS "Almfutterfläche" / cadastre 52
+# Vegetation must be green. Alpine INVEKOS "Almfutterfläche" / BEV NS 52
 # (Alpen) polygons legally cover scree, snow beds and bare ridges; without this
 # veto ~5 % of "grass" rows sit on bare rock (BEV NDVI < 0.15, elev > 1500 m) and
 # the model learns rock→grass.  Thresholds are the ~5th percentile of the BEV
@@ -145,15 +118,14 @@ MIN_NDVI = {"grass": 0.15, "tree": 0.20, "shrub": 0.15, "hedge": 0.20, "orchard"
 # is not needed.  train.py derives the tighter *segment-level* veto (vegetation
 # q05 floors + sealed-class q95 ceilings) from the data at train time.
 
-# Label sources are *current* (INVEKOS 2024, cadastre + OSM live) while the
+# Label sources are *current* (INVEKOS 2024, footprints + OSM live) while the
 # LiDAR behind a KG may be 2006-2024.  Classes whose surface changes on a
 # few-year horizon get their weight decayed with DSM age:
 #   w *= 1 / (1 + AGE_DECAY[ty] * dsm_age_years)
 AGE_DECAY = {"orchard": 0.12, "garden": 0.08, "earthwork": 0.15, "shrub": 0.10, "hedge": 0.10,
              "crop": 0.03, "vineyard": 0.05, "parking": 0.05, "road": 0.03, "roof": 0.05}
 
-# OSM highway fclass → (type, half-width m). Widths are *pavement* half widths;
-# the cadastre legal parcel covers the rest.
+# OSM highway fclass → (type, half-width m). Widths are *pavement* half widths.
 OSM_ROAD = {
     "motorway": ("road", 12.0), "motorway_link": ("road", 5.0),
     "trunk": ("road", 8.0), "trunk_link": ("road", 4.5),
@@ -215,33 +187,27 @@ _SESSION.headers["Accept-Encoding"] = "gzip"
 
 
 class UpstreamUnavailable(RuntimeError):
-    """An umfeld / INVEKOS fetch failed after every retry.  Raised by the
+    """An OSM / INVEKOS fetch failed after every retry.  Raised by the
     strict fetchers so the processor can DEFER the KG instead of baking a
     product on an empty OSM context (dist_road=500 m everywhere, no
-    road/rail/water masks) — what silently happened whenever umfeld-at
-    restarted (503 bursts, 2026-10-15 / 10-19)."""
+    road/rail/water masks)."""
 
 
 # retry ladder for the strict fetchers: ~4 min total, enough to ride out a
-# gunicorn restart of umfeld-at (503 for 30-90 s) without deferring the KG
+# restart of the upstream service (503 for 30-90 s) without deferring the KG
 STRICT_BACKOFF_S = (5, 10, 20, 40, 60, 60, 60)
 
 
 def _get_json(url, params, timeout=180, retries=3, backoff=None):
+    if not url:
+        return None
     last = None
     for a in range(retries):
         if a and backoff:
             time.sleep(backoff[min(a - 1, len(backoff) - 1)])
         try:
-            # Session.get bypasses http_pool's requests.* hook → add the
-            # umfeld bearer token here. Missing token = transport error
-            # (don't let the /k tier's 404 read as "no data").
-            hdrs = {}
-            if _umfeld is not None and _umfeld.is_umfeld_url(url):
-                hdrs = _umfeld.headers()
-                if not hdrs:
-                    raise requests.ConnectionError("umfeld token missing (data/umfeld_token)")
-            r = _SESSION.get(url, params=params, timeout=timeout, headers=hdrs)
+            r = _SESSION.get(url, params=params, timeout=timeout,
+                             headers={"User-Agent": _http_pool.USER_AGENT})
             r.raise_for_status()
             return r.json()
         except Exception as e:  # noqa: BLE001
@@ -256,103 +222,6 @@ def _to_3035(geom):
     return shp_transform(_T_4326_3035.transform, geom)
 
 
-def fetch_cadastre(kg_code: str, bbox_wgs: tuple[float, float, float, float] | None = None) -> dict:
-    """{'footprints': [geom3035], 'landuse': [(geom3035, ns_code)], 'parcels': [geom3035]}
-
-    Source (2026-10-30): the **local bevdirect-serve** viewport documents
-    (``vct_pilot._viewport``, layers parcels+footprints+landuse) — the same
-    BEV Katastralmappe tiles the bev-mode processor uses.  umfeld-at's
-    parcel-keyed ``/k/api/v1/export/geojson`` is gone (404).
-
-    ``bbox_wgs`` = (W, S, E, N); defaults to the KG's bbox from the
-    director's ``kg_list.json`` / bevdirect ``/kg/<code>`` (``austria_processor.
-    _kg_bbox_lookup``).  Landuse codes are the BEV ``ns`` (Nutzungsschlüssel)
-    the ``NS_CODE_TO_TYPE`` table expects; parcels without a dedicated
-    landuse polygon fall back to ``dominant_ns``.
-    """
-    out = {"footprints": [], "landuse": [], "parcels": []}
-    import sys as _sys
-    if str(ROOT) not in _sys.path:
-        _sys.path.insert(0, str(ROOT))
-    import vct_pilot
-    import ne_h3
-    if bbox_wgs is None:
-        import austria_processor as _ap
-        bb = _ap._kg_bbox_lookup(kg_code)
-        if not bb:
-            raise UpstreamUnavailable(f"KG {kg_code}: no bbox (kg_list.json / bevdirect /kg)")
-        bbox_wgs = (bb["min_lon"], bb["min_lat"], bb["max_lon"], bb["max_lat"])
-    try:
-        ne_h3._ensure_bevdirect_server()
-    except Exception as e:  # noqa: BLE001
-        raise UpstreamUnavailable(f"bevdirect-serve not running: {e}") from e
-    W, S, E, N = (float(v) for v in bbox_wgs)
-    cells = vct_pilot._cells(W, S, E, N)
-    deadline = time.time() + 240 + 20 * len(cells)
-    seen_p, seen_f, seen_l = set(), set(), set()
-    n_parcel_fallback = 0
-
-    def _geom(g):
-        s_ = shape(g)
-        if s_.is_empty:
-            return None
-        if not s_.is_valid:
-            s_ = s_.buffer(0)
-        return _to_3035(s_)
-
-    for ix, iy in cells:
-        try:
-            doc = vct_pilot._viewport(vct_pilot._cell_bbox(ix, iy), deadline)
-        except vct_pilot.UpstreamDownError as e:
-            raise UpstreamUnavailable(str(e)) from e
-        except Exception as e:  # noqa: BLE001
-            raise UpstreamUnavailable(f"viewport {ix},{iy}: {str(e)[:160]}") from e
-        for f in doc.get("footprints") or []:
-            fid = str(f.get("id") or "")
-            if not f.get("geometry") or fid in seen_f:
-                continue
-            seen_f.add(fid)
-            try:
-                g = _geom(f["geometry"])
-                if g is not None:
-                    out["footprints"].append(g)
-            except Exception:  # noqa: BLE001
-                pass
-        for lu in doc.get("landuse") or []:
-            lid = str(lu.get("id") or "")
-            if not lu.get("geometry") or lid in seen_l or lu.get("ns") in (None, ""):
-                continue
-            seen_l.add(lid)
-            try:
-                g = _geom(lu["geometry"])
-                if g is not None:
-                    out["landuse"].append((g, int(lu["ns"])))
-            except Exception:  # noqa: BLE001
-                pass
-        for p in doc.get("parcels") or []:
-            pid = str(p.get("parcel_id") or "")
-            if not p.get("geometry") or pid in seen_p:
-                continue
-            seen_p.add(pid)
-            try:
-                g = _geom(p["geometry"])
-                if g is None:
-                    continue
-                out["parcels"].append(g)
-                # parcel-level fallback when the tile carries no landuse
-                # polygon for it (the landuse layer wins in the priority
-                # stack because it is appended first → rasterised first)
-                if not doc.get("landuse") and p.get("dominant_ns") not in (None, ""):
-                    out["landuse"].append((g, int(p["dominant_ns"])))
-                    n_parcel_fallback += 1
-            except Exception:  # noqa: BLE001
-                pass
-        del doc
-    log.info("KG %s cadastre (bevdirect, %d cells): %d footprints, %d landuse polys (%d parcel-fallback), %d parcels",
-             kg_code, len(cells), len(out["footprints"]), len(out["landuse"]), n_parcel_fallback, len(out["parcels"]))
-    return out
-
-
 def fetch_osm(bbox_wgs: tuple[float, float, float, float], strict: bool = False) -> dict:
     """{'road': [(geom3035,fclass)], 'rail': [...], 'water_line': [...], 'water_area': [...]}
 
@@ -360,8 +229,13 @@ def fetch_osm(bbox_wgs: tuple[float, float, float, float], strict: bool = False)
     :class:`UpstreamUnavailable` instead of returning an empty context."""
     w, s, e, n = bbox_wgs
     out = {"road": [], "rail": [], "water_line": [], "water_area": []}
-    # Public tier (no /k, no token): bbox-keyed only; ``cat=water_area`` gives
-    # fillable (Multi)Polygons, ``cat=water`` the centreline/outline chunks.
+    if not OSM_GEOMETRY_URL:
+        # no OSM geometry service configured (config.UMFELD_URL empty): empty
+        # context, never an upstream error — strict callers would otherwise
+        # defer every KG forever
+        return out
+    # bbox-keyed; ``cat=water_area`` gives fillable (Multi)Polygons,
+    # ``cat=water`` the centreline/outline chunks.
     d = _get_json(OSM_GEOMETRY_URL,
                   {"bbox": f"{w},{s},{e},{n}", "cat": "road,rail,water,water_area",
                    "limit": 100000},
@@ -442,6 +316,8 @@ def fetch_invekos_api(bbox_3035, nearest_to: int | None = None, year: int | None
     ``truncated`` cell is subdivided, so a big KG never loses the layer.
     ``strict``: transport failure (5xx / timeout after STRICT_BACKOFF_S)
     raises :class:`UpstreamUnavailable`."""
+    if not INVEKOS_API:
+        return None
     params = {"crs": "3035"}
     if year:
         params["year"] = int(year)
@@ -521,7 +397,7 @@ class LabelContext:
     """Fetched vector inputs for one KG; can rasterise any tile window."""
 
     def __init__(self, kg_code: str, bbox_3035: tuple[float, float, float, float],
-                 flight_year: int | None = None):
+                 flight_year: int | None = None, footprints=None):
         self.kg = kg_code
         self.bbox_3035 = bbox_3035
         self.flight_year = flight_year
@@ -530,7 +406,8 @@ class LabelContext:
         lons, lats = zip(*pts)
         pad = 0.002
         self.bbox_wgs = (min(lons) - pad, min(lats) - pad, max(lons) + pad, max(lats) + pad)
-        self.cad = fetch_cadastre(kg_code, self.bbox_wgs)
+        # in-RAM building footprints (EPSG:3035) from the caller, or none
+        self.footprints = list(footprints or [])
         self.osm = fetch_osm(self.bbox_wgs)
         self.inv = fetch_invekos(bbox_3035, nearest_to=flight_year)
         log.info("KG %s osm: %d road, %d rail, %d water lines, %d water areas; invekos: %d",
@@ -545,9 +422,6 @@ class LabelContext:
         self.water_polys = [g for g, _ in self.osm["water_area"]]
         self.water_polys += [g.buffer(OSM_WATER_LINE.get(fc, 1.5), cap_style=2)
                              for g, fc in self.osm["water_line"]]
-        # OSM road+rail+water union buffered extra 1.5 m → zone where cadastre wide
-        # codes should NOT paint their nominal type
-        self._osm_zone = self.road_polys + self.path_polys + self.rail_polys + self.water_polys
 
     def rasterize(self, transform, shape_hw, ndsm: np.ndarray | None, ndvi: np.ndarray | None,
                   dsm_age: np.ndarray | None = None):
@@ -567,7 +441,7 @@ class LabelContext:
             return [g for g in geoms if g.intersects(win)]
 
         # 1. footprints → roof
-        fp = _burn([(g, 1) for g in _clip(self.cad["footprints"])], transform, shape_hw).astype(bool)
+        fp = _burn([(g, 1) for g in _clip(self.footprints)], transform, shape_hw).astype(bool)
         _paint(label, source, weight, fp, "roof", "footprint")
         # 2. OSM roads / paths
         _paint(label, source, weight, _burn([(g, 1) for g in _clip(self.road_polys)], transform, shape_hw).astype(bool), "road", "osm_road")
@@ -584,22 +458,6 @@ class LabelContext:
         for ty, geoms in inv_by_type.items():
             m = _burn([(g, 1) for g in geoms if not g.is_empty], transform, shape_hw).astype(bool)
             _paint(label, source, weight, m, ty, "invekos")
-        # 6. cadastre NFL landuse (shrunk 1 m); wide codes → verge remainder
-        osm_zone = _burn([(g.buffer(1.5), 1) for g in _clip(self._osm_zone)], transform, shape_hw).astype(bool)
-        by_code: dict[int, list] = {}
-        for g, code in self.cad["landuse"]:
-            if code in NS_CODE_TO_TYPE and g.intersects(win):
-                by_code.setdefault(code, []).append(g.buffer(-1.0))
-        for code, geoms in by_code.items():
-            m = _burn([(g, 1) for g in geoms if not g.is_empty], transform, shape_hw).astype(bool)
-            ty = NS_CODE_TO_TYPE[code]
-            wgt = 0.5 if code in LOW_WEIGHT_CODES else 1.0
-            if code in _CADASTRE_WIDE:
-                # inside OSM zone the OSM label already won; remainder = verge/riparian
-                _paint(label, source, weight, m & ~osm_zone, _CADASTRE_WIDE[code], "cadastre_verge", 0.7)
-            else:
-                _paint(label, source, weight, m, ty, "cadastre", wgt)
-
         # --- physical vetoes ---
         if ndsm is not None:
             for ty, mx in MAX_H.items():

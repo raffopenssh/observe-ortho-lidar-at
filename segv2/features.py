@@ -39,8 +39,9 @@ from terrain_analysis import compute_tri, compute_tpi, compute_curvature  # noqa
 log = logging.getLogger("segv2.features")
 
 V2_EXTRA_KEYS = [
-    # distances (m) to OSM / cadastre context — labels use *geometry* not distance,
-    # so no circularity
+    # distances (m) to OSM / building context — labels use *geometry* not distance,
+    # so no circularity.  dist_parcel_edge: no parcel layer in the public
+    # release → always the 500 m cap (nullable feature, kept for model compat)
     "dist_road", "dist_path", "dist_rail", "dist_water", "dist_building", "dist_parcel_edge",
     # neighbourhood (adjacent segments, area weighted)
     "nb_h_mean", "nb_ndvi_mean", "nb_h_diff", "nb_ndvi_diff", "nb_n",
@@ -376,7 +377,7 @@ def extract(labels: np.ndarray, L: dict, *, context: dict | None = None,
     """Feature table for every segment in ``labels``.
 
     ``context`` (optional): dict of bool rasters {'road','path','rail','water',
-    'building','parcel_edge'} for distance features.
+    'building','parcel_edge'} for distance features (None/missing → 500 m cap).
     """
     mask = L["mask"]
     G = Grouped(labels, mask)

@@ -2,9 +2,9 @@
 
 For each KG code (plain or split block):
   1. fetch + audit the Zenodo *full* GPKG (parallel range download)
-  2. fetch vector truth (cadastre footprints/landuse/parcels, OSM, INVEKOS)
-  3. KG mask = union of cadastre parcels (rasterised) — every step is masked
-     to it and tiles with < 2 % KG coverage are skipped
+  2. fetch vector truth (OSM, INVEKOS; optional in-RAM building footprints)
+  3. KG mask = valid-data mask of the full GPKG — tiles with < 2 % coverage
+     are skipped
   4. per 1500 px tile: pixel layers → v1-parameter segmentation → vectorised
      features → label raster → per-segment label (mode) + purity + source
   5. write ``data/segv2/dataset/<code>.parquet`` (+ ``.meta.json``), delete GPKG
@@ -62,14 +62,13 @@ def _context_rasters(ctx: L2.LabelContext, transform, shape_hw) -> dict:
             return np.zeros(shape_hw, bool)
         return rfeatures.rasterize([(g, 1) for g in geoms], out_shape=shape_hw, transform=transform,
                                    fill=0, dtype=np.uint8).astype(bool)
-    edges = [g.boundary for g in ctx.cad["parcels"]]
     return {
         "road": burn([g for g, _ in ctx.osm["road"] if L2.OSM_ROAD.get(_, ("road",))[0] == "road"]),
         "path": burn([g for g, _ in ctx.osm["road"] if L2.OSM_ROAD.get(_, ("road",))[0] == "path"]),
         "rail": burn([g for g, _ in ctx.osm["rail"]]),
         "water": burn(ctx.water_polys),
-        "building": burn(ctx.cad["footprints"]),
-        "parcel_edge": burn(edges),
+        "building": burn(ctx.footprints),
+        "parcel_edge": np.zeros(shape_hw, bool),   # no parcel layer in the public release → dist cap
     }
 
 
@@ -104,15 +103,11 @@ def build_kg(code: str, *, keep_gpkg=False, v2_edges=False, cop_cache=None, obs_
         fy = ACQ.dsm_flight_year((b.left, b.bottom, b.right, b.top))
         meta["invekos_nearest_to"] = fy
         ctx = L2.LabelContext(parent, (b.left, b.bottom, b.right, b.top), flight_year=fy)
-        if not ctx.cad["parcels"]:
-            meta["error"] = "no_parcels"
-            return meta
-        kg_mask_full = rfeatures.rasterize([(p, 1) for p in ctx.cad["parcels"]], out_shape=g.shape,
-                                           transform=g.transform, fill=0, dtype=np.uint8).astype(bool)
+        kg_mask_full = g.valid_mask()
         meta["kg_cover_frac"] = round(float(kg_mask_full.mean()), 3)
         # --- metadata gate: real NIR + resolvable flight blocks, else skip loudly ---
         import acquisition as ACQ
-        acq = ACQ.audit_kg((b.left, b.bottom, b.right, b.top), mask_geoms=ctx.cad["parcels"])
+        acq = ACQ.audit_kg((b.left, b.bottom, b.right, b.top))
         meta["acquisition"] = acq
         meta["nir_years"] = g.nir_years()
         meta["ortho_years"] = g.ortho_years()
@@ -321,7 +316,7 @@ def main():
             gc.collect()
             with open(OUT_DIR.parent / "build_log.jsonl", "a") as f:
                 f.write(json.dumps(meta) + "\n")
-            if meta.get("error") and meta["error"] not in ("no_parcels", "no_tiles") \
+            if meta.get("error") and meta["error"] not in ("no_tiles",) \
                     and not str(meta["error"]).startswith("gpkg_gone"):
                 failed.append(code)
         if not failed:

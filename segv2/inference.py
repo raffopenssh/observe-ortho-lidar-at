@@ -10,11 +10,13 @@ feature distribution at inference matches training:
   resampled Copernicus, ``dtm_dates/dsm_dates`` (keys ``'20220915'`` → 2022),
   Hansen prior.  Real flight years come from ``acquisition`` (never mosaic
   labels).  ``harmonics=None`` always (dropped from the v2 contract).
-* :class:`Context` — OSM (road/path/rail/water), cadastre footprints + parcel
-  edges, INVEKOS Schläge for one bbox; ``.rasters()`` gives the ``dist_*``
-  context rasters + an INVEKOS polygon-index raster + OSM hard edges.  The
-  processor passes its already-fetched parcels/footprints; the app path
-  fetches them via the cadastre fast paths (``/spatial/parcels|footprints``).
+* :class:`Context` — OSM (road/path/rail/water), optional in-RAM building
+  footprints, INVEKOS Schläge for one bbox; ``.rasters()`` gives the
+  ``dist_*`` context rasters + an INVEKOS polygon-index raster + OSM hard
+  edges.  Footprints only come from the caller (processor building context,
+  ``config.BEV_VECTOR_CONTEXT``); there is no parcel layer in the public
+  release, so ``dist_parcel_edge`` is always its 500 m cap (the model treats
+  it as "far" — a documented degradation).
 * :func:`classify` — ``ModelV2.predict`` + the INVEKOS post-hoc override
   (INVEKOS *was* the label source, so where a segment sits ≥ 70 %% inside one
   Schlag of an agri/veg type and the physical height veto holds, the Schlag
@@ -219,41 +221,15 @@ def layers_from_arrays(dtm, dsm, mask, transform, *, spectral=None, cop=None,
 # ---------------------------------------------------------------------------
 # 2. vector context for one bbox
 # ---------------------------------------------------------------------------
-def _fetch_fast(path: str, bbox_wgs, key: str, limit=20000) -> list | None:
-    """Cadastre viewport fast path → [geom3035]; None on failure/truncation."""
-    w, s, e, n = bbox_wgs
-    for attempt in range(3):
-        d = L2._get_json(f"{L2.CADASTRE_BASE}/spatial/{path}",
-                         {"west": w, "south": s, "east": e, "north": n, "limit": limit},
-                         timeout=60, retries=1)
-        if not d or d.get("truncated"):
-            return None
-        if d.get("ready", True):
-            out = []
-            for f in d.get(key, []):
-                g = f.get("geometry")
-                if g:
-                    try:
-                        gg = shape(g)
-                        if not gg.is_empty:
-                            out.append(shp_transform(_T_4326_3035.transform, gg))
-                    except Exception:  # noqa: BLE001
-                        pass
-            return out
-        time.sleep(1.5 * (attempt + 1))
-    return None
-
-
 class Context:
-    """OSM + cadastre + INVEKOS vectors for one AOI (EPSG:3035).
+    """OSM + optional building footprints + INVEKOS vectors for one AOI (EPSG:3035).
 
-    ``parcels`` / ``footprints``: shapely EPSG:3035 geometries when the caller
-    already has them (processor ``cadastre_data``); otherwise fetched via the
-    cadastre ``/spatial/*`` fast paths.  ``flight_year`` picks the INVEKOS
-    release nearest the LiDAR flight (``acquisition.dsm_flight_year``).
+    ``footprints``: shapely EPSG:3035 geometries from the caller (in-RAM
+    building context) or none.  ``flight_year`` picks the INVEKOS release
+    nearest the LiDAR flight (``acquisition.dsm_flight_year``).
     """
 
-    def __init__(self, bbox_3035, *, flight_year: int | None = None, parcels=None,
+    def __init__(self, bbox_3035, *, flight_year: int | None = None,
                  footprints=None, invekos: bool = True, osm: bool = True,
                  strict: bool = False):
         t0 = time.time()
@@ -265,9 +241,8 @@ class Context:
             except Exception:  # noqa: BLE001
                 flight_year = None
         self.flight_year = flight_year
-        self.parcels = list(parcels) if parcels is not None else (_fetch_fast("parcels", self.bbox_wgs, "parcels") or [])
-        self.footprints = list(footprints) if footprints is not None else (_fetch_fast("footprints", self.bbox_wgs, "footprints") or [])
-        # strict: raise labels.UpstreamUnavailable when umfeld is down instead
+        self.footprints = list(footprints or [])
+        # strict: raise labels.UpstreamUnavailable when the OSM service is down instead
         # of degrading to an empty OSM context (processor defers the KG)
         self.osm = L2.fetch_osm(self.bbox_wgs, strict=strict) if osm else {"road": [], "rail": [], "water_line": [], "water_area": []}
         self.inv: list[tuple] = []
@@ -280,8 +255,8 @@ class Context:
                 self.inv = L2.fetch_invekos(self.bbox_3035, nearest_to=flight_year)
         self.water_polys = [g for g, _ in self.osm["water_area"]] + \
             [g.buffer(L2.OSM_WATER_LINE.get(fc, 1.5), cap_style=2) for g, fc in self.osm["water_line"]]
-        log.info("context: %d parcels, %d footprints, osm %d road/%d rail/%d water, invekos %d (yr %s, flight %s) in %.1fs",
-                 len(self.parcels), len(self.footprints), len(self.osm["road"]), len(self.osm["rail"]),
+        log.info("context: %d footprints, osm %d road/%d rail/%d water, invekos %d (yr %s, flight %s) in %.1fs",
+                 len(self.footprints), len(self.osm["road"]), len(self.osm["rail"]),
                  len(self.water_polys), len(self.inv), self.inv_year, flight_year, time.time() - t0)
 
     # --- rasters -----------------------------------------------------------------
@@ -305,7 +280,7 @@ class Context:
             "rail": self._burn(rails, transform, shape_hw),
             "water": self._burn(self.water_polys, transform, shape_hw),
             "building": self._burn(self.footprints, transform, shape_hw),
-            "parcel_edge": self._burn([g.boundary for g in self.parcels], transform, shape_hw),
+            "parcel_edge": None,   # no parcel layer → features.extract uses the 500 m cap
         }
         # INVEKOS polygon index (1-based; 0 = none). Shrunk 1 m like the label pass.
         inv_idx = np.zeros(shape_hw, np.int32)
@@ -415,7 +390,7 @@ def classify(df: pd.DataFrame, *, model=None, invekos_override: bool = True) -> 
 def run(labels: np.ndarray, dtm, dsm, mask, transform, *, spectral=None, cop=None,
         dtm_dates=None, dsm_dates=None, hansen=None, obs_year: int = 2024,
         ortho_year: int | None = None, context: Context | None = None,
-        parcels=None, footprints=None, model=None, texture: bool = True) -> pd.DataFrame | None:
+        footprints=None, model=None, texture: bool = True) -> pd.DataFrame | None:
     """Features + classification for an existing segmentation ``labels``.
 
     Returns the feature DataFrame (one row per segment, ``label`` column) with
@@ -430,7 +405,7 @@ def run(labels: np.ndarray, dtm, dsm, mask, transform, *, spectral=None, cop=Non
         return None
     shp = L["mask"].shape
     if context is None:
-        context = Context(_bounds(transform, shp), parcels=parcels, footprints=footprints)
+        context = Context(_bounds(transform, shp), footprints=footprints)
     R = context.rasters(transform, shp)
     df = F2.extract(labels, L, context=R["context"], obs_year=obs_year, texture=texture)
     if df.empty:

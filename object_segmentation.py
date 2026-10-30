@@ -8,10 +8,10 @@ Philosophy: segment first, classify per-object.
   4. Per-object feature vector computed ONCE per segment (fast!)
   5. Decision-tree classification with clear rules
   6. Hierarchical grouping: tree→forest, roof→building, etc.
-  7. Cadastre calibration for building thresholds
+  7. Building-context calibration for building thresholds (in-RAM BEV footprints, optional)
 
 References:
-  - Copernicus Parcel Delineation: Sobel → Felzenszwalb → RAG merge
+  - Copernicus field-delineation pipeline: Sobel → Felzenszwalb → RAG merge
   - JRC NRT: EWMA/CuSum harmonic monitoring on per-segment time series
   - EuroSAT: 10-class Sentinel-2 LULC benchmark (Helber et al. 2019)
   - See docs/reference_algorithms_summary.md for full detail
@@ -38,7 +38,7 @@ log = logging.getLogger(__name__)
 
 # === SECTION: Object types (25 types + 11 groups) ===
 # Detection basis: DTM/DSM 1m, RGBI 0.2m, Sentinel-2 NDVI, ESA WorldCover.
-# Cadastre code references in comments for cross-validation.
+# BEV land-use (NS) code references in comments for cross-validation.
 OBJECT_TYPES = {
     # ---- Vegetation (NDVI + height + roughness) ----
     "tree": 1,           # nDSM>4m, rough DSM, high NDVI           [W 56]
@@ -47,7 +47,7 @@ OBJECT_TYPES = {
     "hedge": 4,          # elongated shrub (length/width>4)        [linear veg]
     # ---- Water (very low NDVI + low NIR + flat) ----
     "water": 5,          # ESA water class, very low NDVI+NIR      [GW 70,71,96]
-    "wetland": 6,        # v2 (cadastre NS 61 Feuchtgebiete)        [segv2]
+    "wetland": 6,        # v2 (BEV NS 61 Feuchtgebiete)        [segv2]
     # ---- Infrastructure: buildings (elevated+smooth+low NDVI) ----
     "roof": 10,          # compact elevated, smooth DSM, low NDVI  [B(Geb) 42]
     "greenhouse": 11,    # roof-like but high NIR transmittance     [B(Gwh) 45]
@@ -63,7 +63,7 @@ OBJECT_TYPES = {
     "path": 21,          # narrower road (<3m effective width)      [V(Weg) 74]
     "parking": 22,       # smooth, large, compact, low NDVI        [B(bf) 41]
     "bridge": 23,        # elevated road/path over gap              [Br 75]
-    "rail": 24,          # v2 (OSM rail / cadastre NS 92)           [segv2]
+    "rail": 24,          # v2 (OSM rail / BEV NS 92)           [segv2]
     # ---- Agricultural (ground + NDVI + ESA prior) ----
     "crop": 30,          # flat, seasonal NDVI, ESA cropland        [A 51,62]
     "orchard": 31,       # regular tree spacing, <10m height        [OG 65]
@@ -72,7 +72,7 @@ OBJECT_TYPES = {
     # ---- Terrain (slope + roughness + low NDVI) ----
     "bare_soil": 40,     # low NDVI, flat-moderate slope            [Öd 59,90]
     "rock": 41,          # steep + very rough DTM + low NDVI        [Fe 83,84]
-    "glacier": 42,       # v2 (cadastre NS 88 Gletscher)            [segv2]
+    "glacier": 42,       # v2 (BEV NS 88 Gletscher)            [segv2]
     # ---- Disturbance (DTM temporal change) ----
     "excavation": 50,    # DTM lowered between dates                [Ab 80,93]
     "fill": 51,          # DTM raised between dates                 [Dep 81]
@@ -125,8 +125,8 @@ _COMPAT_MAP = {
     "earthwork": 3,
 }
 
-# Map cadastre land-use codes → our detectable types (for cross-validation)
-CADASTRE_TO_TYPE = {
+# Map BEV land-use (Benützungsart) codes → our detectable types (for cross-validation)
+LANDUSE_CODE_TO_TYPE = {
     40: "garden", 41: "parking", 42: "roof", 43: "roof", 44: "roof",
     45: "greenhouse", 46: "roof", 47: "roof",
     48: "road", 49: "road",
@@ -149,7 +149,7 @@ CADASTRE_TO_TYPE = {
 
 # === SECTION: Type letters (compact single-char type codes) ===
 # Lowercase = natural / vegetated, uppercase = man-made / disturbed.
-# Moved here from parcel_compact.py (Kataster purge, 2026-10-13).
+# Compact single-character type codes (used by the v2 JSON product).
 TYPE_LETTER = {
     'tree': 't', 'shrub': 's', 'grass': 'g', 'hedge': 'h',
     'water': 'w', 'roof': 'R', 'greenhouse': 'G', 'solar_panel': 'P',
@@ -295,7 +295,7 @@ def compute_fused_gradient(
 ) -> np.ndarray:
     """Compute fused edge gradient from all available data layers.
 
-    Uses Sobel on each layer (as per Parcel Delineation pipeline),
+    Uses Sobel on each layer (as per the field-delineation pipeline),
     then weighted sum.  Object boundaries are strong gradient ridges
     in ANY layer.
 
@@ -1777,23 +1777,24 @@ def _resolve_group_name(types: set[str]) -> str:
 
 
 # ===================================================================
-# 6. CADASTRE CALIBRATION
+# 6. BUILDING-CONTEXT CALIBRATION
 # ===================================================================
 
-def calibrate_with_cadastre(
+def calibrate_with_building_mask(
     objects: list[SegmentedObject],
     labels: np.ndarray,
     building_mask: np.ndarray,
     *,
     overlap_threshold: float = 0.3,
 ) -> list[SegmentedObject]:
-    """Refine building classification using cadastre ground truth.
+    """Refine building classification using the in-RAM building context
+    mask (``config.BEV_VECTOR_CONTEXT``; None → no-op).
 
-    High overlap with cadastre but not classified as building → reclassify,
+    High overlap with the mask but not classified as building → reclassify,
     UNLESS the object looks clearly like vegetation (high NDVI + rough DSM).
     Trees commonly overhang building footprints.
 
-    Classified as roof but zero cadastre overlap → lower confidence.
+    Classified as roof but zero mask overlap → lower confidence.
     """
     if building_mask is None or not building_mask.any():
         return objects
@@ -1830,7 +1831,7 @@ def calibrate_with_cadastre(
                 obj.type_code = OBJECT_TYPES["roof"]
                 obj.is_manmade = True
                 obj.confidence = max(obj.confidence, 0.7)
-            # else: canopy overhanging cadastre footprint → leave as-is
+            # else: canopy overhanging a footprint → leave as-is
 
         elif precision < 0.05:
             if obj.obj_type == "roof" and obj.confidence < 0.7:
@@ -1843,14 +1844,14 @@ def calibrate_with_cadastre(
 # 7. EVALUATION
 # ===================================================================
 
-def evaluate_against_cadastre(
+def evaluate_against_building_mask(
     objects: list[SegmentedObject],
     labels: np.ndarray,
     building_mask: np.ndarray,
 ) -> dict:
-    """Precision/recall/F1 for building detection vs cadastre."""
+    """Precision/recall/F1 for building detection vs the building context mask."""
     if building_mask is None or not building_mask.any():
-        return {"error": "no_cadastre_data"}
+        return {"error": "no_building_context"}
 
     h, w = labels.shape
     pred = np.zeros((h, w), dtype=bool)
@@ -1905,7 +1906,6 @@ def segment_and_classify(
     mark_uncertain: bool = False,
     model: str | None = None,
     v2_context=None,
-    parcels=None,
     footprints=None,
 ) -> dict:
     """Full pipeline: gradient → Felzenszwalb → RAG merge → features → classify → group.
@@ -1914,8 +1914,9 @@ def segment_and_classify(
     the same segments; falls back to v1 when the v2 model is unavailable).
     Default from ``SEG_MODEL_VERSION`` env.  In v2 mode ``v2_context``
     (``segv2.inference.Context``, shareable across tiles of one KG) or
-    ``parcels``/``footprints`` (shapely EPSG:3035) feed the OSM/cadastre/
-    INVEKOS context features; without them the context is fetched per tile.
+    ``footprints`` (shapely EPSG:3035, in-RAM building context) feed the
+    OSM/building context features; without them the context is fetched
+    per tile (OSM only).
 
     If features_only=True, return after feature extraction (Steps 1-3b),
     skipping classification/calibration/grouping.  Used by RF training.
@@ -1933,7 +1934,7 @@ def segment_and_classify(
     dtm_dates, dsm_dates : {date: array} for temporal analysis
     spectral : {ndvi, brightness, nir, red, green, blue} from ortho
     copernicus : {ndvi, landcover, ...} from Sentinel-2
-    building_footprints : bool mask from cadastre
+    building_footprints : bool mask of the in-RAM building context (None when off)
     min_object_size : Felzenszwalb min_size (pixels = m² at 1m)
     felz_scale : Felzenszwalb scale (higher = fewer segments)
     rag_threshold : RAG merge threshold (lower = less merging)
@@ -2030,7 +2031,7 @@ def segment_and_classify(
             _v2_model_hash = _m2.model_hash
             _ctx = v2_context
             if _ctx is None:
-                _ctx = _v2inf.Context(_v2inf._bounds(transform, (h, w)), parcels=parcels, footprints=footprints)
+                _ctx = _v2inf.Context(_v2inf._bounds(transform, (h, w)), footprints=footprints)
             df2 = _v2inf.run(labels, dtm, dsm, mask, transform, spectral=spectral, cop=cop_resampled,
                              dtm_dates=dtm_dates, dsm_dates=dsm_dates, hansen=hansen,
                              obs_year=int(observation_year or 2024), ortho_year=ortho_year,
@@ -2256,10 +2257,10 @@ def segment_and_classify(
     if n_ndvi_override > 0:
         log.info("Step 4b: NDVI override reclassified %d path/road → grass", n_ndvi_override)
 
-    # --- Step 5: Cadastre calibration ---
+    # --- Step 5: Building-context calibration ---
     if building_footprints is not None:
-        log.info("Step 5: Cadastre calibration")
-        objects = calibrate_with_cadastre(objects, labels, building_footprints)
+        log.info("Step 5: Building-context calibration")
+        objects = calibrate_with_building_mask(objects, labels, building_footprints)
 
     # --- Step 6: Hierarchical grouping ---
     log.info("Step 6: Hierarchical grouping")
@@ -2270,13 +2271,13 @@ def segment_and_classify(
     # --- Evaluation ---
     evaluation = None
     if building_footprints is not None:
-        evaluation = evaluate_against_cadastre(objects, labels, building_footprints)
+        evaluation = evaluate_against_building_mask(objects, labels, building_footprints)
         if "precision" in evaluation:
-            log.info("Cadastre eval: P=%.3f R=%.3f F1=%.3f IoU=%.3f",
+            log.info("Building-context eval: P=%.3f R=%.3f F1=%.3f IoU=%.3f",
                      evaluation["precision"], evaluation["recall"],
                      evaluation["f1"], evaluation["iou"])
         else:
-            log.info("Cadastre eval: skipped (%s)", evaluation.get("error", "no data"))
+            log.info("Building-context eval: skipped (%s)", evaluation.get("error", "no data"))
 
     stats = _compute_stats(objects)
     stats["model"] = "v2" if v2_results else "v1"
