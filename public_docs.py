@@ -152,6 +152,15 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
     "n-r<res>-<gen>-<fields>", X-Cells-Gen (key your copy on it; rebuilt only when the corpus changed),
     X-Cells-Epoch, X-Cells-Built, Cache-Control max-age 86400. format=json (or meta=1) → build meta {gen, epoch,
     built_at, rows, bytes_gz}. 404 + Retry-After until the first build. Fetch once per generation, never per tile.
+    DAILY UPDATE LOGIC: the table is rebuilt once a day at 10:00 Europe/Vienna (~15 min), and only when the
+    cells corpus changed since the last build (gen = hash of the product set); unchanged corpus ⇒ same gen,
+    same ETag ⇒ 304. New observations keep arriving while the fleet processes KGs, so expect a new gen most
+    days until the run completes, then rarely. Client schedule that is FINE: once a day after ~11:00 CET
+    GET ?format=json (≈1 KB), compare gen with your copy, and only on change GET the table with your
+    fields= list (~20 MB gz for 5 fields at res 9; always send If-None-Match + Accept-Encoding: gzip).
+    NOT fine: polling the table itself (no fields= ⇒ all 33 fields ≈ 65 MB gz), fetching more than once per
+    gen, many distinct fields= combinations (each one is a server-side slice cached per gen; pick one list
+    and keep it), or deriving the overview from per-bin / per-bbox cells calls instead of this table.
   format=h3b      H3B1 container: magic | ver u8 | hdr_len u32 | header JSON | zlib chunks of
     shuffle(NEO1)|shuffle(NET1)|shuffle(NEB1) per res-10 cell (header.chunks[] has off/len/cells/trees/bld).
     The whole-KG file is the public product download (CC BY 4.0, attribution in the header).
