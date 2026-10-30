@@ -2,8 +2,8 @@
 Description=daily cells_national build (skips when the corpus generation is unchanged)
 
 [Timer]
-OnCalendar=*-*-* 03:40:00 UTC
-RandomizedDelaySec=20m
+OnCalendar=*-*-* 10:00:00 Europe/Vienna
+RandomizedDelaySec=10m
 Persistent=true
 
 [Install]

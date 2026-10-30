@@ -481,7 +481,7 @@ per generation** (~20 MB gz), never per tile.
   (`parent_ids`, verified against `h3.cell_to_parent`).
 * **Build**: `python3 cells_national.py --build` — ~10 min / ~1 GB over
   5.4 M chunks → `data/ne/national/r9.nex.gz`, `r8.nex.gz`, `meta.json`.
-  `cells-national.timer` (primary only, 03:40 UTC daily, installed by
+  `cells-national.timer` (primary only, 10:00 Europe/Vienna daily, installed by
   `deploy.sh` when `is_director` exists) — skipped when
   `gen = sha(ALGO | green_fix | cells_generation())` is unchanged. **Never
   build inside gunicorn.**
