@@ -380,7 +380,7 @@ textarea{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font
       <div id="area-hint" style="display:none;width:100%;font-size:11px;color:#b87700;background:#fff8e1;padding:5px 8px;border-radius:4px"></div>
     </div>
   </div>
-  <div class="status" id="status"><span id="status-text">Idle</span><span id="spinner" class="spinner" style="display:none"></span><span id="proc-status" style="margin-left:auto;font-size:10px;opacity:0.8"></span><span id="train-status" style="font-size:10px;opacity:0.8;margin-left:8px"></span><span class="doc-links"><!--/*PRIVATE*/--><a href="/process.html" title="Austria Landscape Processor">process</a><a href="/query.html" title="Query Explorer">query</a><a href="/training.html" title="RF Training Monitor">training</a><a href="/docs" title="API Documentation">docs</a><!--/*/PRIVATE*/--><a href="/api/v1/docs/llm.txt" title="Machine-readable API reference">llm.txt</a></span></div>
+  <div class="status" id="status"><span id="status-text">Idle</span><span id="spinner" class="spinner" style="display:none"></span><span id="proc-status" style="margin-left:auto;font-size:10px;opacity:0.8"></span><span class="doc-links"><!--/*PRIVATE*/--><a href="/process.html" title="Austria Landscape Processor">process</a><a href="/query.html" title="Query Explorer">query</a><a href="/docs" title="API Documentation">docs</a><!--/*/PRIVATE*/--><a href="/api/v1/docs/llm.txt" title="Machine-readable API reference">llm.txt</a></span></div>
   <div class="sidebar-collapse-bar" id="sidebar-collapse-bar"><span class="collapse-arrow">▲</span></div>
 </div>
 
@@ -1306,50 +1306,6 @@ function showFullscreenLoading(msg,sub){const o=document.getElementById('loading
 function hideFullscreenLoading(){document.getElementById('loading-overlay').classList.remove('show');}
 
 // ============ TRAINING STATUS ============
-/*PRIVATE*/(function pollTrainingStatus(){
-  const el=document.getElementById('train-status');
-  async function update(){
-    try{
-      const r=await fetch('/api/v1/training/status');
-      const d=await r.json();
-      const svc=d.service_state||'';
-      const modelStr=d.model?`OOB=${d.model.oob_score}, ${d.model.n_train} samples, ${d.model.n_kgs} KGs (${d.model.trained_at})`:'no model yet';
-      const nDone=d.n_checkpoints||0;
-      const nFail=d.n_failed_kgs||0;
-      const failPart=nFail>0?`; ${nFail} fail`:'';
-      const toNext=d.to_next_model;
-      const cpPart=(typeof toNext==='number'&&toNext>0)?`; ${toNext} more to model cp ${d.next_model_checkpoint}`:'';
-      const progressStr=`${nDone}/${d.current_kg?d.current_kg.total:'4000'}${failPart}${cpPart}`;
-      if(d.credits_paused){
-        const kg=d.current_kg?` KG ${d.current_kg.kg_code}`:'';  
-        el.innerHTML=`🟠 RF training PAUSED — Copernicus credits exhausted${kg} · ${modelStr}`;
-        el.style.color='#d80';
-      } else if(d.running){  
-        const kg=d.current_kg?` KG ${d.current_kg.kg_code} (${d.current_kg.kg_name})`:'';
-        const step=d.current_step?` · ${d.current_step}`:'';
-        const res=d.ram_mb?` · ${d.ram_mb}MB`:'';
-        el.innerHTML=`🟢 RF training: ${progressStr}${kg}${step}${res} · ${modelStr}`;
-        el.style.color='#2a7';
-      } else if(svc==='activating'){
-        el.innerHTML=`🟡 RF training restarting...${failStr} · ${modelStr}`;
-        el.style.color='#b90';
-      } else if(d.n_checkpoints>0){
-        const ckpt=` ${progressStr}`;
-        const stopped=(svc==='failed'||svc==='inactive')?` (${svc})`:''; 
-        el.innerHTML=`🔴 RF training stopped${stopped} ·${ckpt}${failStr} · ${modelStr}`;
-        el.style.color='#c44';
-      } else if(d.model){
-        el.innerHTML=`⚪ RF model: ${modelStr}`;
-        el.style.color='#888';
-      } else {
-        el.textContent='⚪ No RF model';
-        el.style.color='#888';
-      }
-    }catch(e){/* keep previous display on transient fetch error */}
-  }
-  update();
-  setInterval(update,10000);
-})();/*/PRIVATE*/
 
 // ============ PROCESSOR STATUS ============
 /*PRIVATE*/(function pollProcessorStatus(){
