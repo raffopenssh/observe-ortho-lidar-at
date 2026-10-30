@@ -6270,6 +6270,12 @@ def _kg_coverage_complete(code, mentries, after_ts=None, json_dir=None):
         e = mentries.get(c + '_json')
         if not isinstance(e, dict) or 'error' in (e.get('status', '') or ''):
             return None
+        # status=removed records (stale_blocks / legacy clean-up keep the
+        # record with size 0 so the removal propagates) are NOT coverage:
+        # counting them let the oracle call 56404 complete on its retired
+        # unsplit product alone (2026-10-30).
+        if str(e.get('status') or '') == 'removed' or not int(e.get('size') or 0):
+            return None
         return e.get('uploaded_at') or ''  # '' = committed but timestamp-less
 
     if _isb(code):
