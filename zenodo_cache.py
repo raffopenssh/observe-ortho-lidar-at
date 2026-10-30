@@ -159,9 +159,10 @@ ZENODO_BASE_URL = "https://zenodo.org"
 
 
 def _zenodo_token() -> str:
-    """Leased from the primary (fleet_secrets); never a literal here."""
-    import fleet_secrets
-    return fleet_secrets.token("zenodo", required=True)
+    """``config.zenodo_token()`` (``ZENODO_TOKEN`` in .env / secrets dir);
+    empty string when none is configured (public reads still work)."""
+    import config as _config
+    return _config.zenodo_token(required=False) or ""
 
 # Local cache dirs (must match tile_cache.py)
 COP_CACHE_DIR = DATA_DIR / "copernicus_tiles"
@@ -1493,7 +1494,8 @@ class ZenodoCache:
         Non-retryable status codes (4xx other than 429) raise immediately.
         """
         url = f"{self.base_url}{path}"
-        kwargs.setdefault("params", {})["access_token"] = self.token
+        if self.token:
+            kwargs.setdefault("params", {})["access_token"] = self.token
         kwargs.setdefault("timeout", 60)
         last_exc: Optional[Exception] = None
         max_attempts = 7
@@ -1646,7 +1648,7 @@ class ZenodoCache:
                     resp = self._session.put(
                         f"{bucket_url}/{filename}",
                         data=fh,
-                        params={"access_token": self.token},
+                        params={"access_token": self.token} if self.token else None,
                         timeout=600,
                     )
                 last_status = resp.status_code
@@ -1857,7 +1859,7 @@ class ZenodoCache:
         """Return a session with the access_token as a default query param."""
         s = requests.Session()
         s.headers["User-Agent"] = "observe-ortho-lidar-at/1.0 (+https://github.com/raffopenssh/observe-ortho-lidar-at)"
-        s.params = {"access_token": self.token}  # type: ignore[assignment]
+        s.params = {"access_token": self.token} if self.token else {}  # type: ignore[assignment]
         return s
 
     # --- Upload ---

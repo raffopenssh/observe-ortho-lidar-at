@@ -59,8 +59,15 @@ MODEL_ZENODO = {
 
 
 def _zenodo_token() -> str:
-    import fleet_secrets  # leased from the primary, memory-only
-    return fleet_secrets.token("zenodo", required=True)
+    """``config.zenodo_token()``; the model draft on Zenodo is owner-only, so
+    without a token ``ensure_model`` raises instead of downloading — ship
+    the model via ``tools/fetch_models.py`` / ``make fetch-models`` instead."""
+    import config as _config
+    tok = _config.zenodo_token(required=False) or ""
+    if not tok:
+        raise RuntimeError("segv2 model not present locally and no ZENODO_TOKEN configured "
+                           "(run `make fetch-models` or place model_G.joblib under data/segv2/models/)")
+    return tok
 _dl_lock = threading.Lock()
 
 
