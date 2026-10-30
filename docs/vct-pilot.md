@@ -61,7 +61,7 @@ Both run from `app._ensure_v2_deps` at web-service start.
 `vct_pilot.build_declared(kg, bbox, context=…)` fetches the cells, builds
 NEC1 with `ne_cells` (`ne-cells-2`, source `bevdirect@<tag>`, epoch =
 current month) and keeps it under `data/ne/<kg>.nec` (reused < 48 h by
-sibling blocks: the helper then runs `--cadastre-only` and only streams
+sibling blocks: the helper then runs in context-only mode (`fetch_context_only`) and only streams
 the footprints over the pipe). Above `VCT_TILE_CELLS` (300 000) estimated
 cells the global input domain is cut into an nx×ny grid of padded cores
 (`ne_build_tiled.build_cells_tiled`, 0.006° pad, "homed" cells only) —
