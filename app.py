@@ -1870,6 +1870,30 @@ def _drop_tombstone_keys(keys, record: bool = True) -> int:
     return removed
 
 
+def _manifest_entry_newer(cur, entry) -> bool:
+    """Timestamp-aware manifest merge rule shared by ``/manifest/push`` and
+    the two peer-sync merges: *entry* replaces *cur* when strictly newer, OR
+    when the stamps are equal and *entry* carries a ``status`` that *cur*
+    lacks.  The 2.4 writers save the record once from ``upload_stream``
+    (no status) and again a moment later with ``status=cf``
+    (``_mark_cadastre_free``) under the SAME ``uploaded_at``; a peer-sync
+    GET landing in that window pinned the flag-less copy on the primary
+    for good (41 ``legacy: suspect`` files on clean v2.4 uploads,
+    2026-10-30)."""
+    if not isinstance(entry, dict):
+        return False
+    new_ts = entry.get('uploaded_at') or ''
+    if not isinstance(cur, dict):
+        return bool(new_ts)
+    cur_ts = cur.get('uploaded_at') or ''
+    if not new_ts:
+        return False
+    if new_ts > cur_ts:
+        return True
+    return (new_ts == cur_ts and bool(entry.get('status'))
+            and not cur.get('status'))
+
+
 def _reload_tombstones_from_disk() -> None:
     """Union on-disk tombstones into the in-memory ``_MANIFEST_TOMBSTONES``.
 
@@ -2334,9 +2358,7 @@ def _sync_peer_data():
                             added += 1
                             continue
                         # Overwrite when peer entry is strictly newer.
-                        cur_ts = (cur.get('uploaded_at') or '') if isinstance(cur, dict) else ''
-                        new_ts = entry.get('uploaded_at') or ''
-                        if new_ts and new_ts > cur_ts:
+                        if _manifest_entry_newer(cur, entry):
                             local_manifest[key] = entry
                             updated += 1
 
@@ -7596,7 +7618,7 @@ def api_manifest_push():
             local = md.get('entries', md)
         cur = local.get(key)
         cur_ts = (cur.get('uploaded_at') or '') if isinstance(cur, dict) else ''
-        if cur is not None and (not new_ts or new_ts <= cur_ts):
+        if cur is not None and not _manifest_entry_newer(cur, entry):
             return jsonify({'noop': 'not_newer', 'cur_ts': cur_ts, 'new_ts': new_ts})
         local[key] = entry
         import tempfile as _tf
@@ -7696,8 +7718,7 @@ def api_manifest_reconcile():
         if cur is None:
             local[key] = entry; added += 1
             continue
-        cur_ts = (cur.get('uploaded_at') or '') if isinstance(cur, dict) else ''
-        if new_ts and new_ts > cur_ts:
+        if _manifest_entry_newer(cur, entry):
             local[key] = entry; updated += 1
 
     if added or updated:
