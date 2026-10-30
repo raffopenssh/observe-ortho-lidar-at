@@ -169,3 +169,43 @@ circuit before the limiter, as documented ("cached/empty tiles are not counted")
 Forbidden-string scan of every body (the five patterns from the spec: parcel / cadastre / `/k/` / token / the private fleet domain): only `Tokenless` / "admin token" / "no token"
 in the docs text and the attribution id `bev_cadastre` in `/api/v1/license` (an attribution record, intended).
 
+## 5. Processor — FIXED (see 5c)
+
+### 5a. Small KG: `--kg 12115` (Landersdorf, NÖ; 2 tiles, 0.66 km²) — PASS
+
+```
+set -a; . ./.env; set +a
+/tmp/rt-venv/bin/python3 austria_processor.py --kg 12115 --no-upload      # EXIT=0, 0.6 h wall
+```
+(The task text says `--single`; the CLI flag is `--kg`, as README and `docs/austria-processor.md` document.)
+
+Timeline (log `/tmp/rt-logs/proc-12115.log`): BEV DTM/DSM/ortho reads immediate; Copernicus credential rotation
+`1/107 → 70/107` then authenticated; per 0.1° cell: NDVI composite ~3 min, WorldCover 15 s, SAR 1.5 min, 8 monthly
+NDVI scenes ~80 s each (sequential, single credential), harmonics fit; Hansen tile; then per tile Felzenszwalb+RAG
+segmentation (10.8 k segments / tile) and per-object feature extraction ~9 min per tile; products written 17:13.
+No Copernicus 402/throttle during this run; one transient `[502] Bad Gateway` retried.
+
+Products under `/tmp/rt-out/12115/` (v2.4 set, NE cells absent → `-partial` as predicted):
+
+| File | Size | Check |
+|------|------|-------|
+| `12115_full.gpkg` | 390 MB | `integrity_check` ok, `foreign_key_check` empty, `application_id` 0x47504B47; 22 layers (DTM/DSM/nDSM + 2022/2023 dates, NDVI, SAR_VV/VH, WorldCover, Hansen ×2, Ortho 2020/2023/2024, CIR 2020/2023, segments EPSG:3035 **57 columns = fid+geom+55 props**, segment_points EPSG:4326 **56 = fid+geom+54 props**, segment_type, segment_height) |
+| `12115_light_v2.gpkg` | 188 MB | integrity ok, application_id ok; layers `segments`, `segment_points`, `segment_type`, `segment_height`, `infrastructure`, `tree_apices`, `tree_crowns`, `terrain_coarse_{dtm,dsm,ndsm,slope,aspect}` (no footprint-shaped layers) |
+| `12115_v2.json.gz` | 60 KB | `version: 2.4`, keys version/kg_code/…/landscape; `v2verify: PASS 46/49 checks` (warnings: `segments_layer_drift` 2.1 % objects without polygon, `segment_points_count`, `ne_cells: no NE product`) |
+| `12115.json` | 315 KB | legacy JSON, quality 93 % grade A, `missing=building_context,infrastructure` |
+
+Observations (not fixed): `segments` holds 170 608 multipolygon parts for 19 903 distinct ids (one id alone has
+10 485 parts — the vectorised label raster is very fragmented for large ground segments); `v2_verify` documents the
+one-row-per-connected-part layout and tolerates the 2 % id drift. Peak child RSS 1.1 GB, parent 150 MB; the host
+(8 GB, two instances + a production pair) went down to 60 MB free during feature extraction.
+
+### 5c. Bug: outbound Zenodo calls with `--no-upload` — FIXED (`31f3752`)
+
+At KG end the log showed `zenodo_tiles: tile store: shard … unavailable: 400/403 … zenodo.org/api/deposit/depositions`
+(×16), `chkpt_registry: delete chkpt_12115.tar.gz skipped: 403` and `Zenodo cache flush failed: 400`, i.e. the
+tile-cache flush and the checkpoint registry still contacted Zenodo although uploads were disabled. Causes:
+`flush_tile_cache_to_zenodo()` and `tile_checkpoint_registry._get_cache()` never consulted the upload switch, and
+`config.uploads_enabled()` only knew `SRTM_DRY_RUN` while `--no-upload` sets `SRTM_NO_UPLOAD` (the processor had its
+own private helper). Fix: `config.uploads_enabled()` honours both variables, the processor's `_uploads_enabled()`
+delegates to it, and both call sites return early when uploads are disabled. `make check` green.
+
