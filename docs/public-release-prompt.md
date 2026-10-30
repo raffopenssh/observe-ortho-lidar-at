@@ -20,6 +20,31 @@ touch the live repo or services. Read `AGENTS.md` and `docs/api-tiers.md`,
 only when editing that subsystem.
 
 Hard requirements:
+0. Repo hygiene — only shippable files survive. DELETE: the ~27 root-level
+   analysis/prompt/scratch files (`BATCH_*.md`, `CLASSIFIER_REDESIGN_PATCHES.md`,
+   `CODEBASE_SUMMARY.md`, `DATA_FLOW_SUMMARY.md`, `ENRICHMENT_PIPELINE_ANALYSIS.md`,
+   `EXTRACTED_CODE_SECTIONS.md`, `GAP_ANALYSIS.md`, `IMPLEMENTATION_*.md`,
+   `MAIN_LOOP_ANALYSIS.md`, `QUICK_REFERENCE*`, `README_REVIEW.md`,
+   `REDESIGN_SUMMARY.txt`, `REVIEW_SUMMARY.md`, `TECHNICAL_*.md`,
+   `app_code_extraction.md`, `aspect_addition_plan.md`,
+   `austria_processor_sections.txt`, `bev_operate_check_*.txt`,
+   `conversation-summary-*.md`, `enhanced_queue_design.md`,
+   `national-park-kg-api-calls.md`, `prompt-rf-cleanup.md`); tracked runtime
+   junk under `data/` (`MONITOR.md`, `monitor_state.json`, `next-prompt*.md`,
+   `feedback-system-prompt.md`, `oob_*`, `segv2/*.jsonl|*.log`,
+   `best_model/best.log`) and `calibration_results/` (102 files);
+   `static/insights/`; `docs/` files that describe private ops only
+   (`security-tokens.md`, `api-tiers.md`, `kataster-purge.md`,
+   `v2.4-ne-proposal.md`, `forestry-vm-prompt.md`, `*-handoff.md`,
+   `*-single-peer-check.md`, `public-release-prompt.md`, `FEEDBACK-*-REPLY.md`
+   unless genuinely methodological). KEEP + review: `README.md`, `AGENTS.md`,
+   `llm.txt`, `requirements.txt`, `*.service`/`*.timer` (templated),
+   `kg_bbox_r1.json`, `data/als_acquisition/*.geojson`,
+   `data/best_model/rf_model.joblib.xz` + `rf_meta.json`,
+   `data/segv2/models/*` (check size/licence; >50 MB → fetch from Zenodo at
+   first run instead), remaining `docs/*.md`, `tests/`, `tools/`.
+   Final tree: `git ls-files | wc -l` well under 250, no file > 50 MB,
+   `du -sh` of tracked files < 60 MB.
 1. NO secrets, NO private-tier: delete `api_tiers.py`, `peer_tokens.py`,
    `director_ha.py`, the `/k` reverse proxy in `public_api.py`, the
    `X-Admin-Token`/outbound token hook in `http_pool.py`, all `/k` paths,
@@ -79,11 +104,18 @@ Hard requirements:
    - deps: pin `requirements.txt`, run `pip-audit`; no `debug=True`.
    - add `SECURITY.md` (report channel, scope, threat model: public read API +
      single-VM operator).
-7. Rewrite `AGENTS.md`/`docs/` for the public layout: drop
-   `security-tokens.md`, `api-tiers.md`, `kataster-purge.md`, umfeld sections;
-   remove every live URL/token mention.
+7. Docs clean-up — EVERY surviving `.md`/`.txt`/`.html` (AGENTS.md, llm.txt,
+   README, `docs/*.md`, `segv2/README.md`, `static/docs.html`, docstrings in
+   module headers) is rewritten, not just grepped: remove live URLs, `/k`,
+   tokens, peer ids (`at3`, `at106`…), umfeld/cadastre/parcel/Kataster
+   history, incident dates and "Correction (2026-…)" notes that only make
+   sense with the private fleet; drop sections about HA, admin tokens,
+   owner channel, bandwidth-wall parks for 50 VMs; keep architecture,
+   product spec (v2.4 layout), algorithms, data sources + licences, single-VM
+   ops. AGENTS.md ≤ 150 lines, pointing only at docs that exist.
+   Grep gate (docs): `grep -rniE 'exe\.xyz|/k/|/k\b|token|umfeld|parcel|cadastre|kataster|paxl|@gmail|exedev' --include=*.md --include=*.txt --include=*.html .` → 0 hits except the vtcseamless paragraph in `docs/vct-pilot.md` and licence text in README.
 
 Process: inventory first (`git ls-files`, the grep gates), post the plan as a
-table (file → keep/delete/rewrite), then execute in order 1→7, re-running the
-gates after each step. Report remaining hits you could not remove and why.
+table (file → keep/delete/rewrite), then execute in order 0→7, re-running the
+gates after each step. Report remaining hits you could not remove and why, plus the final `git ls-files` list.
 Do not add features. Commit once at the end.
