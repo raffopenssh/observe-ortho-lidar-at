@@ -1,4 +1,4 @@
-"""Peer Director — Orchestrates processing across multiple exe.dev VMs.
+"""Peer Director — Orchestrates processing across one or more VMs.
 
 Each VM has 100 GB/month bandwidth (resets on the 17th). The director:
 1. Tracks bandwidth usage per peer via vnstat
@@ -23,6 +23,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+
+import config
 
 log = logging.getLogger(__name__)
 
@@ -112,24 +114,27 @@ DATA_DIR = Path('data/austria_processor')
 PEERS_CONFIG = DATA_DIR / 'peers.json'
 DIRECTOR_STATE = DATA_DIR / 'director_state.json'
 
-# Cluster-wide admin token (shared with app.py via data/admin_token).
-# Must be the same on every peer or the director's outbound calls 401.
-_ADMIN_TOKEN_PATH = Path('data/admin_token')
 
 
 def _admin_headers() -> dict:
-    """Return headers for outbound peer admin calls.
+    """Headers for outbound peer control calls: ``X-Operator-Token`` from
+    ``config.operator_token()`` (``SRTM_OPERATOR_TOKEN``, same value on every
+    VM).  Empty in single-VM mode (loopback needs no token)."""
+    tok = config.operator_token()
+    return {'X-Operator-Token': tok} if tok else {}
 
-    Re-reads the token on every call so that token rotations propagate
-    without a director restart.
-    """
-    try:
-        tok = _ADMIN_TOKEN_PATH.read_text().strip()
-        if tok:
-            return {'X-Admin-Token': tok}
-    except Exception:
-        pass
-    return {}
+
+def _env_peer_id(url: str) -> str:
+    """Stable roster id for an ``SRTM_PEERS`` URL (host label)."""
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or url).strip().lower()
+    return host.split('.')[0] or host
+
+
+def _env_peer_rows() -> list:
+    return [{'id': _env_peer_id(u), 'url': u, 'enabled': True}
+            for u in config.peers()]
+
 
 # Bandwidth budget per peer per billing cycle (bytes)
 BANDWIDTH_BUDGET_GB = 95  # conservative — leave 5 GB headroom out of 100
@@ -246,20 +251,20 @@ DIRECTOR_KNOBS = {
     'v2_upgrade': bool, 'ne_source': str, 'v2_ingest_mb_per_h': float,
     'ne_ingest_mb_per_h': float, 'ne_ingest_enabled': bool, 'v2_upgrade_fill_below_ready': int,
     'ne_require_built': bool, 'v24_first': bool,
-    # umfeld /obs re-post pacing (ne_ingest.confirm_umfeld): posts per 5-min tick, GiB/day (token limit 4)
+    # NE /obs re-post pacing (ne_ingest): posts per 5-min tick, GiB/day
     'ne_post_max_per_tick': int, 'ne_post_gib_per_day': float, 'ne_green_fix': bool,
     # VTC pilot (docs/vct-pilot.md): explicit peer ids + how many frontier
     # peers the director may auto-enrol (0 = manual only).
     'vct_pilot_peers': list, 'vct_pilot_auto': int,
     # Product switch (docs/vct-pilot.md → bev mode): peers whose declared
     # NE layer is built locally from the BEV vector tiles (per-peer
-    # ``ne_source=bevdirect``; NEO1 posted as NEC1+NEO1 to umfeld /obs).
+    # ``ne_source=bevdirect``).
     'vct_bev_peers': list,
     # Sliver sweep (docs/sliver-sweep.md): on/off, how many cache-only
-    # workers sweep, parents per worker, umfeld bbox_changes min_delta.
+    # workers sweep, parents per worker, bbox_changes min_delta.
     'sliver_sweep': bool, 'sweep_peers': int, 'sweep_per_peer': int, 'sweep_min_delta': float,
     'sweep_peers_auto': bool, 'sweep_peers_max': int,
-    # umfeld ``lu`` fetches per scan tick (~1.2 MB each, primary metered):
+    # declared-layer ``lu`` fetches per scan tick (~1.2 MB each, primary metered):
     # the only throughput limit of the sweep once the sweepers idle.
     'sweep_lu_per_tick': int,
     # Gradual ramp (docs/vct-pilot.md → Ramp): every 24h/N the director
@@ -306,8 +311,8 @@ def set_director_config(updates: dict) -> dict:
             v = bool(v) if not isinstance(v, str) else v.strip().lower() in ('1', 'true', 'yes', 'on')
         elif typ is str:
             v = str(v).strip()
-            if k == 'ne_source' and v not in ('umfeld', 'bevdirect'):
-                raise ValueError('ne_source must be umfeld|bevdirect')
+            if k == 'ne_source' and v != 'bevdirect':
+                raise ValueError('ne_source must be bevdirect')
             if k == 'ne_source' and v == 'bevdirect' and not updates.get('_force'):
                 # Fleet-wide flip is not the supported path: the per-peer
                 # list ``vct_bev_peers`` (+ ``vct_ramp_per_day`` for one
@@ -566,7 +571,7 @@ def _peer_request(method: str, url: str, *,
     if timeout is None:
         timeout = PEER_TIMEOUT_PROBE  # resolved at call time
     kwargs.setdefault('headers', {})
-    if 'X-Admin-Token' not in kwargs['headers']:
+    if 'X-Operator-Token' not in kwargs['headers']:
         kwargs['headers'].update(_admin_headers())
     try:
         r = requests.request(method, url, timeout=timeout, **kwargs)
@@ -1044,7 +1049,7 @@ def _capacity_history_entry(e: tuple) -> dict:
 
 
 def _default_peers_config() -> dict:
-    """Return default peers.json structure."""
+    """Default peers.json: this instance plus the ``SRTM_PEERS`` roster."""
     return {
         'budget_gb': BANDWIDTH_BUDGET_GB,
         'renew_day': BANDWIDTH_RENEW_DAY,
@@ -1054,13 +1059,23 @@ def _default_peers_config() -> dict:
                 'url': None,  # null = this instance (local)
                 'enabled': True,
             },
-            {
-                'id': 'at2',
-                'url': 'https://example.invalid:8000',
-                'enabled': True,
-            },
+            *_env_peer_rows(),
         ],
     }
+
+
+def _merge_env_peers(cfg: dict) -> bool:
+    """Add ``SRTM_PEERS`` URLs missing from peers.json (never removes rows
+    — disabling/removing a peer is an operator action).  Returns True when
+    the config changed."""
+    rows = cfg.setdefault('peers', [])
+    known = {(r.get('url') or '').rstrip('/') for r in rows}
+    changed = False
+    for r in _env_peer_rows():
+        if r['url'] not in known:
+            rows.append(r)
+            changed = True
+    return changed
 
 
 # === SECTION: operator intent journal (cross-worker) ===
@@ -1190,30 +1205,19 @@ def apply_peer_intents(cfg: dict) -> bool:
 
 
 def load_peers_config() -> dict:
-    """Load or create peers config.
-
-    Always passes through ``director_ha.sanitise_peers_json`` first to
-    repair URL corruption before any caller (director loop, dashboard,
-    snapshot builder) sees it.
-    """
+    """Load or create peers config (``SRTM_PEERS`` rows are merged in)."""
     if PEERS_CONFIG.exists():
         try:
-            import director_ha as _dha  # local import to avoid cycle
-            try:
-                rep = _dha.sanitise_peers_json()
-                if rep.get('changes'):
-                    log.warning('load_peers_config: sanitised peers.json: %s',
-                                rep['changes'])
-            except Exception as e:
-                log.warning('load_peers_config: sanitise failed: %s', e)
-            return json.loads(PEERS_CONFIG.read_text())
+            cfg = json.loads(PEERS_CONFIG.read_text())
+            if _merge_env_peers(cfg):
+                PEERS_CONFIG.write_text(json.dumps(cfg, indent=2))
+            return cfg
         except Exception:
             pass
     cfg = _default_peers_config()
     PEERS_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     PEERS_CONFIG.write_text(json.dumps(cfg, indent=2))
     return cfg
-
 
 # Sidecar fcntl lockfile for peers.json. We hold an exclusive flock
 # here for the duration of every save_peers_config() call, so that
@@ -1647,6 +1651,8 @@ def get_billing_cycle_start(renew_day: int | None = None) -> datetime:
                        hour=0, minute=0, second=0, microsecond=0)
 
 
+
+
 def _local_peer_renew_day() -> int | None:
     """Resolve this VM's effective renew_day from local peers.json.
 
@@ -1655,13 +1661,7 @@ def _local_peer_renew_day() -> int | None:
     ~few KB) and tolerant: any failure returns None so vnstat math
     continues using the global anchor exactly as before.
     """
-    try:
-        import director_ha as _dha
-        sid = _dha.self_id()
-    except Exception:
-        return None
-    if not sid:
-        return None
+    sid = config.self_id()
     try:
         cfg = load_peers_config()
     except Exception:
@@ -2640,7 +2640,7 @@ def _requeue_interrupted_kg(code: str, *, reason: str = '') -> bool:
     each interruption lands on a different peer's local strike file.
 
     Goes through the canonical ``POST /api/v1/processing/queue``
-    endpoint on the local loopback (``127.0.0.1:8000``) rather than
+    endpoint on the local loopback (``config.APP_URL``) rather than
     writing ``retry_queue.json`` directly. This matters because the
     primary runs gunicorn with two workers: a direct file write from
     the director-loop worker would race the OTHER worker's queue
@@ -2662,7 +2662,7 @@ def _requeue_interrupted_kg(code: str, *, reason: str = '') -> bool:
     parent = m.group(1) if m else str(code)
     try:
         r = requests.post(
-            'http://127.0.0.1:8000/api/v1/processing/queue',
+            config.APP_URL + '/api/v1/processing/queue',
             json={'kgs': [parent], 'position': 0, 'skip_processed': True},
             timeout=PEER_TIMEOUT_CONTROL, headers=_admin_headers())
         if not r.ok:
@@ -2963,25 +2963,20 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
     if v2_upgrade:
         payload['v2_upgrade'] = True
     _ne_src = knob(None, 'ne_source', None)
-    if _ne_src in ('umfeld', 'bevdirect'):
+    if _ne_src == 'bevdirect':
         payload['ne_source'] = _ne_src
     # VTC pilot flag + per-peer bev mode (docs/vct-pilot.md).  Always sent
     # (True/False) so a peer leaving the pilot clears its sidecar at the
     # next start; a peer in ``vct_bev_peers`` gets ``ne_source=bevdirect``
-    # (its declared layer is built locally) — otherwise ``umfeld``
-    # explicitly, so a peer leaving bev mode falls back at its next start.
+    # (its declared layer is built locally from the BEV vector tiles).  A
+    # peer whose tooling is still installing refuses the start with 503
+    # (processing/start gate) and we retry next tick.
     try:
         _pid = _peer_id_for_url(peer_url)
         _bev = _pid in set(knob(None, 'vct_bev_peers', []) or [])
         payload['vct_pilot'] = _bev or _pid in set(knob(None, 'vct_pilot_peers', []) or [])
         if _bev:
-            # Always bevdirect: umfeld's /k cadastre routes are retired
-            # (410) so an "umfeld" start only yields cadastre-less KGs.  A
-            # peer whose re-pinned tooling is still installing refuses the
-            # start with 503 (processing/start gate) and we retry next tick.
             payload['ne_source'] = 'bevdirect'
-        elif _ne_src is None:
-            payload['ne_source'] = 'umfeld'
     except Exception:
         pass
     if cred_indices is not None:
@@ -2991,7 +2986,7 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
     if peer_url is None:
         # Local start — use the local API so _processor_process is tracked
         try:
-            r = requests.post('http://127.0.0.1:8000/api/v1/processing/start',
+            r = requests.post(config.APP_URL + '/api/v1/processing/start',
                               json=payload, timeout=PEER_TIMEOUT_CONTROL, headers=_admin_headers())
             return r.json() if r.ok else {'error': f'local start: {r.status_code}'}
         except Exception as e:
@@ -3120,7 +3115,7 @@ def stop_peer_processor(peer_url: str | None, graceful: bool = False) -> dict:
     where mid-KG kills waste pure CPU work without any credential-safety
     benefit.
     """
-    url = peer_url if peer_url else 'http://127.0.0.1:8000'
+    url = peer_url if peer_url else config.APP_URL
     try:
         params = {'graceful': '1'} if graceful else None
         r = requests.post(
@@ -3181,65 +3176,6 @@ def safely_stop_peer(peer_url: str | None, peer_id: str = '?',
               peer_id, max_wait, last_state)
     return {'error': f'stop_not_verified after {max_wait}s',
             'last_state': last_state}
-
-
-def install_token_on_peer(peer_url: str, new_token: str) -> dict:
-    """Push the cluster admin token to a peer.
-
-    Used by /api/v1/director/update_peers to keep the cluster secret in
-    sync without manual scp. The peer's /api/v1/admin/install_token
-    endpoint accepts the new token if (a) the peer has none yet
-    (bootstrap), or (b) the request presents the peer's current token
-    via X-Admin-Token. We send our local token in the header, which
-    matches case (b) when peers are already in sync and is harmless
-    (ignored) under case (a).
-
-    Peers running pre-auth code return 404 — reported as 'not_installed';
-    after they pull the new code their next /admin/update will pick up
-    the seeded token from data/admin_token.
-    """
-    if not new_token:
-        return {'status': 'skipped_empty_token'}
-    try:
-        r = requests.post(
-            peer_url.rstrip('/') + '/api/v1/admin/install_token',
-            json={'new_token': new_token, 'current_token': new_token},
-            headers=_admin_headers(),
-            timeout=PEER_TIMEOUT_CONTROL,
-        )
-        if r.status_code == 404:
-            return {'status': 'endpoint_missing',
-                    'note': 'peer running pre-auth code; will be ok after update'}
-        if r.ok:
-            return {'status': 'installed'}
-        return {'status': f'http_{r.status_code}', 'body': r.text[:200]}
-    except Exception as e:
-        return {'error': str(e)}
-
-
-def trigger_peer_update(peer_url: str, graceful: bool = False) -> dict:
-    """Tell a remote peer to git pull and restart its web server.
-    The peer kills itself on restart so the connection always drops — treat
-    any ConnectionError/ReadTimeout after the request was sent as success.
-
-    If ``graceful`` is True, the peer will defer git-pull + restart until
-    the current KG finishes (no mid-KG kills).
-    """
-    try:
-        r = requests.post(
-            peer_url.rstrip('/') + '/api/v1/admin/update',
-            params={'graceful': '1'} if graceful else None,
-            timeout=15,
-        headers=_admin_headers())
-        return r.json()
-    except requests.exceptions.ConnectionError:
-        # Expected: peer restarted and dropped the connection
-        return {'status': 'restarting'}
-    except requests.exceptions.ReadTimeout:
-        # Expected: restart took longer than read timeout
-        return {'status': 'restarting'}
-    except Exception as e:
-        return {'error': str(e)}
 
 
 def _peer_is_scheduled(peer: dict) -> bool:
@@ -4256,10 +4192,6 @@ class PeerDirector:
     # errors silently.
     _STATUS_CACHE_FILE = Path('/tmp/srtm_director_status_cache.json')
     _STATUS_CACHE_TTL = 30.0
-    # Path of the director-role flag. Mirrors director_ha.IS_DIRECTOR_FLAG
-    # but kept as a module constant to avoid the import cycle on the hot
-    # path. Both module references must agree (asserted in tests).
-    _IS_DIRECTOR_FLAG = DATA_DIR / 'is_director'
     # Stale window: if a recompute is in flight, callers that arrive
     # with a cached value at most this old are served the stale copy
     # immediately instead of blocking. Keeps /process.txt and
@@ -4287,15 +4219,7 @@ class PeerDirector:
         fanout that burns external bandwidth. Cheap stat() per call is
         well worth it.
         """
-        try:
-            st = self._IS_DIRECTOR_FLAG.stat()
-            return (True, int(st.st_mtime_ns))
-        except FileNotFoundError:
-            return (False, 0)
-        except Exception:
-            # Be conservative: on stat error treat as "changed" so we
-            # recompute rather than serve a possibly-stale cache.
-            return (False, -1)
+        return (config.is_director(), 0)
 
     def get_status(self) -> dict:
         """Full director status for the dashboard.
@@ -5049,7 +4973,7 @@ class PeerDirector:
                 if k in ('last', 'last_ts', 'unreachable_since',
                          'consecutive_fail', 'handed_over_ts')
             },
-            'is_director_local': (DATA_DIR / 'is_director').exists(),
+            'is_director_local': config.is_director(),
             'self_id': self._self_id_safe(),
             # Pointer to the current director (peer view): when this
             # VM is *not* the director, the dashboard renders a
@@ -5065,18 +4989,10 @@ class PeerDirector:
         }
 
     def _self_id_safe(self) -> str:
-        try:
-            import director_ha as _dha
-            return _dha.self_id()
-        except Exception:
-            return 'primary'
+        return config.self_id()
 
     def _self_url_safe(self) -> str | None:
-        try:
-            import director_ha as _dha
-            return _dha.self_url()
-        except Exception:
-            return None
+        return config.env('SRTM_SELF_URL') or (config.APP_URL if config.is_director() else None)
 
     def _director_url_safe(self) -> str | None:
         """URL of the currently-authoritative director.
@@ -5088,13 +5004,9 @@ class PeerDirector:
         opening a peer dashboard can navigate to the live
         orchestration view in one click.
         """
-        try:
-            if (DATA_DIR / 'is_director').exists():
-                return self._self_url_safe()
-            import director_ha as _dha
-            return _dha.director_url()
-        except Exception:
-            return None
+        if config.is_director():
+            return self._self_url_safe()
+        return config.PRIMARY_URL or None
 
     def set_mode(self, mode: str):
         write_director_mode(mode)  # sidecar first: authoritative
@@ -5766,11 +5678,6 @@ class PeerDirector:
             out['ne_ingest'] = _nei.status()
         except Exception as e:  # noqa: BLE001
             out['ne_ingest'] = {'error': str(e)}
-        try:
-            import vct_fleet as _vf
-            out['vct_pilot'] = _vf.status()
-        except Exception as e:  # noqa: BLE001
-            out['vct_pilot'] = {'error': str(e)}
         return out
 
     def _fleet_proxy_summary_with_history(self, peers_status: list[dict]) -> dict:
@@ -6042,8 +5949,12 @@ class PeerDirector:
           * if the primary somehow ended up the active_peer (race),
             demotes it.
 
-        Cheap: O(1), no I/O unless cfg actually changed.
+        Cheap: O(1), no I/O unless cfg actually changed.  No-op in
+        single-VM mode (``config.peers()`` empty): the one instance IS the
+        processor.
         """
+        if not config.peers():
+            return
         from datetime import datetime as _dt, timezone as _tz
         with self._lock:
             cfg = self.cfg
@@ -6199,15 +6110,9 @@ class PeerDirector:
         with the 2027 floor).
         """
         from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-        try:
-            import director_ha as _dha  # local import to avoid cycle
-            if not _dha.IS_DIRECTOR_FLAG.exists():
-                return
-            me = _dha.self_id()
-        except Exception:
+        if not config.is_director() or not config.peers():
             return
-        if not me:
-            return
+        me = config.self_id()
         shadow = (self.state.get('shadow_peer') or '').strip()
         target = _dt.now(_tz.utc) + _td(seconds=self._ROLE_PARK_REFRESH_S)
         targets = {}
@@ -6321,7 +6226,7 @@ class PeerDirector:
         if me in targets:
             try:
                 r = requests.get(
-                    'http://127.0.0.1:8000/api/v1/processing/status',
+                    config.APP_URL + '/api/v1/processing/status',
                     timeout=5,
                 )
                 running = bool(r.ok and (r.json() or {}).get('running'))
@@ -7988,7 +7893,7 @@ class PeerDirector:
                     log.warning('v2_orphan: %s depo %s DELETE HTTP %s — skip', code, depo, rd.status_code)
                     continue
             try:
-                rm = requests.delete(f'http://127.0.0.1:8000/api/v1/processing/manifest/{key}', timeout=15)
+                rm = requests.delete(f'{config.APP_URL}/api/v1/processing/manifest/{key}', timeout=15)
                 ok = rm.status_code in (200, 404)
             except Exception as ex:
                 ok = False
@@ -8328,7 +8233,7 @@ class PeerDirector:
             if requeued_now >= V2_REGEN_MAX_REQUEUE_PER_TICK or outstanding >= V2_REGEN_MAX_OUTSTANDING:
                 continue
             try:
-                r = requests.post('http://127.0.0.1:8000/api/v1/processing/queue',
+                r = requests.post(config.APP_URL + '/api/v1/processing/queue',
                                   json={'kgs': [code], 'position': 0, 'skip_processed': False,
                                         'keep_products': True, 'gone_keys': [key]},
                                   timeout=PEER_TIMEOUT_CONTROL, headers=_admin_headers())
@@ -9672,12 +9577,6 @@ class PeerDirector:
                                 'Skip restart on %s: plan unchanged and '
                                 'within cooldown (%.0fs/%.0fs)',
                                 active_id, now_ts - last_ts, cooldown)
-                        elif self._has_pending_graceful_update(active_id):
-                            log.info(
-                                'Skip restart on %s: graceful update '
-                                'pending (waiting for git pull + srv '
-                                'restart on peer)',
-                                active_id)
                         else:
                             log.info(
                                 'Restarting processor on %s (%.1f GB remaining)%s creds=%s strip=%s',
@@ -13086,16 +12985,6 @@ class PeerDirector:
             # holder's KG on a parallel frontier that happens to share
             # the same lat strip.
             par_excl = _excluded_kgs(cfg, exclude_peer_id=pid)
-            if self._has_pending_graceful_update(pid):
-                log.info('Parallel frontier: skipping %s — graceful '
-                         'update pending (waiting for git pull + srv '
-                         'restart on peer)', pid)
-                continue
-            if self._peer_is_stale_idle(pid, cand.get('status')
-                                        or get_peer_status(peer.get('url'))):
-                log.info('Parallel frontier: skipping %s — idle on a stale '
-                         'commit, letting the hard update land first', pid)
-                continue
             log.info('Parallel frontier: starting %s with creds=%s strips=%s%s',
                      pid, creds, strips_for,
                      (' (excluding ' + ','.join(sorted(par_excl)) + ')')
@@ -13171,453 +13060,6 @@ class PeerDirector:
             self.state['frontier_cred_plan'] = cred_plan
             self.state['frontier_strip_plan'] = strip_plan
             save_director_state(self.state)
-
-    # --- Stale-peer auto-retry update -----------------------------
-    # If a graceful update was triggered but the peer didn't pull the
-    # new commit (e.g. dropped connection, restart skipped), re-trigger
-    # an immediate update once the peer has been idle for >10 min. After
-    # a second failed retry, surface the peer as needing a manual update
-    # in the dashboard.
-    # First hard update fires this soon after a peer is seen idle+stale.
-    # Was 600 s: with start paths now refusing to respawn idle stale peers
-    # (``_peer_is_stale_idle``) a long grace only idles the fleet. 90 s
-    # still covers a peer whose own git pull + srv restart is in flight.
-    STALE_UPDATE_GRACE_S = 90
-    STALE_UPDATE_RETRY_GAP_S = 600      # 10 min between retries
-    STALE_UPDATE_MAX_ATTEMPTS = 2       # then surface manual command
-    # Hard ceiling on how long a "manual update needed" verdict
-    # sticks. After this many seconds since the last failed attempt,
-    # we wipe the attempt counters and let the auto-retry path try
-    # again from scratch — covers the case where the peer was
-    # transiently wedged (long upload, network hiccup) and is now
-    # reachable + idle but still flagged as needing a human. Tracked
-    # commit must of course still be stale; if the peer has caught
-    # up the rec is removed in the per-peer loop above.
-    STALE_UPDATE_RESET_AFTER_S = 12 * 3600  # 12 h
-    # Graceful nudges to mid-KG peers also need a hard ceiling. Without
-    # this we re-fire SIGTERMs every 30 min indefinitely on a peer that
-    # never reaches a KG boundary in our gap window (long-tail upload,
-    # or a recurring failure mode — see 2026-05-08 incident where 12 h
-    # of graceful kicks SIGTERMed the same KGs over and over while the
-    # cred fan-out was broken). After this many attempts we give up
-    # nudging and let the next idle window be picked up by the hard
-    # path; this also stops needs_manual_update from being suppressed
-    # forever just because the peer is always busy.
-    STALE_GRACEFUL_MAX_ATTEMPTS = 3
-    # Re-send the graceful update while the peer is still on the SAME KG
-    # it was scheduled on (safety net for a lost deferred thread). Does
-    # not count as an attempt.
-    STALE_GRACEFUL_RESEND_S = 4 * 3600
-    # Wave-based update rollout: cap how many peers we trigger per tick
-    # so the cluster restarts in waves rather than a single thundering
-    # herd. With 50 peers all triggered at once (the 2026-05-06
-    # incident) gunicorn workers exhausted file descriptors, circuit
-    # breakers tripped fleet-wide, and orchestrators couldn't see
-    # candidates for ~2 minutes. Stepping by ~3-5 peers/tick spreads
-    # restarts over ~5 minutes — dashboard / cache-only / frontier
-    # never lose more than a fraction of the fleet at once.
-    STALE_UPDATE_HARD_PER_TICK = 3      # hard restarts (idle peers)
-    STALE_UPDATE_GRACEFUL_PER_TICK = 5  # graceful nudges (mid-KG peers)
-
-    def _has_pending_graceful_update(self, pid: str) -> bool:
-        """True iff a graceful update was issued to *pid* recently.
-
-        ``/admin/update?graceful=1`` SIGTERMs the processor and spawns
-        a deferred-update thread that polls ``pgrep austria_processor.py``
-        and only runs ``git pull && systemctl restart srv`` once the
-        processor exits. If we respawn the processor before that pgrep
-        empties (cache-only orchestrator, parallel-frontier orchestrator,
-        active-frontier restart), the deferred update never fires and
-        the peer stays on the stale commit while we re-kick it mid-KG
-        every retry window. This predicate gates all respawn paths.
-        """
-        if not pid:
-            return False
-        rec = (self.state.get('peer_update_state') or {}).get(pid)
-        if not rec:
-            return False
-        ts = float(rec.get('last_graceful_attempt') or 0)
-        if ts <= 0:
-            return False
-        # Holdoff covers the longest realistic KG tail so a peer
-        # mid-upload of a multi-GB _full.gpkg still finishes before
-        # we consider respawning it. Matches the 1800s gate used in
-        # ``_orchestrate_stale_peer_updates`` for re-firing graceful
-        # updates.
-        return (time.time() - ts) < max(self.STALE_UPDATE_RETRY_GAP_S, 1800.0)
-
-    def _peer_is_stale_idle(self, pid: str, ps: dict | None) -> bool:
-        """True iff *pid* is reachable, idle and on a commit behind ours.
-
-        Gate for every *start* path (cache-only, parallel frontier). An
-        idle stale peer is about to receive a hard update from
-        ``_orchestrate_stale_peer_updates`` (within
-        ``STALE_UPDATE_GRACE_S``); starting it on the old commit first
-        turns a 60 s hard restart into a graceful restart at the *next
-        KG boundary* — hours later — and the whole fleet lags the target
-        by one KG per peer (Sep 2026: 6 idle peers were re-started on
-        75ff5b2 every tick while the rollout waited for them to go idle).
-        """
-        if not pid or not ps:
-            return False
-        st = ps.get('state', 'unknown')
-        if st not in ('stopped', 'idle', 'complete', 'paused'):
-            return False
-        commit = (ps.get('git_commit') or '').strip()
-        if not commit or _LOCAL_GIT_COMMIT == 'unknown':
-            return False
-        if commit == _LOCAL_GIT_COMMIT or _peer_commit_is_ahead_or_equal(commit):
-            return False
-        return True
-
-    def _orchestrate_stale_peer_updates(self, statuses: dict):
-        """Re-trigger update on peers stuck on an old commit while idle.
-
-        Only acts on peers that are reachable, on a stale commit, and
-        whose processor is not actively running a KG (stopped / idle /
-        complete). Never interrupts running work.
-
-        Before retrying, ensures the director's local commit is pushed
-        to origin/main — peers update via ``git fetch origin && reset
-        --hard origin/main``, so an unpushed local commit causes peers
-        to silently reset to the *previous* tip and report success.
-        Whenever the director commit advances past the value seen on
-        the previous tick, all per-peer attempt counters are reset so
-        peers get a fresh round of retries (instead of being stuck on
-        ``needs_manual_update`` from a previous, now-superseded commit).
-        """
-        if not _LOCAL_GIT_COMMIT or _LOCAL_GIT_COMMIT == 'unknown':
-            return
-        with self._lock:
-            cfg = self.cfg.copy()
-            tracked = dict(self.state.get('peer_update_state') or {})
-            last_director_commit = self.state.get('peer_update_director_commit')
-        # If the director's commit advanced since last tick, reset *attempt*
-        # counters so peers get a fresh round (a new push effectively
-        # invalidates the previous "manual required" verdict). But preserve
-        # the graceful-update timing fields (``last_graceful_attempt``,
-        # ``graceful_attempts``, ``first_seen_stale``) — wiping these caused
-        # the 2026-05-09 incident where the active frontier was graceful-
-        # kicked every 8 min mid-upload, with each rollout commit truncating
-        # its own KG's Zenodo upload before the previous one finished. Hard
-        # rollouts only act on idle peers, so resetting *their* attempt
-        # counters is fine; graceful kicks already have their own per-peer
-        # ``STALE_GRACEFUL_MAX_ATTEMPTS`` ceiling that should not reset on
-        # every push.
-        if last_director_commit and last_director_commit != _LOCAL_GIT_COMMIT:
-            log.info('Director commit advanced %s -> %s; resetting peer update '
-                     'attempt counters (preserving graceful timing)',
-                     last_director_commit[:8], _LOCAL_GIT_COMMIT[:8])
-            for _pid, _rec in list(tracked.items()):
-                _rec['attempts'] = 0
-                _rec.pop('last_attempt', None)
-                _rec.pop('last_result', None)
-                _rec.pop('needs_manual_update', None)
-                if 'graceful_kg' not in _rec:
-                    # legacy rec (pre boundary-counting): its
-                    # graceful_attempts were send-counts, meaningless now
-                    _rec['graceful_attempts'] = 0
-                tracked[_pid] = _rec
-        # Make sure origin/main matches our local HEAD before we ask peers
-        # to fetch+reset. Without this, peers reset to a stale origin and
-        # silently stay behind.
-        try:
-            self._ensure_origin_synced()
-        except Exception:
-            log.exception('Origin push during stale-peer orchestration failed')
-        now = time.time()
-        live_ids = set()
-        # Pre-classify so we can apply per-tick budgets across the
-        # fleet rather than fire-and-forget on every stale peer.
-        graceful_candidates: list[tuple[dict, dict, str]] = []  # (peer, rec, commit)
-        hard_candidates: list[tuple[dict, dict, str, int]] = []  # (peer, rec, commit, attempts)
-        for peer in cfg.get('peers', []):
-            pid = peer.get('id')
-            url = peer.get('url')
-            if not pid or not url:
-                continue
-            ps = statuses.get(pid) or {}
-            commit = (ps.get('git_commit') or '').strip()
-            proc_state = ps.get('state', 'unknown')
-            online = proc_state != 'unreachable' and not ps.get('error')
-            # Idle = no active KG processing. 'running'/'processing'
-            # means the peer is mid-work; we never interrupt that.
-            idle = proc_state in ('stopped', 'idle', 'complete', 'paused')
-            # "Ahead or equal" peers are NOT stale: their commit
-            # contains _LOCAL_GIT_COMMIT in its history (e.g. operator
-            # pushed a new commit to origin/main and the peer pulled
-            # before this director restarted). Forcing them back would
-            # be a downgrade.
-            ahead = bool(commit) and _peer_commit_is_ahead_or_equal(commit)
-            stale = bool(commit) and commit != _LOCAL_GIT_COMMIT and not ahead
-            # Only drop the tracked record when we've *confirmed* the
-            # peer landed on the local commit. If the peer is briefly
-            # offline (e.g. during the graceful-restart window) or its
-            # commit is unknown, keep the rec so debounce timers like
-            # ``last_graceful_attempt`` survive the flicker. Without
-            # this, a SIGTERM/respawn cycle wipes the 30-min debounce
-            # and we re-fire graceful updates every tick — kicking the
-            # peer mid-KG repeatedly without ever pulling the new
-            # commit (the in-flight `_deferred_update` thread can't
-            # see ``pgrep austria_processor.py`` go empty because the
-            # cache-only orchestrator respawns the processor first).
-            if commit and (commit == _LOCAL_GIT_COMMIT or ahead):
-                # Ahead-or-equal: drop tracking + clear any leftover
-                # ``needs_manual_update`` flag from before the director
-                # noticed the peer was actually ahead.
-                tracked.pop(pid, None)
-                continue
-            if not (online and stale):
-                # Offline or unknown-commit: preserve rec for next tick.
-                if pid in tracked:
-                    live_ids.add(pid)
-                continue
-            live_ids.add(pid)
-            rec = dict(tracked.get(pid) or {})
-            prev_commit = rec.get('commit')
-            # Peer's commit advanced since last tick (manual update or
-            # an out-of-band pull): wipe the auto-retry counters and
-            # clear the manual-update flag. Stays stale (still != local)
-            # so we'll let the auto path fire a fresh round of retries
-            # if needed; but the operator no longer sees the scary
-            # "manual update needed" tag for a peer that has clearly
-            # been touched.
-            if prev_commit and commit and prev_commit != commit:
-                log.info('Peer %s commit advanced %s -> %s; resetting '
-                         'auto-retry state', pid, prev_commit[:8], commit[:8])
-                rec['attempts'] = 0
-                rec['graceful_attempts'] = 0
-                rec['first_seen_stale'] = now
-                rec.pop('needs_manual_update', None)
-                rec.pop('last_attempt', None)
-                rec.pop('last_result', None)
-            rec.setdefault('first_seen_stale', now)
-            rec.setdefault('attempts', 0)
-            rec['commit'] = commit
-            rec['last_state'] = proc_state
-            if not idle:
-                rec['waiting_for_idle'] = True
-                last_graceful = float(rec.get('last_graceful_attempt') or 0)
-                gattempts = int(rec.get('graceful_attempts') or 0)
-                cur_kg = str((ps.get('current_kg') or {}).get('code') or '')
-                sched_kg = str(rec.get('graceful_kg') or '')
-                # A graceful update is a *promise* the peer keeps at its
-                # next KG boundary. While it is still inside the same KG
-                # it was scheduled on, nothing has failed — frontier KGs
-                # routinely run 12–20 h, far past 3 × 30 min. Only a KG
-                # boundary crossed WITHOUT the commit moving counts as a
-                # failed attempt (Sep 2026: 7 frontier peers were flagged
-                # NEEDS-MANUAL 90 min into a 17 h KG). The 4 h re-send is
-                # a safety net for a lost ``_deferred_update`` thread
-                # (peer srv restarted underneath it) and does not count.
-                if last_graceful and sched_kg and cur_kg == sched_kg:
-                    if (now - last_graceful) < self.STALE_GRACEFUL_RESEND_S:
-                        tracked[pid] = rec
-                        continue
-                    rec['graceful_resend'] = True
-                elif last_graceful and sched_kg and cur_kg != sched_kg:
-                    # boundary crossed, still stale -> the promise failed.
-                    # Clear the scheduled KG so the *same* failed promise
-                    # is counted once, not on every tick (at204 showed
-                    # graceful_attempts=942 after one lost promise).
-                    rec['graceful_attempts'] = gattempts = gattempts + 1
-                    rec.pop('graceful_kg', None)
-                    rec.pop('graceful_resend', None)
-                if gattempts >= self.STALE_GRACEFUL_MAX_ATTEMPTS:
-                    rec['needs_manual_update'] = True
-                    tracked[pid] = rec
-                    continue
-                # Don't graceful-kick a peer that is mid-finalization for
-                # the current KG — GPKG build / validation / Zenodo
-                # uploads can each take many minutes for large KGs and a
-                # SIGTERM here forces the next run to redo all of them
-                # (see 2026-05-09 incident: at43 90107-west truncated
-                # 5 times in 8 h, manifest stalled). The processor checks
-                # ``_shutdown_requested`` only between KGs, so once it
-                # has finished the heavy raster steps it will exit
-                # naturally at the next KG boundary anyway. Letting the
-                # current KG complete its full upload chain (full_gpkg,
-                # light_gpkg, json) is always cheaper than re-running.
-                step = ((ps.get('current_kg') or {}).get('step') or '').lower()
-                FINALIZE_STEPS = (
-                    'gpkg_full', 'validate_full_gpkg', 'upload_full_gpkg',
-                    'gpkg_light', 'validate_light_gpkg', 'upload_light_gpkg',
-                    'json', 'upload_json', 'upload', 'disk_cleanup',
-                )
-                if any(step.startswith(s) for s in FINALIZE_STEPS):
-                    log.info('Skip graceful kick on %s: mid-finalization '
-                             '(step=%s) — letting current KG upload chain '
-                             'finish before restart', pid, step)
-                    tracked[pid] = rec
-                    continue
-                if (now - last_graceful) >= 1800:
-                    rec['graceful_kg'] = cur_kg
-                    graceful_candidates.append((peer, rec, commit))
-                else:
-                    tracked[pid] = rec
-                continue
-            rec.pop('waiting_for_idle', None)
-            attempts = int(rec.get('attempts') or 0)
-            last_attempt = float(rec.get('last_attempt') or 0)
-            # 12-hour amnesty: if the peer has been flagged as
-            # "manual update needed" for too long (still stale, still
-            # idle, but reachable), reset counters and try again. A
-            # successful auto-update meanwhile clears the rec entirely
-            # in the per-peer loop above, so this branch only fires
-            # when the peer remained genuinely stuck.
-            if (attempts >= self.STALE_UPDATE_MAX_ATTEMPTS and
-                    last_attempt > 0 and
-                    (now - last_attempt) >= self.STALE_UPDATE_RESET_AFTER_S):
-                log.info('Resetting stale-update counters for %s after %.1fh '
-                         '(was needs_manual_update=%s, attempts=%d)',
-                         pid, (now - last_attempt) / 3600.0,
-                         rec.get('needs_manual_update'), attempts)
-                rec['attempts'] = 0
-                rec.pop('needs_manual_update', None)
-                rec.pop('last_attempt', None)
-                rec.pop('last_result', None)
-                rec['graceful_attempts'] = 0
-                rec['first_seen_stale'] = now
-                attempts = 0
-                last_attempt = 0.0
-            if attempts >= self.STALE_UPDATE_MAX_ATTEMPTS:
-                if (now - last_attempt) >= self.STALE_UPDATE_RETRY_GAP_S:
-                    rec['needs_manual_update'] = True
-                tracked[pid] = rec
-                continue
-            if attempts == 0:
-                ready = (now - float(rec['first_seen_stale'])) >= self.STALE_UPDATE_GRACE_S
-            else:
-                ready = (now - last_attempt) >= self.STALE_UPDATE_RETRY_GAP_S
-            if not ready:
-                tracked[pid] = rec
-                continue
-            hard_candidates.append((peer, rec, commit, attempts))
-
-        # Stable ordering: oldest "first_seen_stale" first, so peers
-        # waiting longest get serviced first. Tie-break by id.
-        graceful_candidates.sort(
-            key=lambda t: (float(t[1].get('first_seen_stale') or 0),
-                           t[0]['id']))
-        hard_candidates.sort(
-            key=lambda t: (float(t[1].get('first_seen_stale') or 0),
-                           t[0]['id']))
-
-        graceful_budget = self.STALE_UPDATE_GRACEFUL_PER_TICK
-        hard_budget = self.STALE_UPDATE_HARD_PER_TICK
-        graceful_done: list[str] = []
-        hard_done: list[str] = []
-        for peer, rec, commit in graceful_candidates:
-            pid = peer['id']
-            if graceful_budget <= 0:
-                tracked[pid] = rec  # try again next tick
-                continue
-            gattempts = int(rec.get('graceful_attempts') or 0)
-            _msg = (
-                'graceful update → ' + str(_LOCAL_GIT_COMMIT)
-                + ' (peer on ' + str(commit)
-                + '; attempt ' + str(gattempts + 1) + '/'
-                + str(self.STALE_GRACEFUL_MAX_ATTEMPTS) + ')'
-            )
-            log.info('Stale peer %s mid-KG (%s on %s); sending '
-                     'graceful update to schedule restart at KG boundary '
-                     '(attempt %d/%d)',
-                     pid, rec.get('last_state'), commit,
-                     gattempts + 1, self.STALE_GRACEFUL_MAX_ATTEMPTS)
-            _emit_director_event(_msg, peer=pid)
-            try:
-                gres = trigger_peer_update(peer['url'], graceful=True)
-            except Exception as e:
-                gres = {'error': str(e)}
-            rec['last_graceful_attempt'] = now
-            rec['last_graceful_result'] = gres
-            # Attempts are counted when a KG boundary passes without the
-            # commit moving (see the not-idle branch above), not on send.
-            rec.pop('graceful_resend', None)
-            tracked[pid] = rec
-            graceful_budget -= 1
-            graceful_done.append(pid)
-        for peer, rec, commit, attempts in hard_candidates:
-            pid = peer['id']
-            if hard_budget <= 0:
-                tracked[pid] = rec  # try again next tick
-                continue
-            log.info('Auto-retry update on stale peer %s '
-                     '(commit=%s, attempt=%d)',
-                     pid, commit, attempts + 1)
-            _emit_director_event(
-                'hard update → ' + str(_LOCAL_GIT_COMMIT)
-                + ' (peer on ' + str(commit)
-                + '; attempt ' + str(attempts + 1) + ')',
-                peer=pid)
-            try:
-                res = trigger_peer_update(peer['url'], graceful=False)
-            except Exception as e:
-                res = {'error': str(e)}
-            rec['attempts'] = attempts + 1
-            rec['last_attempt'] = now
-            rec['last_result'] = res
-            tracked[pid] = rec
-            hard_budget -= 1
-            hard_done.append(pid)
-        if graceful_done or hard_done:
-            log.info('Stale-peer rollout this tick: %d graceful (%s), '
-                     '%d hard (%s); deferred=%d/%d',
-                     len(graceful_done), ','.join(graceful_done) or '-',
-                     len(hard_done), ','.join(hard_done) or '-',
-                     max(0, len(graceful_candidates) - len(graceful_done)),
-                     max(0, len(hard_candidates) - len(hard_done)))
-        # Drop only records for peers that have either confirmed-updated
-        # or been gone long enough that any pending graceful-update is
-        # no longer relevant. ``live_ids`` includes peers we kept across
-        # an offline blip, so they survive here. Peers that disappeared
-        # entirely from the config still get cleaned up.
-        cfg_ids = {p.get('id') for p in cfg.get('peers', []) if p.get('id')}
-        for pid in list(tracked.keys()):
-            if pid not in cfg_ids:
-                tracked.pop(pid, None)
-        with self._lock:
-            self.state['peer_update_state'] = tracked
-            self.state['peer_update_director_commit'] = _LOCAL_GIT_COMMIT
-
-    def _ensure_origin_synced(self) -> None:
-        """Push local main to origin if it's ahead.
-
-        Peers update via ``git fetch origin && reset --hard origin/main``,
-        so the director must keep origin in sync with its own HEAD.
-        Cheap to call every tick: a no-op when origin is already current
-        (single ``git rev-parse`` + ``git rev-list --count``).
-        """
-        import subprocess as sp
-        repo = str(Path(__file__).parent)
-        try:
-            local = sp.run(['git', 'rev-parse', 'main'],
-                           capture_output=True, text=True, timeout=5,
-                           cwd=repo).stdout.strip()
-            if not local:
-                return
-            # NOTE: do NOT gate on local == _LOCAL_GIT_COMMIT.
-            # _LOCAL_GIT_COMMIT is frozen at srv-import time; commits
-            # landed via shelley/git after srv started will make local
-            # main strictly ahead, and we still want them on origin so
-            # peers can pick them up. The previous gate caused a 12 h
-            # outage where 8 unpushed commits left peers stuck on the
-            # pre-multipart zenodo_client and frontier uploads failing.
-            ahead = sp.run(['git', 'rev-list', '--count',
-                            'origin/main..main'],
-                           capture_output=True, text=True, timeout=5,
-                           cwd=repo).stdout.strip()
-            if ahead and int(ahead) > 0:
-                log.info('Origin behind by %s commit(s); pushing main', ahead)
-                push = sp.run(['git', 'push', 'origin', 'main'],
-                              capture_output=True, text=True, timeout=60,
-                              cwd=repo)
-                if push.returncode != 0:
-                    log.warning('git push failed (rc=%d): %s',
-                                push.returncode,
-                                (push.stdout + push.stderr)[-300:])
-        except Exception as e:
-            log.warning('_ensure_origin_synced error: %s', e)
 
     def _orchestrate_cache_only(self):
         """Start/stop cache-only peers around the frontier peer.
@@ -13928,36 +13370,11 @@ class PeerDirector:
             # so this can't push us past the cap.
             ramp_cap = min(deficit, max_add)
         max_add = min(max_add, ramp_cap)
-        # Skip peers with a pending graceful update (see
-        # ``_has_pending_graceful_update`` docstring). Their
-        # ``/admin/update?graceful=1`` deferred-update thread waits for
-        # ``pgrep austria_processor.py`` to be empty before pulling +
-        # restarting srv. If we respawn the processor here, that pgrep
-        # never empties and the peer is stuck on the stale commit
-        # forever — while we kick it mid-KG every retry window from
-        # the stale-peer orchestrator.
         to_start = []
-        _skipped_pending: list[str] = []
-        _skipped_stale: list[str] = []
         for c in idle_cache_only + idle_frontier:
             if len(to_start) >= max_add:
                 break
-            pid = c['peer'].get('id')
-            if pid and self._has_pending_graceful_update(pid):
-                _skipped_pending.append(pid)
-                continue
-            if pid and self._peer_is_stale_idle(pid, c.get('status')):
-                _skipped_stale.append(pid)
-                continue
             to_start.append(c['peer'])
-        if _skipped_pending:
-            log.info('cache-only: skipping %d peer(s) with pending graceful '
-                     'update (waiting for git pull + srv restart): %s',
-                     len(_skipped_pending), ','.join(_skipped_pending))
-        if _skipped_stale:
-            log.info('cache-only: skipping %d idle stale peer(s) — letting the '
-                     'hard update land first: %s',
-                     len(_skipped_stale), ','.join(_skipped_stale))
 
         # --- Build claimed-KG set so no two cache-only peers (and not
         # the frontier) target the same KG.  We pull each peer's current
@@ -14740,15 +14157,9 @@ class PeerDirector:
             # director (at63) was already running, producing the very
             # split-brain the file flag is supposed to prevent
             # (2026-05-10 incident).
-            try:
-                is_dir = (DATA_DIR / 'is_director').exists()
-                stepped = (DATA_DIR / 'stepped_down').exists()
-            except Exception:
-                is_dir, stepped = True, False  # don't kill loop on stat error
-            if not is_dir or stepped:
-                log.warning('director loop self-stopping: is_director=%s '
-                            'stepped_down=%s (cross-worker step_down or '
-                            'operator demotion)', is_dir, stepped)
+            if not config.is_director():
+                log.warning('director loop self-stopping: SRTM_PRIMARY_URL is set '
+                            '(this instance is a worker)')
                 self._running = False
                 # Release fcntl lock so a future takeover in this same
                 # process can acquire it cleanly.
@@ -15072,11 +14483,6 @@ class PeerDirector:
                 except Exception:
                     log.exception('v2.4 audit tick error')
                 try:
-                    import vct_fleet as _vf
-                    _vf.director_tick(self)
-                except Exception:
-                    log.exception('vct pilot tick error')
-                try:
                     self._reconcile_cache_manifest_if_due()
                 except Exception:
                     log.exception('Cache reconcile scheduling error')
@@ -15104,15 +14510,6 @@ class PeerDirector:
                     self._enforce_peer_bandwidth_walls()
                 except Exception:
                     log.exception('Peer bandwidth wall enforce error')
-                # Auto-retry stale peer updates: re-trigger update on
-                # peers that are idle on an old commit (graceful update
-                # didn't take). After 2 failed attempts surfaces a
-                # manual-update prompt in the dashboard.
-                try:
-                    self._orchestrate_stale_peer_updates(
-                        locals().get('_statuses') or {})
-                except Exception:
-                    log.exception('Stale-peer update orchestration error')
                 # Refresh the fleet-aggregated credential HEALTH scores
                 # before any frontier assignment so creds are ranked by
                 # real per-peer usage (incl. the ``stalled`` clamp), not
@@ -15210,732 +14607,11 @@ class PeerDirector:
                         log.exception('director_state peer GC failed')
                     self._sync_queue_to_active()
                     sync_counter = 0
-                # Elect / refresh shadow & push snapshot every tick.
-                try:
-                    self._maintain_shadow(_statuses)
-                except Exception as _e:
-                    log.debug('shadow maintenance failed: %s', _e)
-                # Push identity to one peer per tick that doesn't yet
-                # know who the director is.
-                try:
-                    self._push_identity_to_unaware_peers()
-                except Exception as _e:
-                    log.debug('identity push failed: %s', _e)
-                # Auto-handback: if we're not the primary, and the
-                # primary is healthy enough, hand the director role
-                # back to it. Primary is the canonical home for the
-                # director: it has the search index, dashboard URL,
-                # public DNS, and operators expect to find it there.
-                try:
-                    self._maybe_handback_to_primary()
-                except Exception as _e:
-                    log.debug('auto-handback check failed: %s', _e)
-                # Out-of-band edge probe: is OUR public URL reachable
-                # from the fleet? (2026-09-30: primary alive, exe.dev
-                # inbound path dead for hours, nothing recorded it.)
-                try:
-                    self._edge_probe_tick(_statuses)
-                except Exception as _e:
-                    log.debug('edge probe failed: %s', _e)
                 with self._lock:
                     save_director_state(self.state)
             except Exception:
                 log.exception('Director loop error')
             time.sleep(DIRECTOR_POLL_INTERVAL)
-
-    # --- Shadow election & snapshot push ---------------------------------
-    def _broadcast_identity_to_all_peers(self) -> None:
-        """One-shot: push (peer_id, peer_url, director_url) to every peer
-        in parallel. Used at director startup so every peer learns who
-        the director is without waiting len(peers) ticks.
-        """
-        try:
-            import director_ha as dha
-        except Exception:
-            return
-        my_url = dha.self_url()
-        if not my_url:
-            return
-        peers = [p for p in self.cfg.get('peers') or [] if p.get('url')]
-        if not peers:
-            return
-        from concurrent.futures import ThreadPoolExecutor
-
-        def _push(peer):
-            try:
-                requests.post(
-                    peer['url'].rstrip('/') + '/api/v1/director/identity',
-                    json={'id': peer['id'], 'url': peer['url'],
-                          'director_url': my_url},
-                    headers=_admin_headers(),
-                    timeout=PEER_TIMEOUT_CONTROL,
-                )
-                return True
-            except Exception:
-                return False
-
-        ok = 0
-        with ThreadPoolExecutor(max_workers=10,
-                                thread_name_prefix='dir-id-bcast') as ex:
-            for r in ex.map(_push, peers):
-                if r:
-                    ok += 1
-        log.info('director identity broadcast: %d/%d peers reachable',
-                 ok, len(peers))
-
-    def _push_identity_to_unaware_peers(self) -> None:
-        """Push director_url + peer_id to peers that don't yet know us.
-
-        Cheap GET to ``/api/v1/director/identity``; if the peer reports
-        ``director_url=null`` we POST it. Throttled to one peer per tick.
-        """
-        try:
-            import director_ha as dha
-        except Exception:
-            return
-        my_url = dha.self_url()
-        if not my_url:
-            return
-        # Cycle through peers, one per tick.
-        peers = [p for p in self.cfg.get('peers') or [] if p.get('url')]
-        if not peers:
-            return
-        idx = int(self.state.get('_identity_push_idx', 0)) % len(peers)
-        peer = peers[idx]
-        self.state['_identity_push_idx'] = idx + 1
-        try:
-            r = requests.get(
-                peer['url'].rstrip('/') + '/api/v1/director/identity',
-                headers=_admin_headers(), timeout=PEER_TIMEOUT_PROBE,
-            )
-            if not r.ok:
-                return
-            d = r.json() or {}
-            # Fleet roster for the peer's peer_urls.txt: every enabled
-            # peer except the receiver itself (self-claims would block
-            # its own work).
-            want_urls = sorted({p['url'].rstrip('/') for p in peers
-                                if p.get('enabled', True)
-                                and p['url'].rstrip('/') != peer['url'].rstrip('/')})
-            have_urls = sorted(str(u).rstrip('/') for u in (d.get('peer_urls') or []))
-            needs = (not d.get('director_url')) or (d.get('director_url') != my_url) \
-                or (d.get('id') != peer['id']) \
-                or ('peer_urls' in d and have_urls != want_urls)
-            if not needs:
-                return
-            requests.post(
-                peer['url'].rstrip('/') + '/api/v1/director/identity',
-                json={'id': peer['id'], 'url': peer['url'],
-                      'director_url': my_url, 'peer_urls': want_urls},
-                headers=_admin_headers(), timeout=PEER_TIMEOUT_CONTROL,
-            )
-            log.info('director identity pushed to %s', peer['id'])
-        except Exception:
-            pass
-
-    # --- Edge reachability probe (item 4, 2026-09-30 post-mortem) --------
-
-    @staticmethod
-    def _event(msg: str, level: str = 'info') -> None:
-        try:
-            import app as _app
-            _app.director_event(msg, peer='director', level=level)
-        except Exception as _e:
-            log.warning('director_event failed (%s): %s', _e, msg)
-
-    EDGE_PROBE_INTERVAL_S = 60
-    EDGE_PROBE_RING = 8
-    EDGE_FAIL_MIN_PEERS = 3          # distinct peers failing, consecutively
-    EDGE_HANDOVER_AFTER_S = 600      # persistent → hand role to shadow
-
-    def _edge_probe_tick(self, statuses: dict) -> None:
-        """Ask one reachable peer per minute (rotating) to GET our public
-        heartbeat URL. We can reach *them* (they answered our poll), so
-        a failure is specifically our INBOUND path — the exe.dev proxy /
-        host edge. Records a ring in ``state['edge_probe']``, emits a
-        director_event when ≥ EDGE_FAIL_MIN_PEERS distinct peers fail in
-        a row, and — if the blackout persists EDGE_HANDOVER_AFTER_S and
-        a healthy shadow exists — hands the role over: peers that cannot
-        reach the director cannot get Zenodo leases or push status, so an
-        unreachable director is worse than an interim one."""
-        import director_ha as dha
-        now = time.time()
-        ep = self.state.get('edge_probe') or {}
-        if now - float(ep.get('last_ts') or 0.0) < self.EDGE_PROBE_INTERVAL_S:
-            return
-        my_url = (dha.self_url() or '').rstrip('/')
-        if not my_url:
-            return
-        cand = []
-        for p in self.cfg.get('peers') or []:
-            pid = p.get('id')
-            if not pid or pid == self._self_id_safe() or not p.get('url'):
-                continue
-            st = statuses.get(pid) or {}
-            if st.get('state') in ('unreachable', None):
-                continue
-            cand.append(p)
-        if not cand:
-            return
-        idx = int(ep.get('rr') or 0) % len(cand)
-        peer = cand[idx]
-        ep['rr'] = idx + 1
-        ep['last_ts'] = now
-        res = {'peer': peer['id'], 'ok': False, 'ts': now}
-        try:
-            r = requests.get(peer['url'].rstrip('/') + '/api/v1/director/probe',
-                             params={'url': my_url}, headers=_admin_headers(),
-                             timeout=dha.QUORUM_TIMEOUT)
-            if r.ok:
-                body = r.json() or {}
-                res['ok'] = bool(body.get('ok'))
-                res['status'] = body.get('status')
-                res['err'] = (body.get('error') or '')[:60] or None
-            else:
-                # Peer answered but the probe endpoint is missing (old
-                # code) — not evidence either way; skip this sample.
-                self.state['edge_probe'] = ep
-                return
-        except Exception:
-            # We could not reach the peer → no information about our
-            # inbound path. Skip.
-            self.state['edge_probe'] = ep
-            return
-        ring = list(ep.get('last') or [])[-(self.EDGE_PROBE_RING - 1):]
-        ring.append(res)
-        ep['last'] = ring
-        if res['ok']:
-            if ep.get('unreachable_since'):
-                self._event(
-                    f'edge: public URL {my_url} reachable again from '
-                    f'{peer["id"]} (was unreachable since '
-                    f'{ep["unreachable_since"]})', level='warning')
-            ep['consecutive_fail'] = 0
-            ep['unreachable_since'] = None
-            ep['unreachable_since_ts'] = None   # else a later single FAIL would meet the handover age gate
-            ep['fail_peers'] = []
-            self.state['edge_probe'] = ep
-            return
-        ep['consecutive_fail'] = int(ep.get('consecutive_fail') or 0) + 1
-        fp = list(ep.get('fail_peers') or [])
-        if peer['id'] not in fp:
-            fp.append(peer['id'])
-        ep['fail_peers'] = fp[-10:]
-        if len(fp) >= self.EDGE_FAIL_MIN_PEERS and not ep.get('unreachable_since'):
-            ep['unreachable_since'] = datetime.now(timezone.utc).isoformat()
-            ep['unreachable_since_ts'] = now
-            self._event(
-                f'edge: public URL {my_url} UNREACHABLE from peers '
-                f'{",".join(fp)} while we reach them (inbound proxy/host '
-                f'path) — hosting-level issue; will hand role to shadow if '
-                f'it persists {self.EDGE_HANDOVER_AFTER_S // 60} min',
-                level='error')
-        self.state['edge_probe'] = ep
-        # Persistent blackout → voluntary handover to a healthy shadow.
-        since_ts = float(ep.get('unreachable_since_ts') or 0.0)
-        if (since_ts and now - since_ts >= self.EDGE_HANDOVER_AFTER_S
-                and self.state.get('shadow_last_push_ok')
-                and self.state.get('shadow_peer')
-                and self.state.get('shadow_url')
-                and now - float(ep.get('handover_attempt_ts') or 0.0) > 900):
-            ep['handover_attempt_ts'] = now
-            sid, surl = self.state['shadow_peer'], self.state['shadow_url']
-            self._event(
-                f'edge: blackout persisted {int((now - since_ts) // 60)} min '
-                f'— handing director role to shadow {sid}', level='error')
-            try:
-                res_h = dha.do_handover(sid, surl)
-                log.warning('edge handover to %s: %s', sid, res_h)
-            except Exception as e:
-                log.warning('edge handover to %s failed: %s', sid, e)
-
-    def _maybe_handback_to_primary(self) -> None:
-        """If we're not the primary, hand the director role back to
-        primary as soon as it is reachable, on the same git commit, and
-        not in a stepped_down/scheduled state.
-
-        Throttled. Every entry past the basic gates advances the
-        throttle so an early-return path doesn't fire every 30 s tick
-        (the bug that made at40 hammer primary's clear_stepped_down
-        endpoint for an hour on 2026-05-07). The throttle uses two
-        durations:
-
-          * ``HANDBACK_RETRY_S`` (60 s) on transient/early returns —
-            unreachable primary, stepped_down clear in flight, etc.
-            Short enough that handback fires within one or two minutes
-            of conditions becoming favourable; long enough that we
-            don't spam.
-          * ``HANDBACK_BACKOFF_S`` (300 s) on "hard" failures — commit
-            ancestry blocks or operator must reconcile. We retry less
-            often because the situation needs human intervention.
-
-        All logged at INFO/WARNING so journals always show the reason.
-        """
-        # Short retry on transient/expected paths (primary still
-        # restarting, stepped_down flag clear just landed) so we hand
-        # the role back within one director tick of primary becoming
-        # ready. Was 60s — too conservative; meant operators saw
-        # ~90-120s of at-X-acting-director after every update_peers.
-        HANDBACK_RETRY_S = 15
-        HANDBACK_BACKOFF_S = 300
-        try:
-            import director_ha as dha
-        except Exception:
-            return
-        me = dha.self_id()
-        if me == 'primary':
-            return
-        # Throttle: read once, advance later based on outcome.
-        last = float(self.state.get('_handback_last_attempt') or 0.0)
-        if (time.time() - last) < HANDBACK_RETRY_S:
-            return
-        # Locate primary entry.
-        cfg = self.cfg
-        primary = None
-        for p in cfg.get('peers') or []:
-            if p.get('id') == 'primary' and p.get('url'):
-                primary = p
-                break
-        if not primary or not primary.get('enabled', True):
-            # No primary configured / primary disabled — throttle longer
-            # so we don't recheck cfg every tick.
-            self.state['_handback_last_attempt'] = time.time()
-            self.state['_handback_last_reason'] = (
-                'no_primary' if not primary else 'primary_disabled')
-            return
-        # Advance throttle now — every code path below will set it again
-        # with its own reason, but this guarantees no early return
-        # silently re-fires next tick.
-        self.state['_handback_last_attempt'] = time.time()
-        # NOTE: we deliberately do NOT gate on _peer_is_scheduled() here.
-        # `not_before` parks the primary out of frontier / cache-only work
-        # (those gates honour it in choose_active_peer / _orchestrate_*),
-        # but the director role itself is just HTTP orchestration + the
-        # Zenodo lock broker — ~zero bandwidth. The primary is the
-        # canonical home for the director (search index, public DNS,
-        # dashboard URL), so hand the role back even when scheduled.
-        if _peer_is_scheduled(primary):
-            log.info('Auto-handback: primary scheduled (not_before=%s) — '
-                     'frontier-disabled but still eligible for director role',
-                     primary.get('not_before'))
-        url = primary['url']
-        # Probe primary: must be reachable, on our git commit, and not
-        # currently flagged stepped_down (which would mean operator
-        # demoted it on purpose).
-        try:
-            r = requests.get(url.rstrip('/') + '/api/v1/director/identity',
-                             headers=_admin_headers(),
-                             timeout=PEER_TIMEOUT_PROBE)
-            if not r.ok:
-                log.info('Auto-handback: primary identity HTTP %d — retry in %ds',
-                         r.status_code, HANDBACK_RETRY_S)
-                self.state['_handback_last_reason'] = f'http_{r.status_code}'
-                return
-            d = r.json() or {}
-        except Exception as e:
-            log.info('Auto-handback: primary unreachable (%s) — retry in %ds',
-                     str(e)[:80], HANDBACK_RETRY_S)
-            self.state['_handback_last_reason'] = 'unreachable'
-            return
-        # Flap dampener (item 3): ≥ FLAP_MAX_TAKEOVERS takeovers in 6 h →
-        # hold the role here for FLAP_LOCKOUT_S after our takeover instead
-        # of ping-ponging (7 flips on 2026-09-30).
-        _lock = dha.flap_lockout_remaining_s()
-        if _lock > 0:
-            log.info('Auto-handback: flap lockout — %d takeovers/6h, holding '
-                     'role %dm more', dha.flap_count(), int(_lock // 60))
-            self.state['_handback_last_attempt'] = (
-                time.time() - HANDBACK_RETRY_S + min(_lock, HANDBACK_BACKOFF_S))
-            self.state['_handback_last_reason'] = f'flap_lockout_{int(_lock)}s'
-            return
-        # Peer quorum (item 1/4): *we* reaching primary is not enough —
-        # the fleet must. Ask other peers to probe primary's public URL
-        # (its heartbeat answers 410 while not director; any HTTP answer
-        # = reachable, so we check status, not ok).
-        try:
-            _q = dha.peer_quorum_probe(
-                url, exclude_urls=[url, dha.self_url() or ''],
-                peer_urls=[p.get('url') for p in (cfg.get('peers') or [])
-                           if p.get('url') and p.get('enabled', True)
-                           and p.get('id') not in ('primary', me)])
-        except Exception as _e:
-            _q = {'responded': 0, 'ok': 0, 'fail': 0}
-        # ``ok`` = HTTP 200 (is director); ``http_any`` = any HTTP
-        # answer at all = reachable. Primary is not director here, so
-        # reachability is http_any.
-        _reach = int(_q.get('http_any') or 0)
-        if _q['responded'] >= 2 and _reach < 2:
-            log.warning('Auto-handback: primary reachable from us but only '
-                        '%d/%d peers reach its public URL (fail=%s) — holding '
-                        '(edge/proxy blackout); retry in %ds',
-                        _reach, _q['responded'],
-                        ','.join(_q.get('fail_peers') or [])[:60], HANDBACK_BACKOFF_S)
-            self.state['_handback_last_attempt'] = (
-                time.time() - HANDBACK_RETRY_S + HANDBACK_BACKOFF_S)
-            self.state['_handback_last_reason'] = (
-                f'primary_edge_unreachable_{_reach}of{_q["responded"]}')
-            return
-        if d.get('stepped_down'):
-            # Primary still has the stepped_down flag set. Clear it
-            # remotely so it's eligible again — the flag exists to
-            # prevent cold restarts from auto-promoting; once we hand
-            # back voluntarily it must be cleared.
-            cleared_ok = False
-            try:
-                cr = requests.post(url.rstrip('/')
-                              + '/api/v1/admin/clear_stepped_down',
-                              headers=_admin_headers(),
-                              timeout=PEER_TIMEOUT_CONTROL)
-                if cr.ok:
-                    cleared_ok = True
-                    log.info('Auto-handback: cleared stepped_down on primary '
-                             '(was %s) — proceeding with handover this tick',
-                             cr.json().get('cleared') if cr.headers.get(
-                                 'content-type', '').startswith('application/json')
-                             else 'unknown')
-                else:
-                    log.warning('Auto-handback: clear_stepped_down on primary '
-                                'returned HTTP %d — retry in %ds',
-                                cr.status_code, HANDBACK_RETRY_S)
-            except Exception as e:
-                log.warning('Auto-handback: clear_stepped_down failed (%s) — '
-                            'retry in %ds', str(e)[:80], HANDBACK_RETRY_S)
-            self.state['_handback_last_reason'] = (
-                'cleared_stepped_down' if cleared_ok else 'clear_failed')
-            if not cleared_ok:
-                return
-            # Fall through and attempt handover in the same tick —
-            # do_handover targets primary via URL and primary will
-            # accept now that its stepped_down flag is gone. Saves a
-            # full HANDBACK_RETRY_S window.
-            d['stepped_down'] = False
-        # Same git commit?
-        try:
-            info = requests.get(url.rstrip('/') + '/api/v1/info',
-                                timeout=PEER_TIMEOUT_PROBE).json()
-            primary_commit = (info.get('git_commit') or '')[:7]
-        except Exception:
-            primary_commit = ''
-        my_commit = ''
-        try:
-            import subprocess as _sp
-            my_commit = _sp.check_output(
-                ['git', 'rev-parse', '--short', 'HEAD'],
-                cwd=str(Path(__file__).parent), stderr=_sp.DEVNULL,
-                timeout=2).decode().strip()
-        except Exception:
-            pass
-        # We used to require an exact commit match; that made handback
-        # fail any time the operator pushed an update on the primary
-        # while a non-primary peer was acting as director. Now we use
-        # ancestry checks: primary must be at-or-ahead (my_commit is an
-        # ancestor of primary_commit, OR commits are equal). We refuse
-        # if primary is strictly behind us (could lose schema fields)
-        # OR if commits are unrelated (we can't reason about state
-        # compatibility — operator must intervene).
-        if my_commit and primary_commit and primary_commit != my_commit:
-            import subprocess as _sp
-            repo = str(Path(__file__).parent)
-            def _is_ancestor(a: str, b: str) -> bool | None:
-                """True if a is ancestor of b. None if either commit is
-                not resolvable locally (try `git fetch` first)."""
-                try:
-                    _sp.check_output(
-                        ['git', 'cat-file', '-e', a + '^{commit}'],
-                        cwd=repo, stderr=_sp.DEVNULL, timeout=3,
-                    )
-                    _sp.check_output(
-                        ['git', 'cat-file', '-e', b + '^{commit}'],
-                        cwd=repo, stderr=_sp.DEVNULL, timeout=3,
-                    )
-                except Exception:
-                    return None
-                try:
-                    _sp.check_output(
-                        ['git', 'merge-base', '--is-ancestor', a, b],
-                        cwd=repo, stderr=_sp.DEVNULL, timeout=3,
-                    )
-                    return True
-                except Exception:
-                    return False
-            primary_is_behind = _is_ancestor(primary_commit, my_commit)
-            primary_is_ahead = _is_ancestor(my_commit, primary_commit)
-            if primary_is_behind is None or primary_is_ahead is None:
-                # Try a cheap fetch to resolve unknown commits.
-                try:
-                    _sp.run(['git', 'fetch', '--quiet', 'origin'],
-                            cwd=repo, capture_output=True, timeout=20)
-                    primary_is_behind = _is_ancestor(primary_commit, my_commit)
-                    primary_is_ahead = _is_ancestor(my_commit, primary_commit)
-                except Exception:
-                    pass
-            if primary_is_behind is True:
-                log.warning('handback skipped: primary on %s is behind '
-                            'us %s — primary needs to git pull first '
-                            '(retry in %ds)',
-                            primary_commit, my_commit, HANDBACK_BACKOFF_S)
-                # Long backoff — needs operator action (or stale-peer
-                # rollout) to update primary.
-                self.state['_handback_last_attempt'] = (
-                    time.time() - HANDBACK_RETRY_S + HANDBACK_BACKOFF_S)
-                self.state['_handback_last_reason'] = 'primary_behind'
-                return
-            if primary_is_ahead is True:
-                log.info('handback proceeding: primary on %s is ahead '
-                         'of us %s', primary_commit, my_commit)
-            else:
-                # Commits unrelated (different branches?) or unresolvable.
-                # Refuse — operator must reconcile.
-                log.warning('handback skipped: primary commit %s and '
-                            'our commit %s are unrelated/unresolvable; '
-                            'operator must reconcile (retry in %ds)',
-                            primary_commit, my_commit, HANDBACK_BACKOFF_S)
-                self.state['_handback_last_attempt'] = (
-                    time.time() - HANDBACK_RETRY_S + HANDBACK_BACKOFF_S)
-                self.state['_handback_last_reason'] = 'commits_unrelated'
-                return
-        # Healthy enough — hand over.
-        log.warning('Auto-handback: primary is healthy, handing director '
-                    'role back from %s to primary', me)
-        self.state['_handback_last_attempt'] = time.time()
-        self.state['_handback_last_reason'] = 'attempting'
-        try:
-            res = dha.do_handover('primary', url)
-            log.warning('Auto-handback result: %s', res)
-            self.state['_handback_last_reason'] = 'handed_over'
-        except Exception as e:
-            log.warning('Auto-handback failed: %s', e)
-            self.state['_handback_last_reason'] = f'handover_failed:{str(e)[:80]}'
-
-    def _maintain_shadow(self, statuses: dict) -> None:
-        """Elect a shadow each tick and push the current state snapshot.
-
-        Shadow == the most-trustworthy peer that is not us. Picks the peer
-        with: enabled=True, reachable, lowest noise score (most reliable),
-        not already running heavy frontier work. Re-evaluated every tick;
-        sticky for ~5 min unless the current shadow turns unreachable.
-        """
-        try:
-            import director_ha as dha
-        except Exception:
-            return
-        if not dha.ha_enabled():
-            # Security: no shadow → no snapshot (credentials, peers.json)
-            # ever leaves the primary and nobody can be promoted.
-            if self.state.get('shadow_peer') or self.state.get('shadow_url'):
-                self.state['shadow_peer'] = None
-                self.state['shadow_url'] = None
-                self.state['shadow_last_push_ok'] = False
-                self._event('ha: disabled — shadow cleared, no failover',
-                            level='warning')
-            return
-        cfg = self.cfg
-        peers = cfg.get('peers') or []
-        my_commit = _LOCAL_GIT_COMMIT
-        # Candidate filter: enabled, reachable, running OUR git commit
-        # (so the snapshot endpoint exists), enough disk (>3 GB free) and
-        # enough remaining bandwidth (>10 GB) to act as director if needed.
-        #
-        # As of Jul 2026 the shadow no longer replicates the ~5–7 GB JSON
-        # corpus (see app._is_keep_role_data) — it only stages the small
-        # snapshot state. So the disk gate no longer needs to reserve
-        # corpus space; it just guards against a peer that's genuinely out
-        # of room. Keeping it modest is what breaks the old death loop:
-        # previously a designated shadow downloaded the corpus, filled its
-        # own disk below 5 GB, got rejected here next tick, and the election
-        # ping-ponged to the other candidate — which then did the same. With
-        # the corpus gone from the shadow, the elected peer stays above the
-        # gate and the stickiness logic keeps it put.
-        SHADOW_MIN_DISK_GB = 3.0
-        SHADOW_MIN_BANDWIDTH_GB = 10.0
-        SHADOW_INELIGIBLE_GRACE_S = 600
-        candidates: list[tuple[float, dict]] = []
-        rejected: list[tuple[str, str]] = []
-        for p in peers:
-            if not p.get('enabled') or not p.get('url'):
-                continue
-            ps = (statuses or {}).get(p['id']) or {}
-            if ps.get('state') == 'unreachable':
-                rejected.append((p['id'], 'unreachable'))
-                continue
-            commit = (ps.get('git_commit') or '').strip()
-            if my_commit != 'unknown' and commit and commit != my_commit:
-                rejected.append((p['id'], f'commit_mismatch({commit})'))
-                continue
-            sysd = ps.get('system') or {}
-            disk_free = sysd.get('disk_free_gb')
-            if disk_free is not None and disk_free < SHADOW_MIN_DISK_GB:
-                rejected.append((p['id'], f'low_disk({disk_free}GB)'))
-                continue
-            bw = (self.state.get('peer_bandwidth') or {}).get(p['id']) or {}
-            rem_gb = bw.get('remaining_gb')
-            if rem_gb is not None and rem_gb < SHADOW_MIN_BANDWIDTH_GB:
-                rejected.append((p['id'], f'low_bw({rem_gb}GB)'))
-                continue
-            # Shadow must be able to *act* as director if it gets
-            # promoted (run frontiers, build GPKGs). A peer on a 75%%
-            # steal pool is a poor failover target; weight it down.
-            score = (_peer_noise_score(p['id'], self.state)
-                     + ((1.0 / _peer_cpu_capacity(p['id'])) - 1.0))
-            # The elected shadow is role-parked (2 h rolling) — electing
-            # a peer that is mid-KG (or the frontier we just handed
-            # credentials to) throws that work away. Prefer idle peers;
-            # a busy one is only chosen when nothing idle qualifies
-            # (Sep 2026: at202 was started as parallel frontier and
-            # elected shadow 30 s later, then stopped as "non-active").
-            busy = (ps.get('state') in ('running', 'processing')
-                    or p['id'] == self.state.get('active_peer')
-                    or p['id'] in (self.state.get('parallel_frontiers_active') or [])
-                    or p['id'] in (self.state.get('frontier_cred_plan') or {}))
-            if busy:
-                score += 5.0
-            candidates.append((score, p))
-        if not candidates:
-            # Log only when set changes to avoid spam.
-            tag = ','.join(f'{i}:{r}' for i, r in rejected[:6])
-            if self.state.get('_shadow_reject_tag') != tag:
-                log.warning('director shadow: no eligible candidates (%s)', tag)
-                self.state['_shadow_reject_tag'] = tag
-                self.state['shadow_peer'] = None
-                self.state['shadow_url'] = None
-            return
-        else:
-            self.state.pop('_shadow_reject_tag', None)
-        candidates.sort(key=lambda x: x[0])
-        prev_shadow = self.state.get('shadow_peer')
-        # Stickiness: keep the previous shadow unless it's gone or we have
-        # a much-better candidate (>0.3 score gap).
-        chosen = None
-        if prev_shadow:
-            for s, p in candidates:
-                if p['id'] == prev_shadow:
-                    chosen = (s, p)
-                    break
-        if chosen is None and prev_shadow:
-            # Grace period (Sep 2026): a shadow that is *transiently*
-            # ineligible — unreachable for a minute while its srv
-            # restarts onto the rollout target, or commit_mismatch for
-            # the same reason — is kept for SHADOW_INELIGIBLE_GRACE_S.
-            # Every shadow change costs a full snapshot + archive
-            # reconcile and we were flapping 3× in 3 min during rollouts.
-            _rej = dict(rejected)
-            _reason = _rej.get(prev_shadow, '')
-            _transient = (_reason == 'unreachable'
-                          or _reason.startswith('commit_mismatch'))
-            _since = float(self.state.get('_shadow_inelig_since') or 0.0)
-            if _transient:
-                if not _since:
-                    self.state['_shadow_inelig_since'] = time.time()
-                    _since = time.time()
-                if (time.time() - _since) < SHADOW_INELIGIBLE_GRACE_S:
-                    return   # keep prev shadow, skip this tick's push
-        if chosen is not None or not prev_shadow:
-            self.state.pop('_shadow_inelig_since', None)
-        if chosen is None:
-            chosen = candidates[0]
-        else:
-            best_s, best_p = candidates[0]
-            if best_p['id'] != prev_shadow and (chosen[0] - best_s) > 0.3:
-                chosen = (best_s, best_p)
-        s_score, s_peer = chosen
-        # Only push snapshot every SHADOW_SYNC_INTERVAL seconds.
-        last_push = float(self.state.get('shadow_last_push_ts') or 0.0)
-        now = time.time()
-        push_due = (now - last_push) >= dha.SHADOW_SYNC_INTERVAL
-        # Always push immediately when the shadow changes.
-        shadow_changed = prev_shadow != s_peer['id']
-        self.state['shadow_peer'] = s_peer['id']
-        self.state['shadow_url'] = s_peer.get('url')
-        self.state['shadow_score'] = round(float(s_score), 4)
-        if not (push_due or shadow_changed):
-            return
-        try:
-            # Full snapshot on shadow change / every SHADOW_FULL_INTERVAL
-            # (or after a failed push); otherwise a light one: heavy
-            # telemetry rings stripped + byte-identical files omitted.
-            # See director_ha.build_snapshot. The shadow is guaranteed
-            # to run our commit (election rejects commit_mismatch).
-            last_full = float(self.state.get('shadow_last_full_ts') or 0.0)
-            full = (shadow_changed
-                    or (now - last_full) >= dha.SHADOW_FULL_INTERVAL
-                    or not self.state.get('shadow_last_push_ok'))
-            hashes = dha.snapshot_file_hashes()
-            unchanged: set[str] = set()
-            if not full:
-                prev_h = self._shadow_pushed_hashes if hasattr(
-                    self, '_shadow_pushed_hashes') else {}
-                unchanged = {n for n, h in hashes.items()
-                             if prev_h.get(n) == h}
-            snap = dha.build_snapshot(light=not full, unchanged=unchanged)
-            snap['_meta']['shadow_id'] = s_peer['id']
-            snap['_meta']['director_id'] = (load_director_state()
-                                            .get('active_peer') or 'director')
-            res = dha.push_snapshot_to_shadow(s_peer['url'], snap)
-            ok = isinstance(res, dict) and res.get('status') == 'staged'
-            self.state['shadow_last_push_ts'] = now
-            self.state['shadow_last_push_ok'] = ok
-            self.state['shadow_last_push_result'] = res if not ok else 'staged'
-            self.state['shadow_last_push_bytes'] = (res or {}).get('bytes_sent') if isinstance(res, dict) else None
-            self.state['shadow_last_push_kind'] = 'full' if full else 'light'
-            if ok:
-                if full:
-                    self.state['shadow_last_full_ts'] = now
-                self._shadow_pushed_hashes = hashes
-            else:
-                self._shadow_pushed_hashes = {}
-            if shadow_changed:
-                log.info('director shadow set to %s (score=%.3f, push=%s)',
-                         s_peer['id'], s_score, 'ok' if ok else res)
-            # Replicate the long-term log archive too. Separate throttle
-            # (hourly today-only steady state, full sweep on shadow
-            # change) so the archive doesn't inflate the 30s snapshot
-            # traffic. Best-effort: failures are logged but do NOT
-            # affect the small-state snapshot path above.
-            try:
-                if not hasattr(self, '_log_arch_sha'):
-                    self._log_arch_sha = {}
-                if not hasattr(self, '_log_arch_last_push'):
-                    self._log_arch_last_push = 0.0
-                arch_due = (now - self._log_arch_last_push
-                            >= dha.LOG_ARCHIVE_PUSH_INTERVAL)
-                if shadow_changed:
-                    # New shadow — wipe per-shadow sha cache and do a
-                    # full sweep so the new shadow gets every day.
-                    self._log_arch_sha = {}
-                if shadow_changed or arch_due:
-                    res_a = dha.push_log_archive_to_shadow(
-                        s_peer['url'], full=shadow_changed,
-                        cache=self._log_arch_sha)
-                    self._log_arch_last_push = now
-                    self.state['shadow_log_archive_last'] = res_a
-            except Exception as e:
-                log.warning('shadow log_archive push to %s failed: %s',
-                            s_peer.get('id'), e)
-            # Live merged-log ring → shadow as a gzipped delta every
-            # COMBINED_LOG_PUSH_INTERVAL (item 5, 2026-09-30). Fresh
-            # cache on shadow change = full 24 h ring once (~1 MB gz),
-            # then only new lines (~tens of KB).
-            try:
-                if shadow_changed or not hasattr(self, '_log_delta_cache'):
-                    self._log_delta_cache = {}
-                _ld = self._log_delta_cache
-                if ok and (shadow_changed or
-                           now - float(_ld.get('last_ts') or 0.0)
-                           >= dha.COMBINED_LOG_PUSH_INTERVAL):
-                    try:
-                        res_l = dha.push_combined_log_delta_to_shadow(
-                            s_peer['url'], _ld)
-                    finally:
-                        _ld['last_ts'] = now   # throttle even on failure
-                    self.state['shadow_log_delta_last'] = res_l
-            except Exception as e:
-                log.warning('shadow combined-log delta push to %s failed: %s',
-                            s_peer.get('id'), e)
-        except Exception as e:
-            log.warning('shadow snapshot push to %s failed: %s',
-                        s_peer.get('id'), e)
-            self.state['shadow_last_push_ok'] = False
-            self.state['shadow_last_push_result'] = str(e)[:200]
 
 
 # Singleton

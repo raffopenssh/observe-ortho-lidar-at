@@ -9105,27 +9105,6 @@ def admin_ne_tooling():
     return jsonify(out)
 
 
-# === SECTION: VTC pilot fleet dedupe ===
-
-@app.route('/api/v1/director/vct_reported', methods=['GET'])
-def director_vct_reported():
-    """Has any peer already reported parent ``?kg=`` to the optional NE
-    contrib endpoint with ``?source=`` (default: our bevdirect tag) within
-    ``?max_age_s`` (default 30 d)?  Read from ``vct_fleet.json``'s
-    ``reported`` map (folded from the peers' status pushes by
-    ``vct_fleet._collect_rows``).  Split blocks use it
-    (``vct_pilot.already_reported``) to skip a POST a sibling block made."""
-    import vct_fleet as _vf
-    import ne_h3 as _neh
-    kg = str(request.args.get('kg') or '').zfill(5)
-    source = request.args.get('source') or ('bevdirect@' + _neh.BEVDIRECT_TAG)
-    try:
-        max_age = float(request.args.get('max_age_s') or 30 * 86400)
-    except Exception:
-        max_age = 30 * 86400
-    rep = _vf.reported(kg, source, max_age)
-    return jsonify({'kg': kg, 'source': source, 'reported': rep})
-
 
 # === SECTION: sliver sweep (sliver_sweep.py, docs/sliver-sweep.md) ===
 
@@ -9804,7 +9783,7 @@ def admin_mem_top():
     big = []
     for modname in ('app', 'peer_director', 'search_index',
                     'kg_v2_store', 'zenodo_fetch', 'ne_ingest', 'v2_ingest',
-                    'vct_fleet', 'net_meter', 'http_pool', 'json_cache'):
+                    'net_meter', 'http_pool', 'json_cache'):
         mod = sys.modules.get(modname)
         if not mod:
             continue
@@ -20046,11 +20025,6 @@ def process_txt():
         # VTC pilot (docs/vct-pilot.md): which peers, bevdirect bandwidth,
         # agreement vs declared, /contrib report outcomes, obs round-trip and
         # split-parent assembly for every pilot KG.
-        try:
-            import vct_fleet as _vf
-            out.extend(_vf.process_txt_lines())
-        except Exception as _e:  # noqa: BLE001
-            log.debug('process.txt vct_pilot lines: %s', _e)
         try:
             import zenodo_meta_refresh as _zmr
             out.append(_zmr.text_line())
