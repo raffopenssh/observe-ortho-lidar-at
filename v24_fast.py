@@ -1,6 +1,6 @@
 """v2.4 fast upgrade ("relabel") from an existing v2.3+ product pair.
 
-The v2.4 product differs from v2.3 only by (a) being cadastre-free and
+The v2.4 product differs from v2.3 only by (a) being property-free and
 (b) carrying the NE cells layer (``<code>_ne.h3b`` + JSON section ``ne``).
 Segments, trees, grid25, terrain — everything else is byte-identical.  So a
 KG that already has a committed ``_light_gpkg_v2`` >= 2.3 and a ``_json_v2``
@@ -11,9 +11,9 @@ re-segments every tile).  Instead:
 
 1. download the light GPKG (0.3-1 GB) + the gz JSON (<1 MB) + the v1 JSON
    (verify baseline), see :func:`fetch_inputs`;
-2. copy the light GPKG and DROP the cadastre tables (``parcels``,
-   ``buildings``, ``parcel_outline_z`` + their rtree / style / contents
-   rows), VACUUM → ``<code>_light_v2.gpkg`` (2.4, cadastre-free);
+2. copy the light GPKG and DROP the legacy property-level tables
+   (``LEGACY_TABLES`` + their rtree / style / contents rows), VACUUM →
+   ``<code>_light_v2.gpkg`` (2.4, property-free);
 3. rebuild the NE observed layer from the SAME arrays the fresh path uses,
    read back from the light GPKG: ``segment_type`` (1 m type raster),
    ``segment_height`` (1 m nDSM), ``segments`` polygons rasterised to a
@@ -21,7 +21,7 @@ re-segments every tile).  Instead:
    ``tree_apices``, ``terrain_coarse_*`` (5 m dtm/slope/aspect); Hansen
    loss-year via the (cached) UMD tile, flight years from the JSON
    ``acquisition`` block;
-4. ``strip_cadastre_from_doc`` on the v2.3 JSON + ``ne`` section +
+4. ``strip_legacy_sections`` on the v2.3 JSON + ``ne`` section +
    ``product_version`` 2.4 → ``<code>_v2.json.gz``.
 
 The caller (``austria_processor._process_kg_v24_fast``) then runs the
@@ -50,7 +50,7 @@ import numpy as np
 log = logging.getLogger("v24_fast")
 
 FAST_MIN_PRODUCT = 2.3            # light GPKG must carry tree_apices + terrain_coarse (2.1+) and trees v3.1 (2.3)
-CADASTRE_TABLES = ("parcels", "buildings", "parcel_outline_z")
+LEGACY_TABLES = ("parcels", "buildings", "parcel_outline_z")   # pre-2.4 layer names
 PATH_TAG = "v24_fast"
 
 
@@ -124,7 +124,8 @@ def fetch_inputs(code: str, manifest, work_dir: Path, token: str, *, n_streams: 
     jpath = work_dir / f"{code}_v2.src.json.gz"
     url = f"{_ent(j2, 'bucket_url')}/{_ent(j2, 'filename')}"
     _step(f"json_v2 {int(_ent(j2, 'size', 0) or 0) / 1e6:.1f} MB")
-    r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=120)
+    # toward zenodo.org only; published records need no token
+    r = requests.get(url, headers={"Authorization": f"Bearer {token}"} if token else {}, timeout=120)
     if r.status_code in (403, 404, 410):
         raise FileNotFoundError(f"{code}_json_v2 gone from Zenodo: HTTP {r.status_code}")
     if r.status_code != 200:
@@ -148,7 +149,7 @@ def fetch_inputs(code: str, manifest, work_dir: Path, token: str, *, n_streams: 
         log.info("KG %s: reusing downloaded %s (%.0f MB)", code, gpath.name, size / 1e6)
     else:
         free = shutil.disk_usage("/").free / (1024 ** 3)
-        need = 2 * size / (1024 ** 3) + min_free_gb      # src + cadastre-free copy
+        need = 2 * size / (1024 ** 3) + min_free_gb      # src + property-free copy
         if free < need:
             for old in work_dir.glob("*.src.gpkg*"):
                 if old.name != gpath.name:
@@ -194,10 +195,10 @@ def release_inputs(code: str, work_dir: Path) -> None:
             pass
 
 
-# === SECTION: cadastre-free light GPKG ===
+# === SECTION: property-free light GPKG ===
 
-def make_cadastre_free_gpkg(src: str, dst: str) -> dict:
-    """Copy *src* → *dst* and remove every cadastre-shaped table (+ its
+def make_property_free_gpkg(src: str, dst: str) -> dict:
+    """Copy *src* → *dst* and remove every legacy property-level table (+ its
     GeoPackage bookkeeping).  Returns {dropped: [...], bytes_before, bytes_after}."""
     src, dst = str(src), str(dst)
     if os.path.exists(dst):
@@ -209,7 +210,7 @@ def make_cadastre_free_gpkg(src: str, dst: str) -> dict:
     try:
         tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         views = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='view'")}
-        for t in CADASTRE_TABLES:
+        for t in LEGACY_TABLES:
             if t not in tables and t not in views:
                 continue
             # triggers + rtree virtual tables first (they reference the table)
@@ -245,8 +246,9 @@ def make_cadastre_free_gpkg(src: str, dst: str) -> dict:
         c = sqlite3.connect(dst)
         if c.execute("SELECT 1 FROM sqlite_master WHERE name='gpkg_metadata'").fetchone():
             c.execute("INSERT INTO gpkg_metadata(md_scope, md_standard_uri, mime_type, metadata) VALUES (?,?,?,?)",
-                      ("dataset", "https://example.invalid/docs/v2.4", "application/json",
-                       json.dumps({"product_version": "2.4", "cadastre_free": True, "path": PATH_TAG,
+                      ("dataset", "https://github.com/raffopenssh/observe-ortho-lidar-at/blob/main/docs/v2-upgrade.md",
+                       "application/json",
+                       json.dumps({"product_version": "2.4", "property_free": True, "path": PATH_TAG,
                                    "dropped_tables": dropped,
                                    "relabelled_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})))
             c.commit()
@@ -456,16 +458,16 @@ def rasterio_affine(left: float, top: float, res: float):
 # === SECTION: JSON relabel ===
 
 def relabel_doc(doc: dict, ne_out: dict, *, product_version: str, strip_fn, path_note: str) -> dict:
-    """v2.3 JSON → v2.4 JSON: cadastre-free + ``ne`` + version stamps.
+    """v2.3 JSON → v2.4 JSON: property-free + ``ne`` + version stamps.
     *ne_out* = ``{"summary": …}`` on success or ``{"error": …}``."""
     d = strip_fn(doc)
     prev = d.get("product_version")
     d["product_version"] = product_version
     d["version"] = d.get("version") or "v2"
-    d["cadastre_free"] = True
+    d["property_free"] = True
     d.setdefault("coverage", {})
     if isinstance(d["coverage"], dict):
-        d["coverage"]["note"] = ("Full KG tiled segmentation. Since 2.4 no parcel/footprint data is in this "
+        d["coverage"]["note"] = ("Full KG tiled segmentation. Since 2.4 no property-level data is in this "
                                  "product; sub-KG detail lives in the NE cells layer (section 'ne', product <code>_ne.h3b).")
     if ne_out.get("summary"):
         d["ne"] = dict(ne_out["summary"], status="ok")
@@ -474,22 +476,21 @@ def relabel_doc(doc: dict, ne_out: dict, *, product_version: str, strip_fn, path
     m = d.setdefault("methods", {})
     if isinstance(m, dict):
         m["ne_cells"] = (
-            "H3 res-12 cells: declared land-use mix (NEC1, umfeld-at ne-cells-2, frozen epoch) vs our "
+            "H3 res-12 cells: declared land-use mix (NEC1, ne-cells-2, frozen epoch) vs our "
             "observed layer (NEO1: segment_type mix, nDSM heights, tree count/height/crown, NDVI, dh, "
             "verdict declared-vs-observed); NET1 = every tree apex >= 3 m, NEB1 = every man-made object "
             "with observed height; res-10 chunked .h3b product (manifest key _ne_h3b)")
-        m["calibration"] = "Cadastre footprints as run-time model context only (not stored)"
-        m["cadastre_source"] = ("run-time model context only (umfeld-at /k, cached <= 24 h); products carry "
-                                "cadastre solely as NE cells (ne_h3, algo ne-cells-2) — no parcel / footprint / id")
+        m.pop("calibration", None)
+        m.pop("cadastre_source", None)
         ds = m.get("data_sources")
         if isinstance(ds, list) and not any("NE cells" in str(x) for x in ds):
-            ds.append("BEV Kataster as NE cells (umfeld-at ne-cells-2, H3 res 12)")
+            ds.append("BEV declared land use as NE cells (ne-cells-2, H3 res 12)")
     up = d.get("upgraded_from") if isinstance(d.get("upgraded_from"), dict) else {}
     up = dict(up or {})
     up["relabel"] = {"path": PATH_TAG, "from_product_version": prev, "note": path_note,
                      "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     d["upgraded_from"] = up
-    d.pop("cadastre_stripped_at", None)      # that stamp is for the stripped v1 JSON
+    d.pop("cadastre_stripped_at", None)      # legacy stamp of the stripped v1 JSON
     return d
 
 
@@ -509,8 +510,8 @@ def build(kg: dict, inputs: dict, ne_declared, *, out_gpkg: str, out_h3b: str, p
         if step:
             step(d)
 
-    _step("cadastre-free light GPKG (copy + drop tables + vacuum)")
-    cf = make_cadastre_free_gpkg(inputs["light_src"], out_gpkg)
+    _step("property-free light GPKG (copy + drop tables + vacuum)")
+    cf = make_property_free_gpkg(inputs["light_src"], out_gpkg)
     log.info("KG %s: v2.4 fast — dropped %s, %.0f → %.0f MB", code, cf["dropped"],
              cf["bytes_before"] / 1e6, cf["bytes_after"] / 1e6)
 
