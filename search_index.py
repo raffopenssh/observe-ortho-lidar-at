@@ -1869,6 +1869,7 @@ class SearchIndex:
         if not manifest:
             return 0
         by_parent = {}
+        live_json = set()  # parents with ≥1 committed (non-removed) _json
         for k in manifest:
             if not k.endswith('_json'):
                 continue
@@ -1877,11 +1878,32 @@ class SearchIndex:
             if not base.isdigit():
                 continue
             by_parent.setdefault(base, set()).add(code)
+            e = manifest.get(k)
+            if isinstance(e, dict) and int(e.get('size') or 0) \
+                    and str(e.get('status') or '') != 'removed':
+                live_json.add(base)
         n = 0
+        n_reset = 0
         with self._write_lock:
             c = self._conn()
             rows = c.execute('SELECT kg_code FROM kg WHERE processed=1').fetchall()
             for (parent,) in rows:
+                if parent not in live_json:
+                    # Residue: every ``_json`` of this parent was retired
+                    # (stale_blocks / requeue tombstone) — the row must not
+                    # keep counting as done with an empty product_version
+                    # (``v1_only=1`` for 65309 after its old -south block
+                    # was retired, 2026-10-30).  It flips back to
+                    # processed=1 when the fresh JSON is ingested.
+                    try:
+                        c.execute('UPDATE kg SET processed=0, product_version=NULL, '
+                                  'zenodo_json_url=NULL, zenodo_json_size=NULL, '
+                                  'json_uploaded_at=NULL, json_v2_uploaded_at=NULL '
+                                  'WHERE kg_code=?', (parent,))
+                        n_reset += 1
+                    except Exception as e:
+                        log.debug('sync_manifest_links reset %s: %s', parent, e)
+                    continue
                 codes = sorted(by_parent.get(parent) or {parent})
                 if parent not in codes:
                     codes.insert(0, parent)
@@ -1906,6 +1928,9 @@ class SearchIndex:
                       ('manifest_synced_at',
                        time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
             c.commit()
+        if n_reset:
+            log.info('sync_manifest_links: reset %d processed row(s) without a '
+                     'live _json (retired residue)', n_reset)
         return n
 
     @staticmethod

@@ -32,6 +32,7 @@ since split) are left alone: the old product is the valid coverage.
 
     python3 stale_blocks.py scan              # report only
     python3 stale_blocks.py apply [--limit N] [code ...]
+    python3 stale_blocks.py retire [--dry-run] code ...   # orphan residue (no _json)
 """
 from __future__ import annotations
 
@@ -222,6 +223,88 @@ def reconcile_pushes(codes: list[str], manifest=None, rounds: int = 4) -> list[s
     return repushed
 
 
+def _retire_one(code: str, entries: dict, manifest, client, queue: list, reason: str) -> list[str]:
+    """Retire every live product of *code*: Zenodo deposition deleted,
+    manifest record kept as ``status=removed`` + pushed, v2 store row,
+    retry-queue entry, tombstones and NE block journalled.  Shared by
+    ``apply`` (stale layouts) and ``retire`` (orphan residue)."""
+    import kg_v2_store
+    from zenodo_lock import zenodo_upload_lock
+    keys = [f"{code}_{s}" for s in PRODUCT_SUFFIXES if _live(entries.get(f"{code}_{s}"))]
+    with zenodo_upload_lock(purpose="stale_blocks", kg=code):
+        for key in keys:
+            rec = client.remove_deposition_keep_record(key, manifest, reason=reason)
+            r = _post("/api/v1/manifest/push", {"key": key, "entry": rec.to_dict()}, admin=False)
+            if r.get("status") not in (200, 409):
+                raise RuntimeError(f"manifest push {key}: {r}")
+    kg_v2_store.delete(code)
+    if code in queue:
+        queue[:] = [q for q in queue if q != code]
+        (DATA_DIR / "retry_queue.json").write_text(json.dumps(queue))
+    _post("/api/v1/admin/drop_tombstones", {"prefix": code})
+    _journal_ne([code])
+    return keys
+
+
+def retire(codes: list[str], dry_run: bool = False) -> dict:
+    """Retire *orphan residue*: codes that carry live products but no
+    ``_json`` completion marker and are not part of a stale layout
+    (``zen_stall`` ``orphan`` rows — e.g. ``32002-south-1`` full+light from
+    a July run whose layout drifted, or an unsplit ``12114`` full+light
+    (v1) superseded by its blocks).  Refuses codes with a live ``_json``
+    (that is a complete product, use ``apply``) and codes whose parent is
+    running on a peer.  After this the parent is queued by the operator
+    (``POST /processing/queue skip_processed:false``) for a clean v2.4
+    rerun of the uncovered blocks."""
+    import shutil
+    from zenodo_client import Client, Manifest
+    import austria_processor as ap
+    import kg_splitter
+    entries = _entries()
+    out = {"todo": [], "done": [], "errors": {}, "refused": {}}
+    running = _running_parents()
+    if running is None:
+        return {"error": "peer probe failed"}
+    for c in codes:
+        parent = kg_splitter.parent_kg_code(c) if kg_splitter.is_block_code(c) else c
+        live = [s for s in PRODUCT_SUFFIXES if _live(entries.get(f"{c}_{s}"))]
+        if not live:
+            out["refused"][c] = "no live products"
+        elif "json" in live:
+            out["refused"][c] = "has live _json (complete) — not residue"
+        elif parent in running:
+            out["refused"][c] = f"parent {parent} running on a peer"
+        else:
+            out["todo"].append(c)
+    if dry_run or not out["todo"]:
+        return out
+    try:
+        queue = json.loads((DATA_DIR / "retry_queue.json").read_text())
+    except Exception:  # noqa: BLE001
+        queue = []
+    tmp_mf = Path("/tmp/stale_blocks_manifest.json")
+    shutil.copy(MANIFEST, tmp_mf)
+    manifest = Manifest(str(tmp_mf))
+    client = Client(token=ap._zenodo_token())
+    for code in out["todo"]:
+        try:
+            keys = _retire_one(code, entries, manifest, client, queue, reason="orphan residue")
+            out["done"].append({"code": code, "removed": keys})
+            log.info("stale_blocks: retired orphan %s (%s)", code, ",".join(keys))
+        except Exception as ex:  # noqa: BLE001
+            out["errors"][code] = str(ex)[:300]
+            log.warning("stale_blocks: retire %s failed: %s", code, ex)
+    out["repushed"] = reconcile_pushes([x["code"] for x in out["done"]], manifest)
+    try:
+        import app as _app
+        for x in out["done"]:
+            _app.director_event("info", f"stale_blocks: retired orphan {x['code']} ({len(x['removed'])} products) — "
+                                "partial residue without _json, parent to be re-queued", x["code"])
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def apply(codes: list[str] | None = None, limit: int = 50, dry_run: bool = False) -> dict:
     import shutil
     import kg_v2_store
@@ -261,19 +344,7 @@ def apply(codes: list[str] | None = None, limit: int = 50, dry_run: bool = False
     for code in todo:
         parent = plan[code]
         try:
-            keys = [f"{code}_{s}" for s in PRODUCT_SUFFIXES if _live(entries.get(f"{code}_{s}"))]
-            with zenodo_upload_lock(purpose="stale_blocks", kg=code):
-                for key in keys:
-                    rec = client.remove_deposition_keep_record(key, manifest, reason="stale split layout")
-                    r = _post("/api/v1/manifest/push", {"key": key, "entry": rec.to_dict()}, admin=False)
-                    if r.get("status") not in (200, 409):
-                        raise RuntimeError(f"manifest push {key}: {r}")
-            kg_v2_store.delete(code)
-            if code in queue:
-                queue = [q for q in queue if q != code]
-                (DATA_DIR / "retry_queue.json").write_text(json.dumps(queue))
-            _post("/api/v1/admin/drop_tombstones", {"prefix": code})
-            _journal_ne([code])
+            keys = _retire_one(code, entries, manifest, client, queue, reason="stale split layout")
             touched_parents.add(parent)
             out["done"].append({"code": code, "removed": keys})
             log.info("stale_blocks: retired %s (%s)", code, ",".join(keys))
@@ -366,6 +437,10 @@ if __name__ == "__main__":
         # but whose manifest entry reverted (peer-sync RMW race)
         codes = [a for a in args[1:] if re.match(r"^\d{5}(-[a-z][-a-z0-9]*)?$", a)]
         print(json.dumps(reconcile_pushes(codes), indent=1))
+    elif cmd == "retire":
+        dry = "--dry-run" in args
+        codes = [a for a in args[1:] if re.match(r"^\d{5}(-[a-z][-a-z0-9]*)?$", a)]
+        print(json.dumps(retire(codes, dry_run=dry), indent=1))
     elif cmd == "apply":
         limit = 50
         dry = "--dry-run" in args
