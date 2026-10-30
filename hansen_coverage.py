@@ -305,11 +305,8 @@ def probe_peers(missing: Set[str], timeout: float = 20.0, workers: int = 16) -> 
     """
     import concurrent.futures as cf
     import requests
-    tok = ""
-    try:
-        tok = (DATA_DIR / "admin_token").read_text().strip()
-    except Exception:
-        pass
+    import config
+    hdrs = config.operator_headers()
     peers: List[Tuple[str, str]] = []
     try:
         pj = json.loads((DATA_DIR / "austria_processor" / "peers.json").read_text())
@@ -325,7 +322,7 @@ def probe_peers(missing: Set[str], timeout: float = 20.0, workers: int = 16) -> 
         pid, url = p
         try:
             r = requests.get(url + "/api/v1/processing/tiles",
-                             headers={"X-Admin-Token": tok}, timeout=timeout)
+                             headers=hdrs, timeout=timeout)
             cells = {_key((float(t["w"]), float(t["s"])))
                      for t in r.json().get("hansen", [])
                      if abs(float(t["n"]) - float(t["s"]) - STEP) < 1e-6}

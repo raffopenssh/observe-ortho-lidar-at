@@ -1455,7 +1455,7 @@ class ZenodoCache:
         self.base_url = base_url.rstrip("/")
         self.manifest = CacheManifest()
         self._session = requests.Session()
-        self._session.headers["User-Agent"] = "srtm-lidar-zenodo-cache/1.0"
+        self._session.headers["User-Agent"] = "observe-ortho-lidar-at/1.0 (+https://github.com/raffopenssh/observe-ortho-lidar-at)"
         self._zip_indices: Dict[str, ZipIndex] = {}  # zip_name → ZipIndex
         self._missing_zips: set = set()  # negative cache of ZIPs not in manifest
         self._missing_zips_mtime: float = 0.0  # manifest mtime when cache was built
@@ -1478,7 +1478,7 @@ class ZenodoCache:
         except Exception:
             pass
         self._session = requests.Session()
-        self._session.headers["User-Agent"] = "srtm-lidar-zenodo-cache/1.0"
+        self._session.headers["User-Agent"] = "observe-ortho-lidar-at/1.0 (+https://github.com/raffopenssh/observe-ortho-lidar-at)"
 
     def _api(self, method: str, path: str, **kwargs) -> requests.Response:
         """Zenodo API call with retry on transient 5xx / network errors.
@@ -1524,7 +1524,7 @@ class ZenodoCache:
                 except Exception:
                     pass
                 self._session = requests.Session()
-                self._session.headers["User-Agent"] = "srtm-lidar-zenodo-cache/1.0"
+                self._session.headers["User-Agent"] = "observe-ortho-lidar-at/1.0 (+https://github.com/raffopenssh/observe-ortho-lidar-at)"
                 if attempt < max_attempts - 1:
                     delay = min(2.0 * (2 ** attempt), 300.0)
                     log.info(
@@ -1854,7 +1854,7 @@ class ZenodoCache:
     def _authed_session(self) -> requests.Session:
         """Return a session with the access_token as a default query param."""
         s = requests.Session()
-        s.headers["User-Agent"] = "srtm-lidar-zenodo-cache/1.0"
+        s.headers["User-Agent"] = "observe-ortho-lidar-at/1.0 (+https://github.com/raffopenssh/observe-ortho-lidar-at)"
         s.params = {"access_token": self.token}  # type: ignore[assignment]
         return s
 

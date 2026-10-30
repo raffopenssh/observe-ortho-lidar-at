@@ -249,7 +249,7 @@ def get_hook() -> Optional[Callable[[dict], None]]:
 # ---------------------------------------------------------------------------
 
 def _auth_headers(url: str, headers: Optional[dict]) -> dict:
-    hdr = {'User-Agent': 'srtm-lidar/1.0 zenodo_fetch'}
+    hdr = {'User-Agent': 'observe-ortho-lidar-at/1.0 (+https://github.com/raffopenssh/observe-ortho-lidar-at)'}
     # Both bucket URLs (/api/files/<uuid>/..) and draft record URLs
     # (/api/records/<id>/draft/files/../content) are owner-only → Bearer.
     if url.startswith('https://zenodo.org/api/') and 'access_token=' not in url:

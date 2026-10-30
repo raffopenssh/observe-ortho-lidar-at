@@ -530,14 +530,9 @@ def sweep(*, requeue: bool = True, scan_budget_s: float = 20.0) -> dict:
 def _post_requeue(code: str) -> bool:
     try:
         import requests
-        headers = {}
-        try:
-            tok = Path("data/admin_token").read_text().strip()
-            if tok:
-                headers["X-Admin-Token"] = tok
-        except Exception:
-            pass
-        r = requests.post("http://127.0.0.1:8000/api/v1/processing/queue",
+        import config
+        headers = config.operator_headers()
+        r = requests.post(config.director_url() + "/api/v1/processing/queue",
                           json={"kgs": [code], "position": 0, "skip_processed": False},
                           timeout=30, headers=headers)
         return r.ok
@@ -552,16 +547,11 @@ def _cancel_requeue(code: str) -> bool:
     keeps the code) and remove it from ``retry_queue.json``."""
     try:
         import requests
-        headers = {}
-        try:
-            tok = Path("data/admin_token").read_text().strip()
-            if tok:
-                headers["X-Admin-Token"] = tok
-        except Exception:
-            pass
-        requests.post("http://127.0.0.1:8000/api/v1/admin/drop_tombstones",
+        import config
+        headers = config.operator_headers()
+        requests.post(config.director_url() + "/api/v1/admin/drop_tombstones",
                       json={"keys": [f"{code}_requeue"]}, timeout=30, headers=headers)
-        r = requests.delete("http://127.0.0.1:8000/api/v1/processing/queue",
+        r = requests.delete(config.director_url() + "/api/v1/processing/queue",
                             params={"kg": code}, timeout=30, headers=headers)
         return r.status_code in (200, 404)
     except Exception as ex:  # noqa: BLE001

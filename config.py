@@ -98,6 +98,24 @@ def single_vm() -> bool:
     return not peers() and not PRIMARY_URL
 
 
+def is_director() -> bool:
+    """This instance runs the director (always true unless it is a worker
+    pointed at a remote ``SRTM_PRIMARY_URL``)."""
+    return not PRIMARY_URL
+
+
+def self_id() -> str:
+    """Identifier of this instance in a multi-VM roster (``SRTM_PEER_ID``);
+    ``primary`` for the director, else the hostname."""
+    v = env("SRTM_PEER_ID")
+    if v:
+        return v
+    if is_director():
+        return "primary"
+    import socket
+    return socket.gethostname().split(".")[0] or "peer"
+
+
 # --- Optional upstream services (all disabled when empty) -------------------
 POWER_API_URL = _url("POWER_API_URL")          # power-infrastructure lookup service
 UMFELD_URL = _url("UMFELD_URL")                # NE declared-layer / contrib endpoint
@@ -146,6 +164,20 @@ COPERNICUS_CREDENTIALS_FILE = Path(
 # send it as ``X-Operator-Token``.
 def operator_token() -> str:
     return env("SRTM_OPERATOR_TOKEN") or _file_secret("operator_token")
+
+
+def operator_headers() -> dict:
+    """``{'X-Operator-Token': …}`` when a token is configured, else ``{}``
+    (loopback needs none).  For callers using their own ``requests.Session``;
+    module-level ``requests.*`` toward ``PRIMARY_URL`` get it from http_pool."""
+    tok = operator_token()
+    return {"X-Operator-Token": tok} if tok else {}
+
+
+def director_url() -> str:
+    """Where processor-side helpers reach the director's API: ``PRIMARY_URL``
+    in a multi-VM setup, else the local ``app.py`` (``APP_URL``)."""
+    return PRIMARY_URL or APP_URL
 
 
 # --- Feature flags ----------------------------------------------------------

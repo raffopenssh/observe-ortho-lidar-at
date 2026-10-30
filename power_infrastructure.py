@@ -1,4 +1,4 @@
-"""Austrian energy infrastructure training data from austria-power API + OSM.
+"""Austrian energy infrastructure training data (optional infrastructure API + OSM).
 
 Provides ground-truth labels for:
 - wind_turbine: AustroControl + igwindkraft wind turbines
@@ -6,7 +6,7 @@ Provides ground-truth labels for:
 - solar_panel: large ground-mount solar farms (>1000m² from OSM polygons)
 - substation: transformer stations (from OSM polygons)
 
-Used by the RF training pipeline alongside cadastre and OSM landcover labels.
+Used by the RF training pipeline alongside OSM landcover labels.
 """
 from __future__ import annotations
 
@@ -30,13 +30,15 @@ log = logging.getLogger("power_infrastructure")
 # Constants
 # ---------------------------------------------------------------------------
 
-POWER_API_URL = "https://example.invalid:8000/api/infrastructure"
+import config
+
+POWER_API_URL = config.POWER_API_URL  # "" => power API disabled (OSM only)
 
 OVERPASS_URLS = [
     "https://z.overpass-api.de/api/interpreter",
     "https://overpass-api.de/api/interpreter",
 ]
-USER_AGENT = "srtm-lidar-at/1.0 (noreply@users.noreply.github.com)"
+USER_AGENT = "observe-ortho-lidar-at/1.0 (+https://github.com/raffopenssh/observe-ortho-lidar-at)"
 
 CACHE_DIR = Path("/tmp/power_infra_cache")
 CACHE_MAX_AGE_S = 24 * 3600  # 24 hours
@@ -131,7 +133,7 @@ def _to_3035_geom(geom):
 # ---------------------------------------------------------------------------
 
 def _fetch_power_api(bbox_wgs84: tuple[float, float, float, float]) -> Optional[dict]:
-    """Fetch infrastructure data from austria-power API.
+    """Fetch infrastructure data from the configured infrastructure API (config.POWER_API_URL).
 
     Parameters
     ----------
@@ -141,6 +143,8 @@ def _fetch_power_api(bbox_wgs84: tuple[float, float, float, float]) -> Optional[
     -------
     GeoJSON FeatureCollection dict, or None on failure.
     """
+    if not POWER_API_URL:
+        return None
     cached = _read_cache("power_api", bbox_wgs84)
     if cached is not None:
         return cached
@@ -351,7 +355,8 @@ def fetch_power_infrastructure(
     """
     geojson = _fetch_power_api(bbox_wgs84)
     if geojson is None:
-        log.warning("No data from power API")
+        if POWER_API_URL:
+            log.warning("No data from power API")
         return []
     return _parse_power_features(geojson)
 
@@ -704,7 +709,7 @@ def get_infrastructure_training_labels(
     """Get infrastructure training labels for segments.
 
     Top-level function called by the RF training pipeline. Fetches data from
-    the austria-power API and OSM, then matches to segments.
+    the infrastructure API (if configured) and OSM, then matches to segments.
 
     Parameters
     ----------
@@ -729,7 +734,7 @@ def get_infrastructure_training_labels(
         "errors": [],
     }
 
-    # Fetch infrastructure points from austria-power API
+    # Fetch infrastructure points from the infrastructure API (optional)
     infra_points = []
     try:
         infra_points = fetch_power_infrastructure(bbox_wgs84)

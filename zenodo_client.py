@@ -56,10 +56,11 @@ DEFAULT_BASE_URL = "https://zenodo.org"
 
 
 def default_token(required: bool = True) -> str:
-    """The fleet Zenodo token — leased from the primary, memory-only
-    (``fleet_secrets``). Never a literal in this repo again."""
-    import fleet_secrets
-    return fleet_secrets.token("zenodo", required=required)
+    """The Zenodo token from ``config.zenodo_token()`` (env ``ZENODO_TOKEN``
+    or ``$SRTM_SECRETS_DIR/zenodo_token``).  Empty ⇒ read-only: ``Client()``
+    without a token works for public downloads but refuses every write."""
+    import config
+    return config.zenodo_token(required=required)
 
 
 def __getattr__(name):
@@ -87,13 +88,13 @@ class Entry:
     checksum: str = ""  # "md5:<hex>"
     uploaded_at: str = ""  # ISO-8601
     version: str = ""
-    # v2.4 cadastre clean-up bookkeeping (optional; absent = plain entry):
+    # v2.4 legacy clean-up bookkeeping (optional; absent = plain entry):
     #  * ``status``      "removed" → the deposition was deleted on Zenodo and
-    #                    this record is kept on purpose so the director can
+    #                    this record is kept on purpose so the operator can
     #                    audit that every legacy file is really gone
     #                    (size is 0 — every "committed?" test reads it as absent);
     #                    "stripped" → the file was re-PUT in place without its
-    #                    cadastre sections (v1 ``_json``).
+    #                    legacy sections (v1 ``_json``).
     #  * ``removed_at`` / ``stripped_at``  ISO-8601 of that action.
     #  * ``prev_uploaded_at``  the original upload stamp (progress-rate counters
     #                    must not read a strip as a fresh completion).
@@ -287,9 +288,8 @@ def default_metadata(key: str, filename: str, version: str) -> Dict[str, Any]:
 META_REV = 2
 
 #: Run-time-only context layers that must not be advertised as product
-#: content (v2.4: the cadastre is model context, never stored).
-_NON_PRODUCT_LAYERS = frozenset({"cadastre_buildings", "cadastre_buildings_viewport",
-                                 "cadastre", "parcels"})
+#: content (v2.4: building context is model input only, never stored).
+_NON_PRODUCT_LAYERS = frozenset({"buildings_context", "buildings_context_viewport"})
 
 _CONTENT_BY_TYPE = {
     "json": ("per-KG summary: segmentation statistics (25 object types), terrain "
@@ -321,11 +321,11 @@ def landscape_metadata(
 ) -> Dict[str, Any]:
     """Zenodo metadata for one Austrian landscape product (per KG).
 
-    Cadastre-free wording (product 2.4+): the Katastralgemeinde (KG) is the
-    spatial *unit* of the dataset only; no parcel geometry, footprint, GNR /
-    EZ or address is contained in any product.  The same text is used for
-    the stripped v1 ``_json`` and the (always cadastre-free) full GPKG so
-    the whole deposit family reads consistently.
+    Product 2.4+ wording: the Katastralgemeinde (KG) is the spatial *unit*
+    of the dataset only; no property boundary, building footprint, land
+    register identifier or address is contained in any product.  The same
+    text is used for the stripped v1 ``_json`` and the full GPKG so the
+    whole deposit family reads consistently.
 
     Parameters
     ----------
@@ -368,10 +368,9 @@ def landscape_metadata(
                 f"(KG) <b>{kg_code} {kg_name}</b>. The KG is used only as the "
                 f"spatial unit of this dataset.\n"
                 f"Contains: {content}.\n"
-                f"<b>Cadastre-free.</b> No parcel geometry, building footprint, "
-                f"Grundst\u00fccksnummer, Einlagezahl or address is contained in or "
-                f"recoverable from this file. Cadastre data is used at run time "
-                f"only as model context; land use enters the products solely as "
+                f"<b>No property-level data.</b> No property boundary, building "
+                f"footprint, land-register identifier or address is contained in or "
+                f"recoverable from this file. Land use enters the products solely as "
                 f"k-anonymous per-cell statistics (NE layer).\n"
                 f"Format: {file_type}, version {version}."
                 f"{quality_line}\n"
@@ -676,27 +675,31 @@ class Client:
         retry_base_wait: float = 4.0,
         read_only: bool = False,
     ) -> None:
-        self.token = token or default_token()
+        self.token = token or default_token(required=False)
         self.base_url = base_url.rstrip("/")
         self.max_retries = max_retries
         self.retry_base_wait = retry_base_wait
-        self.read_only = read_only
+        # No token ⇒ read-only (public downloads only).
+        self.read_only = read_only or not self.token
 
         self._session = requests.Session()
-        self._session.headers.update({"Authorization": f"Bearer {self.token}"})
+        self._set_auth_header()
+
+    def _set_auth_header(self) -> None:
+        if self.token:
+            self._session.headers.update({"Authorization": f"Bearer {self.token}"})
+        else:
+            self._session.headers.pop("Authorization", None)
 
     def _maybe_release_token(self) -> None:
-        """401/403 from Zenodo: the token may have been rotated on the
-        primary — re-lease once (rate-limited) and refresh the session
-        header so the caller's retry uses the new value."""
+        """401/403 from Zenodo: re-read the configured token (it may have
+        been rotated on disk) and refresh the session header."""
         try:
-            import fleet_secrets
-            fleet_secrets.invalidate("zenodo")
-            new = fleet_secrets.token("zenodo")
+            new = default_token(required=False)
             if new and new != self.token:
                 self.token = new
-                self._session.headers.update({"Authorization": f"Bearer {self.token}"})
-                log.info("zenodo token refreshed from lease (rev %s)", fleet_secrets.cached_rev())
+                self._set_auth_header()
+                log.info("zenodo token re-read from config")
         except Exception:
             pass
 
@@ -714,7 +717,7 @@ class Client:
         except Exception:
             pass
         self._session = requests.Session()
-        self._session.headers.update({"Authorization": f"Bearer {self.token}"})
+        self._set_auth_header()
 
     # -- internal helpers ----------------------------------------------------
 
@@ -1954,7 +1957,7 @@ class Client:
         log.info("Deposition %d deleted, manifest updated", entry.depo_id)
 
     def remove_deposition_keep_record(self, key: str, manifest: Manifest,
-                                      reason: str = "cadastre_cleanup") -> Entry:
+                                      reason: str = "legacy_cleanup") -> Entry:
         """v2.4 legacy clean-up: DELETE the (draft) deposition on Zenodo but
         KEEP the manifest record as ``status="removed"`` (size 0, fresh
         ``uploaded_at`` so the record propagates through the timestamp-aware

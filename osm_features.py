@@ -35,7 +35,7 @@ OVERPASS_URLS = [
     "https://z.overpass-api.de/api/interpreter",
     "https://overpass-api.de/api/interpreter",
 ]
-USER_AGENT = "srtm-lidar-at/1.0 (noreply@users.noreply.github.com)"
+USER_AGENT = "observe-ortho-lidar-at/1.0 (+https://github.com/raffopenssh/observe-ortho-lidar-at)"
 
 CACHE_DIR = Path("/tmp/osm_cache")
 MAX_RETRIES = 3

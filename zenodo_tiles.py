@@ -216,20 +216,12 @@ class TileStore:
     def _push_shard_to_director(self, key: str, sh: dict) -> None:
         """Fast-path the new shard to the director so sibling peers see it
         before the 5-min sync (best effort)."""
-        try:
-            self_p = Path("data/austria_processor/self.json")
-            url = (json.loads(self_p.read_text()).get("director_url") or "").rstrip("/")
-        except Exception:
-            url = ""
+        import config
+        url = config.PRIMARY_URL  # single VM: no director to push to
         if not url:
             return
         headers = {"Content-Type": "application/json"}
-        try:
-            tok = Path("data/admin_token").read_text().strip()
-            if tok:
-                headers["X-Admin-Token"] = tok
-        except Exception:
-            pass
+        headers.update(config.operator_headers())
         requests.put(url + "/api/v1/processing/cache_manifest",
                      data=json.dumps({"shards": {key: sh}, "files": {}}),
                      headers=headers, timeout=8)
