@@ -123,7 +123,7 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
   cover groups (shared NE cells codes): geb=buildings, bau=construction & parking, acker=cropland,
     gruen=grass/garden/orchard/vineyard/shrub/hedge, wald=trees, wasser=water, verkehr=roads & paths,
     alpen=rock/bare/glacier, sonst=other.  consistency = our observation vs. the statistical land-use layer
-    (declared NE layer) for the same cell (frozen epoch), computed when the product was built:
+    for the same cell (frozen epoch), computed when the product was built:
     consistent | forest_loss | forest_gain | sealed_new | structure_new | green_new | unknown.
   format=columns  {{cells:[hex], kg:[…], cover:[[9 × u8]], h_mean:[u8], …, units, codes}} — raw quantised
     integers at res 12 (~20 B/cell gzipped), the format for map heat layers; res 11/10 → aggregated floats.
