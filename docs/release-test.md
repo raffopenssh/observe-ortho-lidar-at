@@ -166,6 +166,6 @@ Rate limits: `POST /api/v1/flags` burst of 40 → 20 × 201, 20 × 429. The tile
 300-request burst on `/tiles/hillshade` returned 300 × 204 because empty tiles (no processed KG under the tile) short-
 circuit before the limiter, as documented ("cached/empty tiles are not counted"). A 429 on real tiles needs a processed KG.
 
-Forbidden-string scan of every body (`parcel|cadastre|/k/|token|exe.xyz`): only `Tokenless` / "admin token" / "no token"
+Forbidden-string scan of every body (the five patterns from the spec: parcel / cadastre / `/k/` / token / the private fleet domain): only `Tokenless` / "admin token" / "no token"
 in the docs text and the attribution id `bev_cadastre` in `/api/v1/license` (an attribution record, intended).
 

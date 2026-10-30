@@ -145,7 +145,11 @@ def zenodo_token(required: bool = False) -> str:
 
 
 def uploads_enabled() -> bool:
-    return bool(zenodo_token()) and not env_bool("SRTM_DRY_RUN", False)
+    """True only with a Zenodo token and neither ``SRTM_DRY_RUN`` nor
+    ``SRTM_NO_UPLOAD`` (set by ``austria_processor.py --no-upload``)."""
+    return (bool(zenodo_token())
+            and not env_bool("SRTM_DRY_RUN", False)
+            and not env_bool("SRTM_NO_UPLOAD", False))
 
 
 # Where products land when uploads are disabled / dry-run.

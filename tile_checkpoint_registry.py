@@ -237,6 +237,11 @@ def _unpack_bundle(blob: bytes, kg_code: str) -> int:
 
 def _get_cache() -> "object | None":
     try:
+        import config as _config
+        if not _config.uploads_enabled():
+            # No Zenodo token / --no-upload: the registry is local-only;
+            # never contact Zenodo (every caller treats None as "skip").
+            return None
         from zenodo_cache import ZenodoCache
         return ZenodoCache()
     except Exception as e:

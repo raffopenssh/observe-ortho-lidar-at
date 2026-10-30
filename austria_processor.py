@@ -73,7 +73,7 @@ def _zenodo_token() -> str:
 def _uploads_enabled() -> bool:
     """False without a Zenodo token or with ``--no-upload``: products are
     written to ``config.OUT_DIR/<kg>/`` and nothing is uploaded."""
-    return bool(_zenodo_token()) and not os.environ.get("SRTM_NO_UPLOAD")
+    return _config.uploads_enabled()
 # Product/model version.  ``SEG_MODEL_VERSION=v2`` switches the classifier to
 # the segv2 LightGBM (object_segmentation.segment_and_classify(model="v2")),
 # stamps products "v2" and adds the v2-only JSON/GPKG extras (model block).
@@ -300,6 +300,9 @@ def flush_tile_cache_to_zenodo(force: bool = False) -> bool:
     """
     global _last_zenodo_cache_flush
     import time as _t
+    if not _uploads_enabled():
+        # No Zenodo token / --no-upload: nothing may leave this host.
+        return False
     if os.environ.get('COPERNICUS_FORBIDDEN', '').strip() in ('1', 'true', 'yes'):
         # Cache-only peer — never flushes. Pretend we did so callers
         # don't keep retrying.
