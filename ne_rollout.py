@@ -270,6 +270,21 @@ def audit_removed(max_checks: int = 20, entries: dict | None = None, timeout: fl
             aud[k] = {"verdict": "gone", "checked_at": _now(), "depo_id": depo}
             gone += 1
         elif r.status_code == 200:
+            # A record the owner deleted on the Zenodo website keeps an
+            # owner-only draft residue in the deposit API (submitted=true,
+            # files listed, DELETE → 500) while the public record answers
+            # 410.  That is gone for every reader; don't re-delete forever
+            # (12362: published April v1 trio, deleted by the owner).
+            try:
+                if (r.json() or {}).get("submitted"):
+                    pr = requests.get(f"https://zenodo.org/api/records/{depo}", timeout=timeout)
+                    if pr.status_code == 410:
+                        aud[k] = {"verdict": "gone", "checked_at": _now(), "depo_id": depo,
+                                  "note": "public record 410 (deleted), owner draft residue"}
+                        gone += 1
+                        continue
+            except Exception:  # noqa: BLE001
+                pass
             aud[k] = {"verdict": "present", "checked_at": _now(), "depo_id": depo}
             present += 1
             log.warning("legacy audit: %s depo %d marked removed but still PRESENT on Zenodo", k, depo)
