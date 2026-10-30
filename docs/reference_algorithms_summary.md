@@ -92,9 +92,9 @@ Key parameters:
 
 ---
 
-## Reference 2: Copernicus Parcel Delineation (VITO)
+## Reference 2: Copernicus Field-Boundary Delineation (VITO)
 
-**Source**: https://documentation.dataspace.copernicus.eu/.../Parcel%20delineation.html
+**Source**: https://documentation.dataspace.copernicus.eu/ (openEO sample notebook: field-boundary delineation)
 
 ### Pipeline Overview
 
@@ -241,7 +241,7 @@ markers = peak_local_min(-composite_edge, min_distance=10, labels=mask)
 marker_labels = ndimage.label(markers)[0]
 segments = watershed(composite_edge, markers=marker_labels)
 
-# Option B: Felzenszwalb (as in parcel delineation)
+# Option B: Felzenszwalb (as in field delineation)
 segments = felzenszwalb(composite_edge, scale=150, sigma=0.5, min_size=50)
 ```
 
@@ -353,7 +353,7 @@ classes = {
 
 ## Parameter Guidance
 
-| Parameter | Parcel Delineation Value | Suggested for Landscape |
+| Parameter | Field Delineation Value | Suggested for Landscape |
 |-----------|------------------------|------------------------|
 | Felzenszwalb `scale` | 120 | 100-200 (higher for coarser landscape units) |
 | Felzenszwalb `min_size` | 30 px | 50-100 px (landscape objects are larger) |

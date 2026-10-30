@@ -11,18 +11,15 @@ Single source of truth for licence/attribution wording. Consumers:
 | GPKG (`_full`, `_light`, streamed) → `gpkg_metadata` + `gpkg_metadata_reference` | `write_gpkg_metadata(conn, layers=…)` from `_write_gpkg_all_styles`; dataset-scope text + JSON rows, plus a per-table ODbL row for `OSM_DERIVED_LAYERS` |
 | Zenodo deposits (KG products, mirror, tile cache) → `description` footer, `notes`, `license`, `keywords` | `zenodo_description_footer()`, `attribution_text()`, `OUTPUT_LICENSE_ZENODO_ID`, `zenodo_keywords()` |
 | `public_docs.py` (llm.txt attribution section, landing footer, `license_block()` → `/api/v1/license`) | generated from `attribution_short()` / `attribution_dict()` — no hand edits |
-| `index.html` / `query.html` Leaflet attribution control | inline string, links to `/api/v1/attribution` |
-
-Existing Zenodo records were drafts only; no backfill needed (metadata is
-applied at deposit creation / next metadata PUT).
+| `static/index.html` Leaflet attribution control | inline string, links to `/api/v1/attribution` |
 
 ## Assessment
 
-**BEV** (ALS DTM/DSM, DOP orthophoto, Kataster) is Open Government Data
+**BEV** (ALS DTM/DSM, DOP orthophoto, vector tiles) is Open Government Data
 under **CC BY 4.0** (data.bev.gv.at metadata: "Für dieses Produkt gilt die
-Standardlizenz CC-BY-4.0"; BEV confirmed to the OSM community in 2023 that
-kataster.bev.gv.at is CC BY 4.0). CC BY 4.0 permits copying,
-transformation (segmentation, R-tree API, game) and commercial use.
+Standardlizenz CC-BY-4.0"; the same licence applies to the public BEV
+vector-tile service). CC BY 4.0 permits copying, transformation
+(segmentation, APIs, derived products) and commercial use.
 Obligations:
 
 1. Attribution: "Datenquelle: BEV – Bundesamt für Eich- und
@@ -34,8 +31,8 @@ Obligations:
 Caveats:
 - BEV holds copyright + sui generis database rights (§76c ff UrhG); the CC
   BY grant licenses exactly those, no separate agreement needed.
-- Owner data is not in the open datasets nor in our API → no GDPR issue. EZ
-  numbers are public cadastre attributes.
+- No personal data (ownership etc.) is in the open datasets nor in our
+  products → no GDPR issue.
 - Stichtag: ALS epoch folders (20220915 …) are mosaic snapshot dates; real
   flight years per block come from `als_acquisition.py` (`meta.acquisition`).
 
@@ -56,11 +53,10 @@ flagged per-table in GPKG metadata and called out in the Zenodo footer.
 OSM as an RF *training label* source yields a produced work / model, not
 a derivative database (ODbL Community Guidelines).
 
-**austria-power API** — mixed (Austro Control obstacle data, IG Windkraft,
-OSM `source=osm_power`). Treated like OSM (share-alike flag) until upstream
-terms are verified for commercial redistribution.
+**Optional power-infrastructure service** (`POWER_API_URL`, off by
+default) — mixed upstream terms; treated like OSM (share-alike flag).
 
-**basemap.at** — CC BY 4.0, display-only background in `query.html`.
+**basemap.at** — CC BY 4.0, display-only map background in the UI.
 
 Our Zenodo derivatives are published CC BY 4.0 — compatible with all
 sources above except OSM-derived layers, which stay ODbL.
