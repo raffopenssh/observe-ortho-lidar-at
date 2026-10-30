@@ -1,5 +1,10 @@
 """Memory-bounded NEC1 build: ``ne_cells.algo.build_cells`` over sub-domains.
 
+Part of the optional ``config.BEV_VECTOR_CONTEXT`` (bevdirect) block with
+``vct_pilot`` / ``ne_h3``: the input objects are the public BEV vector-tile
+features held in RAM for one KG build; nothing property-level is written
+to disk, products or logs — only the aggregated per-cell statistics.
+
 Why
 ---
 ``build_cells`` (frozen reference algorithm, vtcseamless-py) keeps a dense
