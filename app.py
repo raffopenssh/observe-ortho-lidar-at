@@ -20937,9 +20937,28 @@ def process_txt():
                 # json.loads() guard below.
                 fh.seek(0, 2)
                 size = fh.tell()
-                tail_bytes = 1024 * 1024 if hours_back <= 24 else size
-                fh.seek(max(0, size - tail_bytes))
-                tail = fh.read().decode('utf-8', errors='replace')
+                # Adaptive tail: start at 1 MiB and double until the
+                # oldest complete line predates the requested window
+                # (or the whole file is read). The ring is ~25 MB at
+                # 50 peers (1 MiB ≈ 2 h), so a fixed 1 MiB tail
+                # silently blanked every `?q=<kg>&hours=12` query
+                # (seen 2026-10-30).
+                tail_bytes = size if hours_back > 24 else 1024 * 1024
+                while True:
+                    fh.seek(max(0, size - tail_bytes))
+                    tail = fh.read().decode('utf-8', errors='replace')
+                    if tail_bytes >= size:
+                        break
+                    _nl = tail.find('\n')
+                    try:
+                        _first_ts = json.loads(
+                            tail[_nl + 1:tail.find('\n', _nl + 1)]
+                        ).get('ts', '')
+                    except Exception:
+                        _first_ts = ''
+                    if _first_ts and _first_ts <= since_iso:
+                        break
+                    tail_bytes *= 2
             for line in tail.split('\n'):
                 if not line.strip():
                     continue
