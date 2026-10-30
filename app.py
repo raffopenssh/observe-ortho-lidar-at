@@ -21987,6 +21987,9 @@ def process_txt():
                 c, prod = m.groups()
                 if _is_sweep_code(c):
                     continue   # sliver-sweep add-on: light_v2 + json_v2 only, by design
+                if str(e.get('status') or '') == 'removed' or \
+                        not int(e.get('size') or 0):
+                    continue   # retired record (stale_blocks / legacy) = absent
                 if prod == 'light_gpkg_v2':
                     prod = 'light_gpkg'
                 g = _trip.setdefault(c, {'p': set(), 'first': None,
