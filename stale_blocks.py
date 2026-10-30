@@ -92,15 +92,35 @@ def scan(entries: dict | None = None) -> dict:
         extra = sorted(c for c in cs if c not in layout)
         if not extra:
             continue
-        sans = {k: v for k, v in entries.items()
-                if not any(k.startswith(c + "_") for c in extra)}
-        try:
-            cov = bool(_app._kg_coverage_complete(p, sans)[0])
-        except Exception:  # noqa: BLE001
-            cov = False
-        row = {"parent": p, "codes": extra, "layout": layout,
-               "products": {c: sorted(codes[c]) for c in extra}}
-        (stale if cov else drift).append(row)
+
+        def _cov(drop: set) -> bool:
+            sans = {k: v for k, v in entries.items()
+                    if not any(k.startswith(c + "_") for c in drop)}
+            try:
+                return bool(_app._kg_coverage_complete(p, sans)[0])
+            except Exception:  # noqa: BLE001
+                return False
+
+        # Greedy: an extra code is stale when the parent stays covered
+        # without it (older uploads tried first).  Evaluating all extras
+        # at once missed e.g. 40008 — unsplit July v1 product + 4 finished
+        # Oct blocks of a 4-block layout that has since drifted to 8
+        # blocks: dropping everything uncovers the parent, dropping only
+        # the unsplit product does not (2026-10-30).
+        def _ts(c):
+            return min((str((entries.get(f"{c}_{sfx}") or {}).get("uploaded_at") or "~")
+                        for sfx in codes[c]), default="~")
+        dropped: set = set()
+        for c in sorted(extra, key=_ts):
+            if _cov(dropped | {c}):
+                dropped.add(c)
+        kept = [c for c in extra if c not in dropped]
+        if dropped:
+            stale.append({"parent": p, "codes": sorted(dropped), "layout": layout,
+                          "products": {c: sorted(codes[c]) for c in sorted(dropped)}})
+        if kept:
+            drift.append({"parent": p, "codes": kept, "layout": layout,
+                          "products": {c: sorted(codes[c]) for c in kept}})
     return {"stale": stale, "drift": drift}
 
 
