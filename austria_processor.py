@@ -3,8 +3,8 @@
 
 Produces per-KG:
   1. Full GPKG: all rasters (DTM, DSM, nDSM, ortho, CIR, segmentation) + legend
-  2. Light GPKG: segmentation raster+vector, parcels w/ DTM heights, buildings
-     w/ object heights, vectorised new buildings, vectorised infrastructure
+  2. Light GPKG: segmentation raster+vector, vectorised new buildings,
+     vectorised infrastructure
   3. JSON summary: area summary, landscape characterisation, tallest objects/trees,
      terrain stats, NDVI, Hansen loss, new buildings, infrastructure
 
@@ -59,20 +59,24 @@ from shapely.ops import transform as shapely_transform
 # wrapped past the 8 h hole. 500 entries ≈ 100 KB; peer→director pushes
 # are delta-based (recent_log_delta watermark) so this costs no bandwidth.
 RECENT_LOG_RING = 500
-import umfeld as _umfeld
-CADASTRE_BASE = _umfeld.CADASTRE_BASE  # legacy constant (umfeld /k cadastre routes are 404; nothing here calls them)
+import config as _config
 
 
 def _zenodo_token() -> str:
-    """Fleet Zenodo token, leased from the primary and held in memory only
-    (``fleet_secrets``). Resolved per call so a rotation lands mid-run."""
-    import fleet_secrets
-    return fleet_secrets.token("zenodo", required=True)
+    """Zenodo token from ``config.zenodo_token()`` (env ``ZENODO_TOKEN`` or
+    ``SECRETS_DIR/zenodo_token``), resolved per call.  Empty string when
+    none is configured: the ``zenodo_client.Client`` is then read-only and
+    products stay in ``config.OUT_DIR`` (``--no-upload`` / no-token path)."""
+    return _config.zenodo_token(required=False) or ""
+
+
+def _uploads_enabled() -> bool:
+    """False without a Zenodo token or with ``--no-upload``: products are
+    written to ``config.OUT_DIR/<kg>/`` and nothing is uploaded."""
+    return bool(_zenodo_token()) and not os.environ.get("SRTM_NO_UPLOAD")
 # Product/model version.  ``SEG_MODEL_VERSION=v2`` switches the classifier to
 # the segv2 LightGBM (object_segmentation.segment_and_classify(model="v2")),
-# stamps products "v2" and adds the v2-only JSON/GPKG extras (parcel outline
-# elevation profiles, model block).  Peers stay on v1 until the env is flipped
-# in the processor unit (see segv2/HANDOVER.md → wiring).
+# stamps products "v2" and adds the v2-only JSON/GPKG extras (model block).
 # Default (since the v2 rollout, 2026-09): v2 whenever the model + lightgbm are
 # usable on this host (segv2.model_v2.available()), else v1.  Explicit env
 # always wins (``SEG_MODEL_VERSION=v1`` forces the legacy RF).
@@ -120,15 +124,12 @@ def _product_upload_version(file_key: str, defects=None) -> str:
 V2_UPGRADE_FAILED_FILE = Path("data/austria_processor") / "v2_upgrade_failed.json"
 V2_GPKG_DIR = Path(os.environ.get("V2_UPGRADE_GPKG_DIR", "data/austria_processor/v2_source"))
 V2_UPGRADE_STREAMS = int(os.environ.get("V2_UPGRADE_STREAMS", "4"))
-# v2.4: NO cadastre-shaped output.  Since 2026-10-04 no product (JSON, light
-# GPKG, h3b) carries parcels, footprints, addresses, parcel_outline_z or any
-# parcel/building id.  The cadastre export is still fetched at run time as
-# model context (segment features, new_buildings) and cached ≤ 24 h.  The
-# legacy writers are kept behind this flag for one release and are removed
-# with the next refactor — it must stay False.
-CADASTRE_PRODUCTS = False
-# NE cells (docs/ne-v24-design.md): declared layer from umfeld-at (or a
-# local bevdirect assembly), observed layer by us, product ``<code>_ne.h3b``
+# v2.4: no property-level output.  No product (JSON, light GPKG, h3b)
+# carries property polygons, addresses or ids.  The only property-shaped
+# input is the in-RAM building context of ``fetch_building_context``
+# (``config.BEV_VECTOR_CONTEXT``), used as the segmentation ``building_mask``.
+# NE cells (docs/ne-v24-design.md): declared layer from a local bevdirect
+# assembly (or an optional NE server), observed layer by us, product ``<code>_ne.h3b``
 # (manifest key ``_ne_h3b``).  ``NE_REQUIRED`` → a fresh KG whose declared
 # layer is not built yet is labelled '-partial' (defect ``ne_cells``) and
 # re-upgraded later; an upgrade unit is deferred (no strike).
@@ -997,7 +998,6 @@ class ProgressTracker:
             "eta_seconds": 0,
             "recent_log": [],
             "failed_kgs": [],
-            "parcels_total": 0,
             "buildings_total": 0,
             "started_at": None,
             "last_kg_code": None,
@@ -1313,7 +1313,7 @@ class ProgressTracker:
                 self._state["_completed_parent_codes"] = sorted(_pset)
                 self._state["completed"] += 1
 
-    def record_success(self, parcels: int = 0, buildings: int = 0, upload_bytes: int = 0,
+    def record_success(self, buildings: int = 0, upload_bytes: int = 0,
                         last_kg_code: str = None, last_kg_seconds: float = 0,
                         n_new_buildings: int = 0, n_infrastructure: int = 0,
                         last_kg_name: str = None):
@@ -1331,7 +1331,6 @@ class ProgressTracker:
                 self._state["completed"] += 1
             self._state["uploaded"] += 1
             self._state["upload_size_bytes"] += upload_bytes
-            self._state["parcels_total"] += parcels
             self._state["buildings_total"] += buildings
             if last_kg_code is not None:
                 self._state["last_kg_code"] = last_kg_code
@@ -1499,21 +1498,20 @@ def transform_to_wgs(geom):
 
 # === SECTION: KG list (fetch + cache all 7850 KGs — see kg_universe.py) ===
 
-#: Public (token-free) KG universe endpoint on umfeld-at: one ~520 KB gz
-#: response for all 7850 KGs, ETag == universe_hash. Replaces the old
-#: /search/district × /search/kg?district=… loop (96+ requests per refresh,
-#: and the source of the 8440 artefact — see kg_universe.py).
-KG_UNIVERSE_URL = f"https://{_umfeld.HOST}/api/v1/kgs"
+#: Optional KG universe refresh endpoint (``config.UMFELD_URL`` + /api/v1/kgs,
+#: one ~520 KB gz response for all 7850 KGs, ETag == universe_hash).  Empty
+#: → the shipped ``data/austria_processor/kg_list.json`` is the universe.
+KG_UNIVERSE_URL = (f"{_config.UMFELD_URL}/api/v1/kgs" if _config.UMFELD_URL else "")
 KG_LIST_ETAG_FILE = KG_LIST_FILE.with_suffix('.etag')
 KG_LIST_REFRESH_S = 24 * 3600   # local cache lifetime before a conditional GET
-KG_LIST_MIN_REFETCH_S = 3600    # never hit umfeld more often than hourly
+KG_LIST_MIN_REFETCH_S = 3600    # never refetch more often than hourly
 
 
 _FROZEN_BBOX_R1: dict | None = None
 
 
 def _frozen_bbox_r1() -> dict:
-    """``{kg_code: [w, s, e, n]}`` — the revision-1 umfeld bboxes the whole
+    """``{kg_code: [w, s, e, n]}`` — the revision-1 KG bboxes the whole
     product line was processed on (repo file ``kg_bbox_r1.json``)."""
     global _FROZEN_BBOX_R1
     if _FROZEN_BBOX_R1 is None:
@@ -1525,11 +1523,9 @@ def _frozen_bbox_r1() -> dict:
     return _FROZEN_BBOX_R1
 
 
-def _normalise_umfeld_kg(row: dict, prev: dict | None, state_filter=None) -> dict | None:
-    """Map one ``/api/v1/kgs`` row onto the legacy kg_list.json shape
-    (``bbox`` dict with min/max_lon/lat, ``lat``/``lon`` centroid). Count
-    fields (parcel_count / building_count / total_area_sqm) are not part
-    of the public universe — carried over from the previous cache entry."""
+def _normalise_universe_kg(row: dict, prev: dict | None, state_filter=None) -> dict | None:
+    """Map one ``/api/v1/kgs`` row onto the kg_list.json shape (``bbox``
+    dict with min/max_lon/lat, ``lat``/``lon`` centroid)."""
     code = str(row.get('kg_code') or '')
     if not code:
         return None
@@ -1538,8 +1534,8 @@ def _normalise_umfeld_kg(row: dict, prev: dict | None, state_filter=None) -> dic
         bb = {'min_lon': bb[0], 'min_lat': bb[1], 'max_lon': bb[2], 'max_lat': bb[3]}
     elif not isinstance(bb, dict):
         bb = (prev or {}).get('bbox') or {}
-    # umfeld bbox_revision 2 (2026-10-27): ``bbox`` = old ∪ VGD envelope.
-    # The fleet's processing bbox stays PINNED to the frozen revision-1
+    # bbox_revision 2 (2026-10-27): ``bbox`` = old ∪ VGD envelope.
+    # The processing bbox stays PINNED to the frozen revision-1
     # envelope (kg_bbox_r1.json): split layouts, tile grids and the
     # coverage oracle (app._kg_coverage_complete) are all keyed on it and
     # a silent growth would re-open thousands of complete parents.  The
@@ -1570,9 +1566,6 @@ def _normalise_umfeld_kg(row: dict, prev: dict | None, state_filter=None) -> dic
         'state_name': row.get('state_name', ''),
         'bbox': bb, 'lat': lat, 'lon': lon,
         'bbox_r2': bb_r2 or (prev or {}).get('bbox_r2'),
-        'parcel_count': (prev or {}).get('parcel_count', 0),
-        'building_count': (prev or {}).get('building_count', 0),
-        'total_area_sqm': (prev or {}).get('total_area_sqm', 0),
     }
     if state_filter and out['state_name'].lower() != state_filter.lower():
         return None
@@ -1585,11 +1578,13 @@ def _fetch_kg_universe(etag: str | None):
     Returns ``(rows, etag)``; ``rows is None`` on 304 (unchanged).  Raises
     on transport errors or a universe-contract mismatch (the caller keeps
     the cached list in both cases — a hash mismatch is a new KG epoch
-    that must be coordinated with umfeld-at via kg_universe.py, never
-    merged silently)."""
+    that must be coordinated via kg_universe.py, never merged silently)."""
     import kg_universe
+    import http_pool
+    if not KG_UNIVERSE_URL:
+        raise RuntimeError("no KG universe endpoint configured (UMFELD_URL empty)")
     hdrs = {'Accept': 'application/json', 'Accept-Encoding': 'gzip',
-            'User-Agent': 'srtm-lidar-at kg-universe-sync'}
+            'User-Agent': http_pool.USER_AGENT}
     if etag:
         hdrs['If-None-Match'] = etag
     resp = requests.get(KG_UNIVERSE_URL, headers=hdrs, timeout=90)
@@ -1604,25 +1599,25 @@ def _fetch_kg_universe(etag: str | None):
     claimed = data.get('universe_hash') or resp.headers.get('X-KG-Universe-Hash')
     n = data.get('kg_count', len(codes))
     if claimed and claimed != got_hash:
-        raise RuntimeError(f"umfeld /kgs: claimed universe_hash {claimed[:12]} != "
+        raise RuntimeError(f"/kgs: claimed universe_hash {claimed[:12]} != "
                            f"recomputed {got_hash[:12]} over {len(codes)} codes")
     if int(n) != kg_universe.KG_TOTAL or len(codes) != kg_universe.KG_TOTAL:
-        raise RuntimeError(f"umfeld /kgs: kg_count={n} rows={len(codes)}, "
+        raise RuntimeError(f"/kgs: kg_count={n} rows={len(codes)}, "
                            f"contract KG_TOTAL={kg_universe.KG_TOTAL} — new KG epoch?")
     if got_hash != kg_universe.UNIVERSE_HASH_CONTRACT:
-        raise RuntimeError(f"umfeld /kgs: universe_hash {got_hash[:12]} != contract "
+        raise RuntimeError(f"/kgs: universe_hash {got_hash[:12]} != contract "
                            f"{kg_universe.UNIVERSE_HASH_CONTRACT[:12]} — new KG epoch; "
-                           f"bump kg_universe.UNIVERSE_HASH_CONTRACT in lock-step with umfeld")
+                           f"bump kg_universe.UNIVERSE_HASH_CONTRACT")
     new_etag = resp.headers.get('ETag') or f'"{got_hash}"'
     return rows, new_etag
 
 
 def get_all_kgs(state_filter: str = None) -> list[dict]:
-    """All 7850 KGs (legacy kg_list.json shape). Caches to kg_list.json.
-
-    Source: a single ``GET umfeld-at/api/v1/kgs`` (public, ~520 KB gz),
-    conditional via ``If-None-Match`` once we hold an ETag, at most hourly
-    and only when the local cache is older than :data:`KG_LIST_REFRESH_S`.
+    """All 7850 KGs (kg_list.json shape).  The shipped
+    ``data/austria_processor/kg_list.json`` is the universe; with
+    ``config.UMFELD_URL`` set it is refreshed by a single conditional GET
+    of :data:`KG_UNIVERSE_URL` (``If-None-Match`` once we hold an ETag),
+    at most hourly and only when the cache is older than :data:`KG_LIST_REFRESH_S`.
     The response must satisfy the shared universe contract
     (``kg_count == KG_TOTAL`` and ``universe_hash == UNIVERSE_HASH_CONTRACT``)
     or it is rejected and the cached list is kept — the KG universe can
@@ -1647,9 +1642,13 @@ def get_all_kgs(state_filter: str = None) -> list[dict]:
     if complete and age is not None and age < KG_LIST_REFRESH_S:
         log.info("Loaded %d KGs from cache (%s)", len(cached), KG_LIST_FILE)
         return _filtered(cached)
+    if not KG_UNIVERSE_URL:
+        if cached:
+            return _filtered(cached)
+        raise RuntimeError(f"{KG_LIST_FILE} missing and no KG universe endpoint configured")
     if cached and age is not None and age < KG_LIST_MIN_REFETCH_S:
         # Incomplete-but-recent: someone refreshed <1h ago and the upstream
-        # refused/failed then too — don't hammer umfeld, use what we have.
+        # refused/failed then too — don't hammer it, use what we have.
         return _filtered(cached)
 
     etag = None
@@ -1685,7 +1684,7 @@ def get_all_kgs(state_filter: str = None) -> list[dict]:
     prev_by_code = {str(k.get('kg_code')): k for k in (cached or [])}
     all_kgs = []
     for r in rows:
-        k = _normalise_umfeld_kg(r, prev_by_code.get(str(r.get('kg_code'))))
+        k = _normalise_universe_kg(r, prev_by_code.get(str(r.get('kg_code'))))
         if k:
             all_kgs.append(k)
     all_kgs = kg_universe.dedupe(all_kgs)
@@ -1701,136 +1700,81 @@ def get_all_kgs(state_filter: str = None) -> list[dict]:
     return _filtered(all_kgs)
 
 
-# === SECTION: Cadastre data fetching (REST API calls) ===
+# === SECTION: Building context (in-RAM footprints from the public BEV vector tiles) ===
 
-# Until 2026-10 this section fetched parcels / footprints / addresses from
-# the cadastre API (``example.invalid/k/api/v1/export/geojson``, with a
-# 202-warming poll loop, ETag cache and transient-retry ladder — ~350 lines).
-# Those parcel-keyed routes are gone (404 since the umfeld-at publication;
-# 410 since the 2026-10-13 Kataster purge) and the pipeline has been bev-mode
-# only since then: ``fetch_cadastre_data_bevdirect`` below builds the same
-# dict from the local bevdirect-serve.  The old entry point stays as a stub so
-# a stray caller fails loudly instead of hitting umfeld.
+_BUILDING_CTX_ATTEMPTS = 2
 
 
-class CadastreRetired(RuntimeError):
-    """umfeld's ``/k`` cadastre routes are gone — use bev mode."""
+def _empty_building_ctx(failed: bool = False) -> dict:
+    return {"footprints": [], "_source": "bevdirect" if _config.BEV_VECTOR_CONTEXT else "none",
+            "_fetch_failed": bool(failed)}
 
 
-def fetch_cadastre_data(kg_code: str) -> dict:  # pragma: no cover
-    raise CadastreRetired(
-        f"KG {kg_code}: umfeld /k/api/v1/export/geojson is retired (404) — "
-        "use fetch_cadastre_data_bevdirect (bev mode)")
+def fetch_building_context(kg_code: str, bbox_wgs: tuple, context_only: bool = False) -> dict:
+    """Building footprints of the padded KG bbox from the public BEV vector
+    tiles — the SAME one viewport grid ``vct_pilot.build_declared`` turns
+    into the parent's NEC1 (docs/vct-pilot.md).  Gated by
+    ``config.BEV_VECTOR_CONTEXT``: off → empty context, no network.
 
+    Returns ``{"footprints": [{"geometry": <EPSG:3035>, "geometry_wgs": <WGS84>}], ...}``.
+    The footprints are the sole ``building_mask`` source of the segmentation
+    model (per-tile raster mask, in RAM); nothing of them is written to a
+    file, a product or a log.  The data arrives over a pipe from the helper
+    subprocess and lives only in this process.  Transient failure →
+    ``_fetch_failed`` (the KG is deferred).
 
-
-_CADASTRE_BEV_ATTEMPTS = 2
-
-
-def fetch_cadastre_data_bevdirect(kg_code: str, bbox_wgs: tuple, cadastre_only: bool = False) -> dict:
-    """bev mode (``ne_h3.cadastre_source() == 'bevdirect'``): the pipeline's
-    parcels + footprints from the public BEV vector tiles — the SAME one
-    viewport grid ``vct_pilot.build_declared`` turns into the parent's NEC1
-    (docs/vct-pilot.md → bev mode).  No call to umfeld's ``/k`` tier.
-
-    Shape-compatible with :func:`fetch_cadastre_data`; differences:
-
-    * ``parcels`` = this KG's parcels (``kg_code`` match), ``parcel_id`` /
-      ``area_sqm`` / ``ez`` / ``status`` kept; parcels clipped by the
-      bevdirect cell grid are unioned back (``cad.restored``);
-    * ``building_footprints`` = footprints whose centroid lies inside the
-      own-parcel union (+2 m) — bevdirect footprints carry no ``kg``;
-      ``building_footprints_viewport`` = EVERY footprint of the padded bbox
-      (own + neighbours) for the per-tile raster mask, replacing the per-tile
-      ``/k/spatial/footprints`` call;
-    * no address points (``building_addresses`` = [], unused since v2.4).
-
-    The data arrives over a pipe from the helper subprocess and lives only
-    in this process (never a file).  Transient failure → ``_fetch_failed``
-    (the KG is deferred, exactly like the umfeld path).
-
-    ``cadastre_only`` (sliver-sweep units): viewport fetch for *bbox_wgs*
-    only (``vct_pilot.fetch_cadastre_only``) — no parent-wide NEC1 build
-    (that was ~590 s of a ~1 100 s unit on 57306, Oct 2026), no report.
+    ``context_only`` (sliver-sweep units): viewport fetch for *bbox_wgs*
+    only (``vct_pilot.fetch_context_only``) — no parent-wide NEC1 build.
     """
+    if not _config.BEV_VECTOR_CONTEXT:
+        return _empty_building_ctx()
     import vct_pilot as _vct
-    result = {"parcels": [], "building_footprints": [], "landuse": [],
-              "parcels_geojson": [], "buildings_geojson": [],
-              "building_addresses": [], "building_footprints_viewport": [], "_source": "bevdirect"}
-    cad = None
+    result = _empty_building_ctx()
+    ctx = None
     last = None
-    for attempt in range(1, _CADASTRE_BEV_ATTEMPTS + 1):
+    for attempt in range(1, _BUILDING_CTX_ATTEMPTS + 1):
         box_ = {}
         try:
-            if cadastre_only:
-                _vct.fetch_cadastre_only(kg_code, bbox_wgs, box_)
+            if context_only:
+                _vct.fetch_context_only(kg_code, bbox_wgs, box_)
             else:
-                _vct.build_declared(kg_code, bbox_wgs, cadastre=box_)
+                _vct.build_declared(kg_code, bbox_wgs, context=box_)
         except _vct.DeclaredDeficient as e:
-            log.info("KG %s: %s (cadastre itself is complete)", kg_code, e)
+            log.info("KG %s: %s (building context itself is complete)", kg_code, e)
         except Exception as e:  # noqa: BLE001
             last = e
-            log.warning("KG %s: bevdirect cadastre/declared build failed (attempt %d/%d): %s",
-                        kg_code, attempt, _CADASTRE_BEV_ATTEMPTS, str(e)[:200])
-        cad = box_.get("cad")
-        if cad:
+            log.warning("KG %s: bevdirect context/declared build failed (attempt %d/%d): %s",
+                        kg_code, attempt, _BUILDING_CTX_ATTEMPTS, str(e)[:200])
+        ctx = box_.get("ctx")
+        if ctx:
             break
         if box_.get("error"):
             last = RuntimeError(box_["error"])
-        if attempt < _CADASTRE_BEV_ATTEMPTS:
+        if attempt < _BUILDING_CTX_ATTEMPTS:
             time.sleep(20 * attempt)
-    if not cad:
-        log.error("KG %s: bevdirect cadastre unavailable after %d attempts: %s — deferring",
-                  kg_code, _CADASTRE_BEV_ATTEMPTS, last)
+    if not ctx:
+        log.error("KG %s: bevdirect building context unavailable after %d attempts: %s — deferring",
+                  kg_code, _BUILDING_CTX_ATTEMPTS, last)
         result["_fetch_failed"] = True
         return result
-    for p in cad.get("parcels") or []:
-        try:
-            geom = shapely_shape(p["geometry"])
-            if geom.is_empty:
-                continue
-            if not geom.is_valid:
-                geom = geom.buffer(0)
-            props = {k: p.get(k) for k in ("parcel_id", "kg_code", "gnr", "ez", "status", "area_sqm", "lon", "lat")}
-            result["parcels"].append({"geometry": transform_to_3035(geom), "geometry_wgs": geom, "properties": props,
-                                      "parcel_id": p.get("parcel_id", ""), "area_sqm": p.get("area_sqm", 0)})
-            result["parcels_geojson"].append({"type": "Feature", "geometry": p["geometry"], "properties": props})
-        except Exception:
-            continue
-    own_union = None
-    if result["parcels"]:
-        try:
-            from shapely.ops import unary_union as _uu
-            own_union = _uu([q["geometry"] for q in result["parcels"]]).buffer(2)
-        except Exception as e:  # noqa: BLE001
-            log.warning("KG %s: own-parcel union failed (all footprints kept): %s", kg_code, e)
-    for f in cad.get("footprints") or []:
+    for f in ctx.get("footprints") or []:
         try:
             geom = shapely_shape(f["geometry"])
             if geom.is_empty:
                 continue
             if not geom.is_valid:
                 geom = geom.buffer(0)
-            g3 = transform_to_3035(geom)
-            props = {"id": f.get("id"), "ns": f.get("ns"), "ns_code": f.get("ns_code"), "parcel_id": f.get("parcel_id")}
-            rec = {"geometry": g3, "geometry_wgs": geom, "properties": props}
-            result["building_footprints_viewport"].append(rec)
-            if own_union is None or own_union.contains(g3.centroid):
-                result["building_footprints"].append(rec)
-                result["buildings_geojson"].append({"type": "Feature", "geometry": f["geometry"], "properties": props})
+            result["footprints"].append({"geometry": transform_to_3035(geom), "geometry_wgs": geom})
         except Exception:
             continue
-    st = cad.get("stats") or {}
-    log.info("KG %s: bevdirect cadastre: %d parcels (%s clipped→restored), %d own footprints of %d in bbox",
-             kg_code, len(result["parcels"]), st.get("restored", 0), len(result["building_footprints"]),
-             len(result["building_footprints_viewport"]))
+    log.info("KG %s: bevdirect building context: %d footprints in bbox", kg_code, len(result["footprints"]))
     return result
 
 
 def _kg_bbox_lookup(kg_code: str) -> dict | None:
-    """``{min_lon,min_lat,max_lon,max_lat}`` for a KG without umfeld's ``/k``:
-    the director's ``kg_list.json`` → the local bevdirect-serve ``/kg/<kg>``
-    (BEV VGD admin bbox) → our own public API."""
+    """``{min_lon,min_lat,max_lon,max_lat}`` for a KG: ``kg_list.json`` →
+    the local bevdirect-serve ``/kg/<kg>`` (BEV VGD admin bbox) → the
+    primary's public API (``config.director_url()``)."""
     try:
         # PROCESSING bbox (pinned revision 1) — not the NE viewport.
         for k in json.loads(KG_LIST_FILE.read_text()):
@@ -1851,7 +1795,7 @@ def _kg_bbox_lookup(kg_code: str) -> dict | None:
     except Exception:
         pass
     try:
-        r = requests.get(f"https://example.invalid/api/v1/kg/{str(kg_code).zfill(5)}", timeout=20)
+        r = requests.get(f"{_config.director_url()}/api/v1/kg/{str(kg_code).zfill(5)}", timeout=20)
         if r.ok:
             bb = (r.json() or {}).get("bbox") or {}
             if isinstance(bb, dict) and "min_lon" in bb:
@@ -1861,141 +1805,6 @@ def _kg_bbox_lookup(kg_code: str) -> dict | None:
     except Exception:
         pass
     return None
-
-
-# === SECTION: Height enrichment (DTM/DSM → parcel + building heights) ===
-
-def enrich_parcels_with_heights(parcels: list, dtm: np.ndarray,
-                                transform) -> list[dict]:
-    """Add DTM elevation at each parcel vertex + centroid."""
-    enriched = []
-    for p in parcels:
-        geom_3035 = p["geometry"]
-        geom_wgs = p["geometry_wgs"]
-        props = dict(p.get("properties", {}))
-
-        # Centroid height
-        try:
-            c3 = geom_3035.centroid
-            col = int((c3.x - transform.c) / transform.a)
-            row = int((transform.f - c3.y) / abs(transform.e))
-            h, w = dtm.shape
-            if 0 <= row < h and 0 <= col < w:
-                props["centroid_dtm_m"] = round(float(dtm[row, col]), 2)
-            c_wgs = transform_to_wgs(c3)
-            props["centroid_lon"] = round(c_wgs.x, 7)
-            props["centroid_lat"] = round(c_wgs.y, 7)
-        except Exception:
-            pass
-
-        # Vertex heights
-        try:
-            coords = []
-            if geom_wgs.geom_type == 'Polygon':
-                rings = [geom_wgs.exterior] + list(geom_wgs.interiors)
-            elif geom_wgs.geom_type == 'MultiPolygon':
-                rings = []
-                for poly in geom_wgs.geoms:
-                    rings.append(poly.exterior)
-                    rings.extend(poly.interiors)
-            else:
-                rings = []
-
-            for ring in rings:
-                ring_coords = []
-                for x, y in ring.coords:
-                    pt_3035 = _tx_to_3035.transform(x, y)
-                    col2 = int((pt_3035[0] - transform.c) / transform.a)
-                    row2 = int((transform.f - pt_3035[1]) / abs(transform.e))
-                    dtm_val = None
-                    if 0 <= row2 < dtm.shape[0] and 0 <= col2 < dtm.shape[1]:
-                        dtm_val = round(float(dtm[row2, col2]), 2)
-                    ring_coords.append({"lon": round(x, 7), "lat": round(y, 7),
-                                        "dtm_m": dtm_val})
-                coords.append(ring_coords)
-            props["vertex_heights"] = coords
-        except Exception:
-            pass
-
-        enriched.append({"parcel_id": p["parcel_id"], "area_sqm": p["area_sqm"],
-                         "properties": props, "geometry_wgs": geom_wgs})
-    return enriched
-
-
-def enrich_buildings_with_heights(buildings: list, dtm: np.ndarray,
-                                  dsm: np.ndarray, ndsm: np.ndarray,
-                                  transform) -> list[dict]:
-    """Add object height stats for each building footprint."""
-    from rasterio.features import rasterize as rio_rasterize
-    enriched = []
-    h, w = dtm.shape
-
-    for b in buildings:
-        geom_3035 = b["geometry"]
-        geom_wgs = b["geometry_wgs"]
-        props = dict(b.get("properties", {}))
-
-        try:
-            # Rasterize this single footprint
-            fp_mask = rio_rasterize(
-                [(geom_3035, 1)], out_shape=(h, w), transform=transform,
-                fill=0, dtype=np.uint8, all_touched=True,
-            ).astype(bool)
-
-            obj_heights = ndsm[fp_mask]
-            dsm_vals = dsm[fp_mask]
-
-            if len(obj_heights) > 0:
-                max_h = float(np.nanmax(obj_heights))
-                mean_h = float(np.nanmean(obj_heights))
-                std_h = float(np.nanstd(dsm_vals))  # DSM std for roof type
-
-                props["max_height_m"] = round(max_h, 2)
-                props["mean_height_m"] = round(mean_h, 2)
-                props["dsm_std"] = round(std_h, 2)
-                props["roof_type_hint"] = "flat" if std_h < 1.5 else "pitched"
-                props["stories_est"] = max(1, round(max_h / 3.0))
-                props["footprint_area_sqm"] = round(float(geom_3035.area), 1)
-        except Exception:
-            pass
-
-        # Centroid
-        try:
-            c3 = geom_3035.centroid
-            c_wgs = transform_to_wgs(c3)
-            props["centroid_lon"] = round(c_wgs.x, 7)
-            props["centroid_lat"] = round(c_wgs.y, 7)
-        except Exception:
-            pass
-
-        # Vertex heights
-        try:
-            coords = []
-            if geom_wgs.geom_type == 'Polygon':
-                rings_w = [geom_wgs.exterior]
-            elif geom_wgs.geom_type == 'MultiPolygon':
-                rings_w = [p.exterior for p in geom_wgs.geoms]
-            else:
-                rings_w = []
-            for ring in rings_w:
-                rc = []
-                for x, y in ring.coords:
-                    pt_3035 = _tx_to_3035.transform(x, y)
-                    col2 = int((pt_3035[0] - transform.c) / transform.a)
-                    row2 = int((transform.f - pt_3035[1]) / abs(transform.e))
-                    oh = None
-                    if 0 <= row2 < h and 0 <= col2 < w:
-                        oh = round(float(ndsm[row2, col2]), 2)
-                    rc.append({"lon": round(x, 7), "lat": round(y, 7),
-                               "object_height_m": oh})
-                coords.append(rc)
-            props["vertex_heights"] = coords
-        except Exception:
-            pass
-
-        enriched.append({"properties": props, "geometry_wgs": geom_wgs,
-                         "geometry_3035": geom_3035})
-    return enriched
 
 
 # === SECTION: Vectorise unmatched segments (new buildings, infrastructure) ===
@@ -2017,16 +1826,11 @@ def _segment_touches_edge(seg_mask: np.ndarray) -> bool:
 
 def vectorise_unmatched_buildings(objects: list, labels: np.ndarray,
                                   mask: np.ndarray, transform,
-                                  cadastre_fp_mask: np.ndarray,
-                                  ndsm: np.ndarray,
-                                  kg_mask: np.ndarray | None = None) -> list[dict]:
-    """Find roof/building segments that don't overlap cadastre footprints.
-
-    ``kg_mask`` (bool raster of this KG's parcel union): segments with less
-    than half their pixels inside it are skipped — they are outside the KG
-    (tile grid overhang) and would otherwise be reported as "new" merely
-    because the KG export carries no footprints there.
-    """
+                                  building_fp_mask: np.ndarray | None,
+                                  ndsm: np.ndarray) -> list[dict]:
+    """Find roof/building segments that don't overlap the building context
+    mask (``fetch_building_context``).  Without a context mask every roof
+    segment is reported (``building_context: false`` in the product)."""
     from rasterio.features import shapes as rasterize_shapes
 
     results = []
@@ -2039,7 +1843,6 @@ def vectorise_unmatched_buildings(objects: list, labels: np.ndarray,
 
     building_ids = {o.obj_id for o in building_objs}
     label_int = labels.astype(np.int32)
-    n_outside_kg = 0
 
     for geom_dict, val in rasterize_shapes(
         label_int, mask=mask & np.isin(label_int, list(building_ids)),
@@ -2050,18 +1853,13 @@ def vectorise_unmatched_buildings(objects: list, labels: np.ndarray,
         if obj is None:
             continue
 
-        # Check overlap with cadastre footprints
+        # Check overlap with the building context
         seg_mask = labels == oid
-        if kg_mask is not None:
-            _n_seg = int(np.sum(seg_mask))
-            if _n_seg == 0 or np.sum(seg_mask & kg_mask) / _n_seg < 0.5:
-                n_outside_kg += 1
-                continue  # outside this KG's parcels → neighbour's building
-        if cadastre_fp_mask is not None:
-            overlap = np.sum(seg_mask & cadastre_fp_mask)
+        if building_fp_mask is not None:
+            overlap = np.sum(seg_mask & building_fp_mask)
             total = np.sum(seg_mask)
             if total > 0 and overlap / total > 0.3:
-                continue  # matches existing cadastre footprint
+                continue  # matches an existing footprint
 
         # This is a "new" building
         from shapely.geometry import shape as s_shape
@@ -2099,8 +1897,6 @@ def vectorise_unmatched_buildings(objects: list, labels: np.ndarray,
         except Exception:
             continue
 
-    if n_outside_kg:
-        log.info("new buildings: skipped %d roof segment(s) outside the KG parcel union", n_outside_kg)
     return results
 
 
@@ -3108,8 +2904,7 @@ def _write_gpkg_point_style(gpkg_path: str, layer_name: str):
 
 
 def _write_gpkg_all_styles(gpkg_path: str, has_segments: bool = True,
-                           has_points: bool = True, has_parcels: bool = False,
-                           has_buildings: bool = False, has_new_buildings: bool = False,
+                           has_points: bool = True, has_new_buildings: bool = False,
                            has_infrastructure: bool = False):
     """Write QGIS styles for all vector and raster layers in a GPKG."""
     import sqlite3
@@ -3142,32 +2937,6 @@ def _write_gpkg_all_styles(gpkg_path: str, has_segments: bool = True,
             )
 
         # --- Vector layer styles ---
-
-        # Parcels: yellow outline, transparent fill
-        if has_parcels:
-            _add_style('parcels', 'geom', 'Parcel boundaries',
-                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
-                '<qgis version="3.34"><renderer-v2 type="singleSymbol">'
-                '<symbols><symbol type="fill" name="0" alpha="0.3">'
-                '<layer class="SimpleFill"><Option type="Map">'
-                '<Option type="QString" value="255,255,200,50" name="color"/>'
-                '<Option type="QString" value="200,180,0,255" name="outline_color"/>'
-                '<Option type="QString" value="0.4" name="outline_width"/>'
-                '</Option></layer></symbol></symbols></renderer-v2></qgis>',
-                'Yellow outline parcel boundaries')
-
-        # Buildings: red fill, dark outline
-        if has_buildings:
-            _add_style('buildings', 'geom', 'Buildings',
-                '<!DOCTYPE qgis PUBLIC "http://mrcc.com/qgis.dtd" "SYSTEM">'
-                '<qgis version="3.34"><renderer-v2 type="singleSymbol">'
-                '<symbols><symbol type="fill" name="0" alpha="0.6">'
-                '<layer class="SimpleFill"><Option type="Map">'
-                '<Option type="QString" value="220,20,60,160" name="color"/>'
-                '<Option type="QString" value="100,10,30,255" name="outline_color"/>'
-                '<Option type="QString" value="0.3" name="outline_width"/>'
-                '</Option></layer></symbol></symbols></renderer-v2></qgis>',
-                'Red building footprints')
 
         # New buildings: magenta, dashed
         if has_new_buildings:
@@ -4496,7 +4265,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
             # whose centroid fell outside this tile's core is not in obj_map,
             # so type_tile is 0 there — letting it win would paint a class-0
             # hole and block the neighbour tile where that object IS core
-            # (62202: two ~650 px seam holes inside parcels, 0.62 % of the
+            # (62202: two ~650 px seam holes, 0.62 % of the
             # union, in both v1 and v2 — 2026-09-21).
             tile_valid = (labels_tile > 0) & (type_tile > 0)
             _bw = best_cat_weight[row_off:r_end, col_off:c_end]
@@ -5127,13 +4896,14 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
 
 
 def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
-                           cadastre_data, new_buildings, infrastructure,
+                           building_ctx, new_buildings, infrastructure,
                            obs_year=0, mark_uncertain=False, label_remap=None,
-                           outline_profiler=None, out_path=None, v21_out=None,
+                           out_path=None, v21_out=None,
                            report_step=None, ne_declared=None):
     """Light GPKG: stitched segment rasters + v2.1 layers (+ NE cells, v2.4).
 
-    v2.4: no cadastre vectors are written any more (``CADASTRE_PRODUCTS``).
+    v2.4: no property-level vectors are written.  ``building_ctx`` (in-RAM
+    footprints, may be empty) only excludes tree apices on buildings.
     ``ne_declared`` (``ne_h3.Section``, NEC1 of the parent KG) switches on
     the observed-layer build; the ``.h3b`` product path + summary land in
     ``v21_out["ne"]``.
@@ -5339,7 +5109,7 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                 if _acq:
                     v21_out["acquisition"] = _acq
                 _rs("gpkg_light", f"v2.1 tree apices ({full_h * full_w / 1e6:.0f} Mpx nDSM)")
-                _bg = [b["geometry"] for b in cadastre_data.get("building_footprints", [])
+                _bg = [b["geometry"] for b in (building_ctx or {}).get("footprints", [])
                        if b.get("geometry") is not None and not b["geometry"].is_empty]
                 _di = {}
                 _v21_crowns = []
@@ -5391,7 +5161,7 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
                         raise RuntimeError("h3b self-check failed: " + "; ".join(_chk["errors"]))
                     v21_out["ne"] = {"h3b_path": _h3b_path, "summary": _neh.json_section(_obs, _hdr),
                                      "neo1_section": _obs["neo1"] if not _is_block else None,
-                                     # bevdirect build → NEC1+NEO1 container post (umfeld stores it as ``bev``)
+                                     # bevdirect build → NEC1+NEO1 container post (NE server stores it as ``bev``)
                                      "nec1_section": (_neh.nec1_bytes(ne_declared)
                                                       if not _is_block and _neh.is_bev_declared(ne_declared) else None),
                                      "declared_digest": ne_declared.digest,
@@ -5446,273 +5216,6 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
             _v21_coarse = None
             _v21_apex_rows = None
             _v21_crowns = None
-
-    # --- Lazy DTM loading with LRU eviction for GPKG parcel/building enrichment ---
-    # Pre-loading all tiles is prohibitive for large KGs (56 tiles × ~70 MB
-    # DTM+terrain = ~4 GB).  Instead, load on demand and keep a bounded cache.
-    from terrain_analysis import compute_slope, compute_aspect, compute_tri, compute_tpi
-    from collections import OrderedDict
-    _MAX_CACHED_TILES = 6  # keep at most 6 tiles (~420 MB)
-    _gpkg_tile_data = OrderedDict()  # ti_idx → tdata (LRU order)
-
-    def _gpkg_load_tile(ti_idx, tr):
-        """Load DTM + terrain for one tile, evicting oldest if cache full."""
-        if ti_idx in _gpkg_tile_data:
-            _gpkg_tile_data.move_to_end(ti_idx)
-            return _gpkg_tile_data[ti_idx]
-        try:
-            tdata = _read_dtm_for_tile(tr)
-        except Exception:
-            return None
-        dtm_arr = tdata["dtm"]
-        tdata["slope"] = compute_slope(dtm_arr)
-        tdata["aspect"] = compute_aspect(dtm_arr)
-        tdata["tri"] = compute_tri(dtm_arr)
-        tdata["tpi"] = compute_tpi(dtm_arr, radius=5)
-        _gpkg_tile_data[ti_idx] = tdata
-        while len(_gpkg_tile_data) > _MAX_CACHED_TILES:
-            _gpkg_tile_data.popitem(last=False)
-        return tdata
-
-    def _gpkg_find_tile(e3035, n3035):
-        for ti_idx, tr in enumerate(tile_seg_results):
-            left, bottom, right, top = tr["bounds_3035"]
-            if left <= e3035 <= right and bottom <= n3035 <= top:
-                td = _gpkg_load_tile(ti_idx, tr)
-                if td is not None:
-                    return tr, td
-        return None, None
-
-    # --- Parcels (enriched from tiles) ---
-    parcels = cadastre_data["parcels"]
-    if parcels and CADASTRE_PRODUCTS:   # v2.4: never — kept one release for reference
-        schema_p = {'geometry': 'MultiPolygon', 'properties': [
-            ('parcel_id', 'str'), ('area_sqm', 'float'),
-            ('centroid_dtm_m', 'float'), ('centroid_lon', 'float'), ('centroid_lat', 'float'),
-            ('elevation_min_m', 'float'), ('elevation_max_m', 'float'), ('elevation_range_m', 'float'),
-            ('slope_mean_deg', 'float'), ('aspect_mean_deg', 'float'), ('aspect_dominant', 'str'),
-            ('tri_mean', 'float'), ('tpi_mean', 'float'), ('terrain_class', 'str'),
-            ('vertex_heights', 'str')]}
-        with fiona.open(out_path, 'w', driver='GPKG', layer='parcels',
-                        schema=schema_p, crs=from_epsg(4326)) as dst:
-            for p in parcels:
-                geom_wgs = p["geometry_wgs"]
-                props = {"parcel_id": p["parcel_id"], "area_sqm": p["area_sqm"],
-                         "centroid_dtm_m": None, "centroid_lon": None, "centroid_lat": None,
-                         "elevation_min_m": None, "elevation_max_m": None, "elevation_range_m": None,
-                         "slope_mean_deg": None, "aspect_mean_deg": None, "aspect_dominant": None,
-                         "tri_mean": None, "tpi_mean": None, "terrain_class": None,
-                         "vertex_heights": None}
-                try:
-                    c3 = p["geometry"].centroid
-                    c_wgs = transform_to_wgs(c3)
-                    props["centroid_lon"] = round(c_wgs.x, 7)
-                    props["centroid_lat"] = round(c_wgs.y, 7)
-                    tr, tdata = _gpkg_find_tile(c3.x, c3.y)
-                    if tr and tdata:
-                        tf = tdata["transform"]
-                        dtm_arr = tdata["dtm"]
-                        dh, dw = dtm_arr.shape
-                        col = int((c3.x - tf.c) / tf.a)
-                        row = int((tf.f - c3.y) / abs(tf.e))
-                        if 0 <= row < dh and 0 <= col < dw:
-                            val = float(dtm_arr[row, col])
-                            if np.isfinite(val): props["centroid_dtm_m"] = round(val, 2)
-                        # Full terrain over parcel footprint (uses pre-computed terrain arrays)
-                        try:
-                            from rasterio.features import geometry_mask as _gm
-                            pmask = _gm([mapping(p["geometry"])], out_shape=(dh, dw),
-                                        transform=tf, invert=True)
-                            pv = pmask & np.isfinite(dtm_arr)
-                            if np.sum(pv) > 4:
-                                dtm_pv = dtm_arr[pv]
-                                e_min = float(np.nanmin(dtm_pv))
-                                e_max = float(np.nanmax(dtm_pv))
-                                props["elevation_min_m"] = round(e_min, 2)
-                                props["elevation_max_m"] = round(e_max, 2)
-                                props["elevation_range_m"] = round(e_max - e_min, 2)
-                                props["slope_mean_deg"] = round(float(np.nanmean(tdata["slope"][pv])), 1)
-                                tri_val = float(np.nanmean(tdata["tri"][pv]))
-                                props["tri_mean"] = round(tri_val, 3)
-                                tpi_v = tdata["tpi"][pv]; tpi_v = tpi_v[np.isfinite(tpi_v)]
-                                if len(tpi_v) > 0:
-                                    props["tpi_mean"] = round(float(np.nanmean(tpi_v)), 3)
-                                # Terrain class from TRI
-                                if tri_val < 0.1: props["terrain_class"] = "level"
-                                elif tri_val < 0.3: props["terrain_class"] = "nearly_level"
-                                elif tri_val < 0.8: props["terrain_class"] = "slightly_rugged"
-                                elif tri_val < 1.5: props["terrain_class"] = "intermediately_rugged"
-                                elif tri_val < 3.0: props["terrain_class"] = "moderately_rugged"
-                                elif tri_val < 6.0: props["terrain_class"] = "highly_rugged"
-                                else: props["terrain_class"] = "extremely_rugged"
-                                # Aspect (circular mean)
-                                asp_vals = tdata["aspect"][pv]
-                                asp_nf = asp_vals[asp_vals >= 0]
-                                if len(asp_nf) > 0:
-                                    rad = np.radians(asp_nf)
-                                    mean_asp = float(np.degrees(np.arctan2(
-                                        np.mean(np.sin(rad)), np.mean(np.cos(rad))))) % 360
-                                    props["aspect_mean_deg"] = round(mean_asp, 1)
-                                    _dirs = [("N",0,45),("NE",45,90),("E",90,135),("SE",135,180),
-                                             ("S",180,225),("SW",225,270),("W",270,315),("NW",315,360)]
-                                    props["aspect_dominant"] = next(
-                                        (n for n,lo,hi in _dirs if lo <= mean_asp < hi), "N")
-                                else:
-                                    props["aspect_mean_deg"] = -1.0
-                                    props["aspect_dominant"] = "flat"
-                        except Exception:
-                            pass
-                        # Vertex heights (AMS anchor points)
-                        try:
-                            verts = []
-                            if geom_wgs.geom_type == 'Polygon':
-                                rings = [geom_wgs.exterior] + list(geom_wgs.interiors)
-                            elif geom_wgs.geom_type == 'MultiPolygon':
-                                rings = []
-                                for poly in geom_wgs.geoms:
-                                    rings.append(poly.exterior)
-                                    rings.extend(poly.interiors)
-                            else:
-                                rings = []
-                            for ring in rings:
-                                for x, y in ring.coords:
-                                    pt_3035 = _tx_to_3035.transform(x, y)
-                                    vc = int((pt_3035[0] - tf.c) / tf.a)
-                                    vr = int((tf.f - pt_3035[1]) / abs(tf.e))
-                                    dtm_val = None
-                                    if 0 <= vr < dh and 0 <= vc < dw:
-                                        v = float(dtm_arr[vr, vc])
-                                        if np.isfinite(v): dtm_val = round(v, 2)
-                                    verts.append(f"{round(y,7)},{round(x,7)},{dtm_val}")
-                            if verts:
-                                props["vertex_heights"] = "|".join(verts)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                dst.write({'geometry': _to_multi(mapping(geom_wgs)), 'properties': props})
-
-    # --- Buildings (enriched from tiles) ---
-    bldgs = cadastre_data["building_footprints"]
-    if bldgs and CADASTRE_PRODUCTS:     # v2.4: never
-        from rasterio.features import rasterize as rio_rasterize
-        # Build address lookup for GPKG building enrichment
-        _addr_list_gpkg = cadastre_data.get("building_addresses", [])
-        _addr_lk = {}
-        for a in _addr_list_gpkg:
-            ag = a.get("geometry_3035")
-            if ag:
-                key = (round(ag.x / 10) * 10, round(ag.y / 10) * 10)
-                _addr_lk.setdefault(key, []).append(a)
-
-        def _find_addr_gpkg(c3, max_dist=30):
-            cx, cy = c3.x, c3.y
-            best, best_d = None, max_dist
-            for dx in (-10, 0, 10):
-                for dy in (-10, 0, 10):
-                    key = (round((cx+dx)/10)*10, round((cy+dy)/10)*10)
-                    for a in _addr_lk.get(key, []):
-                        d = c3.distance(a["geometry_3035"])
-                        if d < best_d:
-                            best, best_d = a, d
-            return best
-
-        schema_b = {'geometry': 'MultiPolygon', 'properties': [
-            ('building_id', 'str'), ('ns', 'int'),
-            ('full_address', 'str'), ('house_number', 'str'),
-            ('street', 'str'), ('postal_code', 'str'), ('location', 'str'),
-            ('max_height_m', 'float'), ('mean_height_m', 'float'),
-            ('dsm_std', 'float'), ('roof_type_hint', 'str'),
-            ('stories_est', 'int'), ('footprint_area_sqm', 'float'),
-            ('centroid_lon', 'float'), ('centroid_lat', 'float'),
-            ('centroid_dtm_m', 'float'), ('vertex_heights', 'str')]}
-        with fiona.open(out_path, 'w', driver='GPKG', layer='buildings',
-                        schema=schema_b, crs=from_epsg(4326)) as dst:
-            for b in bldgs:
-                geom_3035 = b["geometry"]
-                geom_wgs = b["geometry_wgs"]
-                bp = b.get("properties", {})
-                props = {"building_id": "", "ns": None,
-                         "full_address": "", "house_number": "",
-                         "street": "", "postal_code": "", "location": "",
-                         "max_height_m": None, "mean_height_m": None, "dsm_std": None,
-                         "roof_type_hint": "", "stories_est": None,
-                         "footprint_area_sqm": round(float(geom_3035.area), 1),
-                         "centroid_lon": None, "centroid_lat": None,
-                         "centroid_dtm_m": None, "vertex_heights": None}
-                if bp.get("ns"): props["ns"] = bp["ns"]
-                try:
-                    c3 = geom_3035.centroid
-                    addr = _find_addr_gpkg(c3)
-                    if addr:
-                        props["building_id"] = addr.get("building_id", "")
-                        for ak in ("full_address", "house_number", "street", "postal_code", "location"):
-                            v = addr.get(ak, "")
-                            if v: props[ak] = v
-                except Exception:
-                    pass
-                try:
-                    c3 = geom_3035.centroid
-                    c_wgs = transform_to_wgs(c3)
-                    props["centroid_lon"] = round(c_wgs.x, 7)
-                    props["centroid_lat"] = round(c_wgs.y, 7)
-                    tr, tdata = _gpkg_find_tile(c3.x, c3.y)
-                    if tr and tdata:
-                        dh, dw = tdata["shape"]
-                        fp = rio_rasterize(
-                            [(geom_3035, 1)], out_shape=(dh, dw),
-                            transform=tdata["transform"],
-                            fill=0, dtype=np.uint8, all_touched=True).astype(bool)
-                        oh = tdata["ndsm"][fp]; oh = oh[np.isfinite(oh)]
-                        dv = tdata["dsm"][fp]; dv = dv[np.isfinite(dv)]
-                        if len(oh) > 0:
-                            mh = float(np.nanmax(oh))
-                            props["max_height_m"] = round(mh, 2)
-                            props["mean_height_m"] = round(float(np.nanmean(oh)), 2)
-                            props["dsm_std"] = round(float(np.std(dv)), 2) if len(dv) > 0 else 0.0
-                            props["roof_type_hint"] = "flat" if props["dsm_std"] < 1.5 else "pitched"
-                            props["stories_est"] = max(1, round(mh / 3.0))
-                        # Centroid DTM elevation
-                        tf_b = tdata["transform"]
-                        col_b = int((c3.x - tf_b.c) / tf_b.a)
-                        row_b = int((tf_b.f - c3.y) / abs(tf_b.e))
-                        if 0 <= row_b < dh and 0 <= col_b < dw:
-                            dtm_v = float(tdata["dtm"][row_b, col_b])
-                            if np.isfinite(dtm_v):
-                                props["centroid_dtm_m"] = round(dtm_v, 2)
-                        # Vertex heights (AMS anchor points)
-                        try:
-                            verts = []
-                            if geom_wgs.geom_type == 'Polygon':
-                                b_rings = [geom_wgs.exterior] + list(geom_wgs.interiors)
-                            elif geom_wgs.geom_type == 'MultiPolygon':
-                                b_rings = []
-                                for poly in geom_wgs.geoms:
-                                    b_rings.append(poly.exterior)
-                                    b_rings.extend(poly.interiors)
-                            else:
-                                b_rings = []
-                            dtm_b = tdata["dtm"]; ndsm_b = tdata["ndsm"]
-                            for ring in b_rings:
-                                for x, y in ring.coords:
-                                    pt_3035 = _tx_to_3035.transform(x, y)
-                                    vc = int((pt_3035[0] - tf_b.c) / tf_b.a)
-                                    vr = int((tf_b.f - pt_3035[1]) / abs(tf_b.e))
-                                    dtm_val = obj_h = None
-                                    if 0 <= vr < dh and 0 <= vc < dw:
-                                        dv2 = float(dtm_b[vr, vc])
-                                        if np.isfinite(dv2): dtm_val = round(dv2, 2)
-                                        nv = float(ndsm_b[vr, vc])
-                                        if np.isfinite(nv): obj_h = round(nv, 2)
-                                    verts.append(f"{round(y,7)},{round(x,7)},{dtm_val},{obj_h}")
-                            if verts:
-                                props["vertex_heights"] = "|".join(verts)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                dst.write({'geometry': _to_multi(mapping(geom_wgs)), 'properties': props})
-    _gpkg_tile_data.clear()  # free memory (closure cell of _gpkg_load_tile)
 
     # --- New buildings ---
     if new_buildings:
@@ -5771,8 +5274,6 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
             out_path,
             has_segments=bool(all_objects),
             has_points=bool(all_objects),
-            has_parcels=bool(cadastre_data.get("parcels")) and CADASTRE_PRODUCTS,
-            has_buildings=bool(cadastre_data.get("building_footprints")) and CADASTRE_PRODUCTS,
             has_new_buildings=bool(new_buildings),
             has_infrastructure=bool(infrastructure),
         )
@@ -5781,19 +5282,6 @@ def build_light_gpkg_tiled(kg_code, tile_seg_results, all_objects,
 
     # Fix CRS for uint8 raster layers (GDAL registers as 'tiles' not '2d-gridded-coverage')
     _fix_gpkg_raster_crs(out_path)
-
-    # v2: parcel outline elevation profiles — v2.4: never written (cadastre-shaped)
-    if outline_profiler is not None and CADASTRE_PRODUCTS:
-        try:
-            import sys as _sys
-            _sv2 = str(Path(__file__).resolve().parent / "segv2")
-            if _sv2 not in _sys.path:
-                _sys.path.insert(0, _sv2)
-            import parcel_elevation as _pe
-            n = _pe.write_gpkg_table(out_path, outline_profiler.gpkg_rows())
-            log.info("  LIGHT_GPKG: %s written (%d parcels)", _pe.GPKG_TABLE, n)
-        except Exception as e:
-            log.warning("Light GPKG parcel_outline_z failed: %s", e)
 
     return out_path
 
@@ -5815,7 +5303,7 @@ _QUALITY_WEIGHTS = {
     "hansen":           0.05,
     "multi_date_dtm":   0.05,
     "terrain":          0.03,
-    "cadastre_buildings": 0.05,
+    "building_context": 0.05,
     "infrastructure":   0.02,
     "segmentation":     0.03,
 }
@@ -6026,19 +5514,14 @@ def _top_candidates(objects, n=10, manmade_only=False):
 
 
 def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
-                             cadastre_data, terrain_stats, spectral_info,
+                             building_ctx, terrain_stats, spectral_info,
                              copernicus_info, hansen_info, new_buildings,
                              infrastructure, obs_year, n_tiles=1, tile_km=1.5,
                              total_seg_pixels=0, tile_data_availability=None,
-                             outline_profiler=None, classifier_used=None,
-                             v21_extras=None):
+                             classifier_used=None, v21_extras=None):
     """Build JSON summary from tiled segmentation results.
 
-    ``outline_profiler`` (v2): ``segv2.parcel_elevation.ParcelOutlineProfiler``
-    already sampled in the tile loop; parcels still missing samples (tiles
-    restored from checkpoints) are topped up here from the lazy tile cache.
-    Each parcel detail then carries ``outline_z`` (compact DTM/nDSM profile
-    along the outline — see ``segv2/parcel_elevation.py`` for the encoding).
+    ``building_ctx`` is accepted for call symmetry and never written.
     ``classifier_used``: {classifier string: n_tiles} → ``summary["model"]``.
     """
     import tile_index as ti
@@ -6059,7 +5542,7 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
             "all_lidar_datasets": sorted(ti.DATASETS.keys()),
             "sentinel2": f"Sentinel-2 L2A {obs_year}",
             "hansen": "Hansen GFC-2024-v1.12 (2000-2024)",
-            "ne_declared": "umfeld-at NE cells (frozen epoch, see section 'ne')",
+            "ne_declared": "NE cells (declared epoch, see section 'ne')",
         },
         # Licence + per-source attribution (CC BY 4.0 obligations; OSM ODbL).
         "attribution": __import__('attributions').attribution_dict(year=obs_year),
@@ -6354,775 +5837,16 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         "by_type": {t: {"count": len(items), "total_area_sqm": round(sum(i.get("area_sqm",0) for i in items),1),
                         "features": [{k:v for k,v in i.items() if k != "geometry_wgs"} for i in items]}
                    for t, items in ibt.items()}}
-    # --- Helpers for per-parcel/building segment stats ---
-    # Build obj_map from ALL per-tile objects (not just core) so labels match.
-    # Core-only all_objects miss overlap-zone objects whose IDs ARE in labels.
-    obj_map = {}
-    for tr_ in tile_seg_results:
-        for o in (tr_.get('objects') or []):
-            obj_map[o.obj_id] = o
-    # Also include core objects (in case tile objects list was pruned)
-    if objects:
-        for o in objects:
-            obj_map[o.obj_id] = o
-
-    def _classification_stats_from_objs(seg_objs, type_area_sqm=None):
-        """Compute classification dict from a list of segment objects.
-
-        type_area_sqm: optional dict {obj_type: pixel_count_sqm} for area.
-                       If None, uses obj.area_sqm summed per type.
-        """
-        if not seg_objs:
-            return None
-        n_total = len(seg_objs)
-        rf_objs = [o for o in seg_objs if getattr(o, 'classifier_source', 'rules') == 'rf']
-        rules_objs = [o for o in seg_objs if getattr(o, 'classifier_source', 'rules') == 'rules']
-        all_conf = [o.confidence for o in seg_objs]
-        rf_conf = [getattr(o, 'rf_confidence', 0.0) for o in rf_objs]
-        diverged = [o for o in seg_objs if getattr(o, 'rf_type', '') and o.obj_type != o.rf_type]
-        div_pairs = Counter((o.rf_type, o.obj_type) for o in diverged) if diverged else Counter()
-        top_div = [{'rf_type': rf, 'final_type': fin, 'count': cnt}
-                   for (rf, fin), cnt in div_pairs.most_common(5)]
-        # Per-type breakdown
-        _by_type_rf = defaultdict(list)   # obj_type → [rf_confidence, ...]
-        _by_type_all = defaultdict(list)  # obj_type → [confidence, ...]
-        _by_type_src = defaultdict(lambda: {'rf': 0, 'rules': 0})
-        _by_type_div = Counter()          # obj_type → diverged count
-        for o in seg_objs:
-            t = o.obj_type
-            _by_type_all[t].append(o.confidence)
-            src = getattr(o, 'classifier_source', 'rules')
-            if src in ('rf', 'rules'):
-                _by_type_src[t][src] += 1
-            if getattr(o, 'rf_confidence', 0) > 0:
-                _by_type_rf[t].append(o.rf_confidence)
-            if getattr(o, 'rf_type', '') and o.obj_type != o.rf_type:
-                _by_type_div[t] += 1
-        # Compute area per type
-        if type_area_sqm is None:
-            _area = defaultdict(float)
-            for o in seg_objs:
-                _area[o.obj_type] += o.area_sqm
-        else:
-            _area = type_area_sqm
-        by_type = {}
-        for t in _by_type_all:
-            entry = {
-                'segments': len(_by_type_all[t]),
-                'area_sqm': round(float(_area.get(t, 0)), 1),
-                'mean_confidence': round(sum(_by_type_all[t]) / len(_by_type_all[t]), 3),
-                'rf_count': _by_type_src[t]['rf'],
-                'rules_count': _by_type_src[t]['rules'],
-            }
-            if _by_type_rf.get(t):
-                entry['rf_mean_confidence'] = round(sum(_by_type_rf[t]) / len(_by_type_rf[t]), 3)
-            if _by_type_div.get(t):
-                entry['diverged_count'] = _by_type_div[t]
-            by_type[t] = entry
-        cls = {
-            'rf_classified': len(rf_objs),
-            'rules_classified': len(rules_objs),
-            'total_segments': n_total,
-            'mean_confidence': round(sum(all_conf) / n_total, 3),
-            'rf_mean_confidence': round(sum(rf_conf) / len(rf_conf), 3) if rf_conf else None,
-            'diverged_count': len(diverged),
-            'diverged_pct': round(100 * len(diverged) / n_total, 1),
-            'by_type': by_type,
-        }
-        if top_div:
-            cls['divergences'] = top_div
-        return cls
-
-    def _parcel_segment_stats(geom_3035, labels, ndsm, transform, shape):
-        """Compute area_summary, height_dist, vegetation, nDSM, classification for a parcel."""
-        from rasterio.features import rasterize as rio_rasterize
-        pm = rio_rasterize([(geom_3035, 1)], out_shape=shape,
-                           transform=transform, fill=0, dtype=np.uint8,
-                           all_touched=True).astype(bool)
-        pl = labels[pm]; pn = ndsm[pm]
-        tc_ = Counter(); th_ = defaultdict(list); seg_objs = []
-        for lbl in np.unique(pl):
-            obj = obj_map.get(int(lbl))
-            if obj:
-                npx = int((pl == lbl).sum())
-                tc_[obj.obj_type] += npx
-                th_[obj.obj_type].append(obj.height_max)
-                seg_objs.append(obj)
-        result = {}
-        if tc_:
-            tpx = max(int(pm.sum()), 1)
-            result['area_summary'] = {t: {'area_sqm': px, 'fraction': round(px / tpx, 4)}
-                                      for t, px in tc_.most_common()}
-            result['height_distribution'] = {t: {'min': round(min(hs_), 2), 'max': round(max(hs_), 2),
-                                                  'mean': round(sum(hs_) / len(hs_), 2)}
-                                              for t, hs_ in th_.items() if hs_}
-        veg = {'tree', 'shrub', 'grass', 'hedge', 'crop', 'orchard', 'vineyard', 'garden'}
-        vpx = sum(v for k, v in tc_.items() if k in veg); tpx = max(int(pm.sum()), 1)
-        result['vegetated_fraction'] = round(vpx / tpx, 4)
-        result['is_vegetated'] = vpx / tpx > 0.5
-        # Forested fraction
-        _forest_types = {'tree', 'shrub'}
-        fpx = sum(v for k, v in tc_.items() if k in _forest_types)
-        result['forested_fraction'] = round(fpx / tpx, 4)
-        # Dominant type
-        if tc_:
-            result['dominant_type'] = tc_.most_common(1)[0][0]
-        vh = pn[np.isfinite(pn)]
-        if len(vh) > 0:
-            result['ndsm_max_m'] = round(float(np.max(vh)), 2)
-            result['ndsm_mean_m'] = round(float(np.mean(vh)), 2)
-        cls = _classification_stats_from_objs(seg_objs, type_area_sqm=dict(tc_))
-        if cls:
-            result['classification'] = cls
-        return result
-
-    # --- Lazy DTM loading with LRU eviction for parcel/building enrichment ---
-    # Pre-loading all tiles is prohibitive for large KGs (56 tiles × ~70 MB
-    # DTM+terrain = ~4 GB).  Load on demand and keep a bounded cache.
-    from terrain_analysis import compute_slope as _js_slope, compute_aspect as _js_aspect, \
-        compute_tri as _js_tri, compute_tpi as _js_tpi
-    from collections import OrderedDict
-    _JS_MAX_CACHED = 6  # ~420 MB peak
-    _tile_data_cache = OrderedDict()
-
-    def _js_load_tile(ti_idx, tr):
-        if ti_idx in _tile_data_cache:
-            _tile_data_cache.move_to_end(ti_idx)
-            return _tile_data_cache[ti_idx]
-        try:
-            tdata = _read_dtm_for_tile(tr)
-        except Exception as e:
-            log.warning("JSON: failed to load DTM for tile %d: %s", ti_idx, e)
-            return None
-        dtm_arr = tdata["dtm"]
-        tdata["slope"] = _js_slope(dtm_arr)
-        tdata["aspect"] = _js_aspect(dtm_arr)
-        tdata["tri"] = _js_tri(dtm_arr)
-        tdata["tpi"] = _js_tpi(dtm_arr, radius=5)
-        _tile_data_cache[ti_idx] = tdata
-        while len(_tile_data_cache) > _JS_MAX_CACHED:
-            _tile_data_cache.popitem(last=False)
-        return tdata
-    log.info("JSON: using lazy DTM loading (cache=%d tiles) for %d tiles",
-             _JS_MAX_CACHED, len(tile_seg_results))
-
-    def _find_tile_with_data(e3035, n3035):
-        """Find tile containing point AND return its lazily-loaded tdata."""
-        for ti_idx, tr in enumerate(tile_seg_results):
-            left, bottom, right, top = tr["bounds_3035"]
-            if left <= e3035 <= right and bottom <= n3035 <= top:
-                tdata = _js_load_tile(ti_idx, tr)
-                if tdata is not None:
-                    return tr, tdata
-        return None, None
-
-    def _point_elevation_fallback(e3035, n3035):
-        """Direct DTM point read as fallback when no tile covers the point."""
-        try:
-            import raster_io as _rio
-            import tile_index as _ti
-            from shapely.geometry import box as _box
-            # Read a tiny window around the point (10×10m)
-            tdata = _rio.read_dtm_dsm(_box(e3035 - 5, n3035 - 5, e3035 + 5, n3035 + 5),
-                                      _ti.DEFAULT_DATASET)
-            dtm = tdata["dtm"]; tf = tdata["transform"]
-            col = int((e3035 - tf.c) / tf.a); row = int((tf.f - n3035) / abs(tf.e))
-            dh, dw = dtm.shape
-            if 0 <= row < dh and 0 <= col < dw:
-                val = float(dtm[row, col])
-                if np.isfinite(val):
-                    return round(val, 2)
-            # Try patch average
-            v = dtm[np.isfinite(dtm)]
-            if len(v) > 0:
-                return round(float(np.nanmean(v)), 2)
-        except Exception:
-            pass
-        return None
-
-    # --- STRtree centroid-in-polygon: object → parcel assignment ---
-    # Used as fallback when raster-based _parcel_segment_stats doesn't fire,
-    # and for Hansen per-parcel enrichment which isn't raster-based.
-    _FOREST_TYPES = {'tree', 'shrub'}
-    _VEGETATED_TYPES = {'tree', 'shrub', 'grass', 'hedge', 'crop', 'orchard',
-                        'vineyard', 'garden'}
-    _parcel_obj_map = defaultdict(list)  # parcel_idx → [obj, ...]
-
-    def _strtree_area_summary(p_objs, parcel_area_sqm):
-        """Build area_summary from STRtree-assigned objects, clamped to parcel area.
-
-        STRtree assigns whole objects to a parcel by centroid containment, so
-        objects that straddle the parcel boundary contribute their *entire*
-        area to a single parcel. Without correction the m² values can exceed
-        the cadastre parcel area by 2–4× (sample of 1000 random parcels: 20%
-        had >1.5× over-coverage). Fractions are unaffected (they're computed
-        relative to the sum), but absolute m² in `area_summary` and `frav`
-        was wrong. Clamp by scaling so the sum equals min(Σ, parcel_area).
-        """
-        from collections import Counter as _C, defaultdict as _D
-        tc = _C(); th = _D(list)
-        for obj in p_objs:
-            tc[obj.obj_type] += float(obj.area_sqm)
-            th[obj.obj_type].append(obj.height_max)
-        tot = sum(tc.values())
-        if tot <= 0:
-            return {}, th, 0.0
-        # Scale down (never up) so absolute m² never exceeds cadastre area.
-        scale = 1.0
-        if parcel_area_sqm and parcel_area_sqm > 0 and tot > parcel_area_sqm:
-            scale = parcel_area_sqm / tot
-        scaled = {t: a * scale for t, a in tc.items()}
-        ssum = max(sum(scaled.values()), 1.0)
-        area_summary = {
-            t: {'area_sqm': int(round(a)), 'fraction': round(a / ssum, 4)}
-            for t, a in sorted(scaled.items(), key=lambda kv: -kv[1])
-        }
-        return area_summary, th, ssum
-    if objects and cadastre_data["parcels"] and CADASTRE_PRODUCTS:
-        try:
-            from shapely import STRtree
-            parcel_geoms = [p["geometry"] for p in cadastre_data["parcels"]]
-            tree = STRtree(parcel_geoms)
-            for obj in objects:
-                pt = Point(obj.centroid_e, obj.centroid_n)
-                idx = tree.nearest(pt)
-                # Verify containment (nearest isn't necessarily containing)
-                if parcel_geoms[idx].contains(pt):
-                    _parcel_obj_map[idx].append(obj)
-            log.info("JSON: STRtree assigned %d/%d objects to %d parcels",
-                     sum(len(v) for v in _parcel_obj_map.values()),
-                     len(objects), len(_parcel_obj_map))
-        except Exception as e:
-            log.warning("JSON: STRtree parcel assignment failed: %s", e)
-
-    # --- Per-parcel Hansen: build raster lookup per tile ---
-    # hansen_info["loss_years"] is a list of arrays, but they lack geo-referencing.
-    # Instead, use hansen_loss_year stored in tile_seg_results (same transform/shape).
-    _hansen_tile_data = []  # list of (bounds_3035, loss_year_array, transform, shape)
-    for tr in tile_seg_results:
-        ly = tr.get("hansen_loss_year")
-        if ly is not None:
-            _hansen_tile_data.append((
-                tr["bounds_3035"], ly, tr["transform"], tr["shape"]
-            ))
-
-    # --- Per-parcel outline elevation profiles (v2) ---
-    _outline_recs = {}
-    if outline_profiler is not None:
-        try:
-            _missing_before = outline_profiler.summary()["missing"]
-            if _missing_before:
-                for _ti_idx, _tr in enumerate(tile_seg_results):
-                    _td = _js_load_tile(_ti_idx, _tr)
-                    if _td is not None:
-                        outline_profiler.sample(_td["dtm"], _td.get("dsm"), _td["transform"])
-                    if outline_profiler.summary()["missing"] == 0:
-                        break
-            _outline_recs = outline_profiler.records()
-            _sm = outline_profiler.summary()
-            log.info("JSON: parcel outline profiles: %d parcels, %d points, %d missing (%d before top-up)",
-                     _sm["parcels"], _sm["points"], _sm["missing"], _missing_before)
-        except Exception as e:
-            log.warning("JSON: parcel outline profiles failed: %s", e)
-            _outline_recs = {}
-
-    # --- Per-parcel detail ---
-    parcel_details = []
-    n_parcel_no_tile = 0
-    _parcel_idx_by_id = {id(p): i for i, p in enumerate(cadastre_data["parcels"])}
-    # v2.4: the per-parcel block is never built (CADASTRE_PRODUCTS=False) —
-    # the loop body is kept one release for reference and runs over [].
-    for p in (cadastre_data["parcels"] if CADASTRE_PRODUCTS else []):
-        pd = {"parcel_id": p["parcel_id"], "area_sqm": round(p.get("area_sqm",0), 1)}
-        geom_3035 = p["geometry"]
-        try:
-            cw = transform_to_wgs(geom_3035.centroid)
-            pd["centroid"] = {"lon": round(cw.x,7), "lat": round(cw.y,7)}
-        except Exception: pass
-        try:
-            c3 = geom_3035.centroid
-            tr, tdata = _find_tile_with_data(c3.x, c3.y)
-            if tr and tdata:
-                dtm = tdata["dtm"]; tf = tdata["transform"]
-                col = int((c3.x - tf.c)/tf.a); row = int((tf.f - c3.y)/abs(tf.e))
-                dh, dw = dtm.shape
-                if 0 <= row < dh and 0 <= col < dw:
-                    val = float(dtm[row,col])
-                    if np.isfinite(val): pd["elevation_m"] = round(val,2)
-                    else:
-                        patch = dtm[max(0,row-2):min(dh,row+3), max(0,col-2):min(dw,col+3)]
-                        v = patch[np.isfinite(patch)]
-                        if len(v) > 0: pd["elevation_m"] = round(float(np.nanmean(v)),2)
-                # Full terrain over parcel footprint (uses pre-computed terrain arrays)
-                try:
-                    from rasterio.features import geometry_mask as _gm_json
-                    pmask = _gm_json([mapping(geom_3035)], out_shape=(dh, dw),
-                                     transform=tf, invert=True)
-                    pv = pmask & np.isfinite(dtm)
-                    if np.sum(pv) > 4:
-                        dtm_pv = dtm[pv]
-                        e_min = float(np.nanmin(dtm_pv))
-                        e_max = float(np.nanmax(dtm_pv))
-                        pd["elevation_min_m"] = round(e_min, 2)
-                        pd["elevation_max_m"] = round(e_max, 2)
-                        pd["elevation_range_m"] = round(e_max - e_min, 2)
-                        pd["slope_mean_deg"] = round(float(np.nanmean(tdata["slope"][pv])), 1)
-                        tri_val = float(np.nanmean(tdata["tri"][pv]))
-                        pd["tri_mean"] = round(tri_val, 3)
-                        tpi_v = tdata["tpi"][pv]; tpi_v = tpi_v[np.isfinite(tpi_v)]
-                        if len(tpi_v) > 0:
-                            pd["tpi_mean"] = round(float(np.nanmean(tpi_v)), 3)
-                        # Terrain class from TRI
-                        if tri_val < 0.1: pd["terrain_class"] = "level"
-                        elif tri_val < 0.3: pd["terrain_class"] = "nearly_level"
-                        elif tri_val < 0.8: pd["terrain_class"] = "slightly_rugged"
-                        elif tri_val < 1.5: pd["terrain_class"] = "intermediately_rugged"
-                        elif tri_val < 3.0: pd["terrain_class"] = "moderately_rugged"
-                        elif tri_val < 6.0: pd["terrain_class"] = "highly_rugged"
-                        else: pd["terrain_class"] = "extremely_rugged"
-                        # Aspect (circular mean)
-                        asp_nf = tdata["aspect"][pv]
-                        asp_nf = asp_nf[asp_nf >= 0]
-                        if len(asp_nf) > 0:
-                            rad = np.radians(asp_nf)
-                            mean_asp = float(np.degrees(np.arctan2(
-                                np.mean(np.sin(rad)), np.mean(np.cos(rad))))) % 360
-                            pd["aspect_mean_deg"] = round(mean_asp, 1)
-                            _dirs = [("N",0,45),("NE",45,90),("E",90,135),("SE",135,180),
-                                     ("S",180,225),("SW",225,270),("W",270,315),("NW",315,360)]
-                            pd["aspect_dominant"] = next(
-                                (n for n,lo,hi in _dirs if lo <= mean_asp < hi), "N")
-                        else:
-                            pd["aspect_mean_deg"] = -1.0
-                            pd["aspect_dominant"] = "flat"
-                except Exception:
-                    pass
-                # Vertex heights (AMS anchor points)
-                try:
-                    verts = []
-                    geom_w = p["geometry_wgs"]
-                    if geom_w.geom_type == 'Polygon':
-                        rings = [geom_w.exterior] + list(geom_w.interiors)
-                    elif geom_w.geom_type == 'MultiPolygon':
-                        rings = []
-                        for poly in geom_w.geoms:
-                            rings.append(poly.exterior)
-                            rings.extend(poly.interiors)
-                    else:
-                        rings = []
-                    for ring in rings:
-                        for x, y in ring.coords:
-                            pt_3035 = _tx_to_3035.transform(x, y)
-                            vc = int((pt_3035[0] - tf.c) / tf.a)
-                            vr = int((tf.f - pt_3035[1]) / abs(tf.e))
-                            dtm_val = None
-                            if 0 <= vr < dh and 0 <= vc < dw:
-                                v = float(dtm[vr, vc])
-                                if np.isfinite(v): dtm_val = round(v, 2)
-                            if dtm_val is None:
-                                # Vertex outside centroid tile — try other tiles
-                                try:
-                                    vtr, vtdata = _find_tile_with_data(pt_3035[0], pt_3035[1])
-                                    if vtdata is not None and vtr is not tr:
-                                        vdtm = vtdata["dtm"]; vtf = vtdata["transform"]
-                                        vvc2 = int((pt_3035[0] - vtf.c) / vtf.a)
-                                        vvr2 = int((vtf.f - pt_3035[1]) / abs(vtf.e))
-                                        vdh, vdw = vdtm.shape
-                                        if 0 <= vvr2 < vdh and 0 <= vvc2 < vdw:
-                                            vv = float(vdtm[vvr2, vvc2])
-                                            if np.isfinite(vv): dtm_val = round(vv, 2)
-                                except Exception:
-                                    pass
-                            verts.append({"lat": round(y,7), "lon": round(x,7), "dtm_m": dtm_val})
-                    if verts:
-                        pd["vertex_heights"] = verts
-                except Exception:
-                    pass
-                # Segment analysis (happy path)
-                # Use tr's own ndsm/transform/shape (consistent with labels).
-                # tdata is a re-read that may differ by 1-2 pixels.
-                if tr.get("labels") is not None and objects:
-                    try:
-                        pss = _parcel_segment_stats(geom_3035, tr["labels"], tr["ndsm"],
-                                                    tr["transform"], tr["shape"])
-                        pd.update(pss)
-                    except Exception:
-                        pass  # STRtree fallback below
-                # STRtree fallback: if _parcel_segment_stats didn't produce area_summary
-                if 'area_summary' not in pd:
-                    p_idx = _parcel_idx_by_id[id(p)]
-                    p_objs = _parcel_obj_map.get(p_idx, [])
-                    if p_objs:
-                        as_, th_f, ssum = _strtree_area_summary(p_objs, p.get('area_sqm'))
-                        pd['area_summary'] = as_
-                        pd['height_distribution'] = {
-                            t: {'min': round(min(hs), 2), 'max': round(max(hs), 2),
-                                'mean': round(sum(hs) / len(hs), 2)}
-                            for t, hs in th_f.items() if hs}
-                        tpx_f = max(ssum, 1.0)
-                        vpx = sum(v['area_sqm'] for k, v in as_.items() if k in _VEGETATED_TYPES)
-                        pd['vegetated_fraction'] = round(vpx / tpx_f, 4)
-                        pd['is_vegetated'] = vpx / tpx_f > 0.5
-                        fpx = sum(v['area_sqm'] for k, v in as_.items() if k in _FOREST_TYPES)
-                        pd['forested_fraction'] = round(fpx / tpx_f, 4)
-                        pd['dominant_type'] = next(iter(as_)) if as_ else None
-                        hmax_vals = [obj.height_max for obj in p_objs if obj.height_max > 0]
-                        if hmax_vals:
-                            pd['ndsm_max_m'] = round(max(hmax_vals), 2)
-                        # classifier still uses true (unscaled) per-type areas
-                        # for confidence stats (reflects evidence volume).
-                        from collections import Counter as _CC
-                        true_tc = _CC()
-                        for obj in p_objs:
-                            true_tc[obj.obj_type] += int(obj.area_sqm)
-                        cls = _classification_stats_from_objs(p_objs, type_area_sqm=dict(true_tc))
-                        if cls:
-                            pd['classification'] = cls
-                # Ensure forested_fraction and dominant_type are always present
-                if 'area_summary' in pd and 'forested_fraction' not in pd:
-                    as_ = pd['area_summary']
-                    tpx_a = max(sum(v.get('area_sqm', 0) for v in as_.values()), 1)
-                    fpx_a = sum(v.get('area_sqm', 0) for k, v in as_.items() if k in _FOREST_TYPES)
-                    pd['forested_fraction'] = round(fpx_a / tpx_a, 4)
-                if 'area_summary' in pd and 'dominant_type' not in pd:
-                    as_ = pd['area_summary']
-                    if as_:
-                        pd['dominant_type'] = max(as_, key=lambda t: as_[t].get('area_sqm', 0))
-                # Per-parcel Hansen forest loss
-                if _hansen_tile_data and 'hansen_loss' not in pd:
-                    try:
-                        from rasterio.features import rasterize as _hz_rasterize
-                        for h_bounds, h_ly, h_tf, h_shape in _hansen_tile_data:
-                            h_left, h_bot, h_right, h_top = h_bounds
-                            c3 = geom_3035.centroid
-                            if h_left <= c3.x <= h_right and h_bot <= c3.y <= h_top:
-                                hm = _hz_rasterize([(geom_3035, 1)], out_shape=h_shape,
-                                                   transform=h_tf, fill=0, dtype=np.uint8,
-                                                   all_touched=True).astype(bool)
-                                hl = h_ly[hm]
-                                hl = hl[hl > 0]
-                                if len(hl) > 0:
-                                    per_yr = Counter(int(y) for y in hl)
-                                    pd['hansen_loss'] = {
-                                        'total_pixels': int(len(hl)),
-                                        'by_year': {str(2000 + yr): int(cnt)
-                                                    for yr, cnt in sorted(per_yr.items())},
-                                    }
-                                    # Recent loss (last 5 years)
-                                    recent = sum(cnt for yr, cnt in per_yr.items() if yr >= 20)
-                                    pd['hansen_loss']['recent_5yr_pixels'] = recent
-                                break
-                    except Exception:
-                        pass
-            else:
-                n_parcel_no_tile += 1
-                # Fallback: direct DTM point read
-                elev = _point_elevation_fallback(c3.x, c3.y)
-                if elev is not None:
-                    pd["elevation_m"] = elev
-                # Vertex heights with geometry-only fallback (dtm_m=None)
-                # so vertex_heights is always present for known parcels
-                try:
-                    verts = []
-                    geom_w = p.get("geometry_wgs")
-                    if geom_w is not None:
-                        if geom_w.geom_type == 'Polygon':
-                            rings = [geom_w.exterior] + list(geom_w.interiors)
-                        elif geom_w.geom_type == 'MultiPolygon':
-                            rings = []
-                            for poly in geom_w.geoms:
-                                rings.append(poly.exterior)
-                                rings.extend(poly.interiors)
-                        else:
-                            rings = []
-                        for ring in rings:
-                            for x, y in ring.coords:
-                                pt_3035 = _tx_to_3035.transform(x, y)
-                                dtm_val = None
-                                try:
-                                    vtr, vtdata = _find_tile_with_data(pt_3035[0], pt_3035[1])
-                                    if vtdata is not None:
-                                        vdtm = vtdata["dtm"]; vtf = vtdata["transform"]
-                                        vvc2 = int((pt_3035[0] - vtf.c) / vtf.a)
-                                        vvr2 = int((vtf.f - pt_3035[1]) / abs(vtf.e))
-                                        vdh, vdw = vdtm.shape
-                                        if 0 <= vvr2 < vdh and 0 <= vvc2 < vdw:
-                                            vv = float(vdtm[vvr2, vvc2])
-                                            if np.isfinite(vv): dtm_val = round(vv, 2)
-                                except Exception:
-                                    pass
-                                verts.append({"lat": round(y,7), "lon": round(x,7), "dtm_m": dtm_val})
-                        if verts:
-                            pd["vertex_heights"] = verts
-                except Exception:
-                    pass
-                # STRtree fallback for parcels outside all tile bounds
-                p_idx = _parcel_idx_by_id[id(p)]
-                p_objs = _parcel_obj_map.get(p_idx, [])
-                if p_objs:
-                    as_, th_f, ssum = _strtree_area_summary(p_objs, p.get('area_sqm'))
-                    pd['area_summary'] = as_
-                    pd['height_distribution'] = {
-                        t: {'min': round(min(hs), 2), 'max': round(max(hs), 2),
-                            'mean': round(sum(hs) / len(hs), 2)}
-                        for t, hs in th_f.items() if hs}
-                    tpx_f = max(ssum, 1.0)
-                    vpx = sum(v['area_sqm'] for k, v in as_.items() if k in _VEGETATED_TYPES)
-                    pd['vegetated_fraction'] = round(vpx / tpx_f, 4)
-                    pd['is_vegetated'] = vpx / tpx_f > 0.5
-                    fpx = sum(v['area_sqm'] for k, v in as_.items() if k in _FOREST_TYPES)
-                    pd['forested_fraction'] = round(fpx / tpx_f, 4)
-                    pd['dominant_type'] = next(iter(as_)) if as_ else None
-                    hmax_vals = [obj.height_max for obj in p_objs if obj.height_max > 0]
-                    if hmax_vals:
-                        pd['ndsm_max_m'] = round(max(hmax_vals), 2)
-                    from collections import Counter as _CC
-                    true_tc = _CC()
-                    for obj in p_objs:
-                        true_tc[obj.obj_type] += int(obj.area_sqm)
-                    cls = _classification_stats_from_objs(p_objs, type_area_sqm=dict(true_tc))
-                    if cls:
-                        pd['classification'] = cls
-        except Exception as e:
-            log.warning("JSON: parcel %s enrichment failed: %s", p.get("parcel_id"), e)
-        # --- Per-parcel top objects / top trees + compact fraction vector ---
-        # The KG-level top_10 lists only surface 10 entries across the whole KG;
-        # for a 4750ha KG with 130+ parcels and 85k trees, that's far too coarse
-        # for parcel-scale filtering. Emit per-parcel highlights from the same
-        # objects already assigned via STRtree (or via _parcel_segment_stats).
-        #
-        # Storage budget: at scale (7850 KGs × 200-500 parcels each) every
-        # extra byte/parcel matters. Use compact array form, top-5 only,
-        # and a tiny `frav` (FRaction Area Vector keyed by short type letters)
-        # so even parcels with no objects get something queryable.
-        #
-        # Format: top_objs[i] = [type_letter, hmax, hmean, area, lon, lat,
-        #                        conf, rf_conf, manmade_flag]
-        #         top_trees[i] = [hmax, hmean, h_p90, area, lon, lat,
-        #                          ndvi_mean, ndvi_fused, hchg, phen, conf, rf_conf]
-        #         frav = {"t": area_sqm, "c": area_sqm, ...}  (rounded ints)
-        # See _PARCEL_TOP_OBJ_KEYS / _PARCEL_TOP_TREE_KEYS below in app.py
-        # query layer (via static/process.html) for decoding.
-        from object_segmentation import TYPE_LETTER
-        TOP_N = 5
-        try:
-            p_idx = _parcel_idx_by_id[id(p)]
-            p_objs = _parcel_obj_map.get(p_idx, [])
-            # Compact frav from area_summary (or from p_objs if no raster summary)
-            as_ = pd.get('area_summary') or {}
-            if as_:
-                frav = {}
-                for t, info in as_.items():
-                    letter = TYPE_LETTER.get(t, '?')
-                    frav[letter] = int(info.get('area_sqm', 0))
-                if frav:
-                    pd['frav'] = frav
-            elif p_objs:
-                # Same clamp as area_summary fallback: scale so Σ ≤ parcel area.
-                as_fb, _, _ = _strtree_area_summary(p_objs, p.get('area_sqm'))
-                frav = {TYPE_LETTER.get(t, '?'): info['area_sqm']
-                        for t, info in as_fb.items() if info.get('area_sqm', 0) > 0}
-                if frav:
-                    pd['frav'] = frav
-            if p_objs:
-                p_top_obj = []
-                for o in sorted(p_objs, key=lambda o: o.height_max, reverse=True)[:TOP_N]:
-                    lon = lat = None
-                    try:
-                        lon, lat = _tx_to_wgs.transform(o.centroid_e, o.centroid_n)
-                        lon, lat = round(lon, 7), round(lat, 7)
-                    except Exception:
-                        pass
-                    p_top_obj.append([
-                        TYPE_LETTER.get(o.obj_type, '?'),
-                        round(o.height_max, 1),
-                        round(o.height_mean, 1),
-                        int(o.area_sqm),
-                        lon, lat,
-                        round(o.confidence, 2),
-                        round(getattr(o, 'rf_confidence', 0.0), 2),
-                        1 if o.is_manmade else 0,
-                    ])
-                if p_top_obj:
-                    pd['top_objs'] = p_top_obj
-                p_trees = [o for o in p_objs if o.obj_type == 'tree']
-                if p_trees:
-                    p_top_tree = []
-                    for t in sorted(p_trees, key=lambda o: o.height_max, reverse=True)[:TOP_N]:
-                        lon = lat = None
-                        try:
-                            lon, lat = _tx_to_wgs.transform(t.centroid_e, t.centroid_n)
-                            lon, lat = round(lon, 7), round(lat, 7)
-                        except Exception:
-                            pass
-                        p_top_tree.append([
-                            round(t.height_max, 1),
-                            round(t.height_mean, 1),
-                            round(t.height_p90, 1),
-                            int(t.area_sqm),
-                            lon, lat,
-                            round(t.ndvi_mean, 3),
-                            round(t.ndvi_fused, 3),
-                            round(t.height_change, 2),
-                            t.phenology_class or '',
-                            round(t.confidence, 2),
-                            round(getattr(t, 'rf_confidence', 0.0), 2),
-                        ])
-                    pd['top_trees'] = p_top_tree
-        except Exception as e:
-            log.debug("JSON: per-parcel top items failed for %s: %s", p.get("parcel_id"), e)
-        _oz = _outline_recs.get(str(p.get("parcel_id")))
-        if _oz:
-            pd["outline_z"] = _oz
-        parcel_details.append(pd)
-    if n_parcel_no_tile > 0:
-        log.warning("JSON: %d/%d parcels have no matching tile (centroid outside all tile bounds)",
-                    n_parcel_no_tile, len(cadastre_data["parcels"]))
-    if CADASTRE_PRODUCTS:
-        summary["parcels"] = {
-            "count": len(cadastre_data["parcels"]),
-            "total_area_sqm": round(sum(p.get("area_sqm",0) for p in cadastre_data["parcels"]), 1),
-            "details": parcel_details}
-    if _outline_recs and CADASTRE_PRODUCTS:
-        summary["parcels"]["outline_z_encoding"] = {
-            "z": "int16 LE decimetres DTM, base64", "zs": "int16 LE decimetres nDSM (DSM-DTM), base64",
-            "nodata": -32768, "points": "exterior ring of the cadastre parcel walked from vertex 0 at 'sp' metres "
-            "(segv2.parcel_elevation.outline_points); p0 = first point EPSG:3035"}
     if classifier_used:
         _cu = sorted(classifier_used.items(), key=lambda kv: -kv[1])
         summary["model"] = {"version": VERSION, "classifier": _cu[0][0],
                             "classifier_by_tile": dict(_cu) if len(_cu) > 1 else None}
-    # --- Per-building detail ---
-    # Build spatial lookup for address points → join to footprints
-    _addr_list = cadastre_data.get("building_addresses", [])
-    _addr_lookup = {}  # keyed by (rounded_x, rounded_y) → list of addr dicts
-    for a in _addr_list:
-        ag = a.get("geometry_3035")
-        if ag:
-            key = (round(ag.x / 10) * 10, round(ag.y / 10) * 10)  # 10m grid
-            _addr_lookup.setdefault(key, []).append(a)
-
-    def _find_address(centroid_3035, max_dist=30):
-        """Find nearest address point within max_dist metres of a footprint centroid."""
-        cx, cy = centroid_3035.x, centroid_3035.y
-        best, best_d = None, max_dist
-        # Search 3x3 grid cells around centroid
-        for dx in (-10, 0, 10):
-            for dy in (-10, 0, 10):
-                key = (round((cx + dx) / 10) * 10, round((cy + dy) / 10) * 10)
-                for a in _addr_lookup.get(key, []):
-                    d = centroid_3035.distance(a["geometry_3035"])
-                    if d < best_d:
-                        best, best_d = a, d
-        return best
-
-    bld_details = []
-    n_bld_no_tile = 0
-    for b in (cadastre_data["building_footprints"] if CADASTRE_PRODUCTS else []):   # v2.4: never
-        bd = {}; geom_3035 = b["geometry"]; props = b.get("properties",{})
-        bd["building_id"] = props.get("building_id", props.get("id",""))
-        bd["footprint_area_sqm"] = round(float(geom_3035.area), 1)
-        # Nutzungssymbol from footprint layer
-        if props.get("ns"): bd["ns"] = props["ns"]
-        try:
-            cw = transform_to_wgs(geom_3035.centroid)
-            bd["centroid"] = {"lon": round(cw.x,7), "lat": round(cw.y,7)}
-        except Exception: pass
-        # Join nearest address point
-        try:
-            addr = _find_address(geom_3035.centroid)
-            if addr:
-                if addr.get("building_id"): bd["building_id"] = addr["building_id"]
-                for ak in ("full_address", "house_number", "street", "postal_code", "location"):
-                    v = addr.get(ak, "")
-                    if v: bd[ak] = v
-        except Exception:
-            pass
-        try:
-            c3 = geom_3035.centroid
-            tr, tdata = _find_tile_with_data(c3.x, c3.y)
-            if tr and tdata:
-                from rasterio.features import rasterize as rio_rasterize
-                dh, dw = tdata["shape"]
-                bm = rio_rasterize([(geom_3035,1)], out_shape=(dh,dw), transform=tdata["transform"],
-                                   fill=0, dtype=np.uint8, all_touched=True).astype(bool)
-                oh = tdata["ndsm"][bm]; oh = oh[np.isfinite(oh)]
-                dv = tdata["dsm"][bm]; dv = dv[np.isfinite(dv)]
-                if len(oh) > 0:
-                    mh = float(np.nanmax(oh))
-                    bd["max_height_m"] = round(mh,2); bd["mean_height_m"] = round(float(np.nanmean(oh)),2)
-                    bd["dsm_std"] = round(float(np.std(dv)),2) if len(dv) > 0 else 0.0
-                    bd["roof_type_hint"] = "flat" if bd["dsm_std"] < 1.5 else "pitched"
-                    bd["stories_est"] = max(1, round(mh/3.0))
-                # Centroid DTM elevation
-                tf_b = tdata["transform"]
-                col_b = int((c3.x - tf_b.c) / tf_b.a)
-                row_b = int((tf_b.f - c3.y) / abs(tf_b.e))
-                if 0 <= row_b < dh and 0 <= col_b < dw:
-                    dtm_v = float(tdata["dtm"][row_b, col_b])
-                    if np.isfinite(dtm_v): bd["centroid_dtm_m"] = round(dtm_v, 2)
-                # Vertex heights (AMS anchor points + object height)
-                try:
-                    geom_w = b["geometry_wgs"]
-                    if geom_w.geom_type == 'Polygon':
-                        b_rings = [geom_w.exterior] + list(geom_w.interiors)
-                    elif geom_w.geom_type == 'MultiPolygon':
-                        b_rings = []
-                        for poly in geom_w.geoms:
-                            b_rings.append(poly.exterior)
-                            b_rings.extend(poly.interiors)
-                    else:
-                        b_rings = []
-                    dtm_b = tdata["dtm"]; ndsm_b = tdata["ndsm"]
-                    verts = []
-                    for ring in b_rings:
-                        for x, y in ring.coords:
-                            pt_3035 = _tx_to_3035.transform(x, y)
-                            vc = int((pt_3035[0] - tf_b.c) / tf_b.a)
-                            vr = int((tf_b.f - pt_3035[1]) / abs(tf_b.e))
-                            dtm_val = obj_h = None
-                            if 0 <= vr < dh and 0 <= vc < dw:
-                                dv2 = float(dtm_b[vr, vc])
-                                if np.isfinite(dv2): dtm_val = round(dv2, 2)
-                                nv = float(ndsm_b[vr, vc])
-                                if np.isfinite(nv): obj_h = round(nv, 2)
-                            verts.append({"lat": round(y,7), "lon": round(x,7),
-                                          "dtm_m": dtm_val, "obj_height_m": obj_h})
-                    if verts: bd["vertex_heights"] = verts
-                except Exception:
-                    pass
-                if tr.get("labels") is not None and objects:
-                    bl = tr["labels"][bm]; tc_ = Counter(); seg_objs = []
-                    for lbl in np.unique(bl):
-                        obj = obj_map.get(int(lbl))
-                        if obj:
-                            tc_[obj.obj_type] += int((bl==lbl).sum())
-                            seg_objs.append(obj)
-                    if tc_: bd["segment_types"] = {t:px for t,px in tc_.most_common()}
-                    cls = _classification_stats_from_objs(seg_objs)
-                    if cls:
-                        bd["classification"] = cls
-            else:
-                n_bld_no_tile += 1
-                # Fallback: at least get elevation for the centroid
-                elev = _point_elevation_fallback(c3.x, c3.y)
-                if elev is not None:
-                    bd["centroid_dtm_m"] = elev
-        except Exception as e:
-            log.debug("JSON: building %s enrichment failed: %s", bd.get("building_id"), e)
-        bld_details.append(bd)
-    if n_bld_no_tile > 0:
-        log.warning("JSON: %d/%d buildings have no matching tile", n_bld_no_tile, len(cadastre_data["building_footprints"]))
-    # Free tile data cache
-    _tile_data_cache.clear()
-    if CADASTRE_PRODUCTS:
-        summary["building_footprints"] = {"count": len(cadastre_data["building_footprints"]), "details": bld_details}
     # --- Coverage ---
     summary["coverage"] = {
         "n_tiles": n_tiles, "tile_km": tile_km, "total_segmented_area_sqm": total_seg_pixels,
-        "note": "Full KG tiled segmentation. Since 2.4 no parcel/footprint data is in this product; "
+        "note": "Full KG tiled segmentation. No property-level data is in this product; "
                 "sub-KG detail lives in the NE cells layer (section 'ne', product <code>_ne.h3b)."}
-    summary["cadastre_free"] = True
+    summary["property_free"] = True
     # --- Data quality ---
     dq = compute_data_quality(tile_data_availability or [])
     summary["data_quality"] = dq
@@ -7135,8 +5859,8 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
     # --- Methods ---
     summary["methods"] = {
         "segmentation": f"Felzenszwalb+RAG on {n_tiles} overlapping {tile_km}km tiles, centroid-dedup",
-        "classification": "Random Forest (44 features, cadastre+OSM trained) + rule-based fallback",
-        "calibration": "Cadastre footprints as run-time model context only (not stored)",
+        "classification": "Random Forest (44 features, OSM trained) + rule-based fallback",
+        "calibration": "BEV building footprints as run-time model context only (in RAM, not stored)",
         "height": "BEV ALS DTM/DSM 1m, nDSM = DSM - DTM",
         "temporal_change": "DTM/DSM differencing, " + ", ".join(sorted(ti.DATASETS.keys())),
         "ortho": "BEV DOP RGBI 0.2m", "ndvi_bev": "(NIR-Red)/(NIR+Red) from BEV DOP",
@@ -7146,19 +5870,19 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         "terrain": "Slope/aspect/TRI from DTM, tiled",
         "texture": "GLCM from ortho greyscale",
         "hansen": "Hansen GFC-2024-v1.12, 30m",
-        "infrastructure": "austria-power API",
+        "infrastructure": "power infrastructure API (config.POWER_API_URL)",
         "roof_type": "DSM std < 1.5m = flat", "stories_est": "max_h/3m",
         "stem_volume": "0.3*canopy_area*height/3", "parking_spots": "area/12.5m\u00b2",
         "earthwork_volume": "mean(|nDSM|)*area",
         "fragmentation": "Shannon diversity", "edge_density": "perimeter/area",
         "phenology": "harmonic amplitude+phase \u2192 class",
-        "cadastre_source": "run-time model context only (umfeld-at /k, cached <= 24 h); products carry "
-                           "cadastre solely as NE cells (ne_h3, algo ne-cells-2) — no parcel / footprint / id",
+        "building_context": "public BEV vector tiles, in RAM only (config.BEV_VECTOR_CONTEXT); products carry "
+                            "sub-KG land-use solely as NE cells (ne_h3, algo ne-cells-2) — no property-level data",
         "data_sources": [
             "BEV ALS DTM/DSM 1m (2022-2024)", "BEV DOP RGBI 0.2m",
             "Sentinel-2 L2A 10m NDVI (openEO)", "ESA WorldCover 10m",
             "Sentinel-1 SAR IW GRD 10m (openEO)", "Hansen GFC-2024-v1.12 30m",
-            "BEV Kataster as NE cells (umfeld-at ne-cells-2, H3 res 12)", "Austria Power Infrastructure API"]}
+            "BEV land-use as NE cells (ne-cells-2, H3 res 12)", "Power Infrastructure API (optional)"]}
     # --- v2.1 coarse indexes (docs/v2.1-product-spec.md) ---------------
     # Fixed-size 25 m grids + a < 1 KB acquisition block; the per-tree /
     # per-5 m data lives in the light GPKG only (disk rule).
@@ -7189,7 +5913,7 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
             ts_["apex_rejected_by_surface"] = int(_di.get("rejected_by_surface", 0) or 0)
         summary["methods"]["tree_apices"] = (
             "tree_inventory.build_inventory on the stitched 1 m nDSM (variable-window "
-            "local maxima + marker watershed, cadastre roof mask, v2 segment stand context); "
+            "local maxima + marker watershed, building-context roof mask, v2 segment stand context); "
             "points in _light_v2.gpkg layer tree_apices (EPSG:3035, R-tree); 2.2: per-crown BEV "
             "ortho RGBI spectra (ndvi_mean/p10, nir, brightness, green_ratio) → vitality + "
             "species_hint ranked KG-wide; crown outlines in layer tree_crowns (join tree_id); "
@@ -7204,7 +5928,7 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         else:
             summary["ne"] = {"status": "missing", "error": _ne.get("error") or "declared layer not available"}
         summary["methods"]["ne_cells"] = (
-            "H3 res-12 cells: declared land-use mix (NEC1, umfeld-at ne-cells-2, frozen epoch) vs our "
+            "H3 res-12 cells: declared land-use mix (NEC1, ne-cells-2, declared epoch) vs our "
             "observed layer (NEO1: segment_type mix, nDSM heights, tree count/height/crown, NDVI, dh, "
             "verdict declared-vs-observed); NET1 = every tree apex >= 3 m, NEB1 = every man-made object "
             "with observed height; res-10 chunked .h3b product (manifest key _ne_h3b)")
@@ -7705,8 +6429,8 @@ def _v2_upload_and_finish(kg: dict, kg_code: str, result: dict, _report_step, *,
                           only_keys: tuple | None = None) -> None:
     """Shared v2 tail (fresh, full-upgrade and v2.4 fast path): stream
     light_gpkg_v2 → ne_h3b → json_v2 (→ json, fresh only) to Zenodo in
-    order, then — only once EVERYTHING landed — POST NEO1 to umfeld-at and
-    run the legacy clean-up.  Mutates *result* (``_uploaded_keys``,
+    order, then — only once EVERYTHING landed — POST NEO1 to the optional
+    NE server and run the legacy clean-up.  Mutates *result* (``_uploaded_keys``,
     ``files[..]=""``, ``legacy_cleanup`` …); the parent uploads whatever is
     left in ``result["files"]`` if we stop early.
 
@@ -7716,6 +6440,16 @@ def _v2_upload_and_finish(kg: dict, kg_code: str, result: dict, _report_step, *,
     _v2_upgrade = v2_upgrade
     _parent_code = parent_code
     result.setdefault("_uploaded_keys", [])
+    if not _uploads_enabled():
+        _keys = [k for k in (only_keys or ("light_gpkg_v2", NE_PRODUCT_KEY, "json_v2", "json"))
+                 if result["files"].get(k)]
+        _st = _stash_products_local(kg_code, {k: result["files"][k] for k in _keys})
+        for _fk in _keys:
+            if f"{kg_code}_{_fk}" in _st["uploaded"]:
+                result["_uploaded_keys"].append(_fk)
+                result["files"][_fk] = ""
+        result["local_products_dir"] = _st["local_dir"]
+        return
     try:
         from zenodo_client import (Client as _ZClientV, landscape_metadata as _lmV,
                                     Manifest as _ZManifestV)
@@ -7747,7 +6481,7 @@ def _v2_upload_and_finish(kg: dict, kg_code: str, result: dict, _report_step, *,
                     result["files"][_fk] = ""
                 if _fk == NE_PRODUCT_KEY:
                     result["_ne_h3b_uploaded"] = True
-                _mark_cadastre_free(f"{kg_code}_{_fk}", _zmanifestV)
+                _mark_property_free(f"{kg_code}_{_fk}", _zmanifestV)
                 if _fk == "json":
                     result["_json_uploaded"] = True
                 try:
@@ -7763,8 +6497,7 @@ def _v2_upload_and_finish(kg: dict, kg_code: str, result: dict, _report_step, *,
         return
     # --- 7b''. v2.4 post-upload: NE round-trip + legacy clean-up ---
     # Strict order (owner rule): the v2.4 products are VERIFIED and
-    # UPLOADED first; only then is the legacy (cadastre-shaped) data
-    # touched.  Both steps are idempotent and re-run by the parent's
+    # UPLOADED first; only then is the legacy data touched.  Both steps are idempotent and re-run by the parent's
     # completion sweep if this subprocess dies here.
     _wanted = [k for k in ("light_gpkg_v2", NE_PRODUCT_KEY, "json_v2", "json")
                if result["files"].get(k) is not None and (k in result.get("_uploaded_keys", []) or result["files"].get(k) == "")]
@@ -7775,14 +6508,10 @@ def _v2_upload_and_finish(kg: dict, kg_code: str, result: dict, _report_step, *,
         try:
             _ne_post = ne_post or {}
             import ne_h3 as _neh
-            if _ne_post.get("neo1_section") and _neh.ne_source() == "bevdirect":
-                # bev mode: /obs is a survey-token write umfeld's /contrib does
-                # not take; the primary's ne_ingest posts (NEC1+NEO1) after it
-                # ingested the h3b — the peer never calls umfeld's /k tier.
-                result["ne_obs_posted"] = {"deferred_to": "primary", "container": "NEC1+NEO1" if _ne_post.get("nec1_section") else "NEO1"}
-                log.info("KG %s: NEO1 post left to the primary (bev mode)", kg_code)
+            if _ne_post.get("neo1_section") and not _neh.ne_server_enabled():
+                result["ne_obs_posted"] = {"skipped": "no NE server configured"}
             elif _ne_post.get("neo1_section"):
-                _report_step("ne_obs", "posting NEO1 to umfeld-at")
+                _report_step("ne_obs", "posting NEO1 to the NE server")
                 _nec = _ne_post.get("nec1_section")
                 _r = _neh.post_observed(_parent_code, _ne_post["neo1_section"], nec1_section=_nec)
                 result["ne_obs_posted"] = {k: _r.get(k) for k in ("unchanged", "replaced", "previous_digest", "status",
@@ -7792,15 +6521,15 @@ def _v2_upload_and_finish(kg: dict, kg_code: str, result: dict, _report_step, *,
                     result["ne_obs_posted"]["bev_digest"] = (_r.get("bev") or {}).get("digest")
                     result["ne_obs_posted"]["container"] = "NEC1+NEO1"
                     if _r.get("declared_layer") != "bev" or result["ne_obs_posted"]["bev_digest"] != _ne_post.get("declared_digest"):
-                        log.warning("KG %s: NEC1+NEO1 posted but umfeld answered declared_layer=%s bev=%s (ours %s)",
+                        log.warning("KG %s: NEC1+NEO1 posted but the NE server answered declared_layer=%s bev=%s (ours %s)",
                                     kg_code, _r.get("declared_layer"), result["ne_obs_posted"]["bev_digest"],
                                     _ne_post.get("declared_digest"))
-                log.info("KG %s: NEO1 posted to umfeld-at%s: %s", kg_code, " (NEC1+NEO1)" if _nec else "",
+                log.info("KG %s: NEO1 posted%s: %s", kg_code, " (NEC1+NEO1)" if _nec else "",
                          result["ne_obs_posted"])
         except Exception as _e:  # noqa: BLE001
-            log.warning("KG %s: NEO1 post to umfeld-at failed (non-fatal, primary re-posts): %s", kg_code, _e)
+            log.warning("KG %s: NEO1 post failed (non-fatal): %s", kg_code, _e)
         try:
-            _report_step("legacy_cleanup", "stripping cadastre data from legacy products")
+            _report_step("legacy_cleanup", "stripping legacy sections from pre-2.4 products")
             result["legacy_cleanup"] = remove_legacy_products(kg_code, v1_doc=v1_doc if _v2_upgrade else None)
             log.info("KG %s: legacy clean-up: %s", kg_code, result["legacy_cleanup"])
         except Exception as _e:  # noqa: BLE001
@@ -7841,7 +6570,7 @@ def _process_kg_v24_fast(kg: dict, kg_code: str, result: dict, fast_inputs: dict
             log.warning("KG %s: fast source hole check failed (%s) — continuing", kg_code, _he)
             _nz, _hole = 0, None
         if _hole is not None and _hole > _v2v.TOL["raster_hole_frac"]:
-            _why = (f"inherited segment_type hole {100 * _hole:.2f}% of parcel union in the "
+            _why = (f"inherited segment_type hole {100 * _hole:.2f}% of the KG bbox in the "
                     f"{fast_inputs.get('light_version')} source (tol {100 * _v2v.TOL['raster_hole_frac']:.1f}%)")
             log.warning("KG %s: v2.4 fast path declined — %s; needs the full path", kg_code, _why)
             result["success"] = False
@@ -7871,7 +6600,7 @@ def _process_kg_v24_fast(kg: dict, kg_code: str, result: dict, fast_inputs: dict
             result["step"] = "v24_fast_declined"
             return result
     b = v24_fast.build(kg, fast_inputs, ne_declared, out_gpkg=out_gpkg, out_h3b=out_h3b,
-                       product_version=PRODUCT_VERSION, strip_fn=strip_cadastre_from_doc,
+                       product_version=PRODUCT_VERSION, strip_fn=strip_legacy_sections,
                        type_names=_ATN, step=lambda d: _report_step("gpkg_light", d))
     light_gpkg = b["light_gpkg"]
     result["files"]["light_gpkg_v2"] = light_gpkg
@@ -7890,12 +6619,12 @@ def _process_kg_v24_fast(kg: dict, kg_code: str, result: dict, fast_inputs: dict
     for _li in _light_issues:
         log.warning("KG %s VALIDATION (fast): %s", kg_code, _li)
     if not _light_issues:
-        log.info("KG %s: light GPKG validated OK (%.0f MB, cadastre tables dropped: %s)",
+        log.info("KG %s: light GPKG validated OK (%.0f MB, legacy tables dropped: %s)",
                  kg_code, _light_size / 1e6, ",".join(b.get("dropped") or []) or "none")
 
     # --- JSON (relabelled v2.3 doc) ---
     result["step"] = "json"
-    _report_step("json", "relabelling v2 JSON (cadastre-free + ne)")
+    _report_step("json", "relabelling v2 JSON (property-free + ne)")
     json_summary = b["json_doc"]
     dq = json_summary.get("data_quality", {}) or {}
     result["quality_score"] = dq.get("quality_score", 0)
@@ -7924,7 +6653,7 @@ def _process_kg_v24_fast(kg: dict, kg_code: str, result: dict, fast_inputs: dict
     _report_step("v2_verify", "integrity + improvement checks")
     _rep = _v2v.verify_before_upload(
         kg_code, json_v2_path, light_gpkg if _light_size > 0 else None, v1_doc,
-        expected_parcels=None, union_geom_3035=union_3035,
+        union_geom_3035=union_3035,
         h3b_path=result["files"].get(NE_PRODUCT_KEY),
         ne_declared_digest=(ne_declared.digest if ne_declared is not None else None))
     result["v2_verify"] = {"ok": bool(_rep["ok"]), "summary": _rep.summary(),
@@ -7975,7 +6704,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
 
     ``fast_inputs`` (v2.4 fast upgrade, ``v24_fast.fetch_inputs``): the KG
     already has a v2.3+ pair on Zenodo — skip the tile loop entirely and
-    relabel (cadastre-free light GPKG + NE cells + JSON) from those
+    relabel (property-free light GPKG + NE cells + JSON) from those
     products; see ``_process_kg_v24_fast``.
 
     ``source_gpkg`` (v2 upgrade mode): path to this KG's own v1 *full* GPKG.
@@ -8300,74 +7029,42 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         full_west, full_south, full_east, full_north = west, south, east, north
         obs_year = ti.dataset_to_year(ti.DEFAULT_DATASET)
 
-        # --- 1. Cadastre ---
-        result["step"] = "cadastre"
-        _report_step("cadastre")
-        # For blocks, fetch cadastre using parent KG code
+        # --- 1. Building context (in-RAM, config.BEV_VECTOR_CONTEXT) ---
+        result["step"] = "building_context"
+        _report_step("building_context")
+        # For blocks, use the parent KG code
         _parent_code = kg.get("_parent_kg_code", kg_code)
         # The PARENT bbox: a bevdirect viewport / NEC1 build keyed by the
         # parent must cover the whole parent, never the block's bbox (the
         # Oct-07 75110/57010 failure).
         _ne_bbox = (full_west, full_south, full_east, full_north)
         if kg.get("_parent_kg_code"):
-            # Sliver-sweep units carry umfeld's bbox_new for the parent
+            # Sliver-sweep units carry the parent's bbox_r2
             # (sliver_sweep.peer_units) — kg_list.json may still hold the
             # pre-revision-2 bbox on this peer.
             _ne_bbox = kg.get("_parent_bbox") or _parent_bbox_wgs(_parent_code) or _ne_bbox
-        import ne_h3 as _neh_cad
-        _cad_src = _neh_cad.cadastre_source()
-        if _cad_src != "bevdirect":
-            # umfeld's /k cadastre routes answer 410 since the Kataster purge
-            # (2026-10-13): bev mode is the ONLY cadastre source for a peer.
-            # A fresh start right after an auto-update races the director's
-            # live sidecar flip (processing/start wrote ``umfeld`` because the
-            # re-pinned bevdirect-serve was still installing) — self-heal
-            # here: tooling present → flip the sidecar and run bev mode;
-            # otherwise defer the KG (never a cadastre-less product).
-            try:
-                _bd = _neh_cad.bevdirect_ready(probe_server=False)
-            except Exception as _e:  # noqa: BLE001
-                _bd = {"error": str(_e)[:120]}
-            if _bd.get("binary") and _bd.get("package"):
-                try:
-                    (DATA_DIR / "ne_source").write_text("bevdirect")
-                except Exception:
-                    pass
-                log.warning("KG %s: ne_source sidecar was %s but bevdirect tooling is ready — "
-                            "switched to bev mode (umfeld cadastre is retired, 410)", kg_code, _cad_src)
-                _cad_src = _neh_cad.cadastre_source()
-            else:
-                log.error("KG %s: not in bev mode and bevdirect tooling not ready (%s) — "
-                          "umfeld cadastre is retired (410); deferring KG", kg_code,
-                          {k: _bd.get(k) for k in ("binary", "binary_version", "package", "package_stale", "error")})
-        if _cad_src == "bevdirect":
-            # bev mode: parcels + footprints from the parent's ONE viewport
-            # grid (the same run that builds the NEC1 below; blocks use the
-            # parent bbox) — umfeld's /k tier is never called from a peer.
+        if _config.BEV_VECTOR_CONTEXT:
+            # Footprints from the parent's ONE viewport grid (the same run
+            # that builds the NEC1 below; blocks use the parent bbox).
             if kg.get("_sweep"):
-                # Sliver-sweep unit: parcels/footprints for the UNIT bbox only
-                # (model context + footprint mask) — the parent-wide NEC1
-                # build is skipped; the declared set is umfeld's lu via the
-                # director relay below (docs/sliver-sweep.md → Fast path).
-                _report_step("cadastre", f"bevdirect viewport (unit) {_parent_code}")
-                cadastre_data = fetch_cadastre_data_bevdirect(
-                    _parent_code, (full_west, full_south, full_east, full_north), cadastre_only=True)
+                # Sliver-sweep unit: footprints for the UNIT bbox only — the
+                # parent-wide NEC1 build is skipped (docs/sliver-sweep.md).
+                _report_step("building_context", f"bevdirect viewport (unit) {_parent_code}")
+                building_ctx = fetch_building_context(
+                    _parent_code, (full_west, full_south, full_east, full_north), context_only=True)
             else:
-                _report_step("cadastre", f"bevdirect viewport {_parent_code}")
-                cadastre_data = fetch_cadastre_data_bevdirect(_parent_code, _ne_bbox)
+                _report_step("building_context", f"bevdirect viewport {_parent_code}")
+                building_ctx = fetch_building_context(_parent_code, _ne_bbox)
         else:
-            cadastre_data = {"parcels": [], "building_footprints": [], "landuse": [],
-                             "parcels_geojson": [], "buildings_geojson": [],
-                             "building_addresses": [], "_fetch_failed": True, "_retired": True}
+            building_ctx = _empty_building_ctx()
         _v2_ctx = None            # segv2.inference.Context (v2 only, built on first tile)
         _v2_ctx_failed = False
-        _outline_prof = None      # segv2.parcel_elevation.ParcelOutlineProfiler (v2 only)
         # --- 1b. NE declared layer (v2.4) ---
         # The frozen NEC1 of the PARENT KG (blocks share the parent's cell
         # set; unseen cells are nodata and the primary merges the blocks).
         # Upgrade units arrive with ``kg["_ne_declared_path"]`` (parent
         # fetched it with the inputs — a 404 there defers the unit); fresh
-        # KGs fetch here and, when umfeld has not built the KG yet, finish
+        # KGs fetch here and, when no declared layer is available, finish
         # without NE as a '-partial' product (defect ``ne_cells``).
         _ne_declared = None
         _ne_status = "disabled"
@@ -8380,15 +7077,6 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 if _nep and os.path.exists(_nep):
                     _secs = [x for x in _neh.unpack_sections(open(_nep, "rb").read()) if x.magic == _neh.MAGIC_LU]
                     _ne_declared = _secs[0] if _secs else None
-                if _ne_declared is None and kg.get("_sweep"):
-                    # umfeld's lu via the director relay (cached there): the
-                    # cell set the sweep scan diffed against — no parent-wide
-                    # bevdirect build for a few km² unit.  Failure → normal path.
-                    try:
-                        _ne_declared = _neh.fetch_declared_director(_parent_code)
-                    except Exception as _ce:  # noqa: BLE001
-                        log.warning("KG %s: lu NEC1 relay for %s failed (%s) — regular declared fetch",
-                                    kg_code, _parent_code, str(_ce)[:120])
                 if _ne_declared is None:
                     _ne_declared = _neh.fetch_declared(_parent_code, _ne_bbox, code=kg_code)
                 _ne_status = "ok"
@@ -8400,7 +7088,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 import ne_h3 as _neh
                 if isinstance(_e, _neh.NENotBuilt):
                     _ne_status = f"not_built:{_e.status}"
-                    log.warning("KG %s: NE declared layer not built at umfeld (%s, retry_after=%s) — "
+                    log.warning("KG %s: NE declared layer not built (%s, retry_after=%s) — "
                                 "retried once more before gpkg_light; else '-partial' (defect ne_cells)",
                                 kg_code, _e.status, _e.retry_after_s)
                 else:
@@ -8409,226 +7097,50 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 _ne_declared = None
             result["ne_status"] = _ne_status
             result["ne_status_initial"] = _ne_status
-            # --- 1c. VTC pilot (docs/vct-pilot.md): on pilot peers, derive the
-            # parent's declared layer from the public BEV vector tiles
-            # (vtcseamless, in memory, one viewport request) and report the
-            # digests to umfeld-at /contrib.  Bounded helper subprocess in a
-            # thread; the product keeps umfeld's NEC1 above.  Never raises.
-            try:
-                import vct_pilot as _vct
-                # ne_source=bevdirect: the declared layer above IS the pilot
-                # run (viewport + report happened in build_declared) — nothing
-                # to compare against umfeld here (lu_diff comes from /obs).
-                if _vct.enabled() and not kg.get("_sweep") \
-                        and not (_ne_declared is not None and _neh.is_bev_declared(_ne_declared)):
-                    _nec_bytes = None
-                    if _ne_declared is not None:
-                        try:
-                            _nec_bytes = _neh.pack_section(_neh.MAGIC_LU, _ne_declared.header, _ne_declared.raw)
-                        except Exception:
-                            _nec_bytes = None
-                    # Blocks of a split parent carry the BLOCK bbox in
-                    # kg["bbox"]; the pilot (and its /contrib report, keyed by
-                    # the parent) must cover the whole parent — a block-sized
-                    # viewport reported under the parent's code was the Oct-07
-                    # 75110/57010 failure (cells=0 → HTTP 400, only_umfeld≫0).
-                    _vct_bbox = (full_west, full_south, full_east, full_north)
-                    if kg.get("_parent_kg_code"):
-                        _pb = kg.get("_parent_bbox") or _parent_bbox_wgs(_parent_code)
-                        if _pb is None:
-                            raise RuntimeError(f"parent bbox for {_parent_code} unknown — pilot skipped for block")
-                        _vct_bbox = _pb
-                    _vct_thread = _vct.run_async(_parent_code, _vct_bbox,
-                                                 _nec_bytes, is_block=bool(kg.get("_parent_kg_code")), on_done=lambda r: result.__setitem__("vct_pilot", {
-                                                     k: r.get(k) for k in ("ok", "cells", "requests", "net_bytes_est",
-                                                                           "report_http", "wall_s", "error")}))
-                    if _vct_thread is not None:
-                        log.info("KG %s: vct_pilot started for parent %s (vtcseamless, in-memory, one viewport)",
-                                 kg_code, _parent_code)
-            except Exception as _e:  # noqa: BLE001
-                log.warning("KG %s: vct_pilot hook failed (ignored): %s", kg_code, _e)
-        if MODEL_VERSION == "v2" and cadastre_data.get("parcels") and CADASTRE_PRODUCTS:
-            try:
-                import sys as _sys
-                _sv2 = str(Path(__file__).resolve().parent / "segv2")
-                if _sv2 not in _sys.path:
-                    _sys.path.insert(0, _sv2)
-                import parcel_elevation as _pe
-                _outline_prof = _pe.ParcelOutlineProfiler(
-                    (p["parcel_id"], p["geometry"]) for p in cadastre_data["parcels"] if p.get("geometry") is not None)
-                log.info("KG %s: parcel outline profiler: %d parcels", kg_code, len(_outline_prof))
-            except Exception as _e:  # noqa: BLE001
-                log.warning("KG %s: parcel outline profiler unavailable: %s", kg_code, _e)
         _classifier_used: dict = {}   # classifier string -> #tiles (→ JSON "model" block)
         _last_tile_classifier = [None]  # set per tile, persisted in the tile checkpoint
 
-        # --- 1.5. Abort + requeue on transient cadastre-API failure ---
-        # The cadastre-process-api can be briefly overloaded (503/timeout).
-        # fetch_cadastre_data() already retried with backoff; if it still
-        # failed it sets _fetch_failed. Proceeding would emit a degraded
-        # KG (GPKG missing the 'parcels'/'buildings' vector layers), which
-        # the validator flags but which still uploads. Abort instead so the
-        # director defers the KG for retry once the API recovers.
-        if cadastre_data.get("_fetch_failed"):
-            log.error("KG %s: aborting — cadastre API unavailable after retries; "
+        # --- 1.5. Abort + requeue on transient building-context failure ---
+        # fetch_building_context() already retried; if it still failed it
+        # sets _fetch_failed.  Abort so the director defers the KG for retry
+        # once bevdirect-serve / BEV recovers (never a context-less product
+        # while the context is switched on).
+        if building_ctx.get("_fetch_failed"):
+            log.error("KG %s: aborting — building context unavailable after retries; "
                       "deferring for retry", kg_code)
-            result["cadastre_failed"] = True
+            result["building_context_failed"] = True
             result["success"] = False
-            result["error"] = "cadastre-process-api unavailable (overloaded?) after retries"
-            result["step"] = "aborted_cadastre_failed"
+            result["error"] = "building context (bevdirect-serve) unavailable after retries"
+            result["step"] = "aborted_building_context_failed"
             return result
 
-        # --- 1a. Block parcel filtering ---
-        # If this is a block (split from a larger KG), filter cadastre
-        # to parcels whose centroid falls within the block's bbox.
         _is_block = kg.get("_parent_kg_code") is not None
+        result["n_buildings"] = len(building_ctx["footprints"])
+        result["building_context"] = bool(building_ctx["footprints"])
+        _report_step("building_context", f"{len(building_ctx['footprints'])} footprints (in RAM)")
         if _is_block:
-            from shapely.geometry import box as _shapely_box
-            _block_bb = kg["bbox"]
-            _block_env_wgs = _shapely_box(
-                _block_bb["min_lon"], _block_bb["min_lat"],
-                _block_bb["max_lon"], _block_bb["max_lat"],
-            )
-            # Use WGS84 geometries for bbox test (block bbox is in WGS84)
-            _n_before = len(cadastre_data["parcels"])
-            _kept_parcel_ids = set()
-            _filtered_parcels = []
-            _filtered_parcels_geojson = []
-            for _i, p in enumerate(cadastre_data["parcels"]):
-                _pg = p.get("geometry_wgs") or p.get("geometry")
-                if _pg is None:
-                    continue
-                try:
-                    if _pg.centroid.within(_block_env_wgs):
-                        _filtered_parcels.append(p)
-                        _kept_parcel_ids.add(p.get("parcel_id", ""))
-                        if _i < len(cadastre_data["parcels_geojson"]):
-                            _filtered_parcels_geojson.append(
-                                cadastre_data["parcels_geojson"][_i])
-                except Exception:
-                    pass
-            cadastre_data["parcels"] = _filtered_parcels
-            cadastre_data["parcels_geojson"] = _filtered_parcels_geojson
-
-            # Filter buildings, addresses, landuse to block bbox
-            if _filtered_parcels:
-                from shapely.ops import unary_union as _block_uu
-                from shapely.validation import make_valid as _block_mv
-                _block_geoms = []
-                for p in _filtered_parcels:
-                    try:
-                        g = p["geometry"]
-                        _block_geoms.append(_block_mv(g) if not g.is_valid else g)
-                    except Exception:
-                        _block_geoms.append(p["geometry"].buffer(0))
-                _block_union = _block_uu(_block_geoms).buffer(10)  # 10m buffer
-                cadastre_data["building_footprints"] = [
-                    b for b in cadastre_data["building_footprints"]
-                    if b["geometry"].intersects(_block_union)
-                ]
-                cadastre_data["buildings_geojson"] = [
-                    f for f in cadastre_data["buildings_geojson"]
-                    if True  # keep all — footprint filter above is primary
-                ]
-                cadastre_data["building_addresses"] = [
-                    a for a in cadastre_data["building_addresses"]
-                    if a["geometry_3035"].intersects(_block_union)
-                ]
-                cadastre_data["landuse"] = [
-                    lu for lu in cadastre_data["landuse"]
-                    if lu["geometry"].intersects(_block_union)
-                ]
-            else:
-                cadastre_data["building_footprints"] = []
-                cadastre_data["buildings_geojson"] = []
-                cadastre_data["building_addresses"] = []
-                cadastre_data["landuse"] = []
-            log.info("KG %s: block parcel filter: %d → %d parcels, %d buildings",
-                     kg_code, _n_before, len(cadastre_data["parcels"]),
-                     len(cadastre_data["building_footprints"]))
-
-        result["n_parcels"] = len(cadastre_data["parcels"])
-        result["n_buildings"] = len(cadastre_data["building_footprints"])
-        _report_step("cadastre", f"{len(cadastre_data['parcels'])} parcels, "
-                     f"{len(cadastre_data['building_footprints'])} buildings")
-
-        # --- 1b. Refine bbox from cadastre geometry union ---
-        # For blocks, SKIP bbox expansion — the block bbox is fixed by the
-        # splitter and must not grow back to the full KG extent.
-        if not _is_block:
-            all_cad_geoms = ([p["geometry"] for p in cadastre_data["parcels"]]
-                             + [b["geometry"] for b in cadastre_data["building_footprints"]])
-            if all_cad_geoms:
-                try:
-                    from shapely.ops import unary_union as _unary_union
-                    from shapely.validation import make_valid
-                    valid_geoms = []
-                    for g in all_cad_geoms:
-                        try:
-                            valid_geoms.append(make_valid(g) if not g.is_valid else g)
-                        except Exception:
-                            valid_geoms.append(g.buffer(0))
-                    cad_union_3035 = _unary_union(valid_geoms)
-                    cad_union_wgs = transform_to_wgs(cad_union_3035)
-                    cb = cad_union_wgs.bounds
-                    full_west = min(full_west, cb[0])
-                    full_south = min(full_south, cb[1])
-                    full_east = max(full_east, cb[2])
-                    full_north = max(full_north, cb[3])
-                    log.info("KG %s: full bbox from cadastre union: %.4f,%.4f → %.4f,%.4f",
-                             kg_code, full_west, full_south, full_east, full_north)
-                except Exception as e:
-                    log.warning("KG %s: cadastre union failed, using API bbox: %s",
-                                kg_code, e)
-        else:
             log.info("KG %s: block mode — using fixed bbox (no expansion)", kg_code)
 
         # --- 1c. v2 upgrade: serve rasters from the KG's own v1 full GPKG ---
         _v2_upgrade = bool(source_gpkg) or fast_inputs is not None
-        # Parcel ∪ building union in EPSG:3035 — drives the v2 raster health
-        # checks *and* the ``segment_type_no_holes`` verify gate.  Computed
-        # for every v2 KG (fresh and upgrade): without it ``v2_verify`` has
-        # no shape and falls back to the grid-only area-ratio floor, which
-        # struck the healthy 15-tile block 57210-south twice (0.745 / 0.780
-        # vs floor 0.828, 2026-09-23/24) on the *fresh* path after eb29c7b
-        # had only fixed upgrades.
+        # KG (or block) bbox polygon in EPSG:3035 — drives the v2 raster
+        # health checks *and* the ``segment_type_no_holes`` verify gate.
+        # Computed for every v2 KG (fresh and upgrade): without it
+        # ``v2_verify`` has no shape and falls back to the grid-only
+        # area-ratio floor.
         _v2_union_3035 = None
         if MODEL_VERSION == "v2":
             try:
-                from shapely.ops import unary_union as _uu_v2
-                _geoms_v2 = [p["geometry"] for p in cadastre_data.get("parcels", [])
-                             if p.get("geometry") is not None]
-                _geoms_v2 += [b["geometry"] for b in cadastre_data.get("building_footprints", [])
-                              if b.get("geometry") is not None]
-                if _geoms_v2:
-                    _v2_union_3035 = _uu_v2([g if g.is_valid else g.buffer(0) for g in _geoms_v2])
-                # Blocks keep parcels by *centroid*, so the union sticks out
-                # west/south of the block bbox where no tile is ever
-                # segmented (tiles only overshoot east/north).  Those slivers
-                # are inherited v1 behaviour, not holes — 34043-south v1 and
-                # v2 both read 0.80 %, 47221-northeast 2.79/2.83 % (2026-09-21,
-                # 27 block upgrades struck for segment_type_no_holes).  Clip
-                # to the block bbox so the health / hole checks only judge
-                # the area the block is responsible for.
-                if _v2_union_3035 is not None and _is_block and kg.get("bbox"):
-                    try:
-                        from shapely.geometry import box as _sbox_v2
-                        from shapely.ops import transform as _stf_v2
-                        from pyproj import Transformer as _Tr_v2
-                        _bbv2 = kg["bbox"]
-                        _tr_v2 = _Tr_v2.from_crs(4326, 3035, always_xy=True).transform
-                        _bbox_3035_v2 = _stf_v2(_tr_v2, _sbox_v2(
-                            _bbv2["min_lon"], _bbv2["min_lat"], _bbv2["max_lon"], _bbv2["max_lat"]))
-                        _clipped_v2 = _v2_union_3035.intersection(_bbox_3035_v2)
-                        if not _clipped_v2.is_empty:
-                            _out_frac = 1.0 - _clipped_v2.area / max(_v2_union_3035.area, 1.0)
-                            if _out_frac > 0.001:
-                                log.info("KG %s: v2 union clipped to block bbox (%.2f%% of parcel "
-                                         "area lies outside the block)", kg_code, 100 * _out_frac)
-                            _v2_union_3035 = _clipped_v2
-                    except Exception as _ce:  # noqa: BLE001
-                        log.warning("KG %s: v2 union block clip failed (%s) — using unclipped union",
-                                    kg_code, _ce)
+                from shapely.geometry import box as _sbox_v2
+                from shapely.ops import transform as _stf_v2
+                from pyproj import Transformer as _Tr_v2
+                _bbv2 = kg.get("bbox") if _is_block and kg.get("bbox") else None
+                _tr_v2 = _Tr_v2.from_crs(4326, 3035, always_xy=True).transform
+                if _bbv2:
+                    _v2_union_3035 = _stf_v2(_tr_v2, _sbox_v2(
+                        _bbv2["min_lon"], _bbv2["min_lat"], _bbv2["max_lon"], _bbv2["max_lat"]))
+                else:
+                    _v2_union_3035 = _stf_v2(_tr_v2, _sbox_v2(full_west, full_south, full_east, full_north))
             except Exception as _e:  # noqa: BLE001
                 log.warning("KG %s: v2 union failed (%s) — health checks use whole windows", kg_code, _e)
         if _v2_upgrade:
@@ -8670,10 +7182,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                  full_west, full_south, full_east, full_north)
 
         # --- 2a. Runtime oversize guard (needs_split) ---
-        # The splitter (maybe_split_kg) estimates tiles from the KG *API*
-        # bbox, but the cadastre-union expansion above can grow the grid
-        # far past that estimate (91017 Schröcken: 20 estimated → 30
-        # runtime tiles). Such KGs overrun peer disk during gpkg_full and
+        # The splitter (maybe_split_kg) estimates tiles from the KG bbox;
+        # a runtime grid past that estimate would overrun peer disk during gpkg_full and
         # wedge (stuck-kg hard restarts) without ever accumulating the
         # strikes needed for an adaptive split — each interruption lands
         # on a different peer's local strike file. Abort *before* the
@@ -8687,7 +7197,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             _rt_limit = runtime_tile_limit()
             if n_tiles > _rt_limit:
                 _msg = (f"runtime grid {n_tiles} tiles > {_rt_limit} limit "
-                        f"(post-cadastre-expansion) — aborting for split")
+                        f"— aborting for split")
                 log.warning("KG %s: %s", kg_code, _msg)
                 try:
                     force_split(kg_code)
@@ -8754,7 +7264,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 # polygon of an unrelated object of tile B.  KG 63330 (Oct
                 # 2026): 15.8k of 403k segments with polygon area > 2× their
                 # own, 27 ha of flat pasture rendered as "roof", NE cells
-                # 36 % geb at h_max = 0.  Found by umfeld's glyph.
+                # 36 % geb at h_max = 0.
                 next_obj_id = _remap_restored_tile_ids(
                     cached_tile, next_obj_id, kg_code, tile_label)
                 all_new_buildings.extend(cached_tile.get("new_buildings", []))
@@ -8796,7 +7306,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 "dtm": False, "dsm": False, "multi_date_dtm": False,
                 "ortho": False, "copernicus_ndvi": False,
                 "worldcover": False, "sar": False, "harmonics": False,
-                "hansen": False, "cadastre_buildings": False,
+                "hansen": False, "building_context": False,
                 "infrastructure": False, "terrain": False,
                 "segmentation": False, "n_objects": 0,
                 "valid_pixels": 0,
@@ -9284,33 +7794,16 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     _tile_hansen["cf_sum"] = [cf_val]
 
             # --- 3g. Segmentation ---
-            _report_step("segment", f"{tile_label} — rasterise cadastre")
+            _report_step("segment", f"{tile_label} — rasterise building context")
 
             building_fp_mask = None
-            # KG footprints (products) ∪ neighbour-KG footprints inside this
-            # tile (cadastre fast path /spatial/footprints, ~0.1 s).  The KG
-            # export only carries *this* KG's buildings, so roofs just across
-            # the KG line used to have no footprint and were emitted as
-            # "new buildings" (2026-09-17).  The viewport set is used ONLY for
-            # the raster mask (calibration + new-building matching), never
-            # written to the buildings layer.
-            _fp_pairs = [(b["geometry"], 1) for b in cadastre_data["building_footprints"]
+            # Building context (in RAM, config.BEV_VECTOR_CONTEXT): every
+            # footprint of the padded parent bbox — own KG and neighbours —
+            # rasterised into this tile.  Used ONLY as the model's
+            # ``building_mask`` (calibration + new-building matching), never
+            # written anywhere.
+            _fp_pairs = [(b["geometry"], 1) for b in building_ctx["footprints"]
                          if not b["geometry"].is_empty]
-            try:
-                if cadastre_data.get("_source") == "bevdirect":
-                    # bev mode: the parent's viewport documents already carry
-                    # the neighbours' footprints (padded bbox) — no network.
-                    _own_ids = {id(b) for b in cadastre_data["building_footprints"]}
-                    _vp = [b["geometry"] for b in cadastre_data.get("building_footprints_viewport", [])
-                           if id(b) not in _own_ids]
-                else:
-                    import cadastre as _cad_mod
-                    _vp = _cad_mod.fetch_building_footprints((tw, ts, te, tn), use_cache=False)
-                if _vp:
-                    _fp_pairs.extend((g, 1) for g in _vp if not g.is_empty)
-                    tile_avail["cadastre_buildings_viewport"] = True
-            except Exception as _e:  # noqa: BLE001
-                log.debug("KG %s %s: viewport footprints skipped: %s", kg_code, tile_label, _e)
             if _fp_pairs:
                 try:
                     from rasterio.features import rasterize as rio_rasterize
@@ -9318,25 +7811,9 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                         _fp_pairs, out_shape=(th, tw_), transform=t_transform,
                         fill=0, dtype=np.uint8, all_touched=True,
                     ).astype(bool)
-                    tile_avail["cadastre_buildings"] = bool(cadastre_data["building_footprints"])
+                    tile_avail["building_context"] = True
                 except Exception:
                     pass
-            # KG parcel-union mask: new-building candidates must lie (mostly)
-            # inside this KG's parcels — anything outside belongs to the
-            # neighbouring KG's run.
-            kg_parcel_mask = None
-            if cadastre_data.get("parcels"):
-                try:
-                    from rasterio.features import rasterize as rio_rasterize
-                    _pp = [(p["geometry"], 1) for p in cadastre_data["parcels"]
-                           if p.get("geometry") is not None and not p["geometry"].is_empty]
-                    if _pp:
-                        kg_parcel_mask = rio_rasterize(
-                            _pp, out_shape=(th, tw_), transform=t_transform,
-                            fill=0, dtype=np.uint8, all_touched=True,
-                        ).astype(bool)
-                except Exception as _e:  # noqa: BLE001
-                    log.debug("KG %s %s: parcel mask skipped: %s", kg_code, tile_label, _e)
 
             infra = None
             try:
@@ -9348,9 +7825,10 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 pass
 
             _report_step("segment", f"{tile_label} — classify")
-            # v2: one OSM/cadastre/INVEKOS context per KG (parcels + footprints
-            # come from the cadastre_data we already hold; OSM + INVEKOS are
-            # fetched once for the KG bbox and rasterised per tile).
+            # v2: one OSM/INVEKOS context per KG (footprints come from the
+            # building context we already hold; OSM (+ INVEKOS when
+            # configured) are fetched once for the KG bbox and rasterised
+            # per tile).
             if MODEL_VERSION == "v2" and _v2_ctx is None and not _v2_ctx_failed:
                 try:
                     import sys as _sys
@@ -9361,8 +7839,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     _kgb = transform_to_3035(box(full_west, full_south, full_east, full_north)).bounds
                     _v2_ctx = _v2inf.Context(
                         _kgb,
-                        parcels=[p["geometry"] for p in cadastre_data.get("parcels", []) if p.get("geometry") is not None],
-                        footprints=[b["geometry"] for b in cadastre_data.get("building_footprints", []) if b.get("geometry") is not None],
+                        footprints=[b["geometry"] for b in building_ctx["footprints"] if b.get("geometry") is not None],
                         strict=True)
                     tile_avail["v2_context"] = True
                 except Exception as _e:  # noqa: BLE001
@@ -9372,15 +7849,15 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     except Exception:  # noqa: BLE001
                         _is_upstream = False
                     if _is_upstream:
-                        # umfeld-at (OSM geometry) is down/restarting: the
-                        # strict fetch already retried ~4 min.  Never bake
+                        # The OSM geometry source is down: the strict fetch
+                        # already retried ~4 min.  Never bake
                         # a KG on an empty road/rail/water context — defer
                         # (checkpoints of restored tiles are kept).
                         log.warning("KG %s: v2 context upstream unavailable (%s) — deferring KG, "
                                     "peer continues with next KG", kg_code, _e)
                         result["context_failed"] = True
                         result["success"] = False
-                        result["error"] = f"v2 context upstream (umfeld OSM / INVEKOS) unavailable: {_e}"
+                        result["error"] = f"v2 context upstream (OSM / INVEKOS) unavailable: {_e}"
                         result["step"] = f"context_failed_tile_{tile_idx+1}"
                         break
                     _v2_ctx_failed = True
@@ -9397,8 +7874,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     mark_uncertain=mark_uncertain,
                     model=MODEL_VERSION,
                     v2_context=_v2_ctx,
-                    parcels=[p["geometry"] for p in cadastre_data.get("parcels", [])] if MODEL_VERSION == "v2" else None,
-                    footprints=[b["geometry"] for b in cadastre_data.get("building_footprints", [])] if MODEL_VERSION == "v2" else None,
+                    footprints=[b["geometry"] for b in building_ctx["footprints"]] if MODEL_VERSION == "v2" else None,
                 )
                 _st = seg_result.get("stats") or {}
                 _last_tile_classifier[0] = _st.get("classifier") or None
@@ -9416,11 +7892,6 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             # _strip_object_features) — ~60 % of per-object RAM and of the
             # core_objects pickle in every tile checkpoint.
             _strip_object_features(t_objects)
-            if _outline_prof is not None:
-                try:
-                    _outline_prof.sample(tdata["dtm"], tdata.get("dsm"), t_transform)
-                except Exception as _e:  # noqa: BLE001
-                    log.debug("KG %s %s: outline sampling failed: %s", kg_code, tile_label, _e)
             tile_avail["n_objects"] = len(t_objects)
 
             # Remap obj_ids to global unique range
@@ -9436,7 +7907,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 new_labels[t_labels == old_id] = new_id
             t_labels = new_labels
 
-            # Store tile segmentation result for parcel enrichment
+            # Store tile segmentation result for the stitched products
             # Compute tile bounds in EPSG:3035 from transform + shape
             import rasterio.transform
             t_bounds_3035 = rasterio.transform.array_bounds(th, tw_, t_transform)
@@ -9498,7 +7969,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             try:
                 _tile_nb = vectorise_unmatched_buildings(
                     t_objects, t_labels, t_mask, t_transform,
-                    building_fp_mask, t_ndsm, kg_mask=kg_parcel_mask)
+                    building_fp_mask, t_ndsm)
                 all_new_buildings.extend(_tile_nb)
             except Exception as e:
                 log.warning("KG %s %s: new buildings failed: %s", kg_code, tile_label, e)
@@ -9573,7 +8044,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             result["step"] = "aborted_copernicus_failed"
             return result
         if result.get("context_failed") and result.get("success") is False:
-            log.warning("KG %s: aborting at tile %d/%d — v2 context upstream (umfeld OSM / INVEKOS) unavailable; "
+            log.warning("KG %s: aborting at tile %d/%d — v2 context upstream (OSM / INVEKOS) unavailable; "
                         "tile checkpoints preserved for deferred retry",
                         kg_code, tile_idx + 1, n_tiles)
             result["step"] = "aborted_context_failed"
@@ -9673,10 +8144,6 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     # Same dict shapes as normal products so index
                     # merge / consumers never see legacy list shapes
                     # (see search_index._merge_block_data hardening).
-                    'parcels': {'count': 0, 'total_area_sqm': 0,
-                                'details': []},
-                    'buildings': [],
-                    'building_footprints': {'count': 0, 'details': []},
                     'new_buildings': {'count': 0, 'features': []},
                     'infrastructure': {'total': 0, 'by_type': {}},
                     'data_quality': {
@@ -9751,8 +8218,8 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             # working space while building it: the R-tree spatial index,
             # the gpkg_ogr_contents triggers, and the rollback/WAL journal
             # can transiently hold 1.5-2x the final file on top of the
-            # file itself. We also build the light GPKG (segments +
-            # parcels + buildings) right after, before the full GPKG's
+            # file itself. We also build the light GPKG (segments)
+            # right after, before the full GPKG's
             # local copy is always freed. Underestimating here is what let
             # at2 hit `database or disk is full` mid-segment_points on KG
             # 90102-southwest (2026-06-07) with a 1.5 GB final file and
@@ -9999,8 +8466,11 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             # Stream full GPKG to Zenodo immediately.  For large KGs the
             # full GPKG can be 4-15 GB.  Upload it now and delete the local
             # copy BEFORE building the light GPKG, so both products never
-            # coexist on disk simultaneously.
-            if _full_size > 0:
+            # coexist on disk simultaneously.  Without uploads the parent
+            # stashes it in config.OUT_DIR (``_stash_products_local``).
+            if _full_size > 0 and not _uploads_enabled():
+                log.info("KG %s: no upload — full GPKG left for the parent to stash locally", kg_code)
+            elif _full_size > 0:
                 if THROTTLE_FILE.exists():
                     _report_step("upload_full_gpkg", "throttle mode \u2014 skipping GPKG upload")
                     log.info("KG %s: throttle mode \u2014 deleting full GPKG locally (%.0f MB saved)",
@@ -10136,19 +8606,6 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 except Exception as _ckpt_e:
                     log.warning("  Failed to free tile checkpoints: %s", _ckpt_e)
 
-        # --- 5b. v2: top up parcel outline profiles for tiles restored from
-        # checkpoints (they never went through the tile loop's sampler) ---
-        if _outline_prof is not None and _outline_prof.summary()["missing"]:
-            try:
-                for _ti_idx, _tr in enumerate(tile_seg_results):
-                    if not _outline_prof.summary()["missing"]:
-                        break
-                    _td = _read_dtm_for_tile(_tr, kg_code=kg_code, tile_idx=_ti_idx)
-                    _outline_prof.sample(_td["dtm"], _td.get("dsm"), _td["transform"])
-                log.info("KG %s: outline profiles topped up: %s", kg_code, _outline_prof.summary())
-            except Exception as _e:  # noqa: BLE001
-                log.warning("KG %s: outline profile top-up failed: %s", kg_code, _e)
-
         # --- 5c. v2.1: top up per-tile coarse evidence for tiles restored
         # from pre-2.1 checkpoints (sidecar-first read; dates/spectral n/a) ---
         _v21_extras = None
@@ -10172,7 +8629,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # product key ``light_gpkg_v2``; the legacy ``_light_gpkg`` is never
         # produced by v2 (the triple-done logic accepts either).
         # --- 5c. NE declared layer, late retry (the "ne_declared step issue") ---
-        # umfeld builds ~1 KG / 33 s in sorted order, so a fresh KG that was
+        # An NE server builds KGs in sorted order, so a fresh KG that was
         # "not built" at step 1b is frequently built by the time the tile
         # loop (1-3 h) is done.  One more fetch here turns a '-partial'
         # (defect ne_cells → full re-upgrade later) into a complete 2.4
@@ -10192,14 +8649,14 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 log.info("KG %s: NE declared layer still unavailable at gpkg_light (%s) — '-partial' (defect ne_cells)",
                          kg_code, str(_e)[:120])
         result["step"] = "gpkg_light"
-        _report_step("gpkg_light", f"{len(cadastre_data['parcels'])} parcels, {len(all_new_buildings)} new bldg")
+        _report_step("gpkg_light", f"{len(all_new_buildings)} new bldg")
         _is_v2 = MODEL_VERSION == "v2"
         _light_key = "light_gpkg_v2" if _is_v2 else "light_gpkg"
         light_gpkg = build_light_gpkg_tiled(
             kg_code, tile_seg_results, all_objects,
-            cadastre_data, all_new_buildings, all_infrastructure,
+            building_ctx, all_new_buildings, all_infrastructure,
             obs_year=obs_year, mark_uncertain=mark_uncertain,
-            label_remap=_boundary_remap, outline_profiler=_outline_prof,
+            label_remap=_boundary_remap,
             out_path=(GPKG_DIR / f"{kg_code}_light_v2.gpkg") if _is_v2 else None,
             v21_out=_v21_extras, report_step=_report_step, ne_declared=_ne_declared)
         result["files"][_light_key] = light_gpkg
@@ -10243,7 +8700,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 pass
             result["files"][_light_key] = ""  # prevent parent upload attempt
         elif _light_size > 0 and result.get("_full_gpkg_uploaded") \
-                and not result.get("zenodo_failed") and not _is_v2:
+                and not result.get("zenodo_failed") and not _is_v2 and _uploads_enabled():
             # --- 6c. Early light GPKG upload (ordering invariant) ---
             # The _json product is the canonical completion marker; the
             # coverage oracle treats a KG as done the moment json is on
@@ -10290,13 +8747,13 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         _report_step("json", "building summary")
         json_summary = build_json_summary_tiled(
             kg_code, kg, tile_seg_results, all_objects,
-            cadastre_data, terrain_stats,
+            building_ctx, terrain_stats,
             all_spectral_info, all_copernicus_info, all_hansen_info,
             all_new_buildings, all_infrastructure, obs_year,
             n_tiles=n_tiles, tile_km=tile_km,
             total_seg_pixels=total_seg_pixels,
             tile_data_availability=tile_data_availability,
-            outline_profiler=_outline_prof, classifier_used=_classifier_used,
+            classifier_used=_classifier_used,
             v21_extras=_v21_extras)
 
         # Store quality info in result for logging / Zenodo
@@ -10351,7 +8808,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             _rep = _v2v.verify_before_upload(
                 kg_code, json_v2_path,
                 light_gpkg if (_light_size > 0 and os.path.exists(light_gpkg)) else None,
-                v1_doc, expected_parcels=None,
+                v1_doc,
                 union_geom_3035=_v2_union_3035,
                 h3b_path=result["files"].get(NE_PRODUCT_KEY),
                 ne_declared_digest=(_ne_declared.digest if _ne_declared is not None else None))
@@ -10406,7 +8863,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             else:
                 log.error("KG %s: %s — NOT uploading", kg_code, _vmsg)
                 # Keep the failed v2 JSON (small) for forensics — it is the
-                # only artefact that shows *which* parcels/tiles regressed.
+                # only artefact that shows *which* tiles regressed.
                 # Ring of the 20 most recent under json/v2_verify_failed/.
                 try:
                     _fdir = JSON_DIR / "v2_verify_failed"
@@ -10512,7 +8969,7 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             and (result.get("_light_gpkg_uploaded") or _light_size == 0)
             and not result.get("zenodo_failed")
         )
-        if THROTTLE_FILE.exists() or _is_v2:
+        if THROTTLE_FILE.exists() or _is_v2 or not _uploads_enabled():
             # Throttle mode never uploads json (matches parent behaviour);
             # leave it for the parent's throttle handling.  v2 handled its
             # ordered upload in 7b' above.
@@ -10689,10 +9146,10 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
             if 'segments' not in vector_tables:
                 issues.append("LIGHT_GPKG: missing vector layer 'segments'")
 
-            # 2.4: no cadastre-shaped layer may exist
+            # 2.4: no property-level layer may exist
             for _forb in ("parcels", "buildings", "parcel_outline_z"):
                 if _forb in vector_tables or _forb in tables:
-                    issues.append(f"LIGHT_GPKG: FORBIDDEN cadastre layer '{_forb}' present (2.4)")
+                    issues.append(f"LIGHT_GPKG: FORBIDDEN legacy layer '{_forb}' present (2.4)")
 
             # Count features in vector layers + check schemas
             try:
@@ -10710,19 +9167,6 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
                                        'tri_mean','tpi_mean','terrain_class']:
                                 if rf not in flds:
                                     issues.append(f"LIGHT_GPKG: segments missing field '{rf}'")
-                        if vt == 'parcels':
-                            for rf in ['slope_mean_deg','aspect_mean_deg','aspect_dominant',
-                                       'elevation_min_m','elevation_max_m','tri_mean',
-                                       'terrain_class','vertex_heights']:
-                                if rf not in flds:
-                                    issues.append(f"LIGHT_GPKG: parcels missing field '{rf}'")
-                            # Spot-check: at least 50% of parcels have terrain_class
-                            n_tc = 0
-                            for feat in src:
-                                if feat['properties'].get('terrain_class'):
-                                    n_tc += 1
-                            if n > 0 and n_tc < n * 0.5:
-                                issues.append(f"LIGHT_GPKG: only {n_tc}/{n} parcels have terrain_class")
             except Exception as e:
                 issues.append(f"LIGHT_GPKG: cannot read vector layers: {e}")
 
@@ -10744,7 +9188,7 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
 
             # Out-of-coverage marker product: a block that lies entirely
             # outside BEV LiDAR coverage (across the national border).
-            # It intentionally carries no objects / area / parcels — its
+            # It intentionally carries no objects / area — its
             # only job is to close the parent KG's geographic coverage
             # so the parent can drain from the priority queue. Every
             # check below (area_summary non-empty, total_area_sqm > 0,
@@ -10772,12 +9216,12 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
             for k in required_keys:
                 if k not in js:
                     issues.append(f"JSON: missing top-level key '{k}'")
-            # 2.4: cadastre-shaped sections are forbidden
-            for k in ("parcels", "building_footprints"):
+            # 2.4: property-level sections are forbidden
+            for k in LEGACY_JSON_SECTIONS:
                 if k in js:
-                    issues.append(f"JSON: FORBIDDEN cadastre section '{k}' present (2.4)")
-            if not js.get("cadastre_free"):
-                issues.append("JSON: cadastre_free flag missing (2.4)")
+                    issues.append(f"JSON: FORBIDDEN legacy section '{k}' present (2.4)")
+            if not js.get("property_free"):
+                issues.append("JSON: property_free flag missing (2.4)")
 
             # Check area_summary not empty
             area_sum = js.get("area_summary", {})
@@ -10787,71 +9231,6 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
             # Check total_area_sqm > 0
             if js.get("total_area_sqm", 0) <= 0:
                 issues.append("JSON: total_area_sqm is zero or negative")
-
-            # Check parcels have details
-            parcels = js.get("parcels", {})
-            p_details = parcels.get("details", [])
-            if parcels.get("count", 0) > 0 and not p_details:
-                issues.append("JSON: parcels.details is empty despite count>0")
-            else:
-                # Spot-check parcels
-                if p_details:
-                    n_with_elev = sum(1 for p in p_details if p.get("elevation_m") is not None)
-                    n_with_area = sum(1 for p in p_details if p.get("area_summary"))
-                    log.info("  JSON: %d/%d parcels with elevation, %d/%d with area_summary",
-                             n_with_elev, len(p_details), n_with_area, len(p_details))
-                    if n_with_elev == 0:
-                        issues.append("JSON: no parcels have elevation_m")
-                    elif n_with_elev < len(p_details) * 0.8:
-                        issues.append(f"JSON: only {n_with_elev}/{len(p_details)} parcels have elevation_m (expect >80% with full-KG DTM)")
-                    if n_with_area == 0 and len(p_details) > 5:
-                        # area_summary only available for parcels inside segmentation window
-                        log.info("  JSON: no parcels have area_summary (may be outside seg window)")
-                    # Terrain enrichment checks
-                    n_with_terrain = sum(1 for p in p_details if p.get("terrain_class"))
-                    n_with_aspect = sum(1 for p in p_details if p.get("aspect_dominant"))
-                    n_with_verts = sum(1 for p in p_details if p.get("vertex_heights"))
-                    log.info("  JSON: %d/%d parcels with terrain_class, %d/%d with aspect, %d/%d with vertex_heights",
-                             n_with_terrain, len(p_details), n_with_aspect, len(p_details),
-                             n_with_verts, len(p_details))
-                    if n_with_terrain == 0:
-                        issues.append("JSON: no parcels have terrain_class")
-                    elif n_with_terrain < len(p_details) * 0.5:
-                        issues.append(f"JSON: only {n_with_terrain}/{len(p_details)} parcels have terrain_class")
-                    if n_with_aspect == 0:
-                        issues.append("JSON: no parcels have aspect_dominant")
-                    if n_with_verts == 0:
-                        issues.append("JSON: no parcels have vertex_heights")
-                    elif n_with_verts < len(p_details) * 0.5:
-                        issues.append(f"JSON: only {n_with_verts}/{len(p_details)} parcels have vertex_heights")
-                    # Check largest parcel has full data
-                    biggest = max(p_details, key=lambda p: p.get("area_sqm", 0))
-                    if not biggest.get("parcel_id"):
-                        issues.append("JSON: largest parcel missing parcel_id")
-                    if not biggest.get("centroid"):
-                        issues.append("JSON: largest parcel missing centroid")
-
-            # Check building_footprints have details
-            bfp = js.get("building_footprints", {})
-            bf_details = bfp.get("details", [])
-            if bfp.get("count", 0) > 0 and not bf_details:
-                issues.append("JSON: building_footprints.details empty despite count>0")
-            else:
-                if bf_details:
-                    b0 = bf_details[0]
-                    if not b0.get("centroid"):
-                        issues.append("JSON: first building missing centroid")
-                    if b0.get("max_height_m") is None:
-                        issues.append("JSON: first building missing max_height_m")
-                    n_bld_verts = sum(1 for b in bf_details if b.get("vertex_heights"))
-                    n_bld_dtm = sum(1 for b in bf_details if b.get("centroid_dtm_m") is not None)
-                    n_bld_roof = sum(1 for b in bf_details if b.get("roof_type_hint"))
-                    log.info("  JSON: %d/%d buildings with vertex_heights, %d with centroid_dtm, %d with roof_type",
-                             n_bld_verts, len(bf_details), n_bld_dtm, n_bld_roof)
-                    if n_bld_verts == 0 and len(bf_details) > 5:
-                        issues.append("JSON: no buildings have vertex_heights")
-                    if n_bld_dtm == 0 and len(bf_details) > 5:
-                        issues.append("JSON: no buildings have centroid_dtm_m")
 
             # Check for NaN/None in critical numeric fields
             for t, vals in js.get("height_distribution", {}).items():
@@ -10927,12 +9306,8 @@ def validate_kg_outputs(kg_code: str, files: dict) -> list[str]:
                     issues.append(f"JSON: methods missing '{mk}' key")
 
             # Summary stats
-            n_parcel_details = len(p_details)
-            n_bfp_details = len(bf_details)
             n_types = len(area_sum)
-            log.info("  JSON: %.1f KB, %d types, %d parcel details, %d building details",
-                     os.path.getsize(json_path)/1024, n_types,
-                     n_parcel_details, n_bfp_details)
+            log.info("  JSON: %.1f KB, %d types", os.path.getsize(json_path)/1024, n_types)
 
         except json.JSONDecodeError as e:
             issues.append(f"JSON: parse error: {e}")
@@ -10953,7 +9328,7 @@ def log_kg_stats_from_json(kg_code: str, json_path: str, elapsed: float):
 
     # An out-of-coverage product (all tiles NoData -- see the
     # empty-coverage gate in process_one_kg) carries plain LISTS where a
-    # normal product carries summary dicts (parcels/new_buildings/
+    # normal product carries summary dicts (new_buildings/
     # infrastructure). Coerce so a legitimately-empty KG can't crash the
     # stats logger -- which it did on at11 for 80110-southeast-3:
     # ``AttributeError: 'list' object has no attribute 'get'`` was raised
@@ -10988,14 +9363,12 @@ def log_kg_stats_from_json(kg_code: str, json_path: str, elapsed: float):
     ndvi = _d("ndvi")
 
     n_seg = landscape.get("n_segments", 0) or len(_l("objects"))
-    n_par = _n("parcels", "count")
-    n_bld = _n("building_footprints", "count") or _n("buildings", "count")
     n_new = _n("new_buildings", "count")
     n_inf = _n("infrastructure", "total", "count")
 
     log.info("KG %s: SUCCESS in %.0fs", kg_code, elapsed)
-    log.info("  %d segments | %d parcels | %d buildings | %d new buildings | %d infrastructure",
-             n_seg, n_par, n_bld, n_new, n_inf)
+    log.info("  %d segments | %d new buildings | %d infrastructure",
+             n_seg, n_new, n_inf)
     log.info("  area=%.0f m\u00b2 | dominant=%s | vegetated=%.0f%% | shannon=%.2f",
              js.get("total_area_sqm", 0),
              landscape.get("dominant_type", "?"),
@@ -11061,42 +9434,29 @@ def log_kg_stats_from_json(kg_code: str, json_path: str, elapsed: float):
 # === SECTION: Zenodo upload helpers ===
 
 def _push_manifest_entry_to_director(zenodo_key: str, manifest) -> None:
-    """Best-effort push of a freshly-saved manifest entry to the director.
-
-    Uses ZENODO_LOCK_URL (set on peers) or http://127.0.0.1:8000 (primary)
-    as the director endpoint.  Director's /api/v1/manifest/push merges the
-    entry with timestamp-aware overwrite. Silent failures are fine — the
-    5-minute peer-sync poll is the safety net.
-    """
-    import os as _os, requests as _req, json as _j
-    director_url = _os.environ.get('ZENODO_LOCK_URL') or 'http://127.0.0.1:8000'
-    director_url = director_url.rstrip('/')
+    """Best-effort push of a freshly-saved manifest entry to the primary
+    (``config.PRIMARY_URL``; no-op on a single VM).  The primary's
+    /api/v1/manifest/push merges the entry with timestamp-aware overwrite.
+    Silent failures are fine — the peer-sync poll is the safety net."""
+    import requests as _req, json as _j
+    director_url = (_config.PRIMARY_URL or "").rstrip('/')
+    if not director_url:
+        return
     entry = manifest.get(zenodo_key) if hasattr(manifest, 'get') else None
     if entry is None:
         return
     payload = {'key': zenodo_key,
                'entry': entry.to_dict() if hasattr(entry, 'to_dict') else entry}
-    # v2.4: tell the director WHO holds the local copy, so the primary's
-    # ne_ingest / v2_ingest can pull <code>_ne.h3b / <code>_v2.json.gz
-    # from this peer (GET /api/v1/processing/product) instead of Zenodo.
+    # v2.4: tell the primary WHO holds the local copy, so its ne_ingest /
+    # v2_ingest can pull <code>_ne.h3b / <code>_v2.json.gz from this peer
+    # (GET /api/v1/processing/product) instead of Zenodo.
     try:
         _self = _j.loads((DATA_DIR / 'self.json').read_text())
         if _self.get('id'):
             payload['peer'] = str(_self['id'])
     except Exception:
         pass
-    headers = {'Content-Type': 'application/json'}
-    # Forward admin token if available (peers carry it via env or file)
-    tok = _os.environ.get('ADMIN_TOKEN', '')
-    if not tok:
-        try:
-            tp = Path('data/admin_token')
-            if tp.exists():
-                tok = tp.read_text().strip()
-        except Exception:
-            pass
-    if tok:
-        headers['X-Admin-Token'] = tok
+    headers = {'Content-Type': 'application/json', **_config.operator_headers()}
     try:
         _req.post(director_url + '/api/v1/manifest/push',
                   data=_j.dumps(payload), headers=headers, timeout=8)
@@ -11104,19 +9464,18 @@ def _push_manifest_entry_to_director(zenodo_key: str, manifest) -> None:
         log.debug('manifest push to %s: %s', director_url, e)
 
 
-# === SECTION: v2.4 legacy clean-up (cadastre-shaped files off Zenodo) ===
+# === SECTION: v2.4 legacy clean-up (pre-2.4 product files off Zenodo) ===
 
-LEGACY_JSON_SECTIONS = ("parcels", "building_footprints")
-_CUTOVER_V24 = "2026-10-04T00:00:00+00:00"   # products uploaded before this may carry cadastre data
+LEGACY_JSON_SECTIONS = ("parcels", "building_footprints")   # pre-2.4 product sections, never written since
+_CUTOVER_V24 = "2026-10-04T00:00:00+00:00"   # products uploaded before this may carry legacy sections
 
 
-def _mark_cadastre_free(zenodo_key: str, manifest) -> None:
-    """Every product written by 2.4+ code carries ``status=cf`` (cadastre-free) in
-    its manifest record (JSON / light / h3b; the full GPKG never had cadastre
-    data).  The director's ``legacy:`` audit and ``legacy_pending`` treat a
-    record WITHOUT this marker (and without ``stripped``/``removed``) as
-    possibly cadastre-shaped — independent of timestamps, so products that
-    old-code peers finished after the cutover are still caught."""
+def _mark_property_free(zenodo_key: str, manifest) -> None:
+    """Every product written by 2.4+ code carries ``status=cf`` (clean
+    format: no property-level data) in its manifest record (JSON / light /
+    h3b; the full GPKG never had such data).  The director's ``legacy:``
+    audit and ``legacy_pending`` treat a record WITHOUT this marker (and
+    without ``stripped``/``removed``) as possibly legacy-shaped."""
     try:
         if zenodo_key.endswith("_full_gpkg"):
             return
@@ -11127,16 +9486,15 @@ def _mark_cadastre_free(zenodo_key: str, manifest) -> None:
         manifest.set(zenodo_key, e)
         manifest.save()
     except Exception as ex:  # noqa: BLE001
-        log.debug("_mark_cadastre_free %s: %s", zenodo_key, ex)
+        log.debug("_mark_property_free %s: %s", zenodo_key, ex)
 
 
-def strip_cadastre_from_doc(doc: dict) -> dict:
-    """Return a copy of a v1/v2.x KG JSON without any cadastre-shaped data.
-    Removes ``parcels`` / ``building_footprints`` wholesale (details carry
-    parcel ids, vertex geometry, footprints, addresses), the parcel
-    coverage percentages and the cadastre wording; keeps everything else
-    (bbox, area_summary, terrain, trees, grid25 …) so the file stays a valid
-    verify baseline and completion marker."""
+def strip_legacy_sections(doc: dict) -> dict:
+    """Return a copy of a v1/v2.x KG JSON without any pre-2.4 property-level
+    sections (``LEGACY_JSON_SECTIONS`` wholesale, the related coverage
+    percentages and wording); keeps everything else (bbox, area_summary,
+    terrain, trees, grid25 …) so the file stays a valid verify baseline and
+    completion marker."""
     import copy as _copy
     d = _copy.deepcopy(doc)
     for k in LEGACY_JSON_SECTIONS:
@@ -11146,7 +9504,7 @@ def strip_cadastre_from_doc(doc: dict) -> dict:
         for k in ("parcel_elevation_coverage_pct", "parcel_segmentation_coverage_pct",
                   "building_height_coverage_pct"):
             cov.pop(k, None)
-        cov["note"] = "cadastre data removed 2.4 (stripped in place); sub-KG detail: NE cells (_ne_h3b)"
+        cov["note"] = "property-level data removed 2.4 (stripped in place); sub-KG detail: NE cells (_ne_h3b)"
     op = d.get("observation_period")
     if isinstance(op, dict):
         op.pop("cadastre", None)
@@ -11159,17 +9517,18 @@ def strip_cadastre_from_doc(doc: dict) -> dict:
     dq = d.get("data_quality")
     if isinstance(dq, dict):
         dq.pop("cadastre_buildings", None)
+    d.pop("cadastre_free", None)
     try:
         d["attribution"] = __import__("attributions").attribution_dict()
     except Exception:  # noqa: BLE001
         pass
-    d["cadastre_free"] = True
-    d["cadastre_stripped_at"] = datetime.now(timezone.utc).isoformat()
+    d["property_free"] = True
+    d["legacy_stripped_at"] = datetime.now(timezone.utc).isoformat()
     return d
 
 
-def _doc_has_cadastre(doc: dict) -> bool:
-    return any(k in doc for k in LEGACY_JSON_SECTIONS) and not doc.get("cadastre_free")
+def _doc_has_legacy(doc: dict) -> bool:
+    return any(k in doc for k in LEGACY_JSON_SECTIONS) and not doc.get("property_free")
 
 
 def legacy_pending(code: str, manifest) -> dict:
@@ -11195,11 +9554,11 @@ def remove_legacy_products(kg_code: str, v1_doc: dict | None = None, manifest=No
     (+ h3b) is verified and uploaded (caller guarantees; we re-check the
     manifest):
 
-    1. v1 ``_json`` still cadastre-shaped → strip in place (same filename
+    1. v1 ``_json`` still legacy-shaped → strip in place (same filename
        PUT into the same bucket; the manifest record keeps its original
        stamp in ``prev_uploaded_at`` and gets ``status=stripped``) — the
        completion marker never disappears.
-    2. v1 ``_light_gpkg`` (parcels/buildings/parcel_outline_z layers) →
+    2. v1 ``_light_gpkg`` (pre-2.4 property-level layers) →
        deposition DELETED, record kept as ``status=removed`` (size 0).
 
     Older ``_json_v2`` / ``_light_gpkg_v2`` were replaced in place by the
@@ -11232,8 +9591,8 @@ def remove_legacy_products(kg_code: str, v1_doc: dict | None = None, manifest=No
                     os.unlink(_dl)
                 except OSError:
                     pass
-            if _doc_has_cadastre(doc) or not doc.get("cadastre_free"):
-                stripped = strip_cadastre_from_doc(doc)
+            if _doc_has_legacy(doc) or not doc.get("property_free"):
+                stripped = strip_legacy_sections(doc)
                 out_p = JSON_DIR / ej.filename          # same filename → in-place PUT
                 JSON_DIR.mkdir(parents=True, exist_ok=True)
                 with open(out_p, "w") as fh:
@@ -11249,9 +9608,9 @@ def remove_legacy_products(kg_code: str, v1_doc: dict | None = None, manifest=No
                 manifest.save()
                 _push_manifest_entry_to_director(f"{kg_code}_json", manifest)
                 done["json_strip"] = {"size": ent.size, "prev_uploaded_at": prev_ts}
-                log.info("KG %s: v1 _json stripped of cadastre data and re-PUT in place (%d B)", kg_code, ent.size)
+                log.info("KG %s: v1 _json stripped of legacy sections and re-PUT in place (%d B)", kg_code, ent.size)
             else:
-                # Clean already (written by a cadastre-free code path but
+                # Clean already (written by a 2.4 code path but
                 # never flagged) — record it, else the legacy audit keeps
                 # listing the code as suspect forever (62004, 2026-10-30).
                 ej.status = "cf"
@@ -11260,11 +9619,34 @@ def remove_legacy_products(kg_code: str, v1_doc: dict | None = None, manifest=No
                 _push_manifest_entry_to_director(f"{kg_code}_json", manifest)
                 done["json_strip"] = "already clean"
         if pend.get("light_remove"):
-            rec = client.remove_deposition_keep_record(f"{kg_code}_light_gpkg", manifest, reason="v2.4 cadastre layers")
+            rec = client.remove_deposition_keep_record(f"{kg_code}_light_gpkg", manifest, reason="legacy_cleanup")
             _push_manifest_entry_to_director(f"{kg_code}_light_gpkg", manifest)
             done["light_remove"] = {"depo_id": rec.depo_id, "removed_at": rec.removed_at}
             log.info("KG %s: legacy _light_gpkg deposition %d removed (record kept)", kg_code, rec.depo_id)
     return done
+
+
+def _stash_products_local(kg_code: str, files: dict) -> dict:
+    """No-upload path (no Zenodo token or ``--no-upload``): move the
+    finished products into ``config.OUT_DIR/<kg_code>/`` and return an
+    ``upload_kg_to_zenodo``-shaped stats dict so the callers' bookkeeping
+    (``_uploaded_keys``, ``files[..] = ""``) stays unchanged."""
+    out = Path(_config.OUT_DIR) / str(kg_code)
+    stats = {"uploaded": [], "errors": [], "total_bytes": 0, "local_dir": str(out)}
+    for file_key, local_path in list(files.items()):
+        if not local_path or not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
+            continue
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+            dst = out / os.path.basename(local_path)
+            if os.path.abspath(local_path) != str(dst):
+                shutil.move(local_path, str(dst))
+            stats["uploaded"].append(f"{kg_code}_{file_key}")
+            stats["total_bytes"] += os.path.getsize(dst)
+            log.info("KG %s: %s written to %s (no upload)", kg_code, file_key, dst)
+        except Exception as e:  # noqa: BLE001
+            stats["errors"].append({"key": f"{kg_code}_{file_key}", "error": str(e)[:200]})
+    return stats
 
 
 def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
@@ -11280,6 +9662,8 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
     to Zenodo without loading them into memory.  This is critical for
     large GPKGs (multi-GB) on a disk-constrained VM.
     """
+    if not _uploads_enabled():
+        return _stash_products_local(kg_code, files)
     from zenodo_client import Client, landscape_metadata
     from zenodo_lock import zenodo_upload_lock
 
@@ -11351,7 +9735,7 @@ def upload_kg_to_zenodo(kg_code: str, kg_name: str, files: dict,
 
             upload_stats["uploaded"].append(zenodo_key)
             upload_stats["total_bytes"] += fsize
-            _mark_cadastre_free(zenodo_key, manifest)
+            _mark_property_free(zenodo_key, manifest)
             if file_key == NE_PRODUCT_KEY and os.path.exists(local_path):
                 # Park the committed h3b where disk_cleanup's "old GPKG
                 # temp" sweep won't touch it (served by
@@ -11648,7 +10032,7 @@ def v24_fast_defects_ok(doc: dict) -> tuple[bool, list]:
 # (its id was gone from ``obj_map``), so any object straddling a tile seam
 # vanished from the raster while its merged polygon survived in ``segments``.
 # Alpine KGs with 20–50 ha rock / grass objects crossing seams lose 4–10 %%
-# of the parcel union (85207-northwest 9.58 %%, 82106-southwest 6.53 %%,
+# of the KG bbox (85207-northwest 9.58 %%, 82106-southwest 6.53 %%,
 # 83113 3.97 %%).  The fast path only relabels the inherited raster, so
 # ``segment_type_no_holes`` fails deterministically and the code struck out
 # instead of taking the full path, which re-stitches from the full GPKG
@@ -11758,7 +10142,7 @@ def _parent_bbox_wgs(parent_code: str):
     try:
         for k in json.loads(KG_LIST_FILE.read_text()):
             if str(k.get("kg_code")) == str(parent_code):
-                # bbox_r2 (umfeld revision 2, VGD envelope) when known: the
+                # bbox_r2 (revision 2, VGD envelope) when known: the
                 # declared layer must cover the whole KG polygon; the
                 # processing bbox stays the pinned revision-1 one.
                 b = k.get("bbox_r2") or k.get("bbox") or {}
@@ -12505,17 +10889,10 @@ def _push_strikes_to_director() -> None:
             data = json.loads(p.read_text() or "{}")
             if not data:
                 return
-            director_url = (os.environ.get("ZENODO_LOCK_URL", "").strip()
-                            or "http://127.0.0.1:8000")
-            if "127.0.0.1" in director_url or "localhost" in director_url:
-                return  # we ARE the director/primary; file is already local
-            headers = {}
-            try:
-                tok = Path("data/admin_token").read_text().strip()
-                if tok:
-                    headers["X-Admin-Token"] = tok
-            except Exception:
-                pass
+            director_url = (_config.PRIMARY_URL or "").strip()
+            if not director_url:
+                return  # single VM: we ARE the primary; file is already local
+            headers = _config.operator_headers()
             r = requests.put(
                 director_url.rstrip("/") + "/api/v1/processing/kg_strikes",
                 json=data, timeout=15, headers=headers)
@@ -12973,21 +11350,6 @@ def _get_peer_claimed_kgs(peer_urls: list[str]) -> set[str]:
 
 
 def main():
-    try:
-        import peer_tokens as _pt
-        _pt.install_outbound_hook()
-    except Exception:
-        pass
-    try:
-        # Lease the provider secrets (Zenodo / umfeld / GitHub) from the
-        # primary into memory and export them to the per-KG subprocess
-        # env — nothing is written to disk (fleet_secrets.py).
-        import fleet_secrets as _fs
-        _fs.refresh(force=True, reason="processor-start")
-        os.environ.update(_fs.export_env())
-        log.info("fleet_secrets: %s", _fs.status())
-    except Exception as _e:
-        log.warning("fleet_secrets bootstrap failed: %s", _e)
     global _active_pool
 
     parser = argparse.ArgumentParser(description="Austria Landscape Processor")
@@ -12999,6 +11361,9 @@ def main():
                         help="Skip Copernicus data (faster)")
     parser.add_argument("--dry-run", action="store_true",
                         help="List KGs without processing")
+    parser.add_argument("--no-upload", action="store_true",
+                        help="Never upload: products are written to config.OUT_DIR/<kg>/ "
+                             "(implied when no Zenodo token is configured; env SRTM_NO_UPLOAD=1)")
     parser.add_argument("--mark-uncertain", action="store_true",
                         help="Label low-confidence RF segments as 'unclassified' instead of rule-based fallback")
     parser.add_argument("--cache-only", action="store_true",
@@ -13012,7 +11377,7 @@ def main():
                              "(no BEV/openEO). With --kg: upgrade that single code. "
                              "Env V2_UPGRADE=1 is equivalent.")
     parser.add_argument("--peers", nargs='*', default=[],
-                        help="Peer instance URLs for coordination (e.g. https://example.invalid:8000)")
+                        help="Peer instance URLs for coordination (default: config.peers())")
     parser.add_argument("--instance-id", default=None,
                         help="Instance identifier (default: hostname)")
     args = parser.parse_args()
@@ -13144,7 +11509,6 @@ def main():
         last_kg_seconds=0,
         n_new_buildings_total=0,
         n_infrastructure_total=0,
-        parcels_total=0,
         buildings_total=0,
         recent_log=[],
         current_kg=None,
@@ -13626,6 +11990,11 @@ def main():
     log.info("Total KGs: %d, completed: %d, failed (permanent): %d, pending: %d",
              len(kgs), len(completed_codes), len(failed_kgs), len(pending))
 
+    if args.no_upload:
+        os.environ["SRTM_NO_UPLOAD"] = "1"
+    if not _uploads_enabled():
+        log.warning("No Zenodo token / --no-upload: products are written to %s and nothing is uploaded",
+                    _config.OUT_DIR)
     if args.dry_run:
         for kg in pending[:20]:
             log.info("  Would process: %s (%s)", kg["kg_code"], kg.get("kg_name", ""))
@@ -13768,10 +12137,8 @@ def main():
         _v2_fast = None
         if kg.get("_v2_upgrade"):
             # v2.4: the declared NE layer of the parent must exist BEFORE we
-            # pull gigabytes of GPKG — umfeld-at builds all KGs over ~3 days;
-            # an unbuilt KG is simply skipped this round (no strike, no
-            # deferral count: the director gates candidates on the umfeld
-            # manifest, so this is rare).
+            # pull gigabytes of GPKG; an unbuilt KG is simply skipped this
+            # round (no strike, no deferral count).
             try:
                 import ne_h3 as _neh
                 _ne_parent = kg.get("_parent_kg_code") or kg_code.split("-")[0]
@@ -13785,7 +12152,7 @@ def main():
                     # bbox (upgrade units often carry no bbox at all, and a
                     # block's bbox must never key a parent build — the
                     # Oct-07 75110/57010 failure).  kg_list → bevdirect
-                    # /kg → public API; never umfeld's /k.
+                    # /kg → public API.
                     _ne_bb = None
                     if _neh.ne_source() == "bevdirect":
                         _ne_bb = _parent_bbox_wgs(_ne_parent)
@@ -13801,7 +12168,7 @@ def main():
             except Exception as _ne_e:  # noqa: BLE001
                 import ne_h3 as _neh
                 if isinstance(_ne_e, _neh.NENotBuilt):
-                    log.info("KG %s: NE declared layer not built yet at umfeld (%s, retry_after=%s) — skipping unit this round",
+                    log.info("KG %s: NE declared layer not built yet (%s, retry_after=%s) — skipping unit this round",
                              kg_code, _ne_e.status, _ne_e.retry_after_s)
                     progress.add_log("info", f"v2up: {kg_code} waits for NE cells ({_ne_e.status})", kg_code)
                     _v2_release_inputs(kg)
@@ -14493,7 +12860,6 @@ def main():
                         log.warning("KG %s: parent legacy sweep failed: %s", kg_code, _le)
                 if not _zenodo_transient:
                     progress.record_success(
-                        parcels=result.get("n_parcels", 0),
                         buildings=result.get("n_buildings", 0),
                         upload_bytes=upload_stats["total_bytes"],
                         last_kg_code=kg_code,
@@ -14521,7 +12887,6 @@ def main():
                             "success",
                             f"KG {kg_code} done in {elapsed_kg:.0f}s "
                             f"({result.get('n_segments', 0)} segs, "
-                            f"{result.get('n_parcels', 0)} par, "
                             f"{result.get('n_buildings', 0)} bldg, "
                             f"quality={_qs:.0%} {_qg})",
                             kg_code,
@@ -14657,13 +13022,13 @@ def main():
                 is_cop_batch_failure = result.get("copernicus_failed", False)
                 is_lidar_failure = result.get("lidar_failed", False)
                 is_ortho_failure = result.get("ortho_failed", False)
-                is_cadastre_failure = result.get("cadastre_failed", False)
+                is_bctx_failure = result.get("building_context_failed", False)
                 is_context_failure = result.get("context_failed", False)
                 is_cache_incomplete = result.get("cache_incomplete", False)
                 is_disk_low = result.get("disk_low", False)
                 is_needs_split = result.get("needs_split", False)
                 if is_needs_split:
-                    # Runtime grid (post-cadastre-expansion) exceeded the
+                    # Runtime grid exceeded the
                     # oversize limit — the subprocess aborted before the
                     # tile loop and forced the strike counter to the split
                     # threshold. Split NOW and insert the blocks right
@@ -14780,22 +13145,14 @@ def main():
                     try:
                         import pathlib as _pl
                         import socket as _sock
-                        _director_url = (os.environ.get('ZENODO_LOCK_URL', '').strip()
-                                         or 'http://127.0.0.1:8000')
-                        _admin_tok = ''
-                        try:
-                            _admin_tok = _pl.Path('data/admin_token').read_text().strip()
-                        except Exception:
-                            pass
+                        _director_url = _config.director_url()
                         _payload = {
                             'kg_code': str(kg_code),
                             'peer_id': os.environ.get('INSTANCE_ID', _sock.gethostname()),
                             'bbox': kg.get('bbox'),
                             'tile_info': str(result.get('step', '')),
                         }
-                        _headers = {'Content-Type': 'application/json'}
-                        if _admin_tok:
-                            _headers['X-Admin-Token'] = _admin_tok
+                        _headers = {'Content-Type': 'application/json', **_config.operator_headers()}
                         _r = requests.post(
                             _director_url.rstrip('/') + '/api/v1/processing/cache_misses',
                             json=_payload, headers=_headers, timeout=10,
@@ -14833,18 +13190,18 @@ def main():
                         f"deferred retry in {DEFER_GAP} KGs",
                         kg_code,
                     )
-                elif is_cadastre_failure or is_context_failure:
-                    # cadastre-process-api / umfeld OSM geometry was
+                elif is_bctx_failure or is_context_failure:
+                    # bevdirect-serve / the OSM geometry source was
                     # overloaded/unreachable even after in-fetch retries.
-                    # Cadastre is step 1 (no checkpoints yet); the OSM
-                    # context is built on the first non-restored tile
-                    # (restored checkpoints are kept) — defer and come back
-                    # once umfeld recovers, rather than emit a KG on an
-                    # empty road/rail/water context.
-                    _what = "v2 context upstream (umfeld OSM / INVEKOS)" if is_context_failure else "cadastre API"
+                    # The building context is step 1 (no checkpoints yet);
+                    # the OSM context is built on the first non-restored
+                    # tile (restored checkpoints are kept) — defer and come
+                    # back once the upstream recovers, rather than emit a KG
+                    # on an empty road/rail/water context.
+                    _what = "v2 context upstream (OSM / INVEKOS)" if is_context_failure else "building context (bevdirect)"
                     log.warning("KG %s: %s unavailable — deferring for retry", kg_code, _what)
                     progress.add_log("warning",
-                                     f"KG {kg_code}: {_what} unavailable (umfeld restart?) — "
+                                     f"KG {kg_code}: {_what} unavailable (upstream restart?) — "
                                      f"deferred retry",
                                      kg_code)
                     if is_context_failure:
