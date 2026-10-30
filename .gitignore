@@ -1,33 +1,17 @@
 __pycache__/
 
-rf_training_data/checkpoints/
-
 data/shares/
 
-# Instance-specific peer config
 data/austria_processor/peers.json
 data/austria_processor/director_state.json
 data/austria_processor/peer_urls.txt
 
 # Large uncompressed model files (keep .xz compressed version)
 data/best_model/rf_model.joblib
-data/best_model/rf_model_pre_infra.joblib
 
-# Training runtime data
-rf_training_data/copernicus_cache/
-rf_training_data/checkpoints_pre_infra_backup/
-rf_training_data/in_progress_kg.txt
-rf_training_data/openeo_circuit.json
 data/austria_processor/is_director
 data/austria_processor/zenodo_manifest.json
-data/admin_token
-data/peer_tokens.json
-data/mesh_token
-data/owner_emails
-data/ha_enabled
 data/*.tmp
-data/umfeld_token
-data/api_tokens
 data/private_only
 data/austria_processor/copernicus_credentials.json
 data/austria_processor/cache_miss_kgs.json
