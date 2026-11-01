@@ -3172,8 +3172,8 @@ def _repair_observe(code, doc, manifest=None) -> None:
         import product_repair as _pr
         # A live ``_json_v2`` makes the v2 doc the authoritative product;
         # ``v2_ingest`` observes it.  The v1 ``_json`` beside it is only the
-        # completion marker and — on the v2.4 fast path — a cadastre-
-        # stripped re-PUT of the ORIGINAL v1 doc (stale data_quality, no
+        # completion marker and — on the v2.4 fast path — a legacy-
+        # section-stripped re-PUT of the ORIGINAL v1 doc (stale data_quality, no
         # harmonics) with a fresh ``uploaded_at``, which re-opened 60+
         # already-repaired codes as ``fixable`` forever (2026-11-01).
         if isinstance(manifest, dict) and _pr.v2_authoritative(code, manifest):
