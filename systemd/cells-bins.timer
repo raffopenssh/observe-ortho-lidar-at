@@ -1,0 +1,10 @@
+[Unit]
+Description=daily cells_bins builder, 18:00 Europe/Vienna, 30 min budget (resumes until all bins are stored and current)
+
+[Timer]
+OnCalendar=*-*-* 18:00:00 Europe/Vienna
+RandomizedDelaySec=5m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

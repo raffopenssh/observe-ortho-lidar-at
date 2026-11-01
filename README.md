@@ -61,12 +61,12 @@ python3 austria_processor.py --kg 63330 --no-upload                     # one KG
 
 Or install the systemd templates in `systemd/` (`srv.service`,
 `srv_public.service`, `austria_processor.service`, `srv-watchdog.timer`,
-`cells-national.timer`, gunicorn config files; they reference `${HOME}` and
+`cells-national.timer`, `cells-bins.timer`, gunicorn config files; they reference `${HOME}` and
 the repo directory — adjust `User=` / `WorkingDirectory=`):
 
 ```bash
 sudo cp systemd/*.service systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload
-sudo systemctl enable --now srv srv_public austria_processor srv-watchdog.timer cells-national.timer
+sudo systemctl enable --now srv srv_public austria_processor srv-watchdog.timer cells-national.timer cells-bins.timer
 ```
 
 Secrets (all optional) go into `SRTM_SECRETS_DIR` (default

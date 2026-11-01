@@ -67,7 +67,10 @@ log = logging.getLogger('cells_bins')
 
 ALGO = 'nex-1'
 MAGIC = b'NEX1'
+BLOCK_MAGIC = b'NEXB'
 BIN_DEG = 0.025
+BLOCK_N = 4                      # a block = 4 × 4 bins = 0.1° × 0.1°
+BLOCK_DEG = BIN_DEG * BLOCK_N
 BIN_DIR = ca.NE_DIR / 'bins'
 MAX_BIN_CELLS = 24_000           # a 0.025° bin holds ~17 k res-12 cells
 LON_I = (int(9.0 / BIN_DEG), int(17.6 / BIN_DEG) + 1)
@@ -165,6 +168,26 @@ def bin_bbox(i: int, j: int) -> tuple[float, float, float, float]:
     return (round(i * BIN_DEG, 6), round(j * BIN_DEG, 6), round((i + 1) * BIN_DEG, 6), round((j + 1) * BIN_DEG, 6))
 
 
+def block_of(w: float, s: float, e: float, n: float, tol: float = 1e-7) -> tuple[int, int] | None:
+    """(bi, bj) when the bbox is exactly one 0.1°-aligned block (= 4 × 4 bins), else None."""
+    bi = round(w / BLOCK_DEG); bj = round(s / BLOCK_DEG)
+    if (abs(bi * BLOCK_DEG - w) > tol or abs(bj * BLOCK_DEG - s) > tol
+            or abs((bi + 1) * BLOCK_DEG - e) > tol or abs((bj + 1) * BLOCK_DEG - n) > tol):
+        return None
+    return int(bi), int(bj)
+
+
+def block_bbox(bi: int, bj: int) -> tuple[float, float, float, float]:
+    return (round(bi * BLOCK_DEG, 6), round(bj * BLOCK_DEG, 6), round((bi + 1) * BLOCK_DEG, 6), round((bj + 1) * BLOCK_DEG, 6))
+
+
+def block_bins(bi: int, bj: int) -> list[tuple[int, int]]:
+    """The 16 bins of a block in **row-major** order: rows = latitude bands south
+    → north (j ascending), within a row west → east (i ascending):
+    ``k = (j - 4·bj)·4 + (i - 4·bi)``."""
+    return [(BLOCK_N * bi + di, BLOCK_N * bj + dj) for dj in range(BLOCK_N) for di in range(BLOCK_N)]
+
+
 def _store_stamps(parents) -> list:
     try:
         import kg_v2_store
@@ -221,6 +244,15 @@ def _gen(i: int, j: int, parts: list, stamps: list) -> str:
 def bin_etag(gen: str, fields: list[str], ids_enc: str) -> str:
     rep = hashlib.sha256((','.join(fields) + '|' + ids_enc).encode()).hexdigest()[:8]
     return f'"b-{gen}-{rep}"'
+
+
+def block_gen(gens: list[str]) -> str:
+    return hashlib.sha256('|'.join(gens).encode()).hexdigest()[:24]
+
+
+def block_etag(gen: str, fields: list[str], ids_enc: str) -> str:
+    rep = hashlib.sha256((','.join(fields) + '|' + ids_enc).encode()).hexdigest()[:8]
+    return f'"B-{gen}-{rep}"'
 
 
 # === SECTION: grid25 (25 m DTM / landcover) sampling ===
@@ -562,6 +594,45 @@ def _lock_for(key):
         return lk
 
 
+_stored_gen_cache: dict = {}
+_stored_gen_guard = threading.Lock()
+
+
+def stored_gen(i: int, j: int) -> str | None:
+    """Generation of the blob on disk without inflating it (first ≤ 16 KiB →
+    header only), memoised on (path, mtime, size).  None when absent / unreadable."""
+    p = _path(i, j)
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    with _stored_gen_guard:
+        hit = _stored_gen_cache.get(p.name)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+    gen = None
+    try:
+        with open(p, 'rb') as fh:
+            head = fh.read(16384)
+        d = zlib.decompressobj()
+        raw = d.decompress(head, 8)
+        if raw[:4] == MAGIC:
+            ln = struct.unpack('<I', raw[4:8])[0]
+            raw += d.decompress(d.unconsumed_tail, ln) if d.unconsumed_tail else b''
+            if len(raw) < 8 + ln:          # header longer than the first 16 KiB inflate → full read
+                raw = zlib.decompress(p.read_bytes())
+            h = json.loads(raw[8:8 + ln])
+            gen = h.get('gen') if h.get('algo') == ALGO else None
+    except Exception as e:  # noqa: BLE001
+        log.debug('cells_bins: stored_gen %s: %s', p, e)
+    with _stored_gen_guard:
+        if len(_stored_gen_cache) > 40_000:
+            _stored_gen_cache.clear()
+        _stored_gen_cache[p.name] = (key, gen)
+    return gen
+
+
 def load_bin(i: int, j: int, *, rebuild: bool = False) -> tuple[dict, 'OrderedDict[str, np.ndarray]', dict]:
     """Current blob for a bin: memory → disk (if its gen matches) → build.
     Returns (hdr, cols, inputs)."""
@@ -590,6 +661,8 @@ def load_bin(i: int, j: int, *, rebuild: bool = False) -> tuple[dict, 'OrderedDi
             tmp = p.with_suffix('.tmp')
             tmp.write_bytes(zlib.compress(encode(hdr, cols, None, 'delta_u64'), 6))
             os.replace(tmp, p)
+            with _stored_gen_guard:
+                _stored_gen_cache.pop(p.name, None)
         except Exception as e:  # noqa: BLE001
             log.warning('cells_bins: store %s: %s', p, e)
         _blob_lru.put(key, (hdr, cols))
@@ -709,12 +782,80 @@ def quick_etag(i: int, j: int, fields: list[str], ids_enc: str) -> tuple[str, di
     return bin_etag(inp['gen'], fields, ids_enc), inp
 
 
+def quick_block_etag(bi: int, bj: int, fields: list[str], ids_enc: str) -> tuple[str, list[dict]]:
+    inps = [bin_inputs(i, j) for i, j in block_bins(bi, bj)]
+    return block_etag(block_gen([x['gen'] for x in inps]), fields, ids_enc), inps
+
+
+def serve_block(bi: int, bj: int, fields: list[str], ids_enc: str, *, rebuild: bool = False) -> tuple[bytes, dict, str, list[dict]]:
+    """``block=1``: the 16 bins of a 0.1° block in one body.
+
+    Container ``NEXB`` (little-endian)::
+
+        b'NEXB' | u32 header_len | header JSON | frame_0 | frame_1 | … | frame_15
+
+    ``frame_k`` is **byte-identical** to the single-bin ``NEX1`` answer of bin
+    ``header.bins[k]`` for the same ``fields`` / ``ids`` encoding; ``header.bins[k]
+    = {i, j, off, len, gen, n, complete}`` with ``off`` relative to the end of
+    the header (``8 + header_len``), bins in row-major order
+    (:func:`block_bins`).  ``header.gen`` = sha256 of the 16 bin generations.
+    → (body, headers, etag, inputs)."""
+    frames = []; entries = []; gens = []; kgs = set(); epochs = []; partial = False
+    off = 0
+    for i, j in block_bins(bi, bj):
+        hdr, cols, inp = load_bin(i, j, rebuild=rebuild)
+        fb = encode(hdr, cols, fields, ids_enc)
+        entries.append({'i': i, 'j': j, 'off': off, 'len': len(fb), 'gen': hdr['gen'], 'n': int(hdr['n']),
+                        'complete': bool(hdr.get('complete'))})
+        frames.append(fb); gens.append(hdr['gen']); kgs.update(hdr.get('kgs') or [])
+        if hdr.get('epoch'):
+            epochs.append(str(hdr['epoch']))
+        partial = partial or bool(inp['missing'] or inp['partial_files'])
+        off += len(fb)
+    gen = block_gen(gens)
+    w, s, e, n = block_bbox(bi, bj)
+    h = {'algo': ALGO, 'container': 'nexb', 'block_deg': BLOCK_DEG, 'bin_deg': BIN_DEG, 'ij': [bi, bj],
+         'bbox': [w, s, e, n], 'gen': gen, 'ids': ids_enc, 'fields': list(fields), 'order': 'row-major: j south→north, i west→east',
+         'bins': entries, 'n': sum(x['n'] for x in entries), 'cells_total': sum(x['n'] for x in entries)}
+    hb = json.dumps(h, separators=(',', ':'), ensure_ascii=False).encode()
+    body = BLOCK_MAGIC + struct.pack('<I', len(hb)) + hb + b''.join(frames)
+    etag = block_etag(gen, fields, ids_enc)
+    hx = {'X-Cells-Gen': gen, 'X-Cells-Block': f'{bi},{bj}', 'X-Cells-Record': f'nexb/{ALGO}',
+          'X-Cells-Kgs': ','.join(sorted(kgs)), 'X-Cells-Fields': ','.join(fields),
+          'X-Cells-Layout': 'nexb=' + ','.join(str(x['n']) for x in entries)}
+    hx = ca._with_epoch(hx, max(epochs) if epochs else None)
+    if partial:
+        hx['X-Cells-Partial'] = '1'
+    return body, hx, etag, entries
+
+
+def decode_block(blob: bytes) -> tuple[dict, list[bytes]]:
+    """NEXB → (header, [16 NEX1 frames])."""
+    if blob[:4] != BLOCK_MAGIC:
+        raise ValueError('not a NEXB blob')
+    ln = struct.unpack('<I', blob[4:8])[0]
+    hdr = json.loads(blob[8:8 + ln])
+    base = 8 + ln
+    return hdr, [blob[base + e['off']:base + e['off'] + e['len']] for e in hdr['bins']]
+
+
 def dict_block() -> dict:
     return {
         'what': 'columnar per-cell export of a 0.025°-aligned bin — every local product joined (cells .h3b rows, '
                 'tree apices, man-made objects, 25 m DTM/landcover grid, product roof hints)',
         'request': 'GET /api/v1/cells?bbox=w,s,e,n&format=bin&fields=a,b,c[&ids=u64][&rebuild=1] with w=i·0.025, s=j·0.025, '
                    'e=w+0.025, n=s+0.025 (half-open); fields=* for everything; omitted → defaults',
+        'block': {'request': 'GET /api/v1/cells?bbox=w,s,e,n&format=bin&block=1&fields=… with w=bi·0.1, s=bj·0.1, e=w+0.1, n=s+0.1 '
+                             '— the 16 bins of the 0.1° block in one body',
+                  'container': "'NEXB' | u32 header_len | header JSON {gen, ij:[bi,bj], bbox, fields, ids, bins:[{i,j,off,len,gen,n,complete}]} "
+                               '| frame_0 … frame_15; frame_k is byte-identical to the single-bin NEX1 answer for bins[k] '
+                               '(off relative to the end of the header = 8 + header_len)',
+                  'order': 'row-major: k = (j - 4·bj)·4 + (i - 4·bi) — rows = latitude bands south→north, west→east within a row',
+                  'etag': 'strong: "B-<sha256 of the 16 bin gens>-<fields hash>"; X-Cells-Gen = that block gen; '
+                          'per-bin gens in the header let you keep per-bin state',
+                  'block_deg': BLOCK_DEG, 'bins_per_block': BLOCK_N * BLOCK_N},
+        'precompute': 'every bin touching a published product is built/refreshed on disk by the cells-bins builder '
+                      '(systemd cells-bins.service) within minutes of ingest; cold reads are disk → < 100 ms',
         'container': "'NEX1' | u32 header_len | header JSON {n, gen, epoch, kgs[], columns[{name,dtype,bytes,shape?,nodata?,unit}], "
                      'ids: delta_u64|u64, complete, lc25_legend, …} | column bytes in header order (little-endian, rows sorted by cell id)',
         'headers': {'ETag': 'strong: "b-<gen>-<fields hash>" — If-None-Match → 304',
@@ -743,30 +884,88 @@ def dict_block() -> dict:
 
 # === SECTION: CLI ===
 
-def prewarm(limit: int | None = None, verbose: bool = True) -> dict:
-    m = manifest()
-    b = m['bins']
-    n_built = 0; n_ok = 0; t0 = time.time()
-    for k, (i, j, g, st) in enumerate(zip(b['i'], b['j'], b['gen'], b['stored'])):
-        if limit and n_built >= limit:
-            break
-        p = _path(i, j)
-        if st:
-            try:
-                hdr, _ = decode(zlib.decompress(p.read_bytes()))
-                if hdr.get('gen') == g:
-                    n_ok += 1
-                    continue
-            except Exception:  # noqa: BLE001
-                pass
+STATE_PATH = BIN_DIR / 'builder.json'
+
+
+def builder_status() -> dict:
+    """Last builder run (``data/ne/bins/builder.json``) + what is still missing/stale now."""
+    st = {}
+    try:
+        st = json.loads(STATE_PATH.read_text())
+    except Exception:  # noqa: BLE001
+        pass
+    m = manifest(); b = m['bins']
+    missing = stale = 0
+    for i, j, g in zip(b['i'], b['j'], b['gen']):
+        sg = stored_gen(i, j)
+        if sg is None:
+            missing += 1
+        elif sg != g:
+            stale += 1
+    return {'bins': m['n'], 'stored_current': m['n'] - missing - stale, 'missing': missing, 'stale': stale,
+            'complete': missing == 0 and stale == 0, 'generation': m['generation'], 'last_run': st or None}
+
+
+def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | None = None, jobs: int = 1) -> dict:
+    """Build / refresh every manifest bin whose stored generation is not current.
+    Missing bins first (cold-start coverage), then stale ones; stops at
+    ``limit`` builds or ``budget_s`` seconds (the daily ``cells-bins.timer``
+    runs with a 30 min budget until all of Austria is on disk).  The on-disk
+    generation is read from the blob header only (:func:`stored_gen`), so a
+    pass over an all-current corpus costs ~2 s."""
+    from concurrent.futures import ThreadPoolExecutor
+    m = manifest(); b = m['bins']
+    t0 = time.time()
+    todo_missing = []; todo_stale = []; n_ok = 0
+    for i, j, g in zip(b['i'], b['j'], b['gen']):
+        sg = stored_gen(i, j)
+        if sg == g:
+            n_ok += 1
+        elif sg is None:
+            todo_missing.append((i, j))
+        else:
+            todo_stale.append((i, j))
+    todo = todo_missing + todo_stale
+    if limit:
+        todo = todo[:limit]
+    n_built = 0; n_err = 0; stop = False
+    lock = threading.Lock()
+
+    def one(ij):
+        nonlocal n_built, n_err, stop
+        if stop or (budget_s and time.time() - t0 > budget_s):
+            stop = True
+            return
         try:
-            load_bin(i, j)
-            n_built += 1
-            if verbose and n_built % 50 == 0:
-                print(f'  built {n_built} (+{n_ok} current) of {m["n"]} … {time.time() - t0:.0f}s', flush=True)
+            load_bin(*ij)
+            with lock:
+                n_built += 1
+                if verbose and n_built % 50 == 0:
+                    print(f'  built {n_built}/{len(todo)} (+{n_ok} current) … {time.time() - t0:.0f}s', flush=True)
         except Exception as e:  # noqa: BLE001
-            log.warning('cells_bins: prewarm %d_%d: %s', i, j, e)
-    return {'bins': m['n'], 'built': n_built, 'current': n_ok, 'seconds': round(time.time() - t0, 1)}
+            with lock:
+                n_err += 1
+            log.warning('cells_bins: prewarm %d_%d: %s', ij[0], ij[1], e)
+
+    if jobs > 1:
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            list(ex.map(one, todo))
+    else:
+        for ij in todo:
+            one(ij)
+            if stop:
+                break
+    out = {'bins': m['n'], 'built': n_built, 'errors': n_err, 'current_before': n_ok,
+           'missing_before': len(todo_missing), 'stale_before': len(todo_stale),
+           'remaining': len(todo_missing) + len(todo_stale) - n_built,
+           'budget_s': budget_s, 'stopped_on_budget': bool(stop), 'seconds': round(time.time() - t0, 1),
+           'finished_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'generation': m['generation']}
+    try:
+        BIN_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_PATH.write_text(json.dumps(out, indent=1))
+    except Exception as e:  # noqa: BLE001
+        log.debug('cells_bins: builder state: %s', e)
+    return out
 
 
 if __name__ == '__main__':
@@ -774,14 +973,26 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--bin', help='i,j  → build and print header')
     ap.add_argument('--bbox', help='w,s,e,n of an aligned bin')
-    ap.add_argument('--prewarm', action='store_true'); ap.add_argument('--limit', type=int)
-    ap.add_argument('--manifest', action='store_true')
+    ap.add_argument('--block', help='bi,bj → build the 16 bins of a 0.1° block and print the NEXB header')
+    ap.add_argument('--prewarm', action='store_true', help='build / refresh every bin that is missing or stale')
+    ap.add_argument('--limit', type=int); ap.add_argument('--budget-s', type=float, help='stop after this many seconds')
+    ap.add_argument('--jobs', type=int, default=1)
+    ap.add_argument('--manifest', action='store_true'); ap.add_argument('--status', action='store_true')
+    ap.add_argument('--quiet', action='store_true')
     a = ap.parse_args()
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.WARNING if a.quiet else logging.INFO)
     if a.manifest:
         m = manifest(); print(json.dumps({k: v for k, v in m.items() if k != 'bins'}, indent=1)); print('stored', sum(m['bins']['stored']))
+    elif a.status:
+        print(json.dumps(builder_status(), indent=1))
     elif a.prewarm:
-        print(json.dumps(prewarm(a.limit)))
+        print(json.dumps(prewarm(a.limit, verbose=not a.quiet, budget_s=a.budget_s, jobs=max(1, a.jobs))))
+    elif a.block:
+        bi, bj = (int(x) for x in a.block.split(','))
+        t = time.time(); body, hx, etag, _ = serve_block(bi, bj, list(DEFAULT_FIELDS), 'delta_u64')
+        hdr, frames = decode_block(body)
+        print(json.dumps({k: v for k, v in hdr.items() if k != 'bins'}, indent=1)); print('bins', [(e['i'], e['j'], e['n']) for e in hdr['bins']])
+        print('bytes', len(body), 'ms', int((time.time() - t) * 1000), etag)
     else:
         if a.bbox:
             ij = bin_of(*[float(x) for x in a.bbox.split(',')])

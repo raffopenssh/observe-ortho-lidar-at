@@ -92,3 +92,53 @@ if __name__ == '__main__':
     for n, f in list(globals().items()):
         if n.startswith('test_'):
             f(); print('ok', n)
+
+
+def test_block_geometry():
+    assert cb.block_of(16.3, 48.2, 16.4, 48.3) == (163, 482)
+    assert cb.block_of(16.3, 48.2, 16.4, 48.325) is None
+    assert cb.block_of(16.325, 48.2, 16.425, 48.3) is None
+    bins = cb.block_bins(163, 482)
+    assert len(bins) == 16 and bins[0] == (652, 1928) and bins[1] == (653, 1928) and bins[4] == (652, 1929)
+    assert bins[15] == (655, 1931)
+    assert cb.bin_bbox(*bins[0])[:2] == cb.block_bbox(163, 482)[:2]
+    assert cb.bin_bbox(*bins[15])[2:] == cb.block_bbox(163, 482)[2:]
+
+
+def test_block_container_roundtrip(monkeypatch):
+    """serve_block = NEXB header + 16 frames, each byte-identical to encode() of the bin."""
+    def fake_load(i, j, rebuild=False):
+        n = 3
+        ids = np.array([i * 100 + j * 10 + k for k in range(n)], '<u8')
+        cols = {'id': ids, 'obs': np.ones(n, np.uint8), 'elev_mean': np.full(n, i, '<u2')}
+        hdr = {'n': n, 'gen': f'g{i}_{j}', 'epoch': '2026-10', 'kgs': [f'{i}'], 'complete': True}
+        return hdr, cols, {'missing': [], 'partial_files': []}
+    monkeypatch.setattr(cb, 'load_bin', fake_load)
+    monkeypatch.setattr(cb.ca, '_with_epoch', lambda hx, v=None: dict(hx, **({'X-Cells-Epoch': v} if v else {})))
+    body, hx, etag, entries = cb.serve_block(163, 482, ['elev_mean'], 'delta_u64')
+    assert body[:4] == b'NEXB' and etag.startswith('"B-') and hx['X-Cells-Block'] == '163,482'
+    hdr, frames = cb.decode_block(body)
+    assert len(frames) == 16 and [(e['i'], e['j']) for e in hdr['bins']] == cb.block_bins(163, 482)
+    for e, fr in zip(hdr['bins'], frames):
+        h, c, _ = fake_load(e['i'], e['j'])
+        assert fr == cb.encode(h, c, ['elev_mean'], 'delta_u64')
+        h2, c2 = cb.decode(fr)
+        assert h2['gen'] == e['gen'] and c2['elev_mean'].tolist() == [e['i']] * 3
+    assert hdr['gen'] == cb.block_gen([e['gen'] for e in hdr['bins']])
+    assert 'X-Cells-Partial' not in hx
+
+
+def test_stored_gen_header_peek(tmp_path, monkeypatch):
+    import zlib
+    monkeypatch.setattr(cb, 'BIN_DIR', tmp_path)
+    monkeypatch.setattr(cb, '_path', lambda i, j: tmp_path / f'{i}_{j}.nex')
+    cb._stored_gen_cache.clear()
+    n = 20000
+    cols = {'id': np.arange(n, dtype='<u8'), 'obs': np.ones(n, np.uint8), 'cover': np.random.randint(0, 255, (n, 9)).astype(np.uint8)}
+    hdr = {'n': n, 'gen': 'abc123', 'algo': cb.ALGO, 'kgs': ['1'] * 50}
+    (tmp_path / '1_2.nex').write_bytes(zlib.compress(cb.encode(hdr, cols, None, 'delta_u64'), 6))
+    assert cb.stored_gen(1, 2) == 'abc123'
+    assert cb.stored_gen(1, 3) is None
+    hdr['gen'] = 'zzz'
+    (tmp_path / '1_2.nex').write_bytes(zlib.compress(cb.encode(hdr, cols, None, 'delta_u64'), 6))
+    assert cb.stored_gen(1, 2) == 'zzz'

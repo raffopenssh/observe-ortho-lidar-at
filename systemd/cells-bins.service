@@ -1,0 +1,14 @@
+# Builds / refreshes the per-bin NEX1 exports (cells_bins.py --prewarm) with a
+# 30 min budget; the timer runs it daily until every bin of Austria is stored.
+[Unit]
+Description=observe-ortho-lidar-at: build the per-bin cells exports
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/srtm-lidar-public
+ExecStart=%h/srtm-lidar-public/.venv/bin/python3 cells_bins.py --prewarm --budget-s 1800 --jobs 2 --quiet
+Nice=15
+IOSchedulingClass=idle
+MemoryMax=2000M
+TimeoutStartSec=40min

@@ -1692,18 +1692,35 @@ def _bin_request():
     if len(bb) != 4:
         return None
     import cells_bins
+    fields = cells_bins.parse_fields(a.get('fields'))
+    ids_enc = 'u64' if (a.get('ids') or '').lower() == 'u64' else 'delta_u64'
+    inm = request.headers.get('If-None-Match') or ''
+    cc = f'public, max-age={CACHE_MAX_AGE}'
+
+    def _match(etag):
+        return etag in [x.strip() for x in inm.split(',')] or inm.strip() == '*'
+
+    if _flag('block'):
+        bij = cells_bins.block_of(*bb)
+        if bij is None:
+            raise CellsError(400, f'block=1 needs a {cells_bins.BLOCK_DEG}°-aligned block: w=bi·{cells_bins.BLOCK_DEG}, '
+                                  f's=bj·{cells_bins.BLOCK_DEG}, e=w+{cells_bins.BLOCK_DEG}, n=s+{cells_bins.BLOCK_DEG}',
+                             bins='/api/v1/cells/bins')
+        etag, inps = cells_bins.quick_block_etag(*bij, fields, ids_enc)
+        if not _flag('rebuild') and _match(etag):
+            return Response(status=304, headers={'ETag': etag, 'Cache-Control': cc, 'X-Cells-Gen': etag[3:-10]})
+        body, hx, etag, _ = cells_bins.serve_block(*bij, fields, ids_enc, rebuild=_flag('rebuild'))
+        return _resp(body, mimetype='application/octet-stream', headers=hx, etag=etag,
+                     partial=any(x['missing'] or x['partial_files'] for x in inps))
     ij = cells_bins.bin_of(*bb)
     if ij is None:
         raise CellsError(400, f'format=bin&fields= needs a {cells_bins.BIN_DEG}°-aligned bin: w=i·{cells_bins.BIN_DEG}, '
-                              f's=j·{cells_bins.BIN_DEG}, e=w+{cells_bins.BIN_DEG}, n=s+{cells_bins.BIN_DEG}',
+                              f's=j·{cells_bins.BIN_DEG}, e=w+{cells_bins.BIN_DEG}, n=s+{cells_bins.BIN_DEG} '
+                              f'(or block=1 with a {cells_bins.BLOCK_DEG}°-aligned block)',
                          bins='/api/v1/cells/bins')
-    fields = cells_bins.parse_fields(a.get('fields'))
-    ids_enc = 'u64' if (a.get('ids') or '').lower() == 'u64' else 'delta_u64'
     etag, inp = cells_bins.quick_etag(*ij, fields, ids_enc)
-    inm = request.headers.get('If-None-Match') or ''
-    if not _flag('rebuild') and (etag in [x.strip() for x in inm.split(',')] or inm.strip() == '*'):
-        return Response(status=304, headers={'ETag': etag, 'Cache-Control': f'public, max-age={CACHE_MAX_AGE}',
-                                             'X-Cells-Gen': inp['gen']})
+    if not _flag('rebuild') and _match(etag):
+        return Response(status=304, headers={'ETag': etag, 'Cache-Control': cc, 'X-Cells-Gen': inp['gen']})
     body, hx, etag = cells_bins.serve(*ij, fields, ids_enc, rebuild=_flag('rebuild'))
     return _resp(body, mimetype='application/octet-stream', headers=hx, etag=etag,
                  partial=bool(inp['missing'] or inp['partial_files']))
@@ -1712,6 +1729,8 @@ def _bin_request():
 @cells_bp.route('/api/v1/cells/bins')
 def cells_bins_manifest():
     import cells_bins
+    if _flag('status'):
+        return _resp(cells_bins.builder_status(), headers={'Cache-Control': 'no-store'})
     m = cells_bins.manifest()
     etag = f'"bins-{m["generation"]}"'
     fmt = _format(('json', 'columns'), default='columns')

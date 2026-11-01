@@ -234,6 +234,50 @@ per-KG summaries persist in `cells.sqlite.summary`, with a 256-entry
 response cache keyed on `(scope, codes, cells_generation())`. ETag +
 `Cache-Control: public, max-age=600`.
 
+## 6a. Per-bin NEX1 export, blocks and the builder (`cells_bins.py`)
+
+`GET /api/v1/cells?bbox=<0.025° bin>&format=bin&fields=…` returns one
+columnar `NEX1` frame per bin (container documented in `cells_bins.py` and
+`/cells/dict → bins`). Measured by a downstream index before this change:
+0.7–0.8 s cold per bin (the bin was **built on first request**: h3b join +
+grid25 + roof hints + ALS overlay), 50 ms warm; a 0.1° view = 16 requests
+≈ 12 s.
+
+* **`block=1`** — a `0.1°`-aligned bbox (`w = bi·0.1, s = bj·0.1`) answers
+  the 4 × 4 bins in one body, container **`NEXB`**:
+
+  ```
+  b'NEXB' | u32 header_len | header JSON | frame_0 | … | frame_15
+  header = {gen, ij:[bi,bj], bbox, fields, ids, order,
+            bins:[{i, j, off, len, gen, n, complete} × 16], cells_total}
+  ```
+
+  `frame_k` is **byte-identical** to the single-bin `NEX1` answer for
+  `bins[k]` with the same `fields` / `ids`; `off` is relative to the end of
+  the header (`8 + header_len`). Order is row-major: `k = (j − 4·bj)·4 +
+  (i − 4·bi)` — latitude rows south → north, west → east within a row.
+  ETag `"B-<sha256 of the 16 bin gens>-<fields hash>"`, `X-Cells-Gen` = that
+  block gen, `X-Cells-Block: bi,bj`, `X-Cells-Layout: nexb=n0,…,n15`,
+  `X-Cells-Partial: 1` when any bin is partial. Bins with no product
+  underneath still get an (all-unknown) frame, so the client never has to
+  special-case holes. `python3 cells_bins.py --block bi,bj` prints one.
+* **Precompute** — `cells-bins.timer` (**18:00 Europe/Vienna daily, 30 min
+  budget**, `python3 cells_bins.py --prewarm --budget-s 1800 --jobs 2`)
+  builds every bin of the manifest that is missing on disk (first) or whose
+  stored generation differs from the current one (after a KG re-ingest /
+  grid25 re-ingest), and resumes the next day until all of Austria (~16 k
+  bins, ~3.5 GB) is current. `python3 cells_bins.py --status` /
+  `GET /cells/bins?status=1` → `{bins, stored_current, missing, stale,
+  complete, last_run}`. The on-disk generation is read from the blob header
+  only (`stored_gen`, ≤ 16 KiB per file), so a no-op pass costs ~2 s. The
+  request path still builds a bin on demand when it is missing or stale.
+* **Serving** — disk → inflate → slice columns → gzip (`public_api`
+  after-request, `Accept-Encoding: gzip`, `Vary`) ≈ 15–45 ms per bin cold
+  (process LRU empty), `ETag` + `If-None-Match → 304`, `Cache-Control:
+  public, max-age=86400`. Measured (localhost, 5 dense bins, 9 fields,
+  fresh worker): **before 0.5–1.4 s (build) → after 13–25 ms** (first
+  request on a fresh worker ~150 ms). Only `4xx`/`5xx` carry `no-store`.
+
 ## 7. National aggregate `/api/v1/cells/national` (`cells_national.py`)
 
 One row per res-9 H3 parent (~1.05 M rows; `res=8` ≈ 150 k), Austria-wide,
