@@ -75,7 +75,7 @@ MAX_ATTEMPTS = 2
 #: registry entries in a terminal state are dropped after this
 DONE_TTL_S = 7 * 86400
 
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
 _FIXABLE_CACHE: dict[str, tuple[float, bool, list]] = {}
 FIXABLE_TTL_S = 600
 
@@ -338,6 +338,83 @@ def prune(d: dict) -> int:
     return len(gone)
 
 
+def _live(e) -> bool:
+    return (isinstance(e, dict) and int(e.get("size") or 0) > 0
+            and str(e.get("status") or "") not in ("removed",)
+            and "error" not in str(e.get("status") or ""))
+
+
+def v2_authoritative(code: str, entries: dict) -> bool:
+    """True when a live ``<code>_json_v2`` exists: the v2 doc (observed by
+    ``v2_ingest``) is the product; the v1 ``_json`` beside it is only the
+    completion marker and may carry stale ``data_quality`` (fast-path
+    re-PUT of the original v1 doc).  Observations from the v1 path must
+    be skipped then."""
+    ent = entries.get("entries", entries) if isinstance(entries, dict) else {}
+    return _live((ent or {}).get(f"{code}_json_v2"))
+
+
+def reconcile(_d: dict | None = None, *, _save: bool = True) -> dict:
+    """Re-derive every OPEN entry from the authoritative product.
+
+    * all products removed/absent on the manifest (old-layout block,
+      ``stale_blocks`` clean-up) → entry dropped;
+    * live ``_json_v2`` + doc in ``kg_v2_store`` → re-observed from that
+      doc, bypassing the ``product_ts`` monotonic guard (the stale v1
+      ``_json`` observation that re-opened it carries a NEWER stamp).
+    Runs inside ``sweep()``; also ``python3 product_repair.py reconcile``.
+    """
+    out = {"dropped": [], "closed": [], "kept": 0}
+    try:
+        mf = json.loads((Path("data/austria_processor") / "zenodo_manifest.json").read_text())
+        ent = mf.get("entries", mf) or {}
+    except Exception:
+        return out
+    try:
+        import kg_v2_store as _st
+    except Exception:
+        _st = None
+    with _LOCK:
+        d = _d if _d is not None else load()
+        for c in [c for c, e in d.items() if e.get("state") in ("pending", "fixable", "stuck")]:
+            if not any(_live(ent.get(f"{c}_{k}")) for k in ("json", "json_v2", "full_gpkg", "light_gpkg_v2")):
+                d.pop(c, None)
+                out["dropped"].append(c)
+                continue
+            if _st is None or not v2_authoritative(c, ent):
+                out["kept"] += 1
+                continue
+            try:
+                doc = _st.get(c)
+                meta = _st.get_meta(c) or {}
+            except Exception:
+                doc, meta = None, {}
+            if not doc:
+                out["kept"] += 1
+                continue
+            dfx = defects(doc)
+            ts = str(meta.get("uploaded_at") or (ent.get(f"{c}_json_v2") or {}).get("uploaded_at") or "")
+            if not dfx:
+                e = d[c]
+                was = list(e.get("defects") or [])
+                e.update(state="done", done_at=_now(), repaired=was, defects=[], tiles=0,
+                         product_ts=ts or e.get("product_ts"), version=str(ent.get(f"{c}_json_v2", {}).get("version") or ""),
+                         updated_at=_now())
+                _FIXABLE_CACHE.pop(c, None)
+                out["closed"].append(c)
+                log.info("product_repair %s: v2 doc clean (%s) — closed (stale v1 _json observation)", c, ",".join(was))
+            else:
+                d[c].update(defects=dfx, tiles=defect_tiles(doc.get("data_quality")),
+                            fp=_footprint_of(doc) or d[c].get("fp"), updated_at=_now())
+                out["kept"] += 1
+        if _save and (out["dropped"] or out["closed"]):
+            save(d)
+    if out["dropped"] or out["closed"]:
+        log.info("product_repair reconcile: closed=%d dropped=%d kept=%d",
+                 len(out["closed"]), len(out["dropped"]), out["kept"])
+    return out
+
+
 def reset(codes) -> int:
     """Operator: put ``stuck`` codes back to ``pending`` with 0 attempts."""
     with _LOCK:
@@ -450,6 +527,7 @@ def sweep(max_cells: int = 40, year: int = 2024) -> dict:
     with _LOCK:
         d = load()
         prune(d)
+        reconcile(d, _save=False)
         cells: dict[tuple, dict] = {}
         promoted = []
         order = sorted((c for c, e in d.items() if e.get("state") in ("pending", "fixable")),
@@ -709,6 +787,9 @@ def _cli(argv: list[str]) -> int:
         return 0
     if cmd == "reset":
         print(reset(argv[1:]))
+        return 0
+    if cmd == "reconcile":
+        print(json.dumps(reconcile()))
         return 0
     print(process_txt_line() or "repair: registry empty")
     print(json.dumps(summary(), indent=1))
