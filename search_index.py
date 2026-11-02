@@ -3397,6 +3397,10 @@ class GpkgCache:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.max_bytes = max_bytes
         self._lock = threading.Lock()
+        try:
+            self._evict_if_needed()   # enforce the budget at start-up too, not only after downloads
+        except Exception:
+            pass
 
     def _path(self, kg_code, variant):
         return self.cache_dir / f'{kg_code}_{variant}.gpkg'
@@ -3484,7 +3488,19 @@ class GpkgCache:
             return None
 
     def _evict_if_needed(self):
-        """Remove oldest files until under max_bytes."""
+        """Remove oldest files until under max_bytes.
+
+        Also drops abandoned ``*.gpkg.tmp`` / ``*.lock`` leftovers older than
+        24 h (dead resumable downloads — zenodo_fetch never resumes something
+        that old) so they cannot pile up outside the byte budget."""
+        cutoff = time.time() - 86400
+        for p in list(self.cache_dir.glob('*.gpkg.tmp')) + list(self.cache_dir.glob('*.lock')):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    log.info('gpkg_cache: dropped abandoned %s', p.name)
+            except OSError:
+                pass
         files = sorted(self.cache_dir.glob('*.gpkg'), key=lambda p: p.stat().st_mtime)
         total = sum(f.stat().st_size for f in files)
         while total > self.max_bytes and files:
