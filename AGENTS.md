@@ -22,6 +22,7 @@ and setup: `README.md`. Security model: `SECURITY.md`.
 | partial products (missing cache layers) | `docs/product-repair.md` | `product_repair.py` |
 | label-id collision guard | `docs/label-mix.md` | `label_mix.py` |
 | sliver sweep (bbox-edge cells) | `docs/sliver-sweep.md` | `sliver_sweep.py` |
+| host patch audit (OS / pip pin drift per VM) | `docs/host-maintenance.md` | `app.py` (`/api/v1/admin/pkgstat`), `tools/fleet_pkgstat.py` |
 | BEV vector-tile context (`SRTM_BEV_VECTOR_CONTEXT`) | `docs/vct-pilot.md` | `vct_pilot.py`, `ne_build_tiled.py` |
 | licences / attribution strings | `docs/attributions.md` | `attributions.py` |
 | exceptions, logging, caches, conventions | `docs/cross-cutting-concerns.md` | — |
@@ -99,7 +100,7 @@ layers. Details: `docs/v2.1-product-spec.md`.
 | `safe_load.py`, `service_guard.py`, `mem_lru.py`, `net_meter.py`, `host_telemetry.py`, `inbound_budget.py`, `geo_parse.py`, `attributions.py` | safety, limits, helpers |
 | `static/index.html`, `process.html`, `docs.html`, `flag.js` | UI and dashboards |
 | `systemd/` (`srv`, `srv_public`, `austria_processor`, `srv-watchdog`, `cells-national`, gunicorn confs) | service templates |
-| `tests/`, `tools/` (`fetch_models.py`, `bench_cells_api.py`, `scan_partial_kgs.py`, `ca_check.sh`) | tests and scripts |
+| `tests/`, `tools/` (`fetch_models.py`, `fleet_pkgstat.py`, `bench_cells_api.py`, `scan_partial_kgs.py`, `ca_check.sh`) | tests and scripts |
 | `data/` shipped: `austria_processor/kg_list.json` (the only processor runtime file in git), `best_model/rf_meta.json`, `segv2/models/model_G.meta.json`, `als_acquisition/*.geojson`, `models_manifest.json`; root `kg_bbox_r1.json`. Fetched: `best_model/rf_model.joblib(.xz)`, `segv2/models/model_G.joblib`. Generated: `austria_processor/*` state, `search_index.db`, `kg_v2_store.db`, `ne/`, `tile_cache/`, `shares/`, `feedback.sqlite`, `public_flags.sqlite` | data |
 
 Runtime state files of the processor are listed in

@@ -9501,6 +9501,85 @@ def admin_mem_top():
     return jsonify(out)
 
 
+# === SECTION: host package / security-patch status ===
+# Read-only fleet patch audit (`python3 tools/fleet_pkgstat.py`). Reports the
+# installed versions of the security-relevant OS packages + the pip pins from
+# requirements.txt, so the operator can confirm every VM runs the same patched
+# set without shell access. Never runs apt-get update / upgrade itself.
+_PKGSTAT_WATCH = ('openssl', 'libssl3t64', 'openssh-server', 'openssh-client',
+                  'sudo', 'libc6', 'python3.12', 'libpython3.12t64', 'nginx',
+                  'curl', 'libcurl4t64', 'git', 'linux-image-virtual')
+_PKGSTAT_CACHE = {'at': 0.0, 'out': None}
+
+
+def _pkgstat_collect() -> dict:
+    import subprocess as _sp
+    out = {'host': __import__('socket').gethostname(),
+           'git_commit': getattr(__import__('peer_director'), '_LOCAL_GIT_COMMIT', '')}
+    try:
+        r = _sp.run(['dpkg-query', '-W', '-f', '${Package}\t${Version}\t${db:Status-Abbrev}\n',
+                     *_PKGSTAT_WATCH], capture_output=True, text=True, timeout=20)
+        out['dpkg'] = {p: v for p, v, s in (l.split('\t') for l in r.stdout.splitlines()
+                                            if l.count('\t') == 2) if s.startswith('ii')}
+    except Exception as e:
+        out['dpkg_err'] = str(e)
+    try:
+        r = _sp.run(['apt', 'list', '--upgradable'], capture_output=True, text=True, timeout=60)
+        sec = [l.split('/')[0] for l in r.stdout.splitlines() if '-security' in l]
+        out['upgradable'] = sum(1 for l in r.stdout.splitlines() if '/' in l)
+        out['security_pending'] = len(sec)
+        out['security_pending_watch'] = sorted(set(sec) & set(_PKGSTAT_WATCH))
+    except Exception as e:
+        out['apt_err'] = str(e)
+    try:
+        st = os.stat('/var/lib/apt/periodic/update-success-stamp')
+        out['apt_lists_age_h'] = round((time.time() - st.st_mtime) / 3600, 1)
+    except Exception:
+        try:
+            st = os.stat('/var/lib/apt/lists')
+            out['apt_lists_age_h'] = round((time.time() - st.st_mtime) / 3600, 1)
+        except Exception:
+            pass
+    out['reboot_required'] = os.path.exists('/var/run/reboot-required')
+    out['kernel'] = os.uname().release
+    # pip pins (exact `==` lines only) vs what is importable right now
+    pins, drift = {}, {}
+    try:
+        from importlib import metadata as _md
+        for line in Path('requirements.txt').read_text().splitlines():
+            line = line.split('#', 1)[0].strip()
+            if '==' not in line:
+                continue
+            name, want = (x.strip() for x in line.split('==', 1))
+            try:
+                have = _md.version(name)
+            except Exception:
+                have = None
+            pins[name] = have
+            if have != want:
+                drift[name] = {'want': want, 'have': have}
+    except Exception as e:
+        out['pip_err'] = str(e)
+    out['pip'] = pins
+    out['pip_drift'] = drift
+    out['at'] = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+    return out
+
+
+@app.route('/api/v1/admin/pkgstat', methods=['GET'])
+def admin_pkgstat():
+    """Package / security-patch status of this VM (operator gate; 10 min
+    cache, ``?fresh=1`` bypasses). See `docs/host-maintenance.md →
+    Host patch audit`."""
+    now = time.time()
+    if (request.args.get('fresh') != '1' and _PKGSTAT_CACHE['out']
+            and now - _PKGSTAT_CACHE['at'] < 600):
+        return jsonify(_PKGSTAT_CACHE['out'])
+    out = _pkgstat_collect()
+    _PKGSTAT_CACHE.update(at=now, out=out)
+    return jsonify(out)
+
+
 @app.route('/api/v1/admin/diskstat', methods=['GET'])
 def admin_diskstat():
     """Per-VM disk + role status. Used to diagnose disk pressure on
