@@ -28,6 +28,17 @@ property or ownership unit. Design of the cell records: `docs/ne-v24-design.md`.
 
 ## 1. Data on disk
 
+**Epoch pin.** Every `X-Cells-Epoch` / `epoch` / `ne_epoch` value the public
+tier emits is `cells_api.NE_EPOCH` (`2026-10`), one value corpus-wide. The
+`YYYY-MM` in a product's own header (`neo1.epoch`, stamped by `ne_h3.build`)
+is only the **build month** — products built in 2026-10 and 2026-11 are the
+same epoch (same algorithm, vocabulary, sources) and are exposed as
+`ne_built` / `built` instead. Downstream consumers hash the epoch header
+into their cache state, so it must only move when the observed product
+semantics change (bump the constant together with `ne_h3.ALGO_OBS`), never
+per build.
+
+
 * `data/ne/<parent>.h3b` — written by the processor (unsplit KGs) or by
   `ne_ingest` (split parents merged from their blocks, header
   `merged_from`, `partial_cells` until complete). Header `chunks[]` = one
@@ -311,8 +322,7 @@ computation; the only epoch/version signal is the existing `X-Cells-Epoch`
   columns `{bi, bj, gen, etag, bytes, stored, current, n, bins_n, complete}`
   for every block touching a published product; `bytes`/`n` null until
   prebuilt for that field set (`stored`), `current` = stored gen == gen.
-  ETag `"blocks-<generation>"`; `epoch=` not an epoch still present in the
-  corpus (a block's own `X-Cells-Epoch` always is) → 409
+  ETag `"blocks-<generation>"`; `epoch=` ≠ current `X-Cells-Epoch` → 409
   `{epoch}`. `?status=1` → builder/sample status (also on `/cells/bins?status=1`).
 * **`GET /api/v1/cells/sample?res=10&format=bin[&fields=glyph|default|*|a,b]`**
   — one row per res-10 cell of Austria = its res-12 **centre child**

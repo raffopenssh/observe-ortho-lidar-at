@@ -55,6 +55,14 @@ SEARCH_DB = DATA_DIR / 'search_index.db'
 
 RES = ne_h3.H3_RES              # 12
 CHUNK_RES = ne_h3.CHUNK_RES     # 10
+# The ne-observe product epoch served as ``X-Cells-Epoch`` / ``ne_epoch``.
+# The month in a product's own header (``neo1.epoch``, ``ne_h3.build``) is
+# only the *build* month — products built in 2026-10 and 2026-11 are the
+# same epoch (same algorithm, vocabulary, sources).  Downstream consumers
+# key cache state on this header, so it must stay one value corpus-wide and
+# only move when the observed product semantics change.  The raw build
+# month is exposed as ``ne_built`` / ``built`` next to it.
+NE_EPOCH = '2026-10'
 REC = ne_h3.OBS_REC.size        # 41
 
 MAX_BBOX_SPAN_DEG = 0.05
@@ -318,8 +326,9 @@ def _files() -> dict:
     v = {}
     if c is not None:
         for row in c.execute('SELECT kg, body_offset, cells_n, epoch, product_version, neo1_digest, partial, mtime, w, s, e, n FROM file'):
-            v[row[0]] = dict(zip(('kg', 'body_offset', 'cells_n', 'epoch', 'product_version', 'neo1_digest',
+            v[row[0]] = dict(zip(('kg', 'body_offset', 'cells_n', 'built', 'product_version', 'neo1_digest',
                                   'partial', 'mtime', 'w', 's', 'e', 'n'), row))
+            v[row[0]]['epoch'] = NE_EPOCH
     _files_cache.update(t=now, v=v)
     return v
 
@@ -371,7 +380,7 @@ def ne_state(code: str, product_version=None) -> dict:
     if f is not None:
         st = 'partial' if f.get('partial') else 'served'
         return {'ne_ready': st == 'served', 'ne_status': st, 'ne_cells_n': int(f.get('cells_n') or 0),
-                'ne_cells_published_at': _iso(f.get('mtime')), 'ne_epoch': f.get('epoch'),
+                'ne_cells_published_at': _iso(f.get('mtime')), 'ne_epoch': NE_EPOCH, 'ne_built': f.get('built'),
                 'retry_after_s': RETRY_AFTER_S if st != 'served' else None}
     if product_version is None:
         product_version = _registry_versions([code]).get(code)
@@ -415,24 +424,16 @@ def index_status() -> dict:
             'generation': cells_generation()}
 
 
-def _epochs() -> list[str]:
-    """Every product epoch present in the corpus, ascending."""
-    return sorted({f['epoch'] for f in _files().values() if f.get('epoch')})
+def _epoch_pin() -> str:
+    return NE_EPOCH
 
 
-def _epoch_pin() -> str | None:
-    eps = _epochs()
-    return eps[-1] if eps else None
-
-
-def epoch_hdr(v=None) -> str | None:
-    """Value for ``X-Cells-Epoch``: the product epoch *v* when it is a real
-    string, else the corpus-wide pin (newest epoch on disk), else None — the
-    caller must then omit the header.  Never ``str(None)``: downstream indexes
-    hash this header into their bin state and a literal ``None`` forced rebuilds."""
-    if isinstance(v, str) and v.strip() and v.strip().lower() not in ('none', 'null'):
-        return v.strip()
-    return _epoch_pin() or None
+def epoch_hdr(v=None) -> str:
+    """Value for ``X-Cells-Epoch``: always the corpus-wide ``NE_EPOCH``.
+    *v* (a product's own header month = build month) is accepted for
+    call-site compatibility and ignored — see ``NE_EPOCH``.  Never
+    ``str(None)``: downstream indexes hash this header into their bin state."""
+    return NE_EPOCH
 
 
 def _with_epoch(headers: dict | None, v=None) -> dict:
@@ -515,7 +516,8 @@ def header(kg: str, with_chunks: bool = False) -> dict | None:
     h = {k: full.get(k) for k in ('kg', 'body_offset', 'cells_n', 'product_version', 'partial_cells',
                                    'record_bytes', 'chunk_layout', 'neo1', 'net1', 'neb1', 'h3_res',
                                    'chunk_res', 'created_at', 'merged_from')}
-    h['epoch'] = (full.get('neo1') or {}).get('epoch')
+    h['built'] = (full.get('neo1') or {}).get('epoch')
+    h['epoch'] = NE_EPOCH
     h['neo1_digest'] = (full.get('neo1') or {}).get('digest')
     h['summary'] = public_summary(full.get('summary') or {})
     h['_mtime'] = mt
@@ -529,7 +531,7 @@ def public_summary(s: dict) -> dict:
     """Allow-listed, renamed view of the product header ``summary``."""
     obs = s.get('observed') or {}
     out = {
-        'epoch': obs.get('epoch'), 'source': obs.get('source'), 'cells_observed': obs.get('cells_observed'),
+        'epoch': NE_EPOCH, 'built': obs.get('epoch'), 'source': obs.get('source'), 'cells_observed': obs.get('cells_observed'),
         'trees_n': obs.get('trees_n'), 'structures_n': obs.get('manmade_n'),
         'cover_ha': s.get('observed_ha'), 'terrain': s.get('terrain'),
         'h3_res': s.get('h3_res'), 'chunk_res': s.get('chunk_res'), 'groups': s.get('groups'),
@@ -1765,10 +1767,7 @@ def cells_blocks_manifest():
     fields = cells_bins.parse_fields(a.get('fields'))
     want = (a.get('epoch') or '').strip()
     cur = epoch_hdr(None)
-    # a block's own X-Cells-Epoch is the newest epoch of *its* products, which
-    # may trail the corpus pin while a new epoch lands — any epoch still on
-    # disk is current enough; only a vanished / unknown one is a 409.
-    if want and cur and want != cur and want not in _epochs():
+    if want and want != cur:
         raise CellsError(409, f'epoch {want!r} is not current', epoch=cur)
     m = cells_blocks.manifest(fields)
     etag = f'"blocks-{m["generation"]}"'
@@ -2085,7 +2084,7 @@ def merge_summaries(items: list[tuple[str, dict]]) -> dict:
         out[k] = {}
     terr = {'cells_with_terrain': 0, 'hansen_loss_cells': 0, 'elev_min_m': None, 'elev_max_m': None}
     slope_w = 0.0; slope_n = 0
-    epochs = set(); sources = set(); groups = None; h3_res = None; chunk_res = None
+    epochs = set(); built = set(); sources = set(); groups = None; h3_res = None; chunk_res = None
     for _kg, s in items:
         for k in _SUM_INT:
             out[k] += int(s.get(k) or 0)
@@ -2104,6 +2103,8 @@ def merge_summaries(items: list[tuple[str, dict]]) -> dict:
             slope_w += float(t['slope_mean_deg']) * w; slope_n += w
         if s.get('epoch'):
             epochs.add(s['epoch'])
+        if s.get('built'):
+            built.add(str(s['built']))
         if s.get('source'):
             sources.add(s['source'])
         groups = groups or s.get('groups'); h3_res = h3_res or s.get('h3_res'); chunk_res = chunk_res or s.get('chunk_res')
@@ -2117,6 +2118,7 @@ def merge_summaries(items: list[tuple[str, dict]]) -> dict:
     out['terrain'] = terr
     out['epoch'] = max(epochs) if epochs else None
     out['epochs'] = sorted(epochs)
+    out['built'] = sorted(built)
     out['source'] = sorted(sources)[-1] if sources else None
     out['h3_res'] = h3_res; out['chunk_res'] = chunk_res; out['groups'] = groups
     return out

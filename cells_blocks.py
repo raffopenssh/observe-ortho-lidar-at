@@ -648,7 +648,7 @@ def dict_block() -> dict:
                         'X-Cells-Partial': '1 when a KG in the block has no published cells yet or is partial'},
             'manifest': 'GET /api/v1/cells/blocks[?fields=…][&epoch=…] → columns {bi, bj, gen, etag, bytes, stored, current, n, '
                         'bins_n, complete} for every block touching a published product (bytes/n null until prebuilt for that '
-                        'field set); epoch= must be an epoch still present in the corpus (a block\'s own X-Cells-Epoch always is) or you get 409 with the current one',
+                        'field set); epoch= must equal the current X-Cells-Epoch or you get 409 with the current one',
             'precompute': 'cells-bins.timer (hourly, 50 min budget, nice 15) builds bins → blocks (default + glyph field sets + '
                           'any field set a block request used) → the national sample; a block that is requested before it is '
                           'prebuilt is built on the spot and stored (first request slow, then disk)',
