@@ -1683,7 +1683,7 @@ def _bin_request():
     a = _args()
     if request.method != 'GET' or (a.get('format') or '').lower() != 'bin' or not a.get('bbox'):
         return None
-    if not (a.get('fields') or _flag('nex')):
+    if not (a.get('fields') or _flag('nex') or _flag('block')):
         return None
     try:
         bb = [float(x) for x in a['bbox'].split(',')]
