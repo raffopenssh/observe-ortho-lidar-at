@@ -15,6 +15,7 @@ running in a 2-thread pool and answers 202 until the cache is warm.
 from __future__ import annotations
 
 import gzip
+import re
 import hashlib
 import json
 import logging
@@ -54,6 +55,12 @@ CELLS_MAGIC = b'NEI1'                # POST unit=cells body: magic · u32 n · n
 CELLS_MAX_N = 1_000_000
 CELLS_MAX_SCALE = 7 ** 6            # ≥ one res-12 cell standing for a whole res-6 cell
 CELLS_EXACT_AREA_MAX_R10 = 60_000   # per-r10 h3 area below this many parents, res-8 ancestor / 2401 above
+CELLS_FAST_MIN_N = 2_000             # above this the row-streaming reader replaces ca.select (no chunk LRU)
+CELLS_BATCH_ROWS = 8_000             # chunk rows read per batch (bounds the transient working set)
+CELLS_POLL_WAIT_S = 0.25             # synchronous wait on a repeat POST / GET key= poll
+CELLS_JOB_STALE_S = 180.0            # a job record older than this with no result → recompute
+CELLS_JOB_TTL_S = 24 * 3600          # key= lookups answer 404 past this
+BODY_LRU_N = 512                     # sha256(raw body) → parsed list meta (per worker)
 
 GROUPS = list(ne_h3.GROUPS)
 CONS = list(ca._CONSISTENCY_NAMES)       # 7 public verdict names
@@ -554,29 +561,192 @@ def _scale_figures(fig: dict, scale: int) -> dict:
     return out
 
 
-def unit_cells(ids: np.ndarray, scale: int, wait_s: float, year: str | None = None) -> dict | None:
+# --- row-streaming reader (large lists) -------------------------------------
+# ``ca.select`` inflates every touched res-10 chunk into a ``Chunk`` (trees,
+# structures, offsets, green fix per chunk) and parks it in the chunk LRU — for
+# a 1-in-49 national sample that is one full chunk per listed cell: ~0.25 ms
+# and ~10 KB each, 100 k ids ≈ 25 s + >1 GB transient.  This path reads the
+# obs + ctx rows of the wanted cells only, one file handle per KG, applies the
+# green-ground override once over the collected rows and never touches the LRU.
+
+class _R10Ref:
+    __slots__ = ('r10', 'cells')
+
+    def __init__(self, r10: int, cells: int):
+        self.r10 = r10; self.cells = cells
+
+
+def _rows_wanted(kg: str, hdr: dict, fh, rows: list[dict], want_by_r10: dict) -> list[tuple]:
+    """→ [(row, obs_raw(k×41), ctx_raw(k×30), ids(k), n_chunk)] for the chunk rows of one KG;
+    ``want_by_r10`` = r10 → sorted wanted ids inside that chunk."""
+    rb = hdr.get('record_bytes') or {}
+    r0, r1 = int(rb.get('nec1', 30)), int(rb.get('neo1', ca.REC))
+    shuffled = 'shuffle' in str(hdr.get('chunk_layout') or '')
+    base = int(hdr['body_offset'])
+    out = []
+    for row in rows:
+        n = int(row['cells'])
+        if n == 0:
+            continue
+        fh.seek(base + int(row['off']))
+        comp = fh.read(int(row['len']))
+        o1 = n * r0; o2 = o1 + n * r1
+        try:
+            raw = zlib.decompressobj().decompress(comp, o2)
+        except zlib.error as ex:
+            log.warning('cells: chunk %s/%x unreadable: %s', kg, int(row['r10']), ex)
+            continue
+        if len(raw) < o2:
+            continue
+        if shuffled:
+            ctx = ne_h3._unshuffle(raw[:o1], r0, n); obs = ne_h3._unshuffle(raw[o1:o2], r1, n)
+        else:
+            ctx = raw[:o1]; obs = raw[o1:o2]
+        ids = np.frombuffer(obs, ca.OBS_DT, n)['id']
+        want = want_by_r10.get(int(row['r10']))
+        if want is None:
+            continue
+        m = (ids == want[0]) if want.size == 1 else np.isin(ids, want)
+        if not m.any():
+            continue
+        k = int(m.sum())
+        if k == n:
+            out.append((row, obs, ctx, ids, n))
+        else:
+            o2d = np.frombuffer(obs, np.uint8, n * r1).reshape(n, r1)[m]
+            c2d = np.frombuffer(ctx, np.uint8, n * r0).reshape(n, r0)[m]
+            out.append((row, o2d.tobytes(), c2d.tobytes(), ids[m], n))
+    return out
+
+
+def _acc_for_cells_fast(ids: np.ndarray) -> dict:
+    """Accumulator over exactly ``ids`` (sorted unique res-12) — same figures as
+    ``_acc_from_table(ca.select(ids)…)`` incl. the cross-KG de-duplication rule
+    (observed copy first, then the larger chunk, then the lowest kg)."""
+    par = ne_h3.h3_parent_vec(ids, ca.CHUNK_RES)
+    if not np.all(par[1:] >= par[:-1]):
+        o = np.argsort(par, kind='stable'); par = par[o]; ids = ids[o]
+    r10s, starts = np.unique(par, return_index=True)
+    bounds = np.append(starts, ids.size)
+    want_by_r10 = {int(r): ids[bounds[i]:bounds[i + 1]] for i, r in enumerate(r10s.tolist())}
+    rows = ca._chunk_rows(r10s)
+    by_kg: dict[str, list[dict]] = {}
+    for r in rows:
+        by_kg.setdefault(r['kg'], []).append(r)
+    hdrs: dict = {}
+    obs_parts: list[bytes] = []; ctx_parts: list[bytes] = []
+    chunk_refs: list[_R10Ref] = []; src_chunk_parts: list[np.ndarray] = []; kg_parts: list[np.ndarray] = []
+    kgs = sorted(by_kg)
+    kg_rank = {k: i for i, k in enumerate(kgs)}
+    for kg in kgs:
+        h = ca.header(kg)
+        if h is None:
+            continue
+        hdrs[kg] = h
+        krows = sorted(by_kg[kg], key=lambda r: int(r['off']))
+        try:
+            with open(ca._file_path(kg), 'rb') as fh:
+                for i in range(0, len(krows), CELLS_BATCH_ROWS):
+                    for row, o, c, rid, n in _rows_wanted(kg, h, fh, krows[i:i + CELLS_BATCH_ROWS], want_by_r10):
+                        ci = len(chunk_refs)
+                        chunk_refs.append(_R10Ref(int(row['r10']), n))
+                        obs_parts.append(o); ctx_parts.append(c)
+                        src_chunk_parts.append(np.full(rid.size, ci, np.int64))
+                        kg_parts.append(np.full(rid.size, kg_rank[kg], np.int64))
+        except OSError as ex:
+            log.warning('cells: %s unreadable: %s', kg, ex)
+    if not obs_parts:
+        t = ca.Table(np.zeros(0, np.uint64), np.zeros(0, ca.OBS_DT), np.zeros(0, np.int64), kgs,
+                     np.zeros(0, np.int64), np.zeros(0, np.int64), [])
+        return _acc_from_table(t, hdrs), hdrs
+    obs_raw = b''.join(obs_parts); ctx_raw = b''.join(ctx_parts)
+    obs_raw, _ = ca._green_fix.fix_rows(obs_raw, ctx_raw)
+    obs = np.frombuffer(obs_raw, ca.OBS_DT)
+    cid = obs['id']
+    src_chunk = np.concatenate(src_chunk_parts); krank = np.concatenate(kg_parts)
+    observed = (obs['hm'] != 255) | (obs['cover'].sum(axis=1) > 0)
+    csize = np.array([c.cells for c in chunk_refs], np.int64)[src_chunk]
+    order = np.lexsort((krank, -csize, ~observed, cid))
+    ids_s = cid[order]
+    first = np.concatenate([[True], ids_s[1:] != ids_s[:-1]])
+    sel = order[first]
+    t = ca.Table(cid[sel], obs[sel], krank[sel], kgs, src_chunk[sel], np.zeros(sel.size, np.int64), chunk_refs)
+    return _acc_from_table(t, hdrs), hdrs
+
+
+# --- job registry: cheap polls (repeat POST / GET key=) ----------------------
+# ``cj:<key>`` rows in the unit_stats table carry the list meta (n, bbox, fp,
+# started_at) so any gunicorn worker can answer a poll from the cache: result
+# row present → 200, job younger than CELLS_JOB_STALE_S → 202 (no second
+# compute), older → the holder of the ids recomputes, key-only callers get 404.
+
+_body_lru: OrderedDict = OrderedDict()      # sha256(raw body) → (h, n, bbox, fp)
+
+
+def _job_key(h: str) -> str:
+    return f'cj:{h}'
+
+
+def _job_get(h: str) -> dict | None:
+    with _mem_lock:
+        hit = _mem.get(_job_key(h))
+    if hit is not None:
+        return hit[1]
+    hit = _db_get(_job_key(h), 'job')
+    return hit[0] if hit else None
+
+
+def _job_put(h: str, meta: dict) -> None:
+    _store(_job_key(h), 'job', meta, persist=True)
+
+
+def _cells_meta_from_ids(ids: np.ndarray) -> tuple[str, int, tuple, str]:
     n = int(ids.size)
     h = hashlib.sha256(ids.tobytes()).hexdigest()[:16]
     bbox = ca._bbox_of_ids(ids) if n else (0.0, 0.0, 0.0, 0.0)
-    fp, _on, _miss = _fingerprint_bbox(*bbox) if n else ('empty', [], [])
+    fp = _fingerprint_bbox(*bbox)[0] if n else 'empty'
+    return h, n, bbox, fp
 
-    def _compute() -> dict:
-        if n == 0:
-            a = _acc_empty(); a['want'] = 0; a['miss'] = []; a['pend'] = []; a['pfiles'] = []
-            return a
+
+def cells_meta_for_body(raw: bytes, encoding: str | None) -> tuple[str, int, tuple, str, np.ndarray | None]:
+    """(h, n, bbox, fp, ids|None) — ids is None when the raw body was seen before
+    on this worker (no re-parse: the list hash alone addresses cache + job)."""
+    bh = hashlib.sha256(raw).hexdigest()
+    with _mem_lock:
+        hit = _body_lru.get(bh)
+        if hit is not None:
+            _body_lru.move_to_end(bh)
+    if hit is not None:
+        return hit + (None,)
+    ids = parse_cells_body(raw, encoding)
+    meta = _cells_meta_from_ids(ids)
+    with _mem_lock:
+        _body_lru[bh] = meta
+        while len(_body_lru) > BODY_LRU_N:
+            _body_lru.popitem(last=False)
+    return meta + (ids,)
+
+
+def _cells_compute(ids: np.ndarray, n: int, bbox) -> dict:
+    if n == 0:
+        a = _acc_empty(); a['want'] = 0; a['miss'] = []; a['pend'] = []; a['pfiles'] = []
+        return a
+    if n >= CELLS_FAST_MIN_N:
+        a, hdrs = _acc_for_cells_fast(ids)
+        pfiles = [k for k, h in hdrs.items() if h.get('partial_cells')]
+    else:
         t, hdrs, meta = ca.select(ids, bbox)
         a = _acc_from_table(t, hdrs)
-        a['miss'] = []          # bbox-of-list spans KGs the list never touches — report unknown cells instead
-        a['pend'] = []
-        a['pfiles'] = meta.get('partial_files') or []
-        a['want'] = n
-        a['list_area_m2'] = round(_cells_area_m2(ids), 1)
-        return a
+        pfiles = meta.get('partial_files') or []
+    a['miss'] = []          # bbox-of-list spans KGs the list never touches — report unknown cells instead
+    a['pend'] = []
+    a['pfiles'] = pfiles
+    a['want'] = n
+    a['list_area_m2'] = round(_cells_area_m2(ids), 1)
+    return a
 
-    r = _get_or_compute(f'cl:{h}:{n}', fp, _compute, wait_s=wait_s, persist=n > 20_000)
-    if r is None:
-        return None
-    acc, ts = r
+
+def cells_envelope(h: str, n: int, bbox, fp: str, acc: dict, ts: float, scale: int, year: str | None) -> dict:
     unit = {'kind': 'cells', 'key': h, 'bbox': [round(x, 6) for x in bbox] if n else None, 'n': n, 'scale': scale}
     if year:
         unit['year'] = year
@@ -587,6 +757,60 @@ def unit_cells(ids: np.ndarray, scale: int, wait_s: float, year: str | None = No
         env['figures'] = _scale_figures(env['figures'], scale)
         env['coverage']['cells_known'] = int(acc['kn']) * scale
     return env
+
+
+def unit_cells_by_key(h: str, scale: int, wait_s: float, year: str | None = None) -> dict | None:
+    """GET key= poll: finished envelope, None = still computing. Raises 404 when
+    no job for the key is known (or it expired without a result)."""
+    meta = _job_get(h)
+    if meta is None:
+        raise StatsError(404, 'unknown cell-list key — POST the list first (stats-envelope.md §6)', key=h)
+    n, bbox, fp = int(meta['n']), tuple(meta['bbox']), meta['fp']
+    key = f'cl:{h}:{n}'
+    hit = _cached(key, fp)
+    if hit is None:
+        with _inflight_lock:
+            fut = _inflight.get(key)
+        if fut is not None:
+            try:
+                hit = fut.result(timeout=max(0.0, wait_s))
+            except TimeoutError:
+                return None
+        else:
+            if time.time() - float(meta.get('started_at') or 0) > CELLS_JOB_TTL_S:
+                raise StatsError(404, 'cell-list key expired — POST the list again', key=h)
+            return None                 # computing on another worker (or stale: the next POST recomputes)
+    return cells_envelope(h, n, bbox, fp, hit[0], hit[1], scale, year)
+
+
+class NeedIds(Exception):
+    """unit_cells was called with ids=None but has to compute — caller re-parses the body."""
+
+
+def unit_cells(ids: np.ndarray | None, scale: int, wait_s: float, year: str | None = None,
+               meta: tuple | None = None) -> dict | None:
+    """Envelope over a cell list, None = computing.  ``meta`` = (h, n, bbox, fp)
+    from ``cells_meta_for_body``; ``ids`` may be None for a repeat POST whose
+    body this worker already parsed (raises ``NeedIds`` if it must compute)."""
+    h, n, bbox, fp = meta if meta is not None else _cells_meta_from_ids(ids)
+    key = f'cl:{h}:{n}'
+    r = _cached(key, fp)
+    if r is None:
+        with _inflight_lock:
+            local = key in _inflight
+        if not local:
+            job = _job_get(h)
+            if (job is not None and job.get('fp') == fp
+                    and time.time() - float(job.get('started_at') or 0) < CELLS_JOB_STALE_S):
+                return None             # running on another worker — poll again (no duplicate compute)
+            if ids is None:
+                raise NeedIds()
+            _job_put(h, {'n': n, 'bbox': list(bbox), 'fp': fp, 'started_at': time.time()})
+        r = _get_or_compute(key, fp, lambda: _cells_compute(ids, n, bbox), wait_s=wait_s, persist=True)
+        if r is None:
+            return None
+    acc, ts = r
+    return cells_envelope(h, n, bbox, fp, acc, ts, scale, year)
 
 
 # === SECTION: route ===
@@ -647,6 +871,8 @@ def stats_unit_route():
         sel = ['cells']
     else:
         sel = [k for k in ('h3', 'kg', 'bbox') if a.get(k)]
+        if a.get('key') and (a.get('unit') or 'cells') == 'cells':
+            sel = ['cells_key']
         if len(sel) != 1:
             raise StatsError(400, 'exactly one of h3=, kg=, bbox= is required',
                              example='/api/v1/stats/unit?kg=63330')
@@ -694,9 +920,23 @@ def stats_unit_route():
             raise StatsError(400, 'scale must be an integer')
         if not 1 <= scale <= CELLS_MAX_SCALE:
             raise StatsError(400, f'scale must be 1–{CELLS_MAX_SCALE}')
-        ids = parse_cells_body(request.get_data(cache=False), request.headers.get('Content-Encoding'))
-        env = unit_cells(ids, scale, BUDGET_S, year=(a.get('year') or '').strip() or None)
+        year = (a.get('year') or '').strip() or None
         multi = False
+        if kind == 'cells_key':
+            h = a['key'].strip().lower()
+            if not re.fullmatch(r'[0-9a-f]{16}', h):
+                raise StatsError(400, 'key must be the 16-hex unit.key of a POSTed cell list', key=h)
+            env = unit_cells_by_key(h, scale, CELLS_POLL_WAIT_S, year=year)
+        else:
+            raw = request.get_data(cache=False)
+            enc = request.headers.get('Content-Encoding')
+            h, n, bbox, fp, ids = cells_meta_for_body(raw, enc)
+            meta = (h, n, bbox, fp)
+            try:                        # repeat POST (body seen before) → cheap poll; first POST waits BUDGET_S
+                env = unit_cells(ids, scale, BUDGET_S if ids is not None else CELLS_POLL_WAIT_S, year=year, meta=meta)
+            except NeedIds:
+                env = unit_cells(parse_cells_body(raw, enc), scale, BUDGET_S, year=year, meta=meta)
+        pending_unit = {'kind': 'cells', 'key': h, 'scale': scale}
         if env is None:
             pending = 1
         else:
@@ -704,6 +944,9 @@ def stats_unit_route():
     if pending:
         body = {'schema': SCHEMA, 'service': SERVICE, 'status': 'computing', 'retry_after_s': RETRY_AFTER_S,
                 'units_ready': len(envs), 'units_pending': pending}
+        if kind in ('cells', 'cells_key'):
+            body['unit'] = pending_unit
+            body['poll'] = f'/api/v1/stats/unit?unit=cells&key={pending_unit["key"]}&scale={scale}'
         r = Response(ca._dumps(body, pretty), status=202, mimetype='application/json')
         r.headers['Retry-After'] = str(RETRY_AFTER_S); r.headers['Cache-Control'] = 'no-store'
         return r
