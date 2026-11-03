@@ -627,12 +627,51 @@ def _chunk_rows(r10s: np.ndarray) -> list[dict]:
         return []
     out = []
     ids = [int(x) for x in np.unique(r10s).tolist()]
+    idx_mtime: dict[str, float] = {}
     for i in range(0, len(ids), MAX_SQL_IN):
         part = ids[i:i + MAX_SQL_IN]
-        q = ('SELECT r10, kg, off, len, raw_len, cells, trees, bld FROM chunk WHERE r10 IN (%s)'
+        q = ('SELECT c.r10, c.kg, c.off, c.len, c.raw_len, c.cells, c.trees, c.bld, f.mtime '
+             'FROM chunk c LEFT JOIN file f ON f.kg = c.kg WHERE c.r10 IN (%s)'
              % ','.join('?' * len(part)))
         for row in c.execute(q, part):
-            out.append(dict(zip(('r10', 'kg', 'off', 'len', 'raw_len', 'cells', 'trees', 'bld'), row)))
+            out.append(dict(zip(('r10', 'kg', 'off', 'len', 'raw_len', 'cells', 'trees', 'bld'), row[:8])))
+            idx_mtime[row[1]] = row[8]
+    return _reconcile_stale_rows(out, idx_mtime, set(ids))
+
+
+def _reconcile_stale_rows(rows: list[dict], idx_mtime: dict, want: set) -> list[dict]:
+    """Index-lag guard.  ``ne_ingest`` replaces ``<kg>.h3b`` atomically *then*
+    verifies it *then* calls ``index_file`` — for a few seconds the file on
+    disk is newer than its ``chunk`` rows, so every offset is wrong and
+    readers log ``chunk … unreadable: incorrect header check`` (seen on
+    68227 during a sliver-sweep merge overlapping the cells-bins prewarm).
+    When the index's recorded mtime differs from the file's, serve the chunk
+    rows from the live file header instead (read-only; the writer's own
+    ``index_file`` catches the index up)."""
+    stale = []
+    for kg, mt in idx_mtime.items():
+        try:
+            disk = _file_path(kg).stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if mt is None or abs(float(mt) - disk) > 1e-6:
+            stale.append(kg)
+    if not stale:
+        return rows
+    out = [r for r in rows if r['kg'] not in stale]
+    for kg in stale:
+        h = header(kg, with_chunks=True)
+        if not h:
+            continue
+        n = 0
+        for ch in h.get('chunks') or []:
+            r10 = int(ch['r10'], 16)
+            if r10 in want:
+                out.append({'r10': r10, 'kg': kg, 'off': int(ch['off']), 'len': int(ch['len']),
+                            'raw_len': int(ch.get('raw_len') or 0), 'cells': int(ch['cells']),
+                            'trees': int(ch.get('trees') or 0), 'bld': int(ch.get('bld') or 0)})
+                n += 1
+        log.info('cells: index lags file for %s (file newer) — %d chunk rows served from live header', kg, n)
     return out
 
 
