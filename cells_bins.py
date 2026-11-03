@@ -845,7 +845,9 @@ def dict_block() -> dict:
                 'tree apices, man-made objects, 25 m DTM/landcover grid, product roof hints)',
         'request': 'GET /api/v1/cells?bbox=w,s,e,n&format=bin&fields=a,b,c[&ids=u64][&rebuild=1] with w=i·0.025, s=j·0.025, '
                    'e=w+0.025, n=s+0.025 (half-open); fields=* for everything; omitted → defaults',
-        'block': {'request': 'GET /api/v1/cells?bbox=w,s,e,n&format=bin&block=1&fields=… with w=bi·0.1, s=bj·0.1, e=w+0.1, n=s+0.1 '
+        'block': {'note': 'NEXB v1 (frames with ids) — since 2026-11-03 only with ids=1 (or ids=u64); the default block=1 '
+                          'answer is the id-free zstd NEXB v2, see /cells/dict → blocks_v2',
+                  'request': 'GET /api/v1/cells?bbox=w,s,e,n&format=bin&block=1&ids=1&fields=… with w=bi·0.1, s=bj·0.1, e=w+0.1, n=s+0.1 '
                              '— the 16 bins of the 0.1° block in one body',
                   'container': "'NEXB' | u32 header_len | header JSON {gen, ij:[bi,bj], bbox, fields, ids, bins:[{i,j,off,len,gen,n,complete}]} "
                                '| frame_0 … frame_15; frame_k is byte-identical to the single-bin NEX1 answer for bins[k] '
@@ -855,7 +857,7 @@ def dict_block() -> dict:
                           'per-bin gens in the header let you keep per-bin state',
                   'block_deg': BLOCK_DEG, 'bins_per_block': BLOCK_N * BLOCK_N},
         'precompute': 'every bin touching a published product is built/refreshed on disk by the cells-bins builder '
-                      '(systemd cells-bins.service) within minutes of ingest; cold reads are disk → < 100 ms',
+                      '(systemd cells-bins.timer, hourly), then the NEXB v2 blocks and the national sample; cold reads are disk → < 100 ms',
         'container': "'NEX1' | u32 header_len | header JSON {n, gen, epoch, kgs[], columns[{name,dtype,bytes,shape?,nodata?,unit}], "
                      'ids: delta_u64|u64, complete, lc25_legend, …} | column bytes in header order (little-endian, rows sorted by cell id)',
         'headers': {'ETag': 'strong: "b-<gen>-<fields hash>" — If-None-Match → 304',
@@ -906,7 +908,8 @@ def builder_status() -> dict:
             'complete': missing == 0 and stale == 0, 'generation': m['generation'], 'last_run': st or None}
 
 
-def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | None = None, jobs: int = 1) -> dict:
+def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | None = None, jobs: int = 1,
+            blocks: bool = True) -> dict:
     """Build / refresh every manifest bin whose stored generation is not current.
     Missing bins first (cold-start coverage), then stale ones; stops at
     ``limit`` builds or ``budget_s`` seconds (the daily ``cells-bins.timer``
@@ -960,6 +963,24 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
            'remaining': len(todo_missing) + len(todo_stale) - n_built,
            'budget_s': budget_s, 'stopped_on_budget': bool(stop), 'seconds': round(time.time() - t0, 1),
            'finished_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'generation': m['generation']}
+    # phase 2 + 3 (cells_blocks): prebuilt NEXB v2 blocks, then the national
+    # sample — both derived from the bins just (re)built, same budget.
+    if blocks and not stop:
+        import cells_blocks
+        left = None if budget_s is None else max(0.0, budget_s - (time.time() - t0))
+        try:
+            out['blocks'] = cells_blocks.prewarm_blocks(left, verbose=verbose, jobs=jobs)
+            stop = bool(out['blocks'].get('stopped_on_budget'))
+        except Exception as e:  # noqa: BLE001
+            log.warning('cells_bins: prewarm blocks: %s', e); out['blocks'] = {'error': str(e)}
+        if not stop:
+            left = None if budget_s is None else max(0.0, budget_s - (time.time() - t0))
+            try:
+                out['sample'] = cells_blocks.build_sample(verbose=verbose, budget_s=left)
+            except Exception as e:  # noqa: BLE001
+                log.warning('cells_bins: prewarm sample: %s', e); out['sample'] = {'error': str(e)}
+        out['seconds'] = round(time.time() - t0, 1)
+        out['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     try:
         BIN_DIR.mkdir(parents=True, exist_ok=True)
         STATE_PATH.write_text(json.dumps(out, indent=1))
@@ -976,7 +997,7 @@ if __name__ == '__main__':
     ap.add_argument('--block', help='bi,bj → build the 16 bins of a 0.1° block and print the NEXB header')
     ap.add_argument('--prewarm', action='store_true', help='build / refresh every bin that is missing or stale')
     ap.add_argument('--limit', type=int); ap.add_argument('--budget-s', type=float, help='stop after this many seconds')
-    ap.add_argument('--jobs', type=int, default=1)
+    ap.add_argument('--jobs', type=int, default=1); ap.add_argument('--no-blocks', action='store_true', help='bins only')
     ap.add_argument('--manifest', action='store_true'); ap.add_argument('--status', action='store_true')
     ap.add_argument('--quiet', action='store_true')
     a = ap.parse_args()
@@ -986,7 +1007,7 @@ if __name__ == '__main__':
     elif a.status:
         print(json.dumps(builder_status(), indent=1))
     elif a.prewarm:
-        print(json.dumps(prewarm(a.limit, verbose=not a.quiet, budget_s=a.budget_s, jobs=max(1, a.jobs))))
+        print(json.dumps(prewarm(a.limit, verbose=not a.quiet, budget_s=a.budget_s, jobs=max(1, a.jobs), blocks=not a.no_blocks)))
     elif a.block:
         bi, bj = (int(x) for x in a.block.split(','))
         t = time.time(); body, hx, etag, _ = serve_block(bi, bj, list(DEFAULT_FIELDS), 'delta_u64')

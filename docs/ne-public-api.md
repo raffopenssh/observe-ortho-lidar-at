@@ -278,6 +278,74 @@ grid25 + roof hints + ALS overlay), 50 ms warm; a 0.1° view = 16 requests
   fresh worker): **before 0.5–1.4 s (build) → after 13–25 ms** (first
   request on a fresh worker ~150 ms). Only `4xx`/`5xx` carry `no-store`.
 
+## 6b. Id-free zstd blocks (NEXB v2), `/cells/blocks`, national sample `/cells/sample` (`cells_blocks.py`, 2026-11-03)
+
+Downstream glyph filters now run nationally. Both additions are **derived from the stored 0.025° bins** — no new per-cell
+computation; the only epoch/version signal is the existing `X-Cells-Epoch`
+(the ne-observe product epoch, `2026-11` today) plus a content generation.
+
+* **`block=1` default = NEXB v2** (`ids=1` / `ids=u64` keep the v1
+  frames-with-ids form byte for byte). No ids: the cell set of a bin is the
+  shared enumeration *all res-12 cells whose centre lies in the half-open bin
+  [w,w+0.025)×[s,s+0.025), ascending H3* (= `h3.polygon_to_cells` centre
+  rule = what `build_bin` stores). Header carries per bin `n`, `row0`,
+  `ids_xor` (xor of the u64 ids, hex) and `gen`; the client enumerates
+  itself, checks `n`/`ids_xor`, and falls back to `ids=1` on mismatch. Body
+  = header | present bitmap (ceil(n/8) B, all ones today — reserved so the
+  enumeration may shrink later) | planar columns (n rows each, the 16 bin
+  enumerations concatenated in row-major bin order). Container documented in
+  `cells_blocks.py` / `/cells/dict → blocks_v2`; decoder
+  `cells_blocks.decode_block`.
+* **Prebuilt + zstd**: `data/ne/blocks/<bi>_<bj>.<fields-hash>.nexb.zst` +
+  `.json` meta `{gen, etag, bytes, n, epoch, fields, partial, bins_n,
+  built_at}`; one zstd level (9) everywhere so the strong ETag
+  `"B-<gen>-<hash(fields|bitmap)>"` is byte-exact. Served with
+  `Content-Encoding: zstd` when accepted (else inflated → `public_api`
+  gzips), `Vary`, `X-Cells-Gen`, `X-Cells-Epoch`, `X-Cells-Ids: bitmap`,
+  `X-Cells-Layout: nexb2=n0,…`, `X-Cells-Zstd-Bytes`. Measured: 9 glyph
+  fields ≈ 0.7–1.1 MB (was ≈ 1.1 MB gz with ids), 18 defaults ≈ 1.3–2.1 MB; warm serve < 100 ms
+  (ETag check 2 ms, then a file read); a block requested before it is
+  prebuilt is built on the spot (~0.15 s when its bins are stored, ~10 s
+  when not) and stored.
+* **`GET /api/v1/cells/blocks[?fields=…][&epoch=…][&format=json]`** —
+  columns `{bi, bj, gen, etag, bytes, stored, current, n, bins_n, complete}`
+  for every block touching a published product; `bytes`/`n` null until
+  prebuilt for that field set (`stored`), `current` = stored gen == gen.
+  ETag `"blocks-<generation>"`; `epoch=` ≠ current `X-Cells-Epoch` → 409
+  `{epoch}`. `?status=1` → builder/sample status (also on `/cells/bins?status=1`).
+* **`GET /api/v1/cells/sample?res=10&format=bin[&fields=glyph|default|*|a,b]`**
+  — one row per res-10 cell of Austria = its res-12 **centre child**
+  (`cellToCenterChild(parent,12)`; bit rule `_sample_mask`: digits res+1…12
+  zero, verified against h3), ascending H3 (= parent order), every cell
+  with DTM (`terrain_src != 0`), ≈ 5.6 M rows. NEX1 container (`sample_res`,
+  `rule`, `ids: delta_u64`, planar columns, bin dtypes/units/nodata).
+  `fields=glyph` = the nine glyph-filter fields (`GLYPH_FIELDS`, ≈ 26 MB);
+  default adds the cheap extras not used by the glyph filter
+  (`SAMPLE_EXTRA_FIELDS`: obs, terrain_src, bld_n, bld_area_sum,
+  struct_h_max, canopy_h_p50, lc25, tree_n, dh_m, consistency,
+  forest_loss_year, phenology, als_year_newest — ≈ +12 MB); `*` = every
+  bin column except `cover` (≈ 100 MB). Stored superset
+  `data/ne/sample/r10.nex.zst` (zstd 19) + `r10.json`; slices cached in
+  `sample/cache` (LRU 16). ETag `"S-r<res>-<gen>-<hash(fields)>"`,
+  `X-Cells-Gen` = `sha(sample-1 | bin-manifest generation)`,
+  `X-Cells-Epoch`, `X-Cells-Built`, `X-Cells-Partial` when bins were
+  missing on disk at build time (`header.bins_missing`). `format=json` /
+  `meta=1` → build meta (+ `current`). 404 + `Retry-After` before the
+  first build. res 9 / 11 are accepted too.
+* **Prewarm = the existing builder, extended**: `cells-bins.timer` is now
+  **hourly, 50 min budget** (`cells_bins.py --prewarm --budget-s 3000 --jobs
+  2`, nice 15, idle IO): phase 1 bins (missing → stale, as before), phase 2
+  blocks for `cells_blocks.prewarm_fieldsets()` = defaults + glyph + up to 8
+  field sets seen in real block requests (`data/ne/blocks/fieldsets.json`,
+  `remember_fieldset`), phase 3 the sample (skipped when its gen is
+  current). A pass over an all-current corpus costs seconds, so new blocks
+  are picked up within the hour of a product landing; never run in gunicorn.
+  `python3 cells_blocks.py --status | --block bi,bj [--fields glyph] |
+  --prewarm | --sample 10 [--force]`.
+* **Test**: `python3 tests/test_cells_blocks.py` (centre-child rule vs h3,
+  v2 codec + xor checksum vs v1 frames, routes incl. 304 / gzip fallback /
+  ids=1 / manifest / sample).
+
 ## 7. National aggregate `/api/v1/cells/national` (`cells_national.py`)
 
 One row per res-9 H3 parent (~1.05 M rows; `res=8` ≈ 150 k), Austria-wide,

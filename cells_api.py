@@ -1693,7 +1693,7 @@ def _bin_request():
         return None
     import cells_bins
     fields = cells_bins.parse_fields(a.get('fields'))
-    ids_enc = 'u64' if (a.get('ids') or '').lower() == 'u64' else 'delta_u64'
+    ids_enc = 'u64' if (a.get('ids') or '').lower() == 'u64' else 'delta_u64'   # block=1 without ids= → NEXB v2 (cells_blocks)
     inm = request.headers.get('If-None-Match') or ''
     cc = f'public, max-age={CACHE_MAX_AGE}'
 
@@ -1705,7 +1705,15 @@ def _bin_request():
         if bij is None:
             raise CellsError(400, f'block=1 needs a {cells_bins.BLOCK_DEG}°-aligned block: w=bi·{cells_bins.BLOCK_DEG}, '
                                   f's=bj·{cells_bins.BLOCK_DEG}, e=w+{cells_bins.BLOCK_DEG}, n=s+{cells_bins.BLOCK_DEG}',
-                             bins='/api/v1/cells/bins')
+                             bins='/api/v1/cells/bins', blocks='/api/v1/cells/blocks')
+        if not a.get('ids'):
+            # NEXB v2 (2026-11-03): no ids, present bitmap + ids_xor, prebuilt zstd on disk
+            import cells_blocks
+            etag, gen, inps = cells_blocks.quick_etag(*bij, fields)
+            if not _flag('rebuild') and _match(etag):
+                return Response(status=304, headers={'ETag': etag, 'Cache-Control': cc, 'X-Cells-Gen': gen})
+            body, hx, etag, meta = cells_blocks.serve_block(*bij, fields, rebuild=_flag('rebuild'))
+            return _zstd_resp(body, hx, etag, partial=bool(meta.get('partial')))
         etag, inps = cells_bins.quick_block_etag(*bij, fields, ids_enc)
         if not _flag('rebuild') and _match(etag):
             return Response(status=304, headers={'ETag': etag, 'Cache-Control': cc, 'X-Cells-Gen': etag[3:-10]})
@@ -1726,11 +1734,82 @@ def _bin_request():
                  partial=bool(inp['missing'] or inp['partial_files']))
 
 
+def _zstd_resp(body_zst: bytes, hx: dict, etag: str, *, partial: bool = False) -> Response:
+    """A prebuilt zstd body: sent as is with ``Content-Encoding: zstd`` when the
+    client accepts it, else inflated (``public_api`` then gzips)."""
+    import cells_blocks
+    hx = dict(hx)
+    ae = (request.headers.get('Accept-Encoding') or '').lower()
+    if 'zstd' in ae:
+        hx['Content-Encoding'] = 'zstd'; body = body_zst
+    else:
+        body = cells_blocks.zdecompress(body_zst)
+    hx['Vary'] = 'Accept-Encoding'
+    hx['X-Cells-Zstd-Bytes'] = str(len(body_zst))
+    return _resp(body, mimetype='application/octet-stream', headers=hx, etag=etag, partial=partial)
+
+
+@cells_bp.route('/api/v1/cells/blocks')
+def cells_blocks_manifest():
+    """Per-block manifest of the prebuilt NEXB v2 store (``cells_blocks``)."""
+    import cells_bins, cells_blocks
+    if _flag('status'):
+        return _resp({'blocks': cells_blocks.blocks_status(), 'sample': cells_blocks.sample_status()},
+                     headers={'Cache-Control': 'no-store'})
+    a = _args()
+    fields = cells_bins.parse_fields(a.get('fields'))
+    want = (a.get('epoch') or '').strip()
+    cur = epoch_hdr(None)
+    if want and cur and want != cur:
+        raise CellsError(409, f'epoch {want!r} is not current', epoch=cur)
+    m = cells_blocks.manifest(fields)
+    etag = f'"blocks-{m["generation"]}"'
+    fmt = _format(('json', 'columns'), default='columns')
+    if fmt == 'json':
+        b = m['blocks']
+        m = dict(m); m['blocks'] = [dict(zip(b.keys(), row)) for row in zip(*b.values())]
+    return _resp(m, etag=etag, headers=_with_epoch({'X-Cells-Gen': m['generation']}, None))
+
+
+@cells_bp.route('/api/v1/cells/sample')
+def cells_sample():
+    """National res-10 centre-child sample (``cells_blocks.serve_sample``)."""
+    import cells_blocks as cbl
+    a = _args()
+    try:
+        res = int(a.get('res') or cbl.SAMPLE_DEFAULT_RES)
+    except ValueError:
+        raise CellsError(400, 'res must be an integer')
+    if res not in cbl.SAMPLE_RES:
+        raise CellsError(400, f'res must be one of {list(cbl.SAMPLE_RES)}')
+    fmt = _format(('bin', 'json'), default='bin')
+    meta = cbl.sample_meta(res)
+    if fmt == 'json' or _flag('meta'):
+        if not meta:
+            raise CellsError(404, f'national sample r{res} not built yet', retry_after_s=RETRY_AFTER_S)
+        d = dict(meta); d['res_available'] = list(cbl.SAMPLE_RES); d['current'] = meta['gen'] == cbl.sample_gen()
+        d['etag'] = cbl.sample_etag(meta['gen'], res, cbl.SAMPLE_DEFAULT_FIELDS)
+        return _resp(d, etag=f'"S-meta-{meta["gen"]}"', headers=_with_epoch({'X-Cells-Gen': meta['gen']}, meta.get('epoch')))
+    fields = cbl.parse_sample_fields(a.get('fields'))
+    if meta:
+        etag = cbl.sample_etag(meta['gen'], res, fields)
+        inm = request.headers.get('If-None-Match') or ''
+        if etag in [x.strip() for x in inm.split(',')] or inm.strip() == '*':
+            return Response(status=304, headers={'ETag': etag, 'Cache-Control': f'public, max-age={CACHE_MAX_AGE}',
+                                                 'X-Cells-Gen': meta['gen']})
+    body, hx, etag, meta = cbl.serve_sample(res, fields)
+    hx['Content-Disposition'] = f'inline; filename="cells-sample-r{res}.nex"'
+    return _zstd_resp(body, hx, etag, partial=bool(meta.get('bins_missing')))
+
+
 @cells_bp.route('/api/v1/cells/bins')
 def cells_bins_manifest():
     import cells_bins
     if _flag('status'):
-        return _resp(cells_bins.builder_status(), headers={'Cache-Control': 'no-store'})
+        import cells_blocks
+        st = cells_bins.builder_status()
+        st['blocks'] = cells_blocks.blocks_status(); st['sample'] = cells_blocks.sample_status()
+        return _resp(st, headers={'Cache-Control': 'no-store'})
     m = cells_bins.manifest()
     etag = f'"bins-{m["generation"]}"'
     fmt = _format(('json', 'columns'), default='columns')
@@ -1832,6 +1911,7 @@ def cells_dict():
         'formats': list(FORMATS), 'epoch': _epoch_pin(),
         'bins': __import__('cells_bins').dict_block(),
         'national': __import__('cells_national').dict_block(),
+        **__import__('cells_blocks').dict_block(),
         'dedupe': 'a border cell present in several KG products is served once: observed copy first, then the '
                   'larger chunk, then the lowest kg; meta.kgs lists the products touched',
         'rollup': {'res': [11, 10], 'mean': ['cover', 'structures_cover', 'canopy', 'ndvi.*', 'terrain.* (aspect → mode)',

@@ -67,6 +67,8 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
   GET  /api/v1/cells/dict                         fields, units, code tables, group labels, limits, epoch, bins
   GET  /api/v1/cells/bins                         every 0.025° bin with a published product + its generation (see format=bin)
   GET  /api/v1/cells/national?res=9[&fields=…]    Austria-wide NEX1 table, one row per res-9 (or res-8) H3 parent (see below)
+  GET  /api/v1/cells/blocks[?fields=…&epoch=…]    manifest of the prebuilt id-free zstd 0.1° blocks (bi, bj, gen, etag, bytes)
+  GET  /api/v1/cells/sample?res=10&format=bin     national sample: one row per res-10 cell = its res-12 centre child, every cell with DTM
   GET  /api/v1/kg/<code>/cells                    whole-KG container: format=h3b (default, downloadable) | json (summary)
   GET  /api/v1/kgs/summary?codes=a,b,…             merged observed summary over a KG SET (≤ 500 codes, else 400);
        …?gemeinde=61630 | district=616 | state=6    or by Statistik Austria GKZ prefix (5 / 3 / 1 digits).
@@ -146,6 +148,27 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
     Discovery: GET /api/v1/cells/bins → columns {{i, j, gen, epoch, complete, kgs_n, stored}} for every
     bin touching a published product (ETag "bins-<generation>"); diff gen against your copy, pull only
     changed bins, ≤ 4 in flight. Field table + semantics: /api/v1/cells/dict → bins.
+  block=1 on a 0.1°-aligned bbox (w=bi·0.1, s=bj·0.1) → NEXB v2 (since 2026-11-03): the 16 bins in one body WITHOUT
+    ids — the cell set of each bin is the shared enumeration "all res-12 cells whose centre lies in the half-open
+    bin [w,w+0.025)×[s,s+0.025), ascending H3" (h3 polygonToCells centre rule); header.bins[k] = {{i, j, n, row0,
+    ids_xor (xor of the u64 ids, hex), gen, complete}}, body = present bitmap (ceil(n/8) B, bit r = byte r>>3 bit
+    r&7) | planar columns (n rows each, rows = the 16 bin enumerations concatenated in row-major bin order).
+    Check n / ids_xor against your enumeration; on mismatch re-request with ids=1 (NEXB v1 frames with ids, unchanged).
+    Prebuilt on disk and served zstd (send Accept-Encoding: zstd; else inflated + gzip): ≈ 0.7–1.1 MB per block
+    for the 9 glyph fields, < 100 ms warm. ETag "B-<gen>-<hash>", X-Cells-Gen, X-Cells-Epoch, X-Cells-Ids: bitmap.
+    Manifest: GET /api/v1/cells/blocks?fields=… → columns {{bi, bj, gen, etag, bytes, stored, current, n, bins_n,
+    complete}} (bytes null until prebuilt for that field set); epoch= must equal X-Cells-Epoch (else 409).
+  /api/v1/cells/sample?res=10&format=bin[&fields=glyph|default|*|a,b,…]  → the NATIONAL SAMPLE for the glyph
+    filter: one NEX1 row per res-10 cell of Austria = its res-12 centre child (cellToCenterChild(parent,12);
+    parent = cellToParent(id,10)), ascending H3, every cell with DTM (terrain_src != 0), ≈ 5.6 M rows, ids
+    delta-coded then planar columns with the bin dtypes / units / nodata (255 = unknown). fields=glyph =
+    bld_h_max bld_h_p50 stories_max roof_dom canopy_h_p90 aspect_deg slope_mean slope_p90 elev_mean (≈ 26 MB zstd);
+    default adds obs terrain_src bld_n bld_area_sum struct_h_max canopy_h_p50 lc25 tree_n dh_m consistency
+    forest_loss_year phenology als_year_newest (≈ +12 MB); * = every bin column except cover. Rebuilt by the hourly
+    builder only when the bin corpus changed. Headers: ETag "S-r10-<gen>-<fields>" (strong; If-None-Match → 304),
+    X-Cells-Gen (key your copy on it), X-Cells-Epoch (the ne-observe product epoch), X-Cells-Built, Content-Encoding
+    zstd when accepted. format=json / meta=1 → build meta. 404 + Retry-After before the first build. One pull per
+    generation from one client — never per tile.
   /api/v1/cells/national?res=9|8[&fields=a,b,…]  → the NATIONAL aggregate for overview zooms: one NEX1
     row per res-9 parent (~1.05 M rows, ~20 MB gz; res 8 ≈ 150 k rows), Austria-wide, built daily from every
     published cells product. Same container / dtypes / units as the bins (header "res": 9, no ij / bbox); per
