@@ -45,3 +45,10 @@ data/host_patch_state.json
 data/host_patch_launch
 data/host_patch.lock
 data/host_patch_off
+
+# host patch / reboot runtime state (peers)
+data/host_patch_*
+data/host_patch.lock
+data/host_reboot_*
+data/host_reboot.lock
+data/austria_processor/host_reboot_slots.json*
