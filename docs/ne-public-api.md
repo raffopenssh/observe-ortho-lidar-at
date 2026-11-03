@@ -296,7 +296,7 @@ computation; the only epoch/version signal is the existing `X-Cells-Epoch`
   enumerations concatenated in row-major bin order). Container documented in
   `cells_blocks.py` / `/cells/dict → blocks_v2`; decoder
   `cells_blocks.decode_block`.
-* **Prebuilt + zstd**: `data/ne/blocks/<bi>_<bj>.<fields-hash>.nexb.zst` +
+* **Prebuilt + zstd**: `data/ne/nexb/<bi>_<bj>.<fields-hash>.nexb.zst` +
   `.json` meta `{gen, etag, bytes, n, epoch, fields, partial, bins_n,
   built_at}`; one zstd level (9) everywhere so the strong ETag
   `"B-<gen>-<hash(fields|bitmap)>"` is byte-exact. Served with
@@ -336,7 +336,7 @@ computation; the only epoch/version signal is the existing `X-Cells-Epoch`
   **hourly, 50 min budget** (`cells_bins.py --prewarm --budget-s 3000 --jobs
   2`, nice 15, idle IO): phase 1 bins (missing → stale, as before), phase 2
   blocks for `cells_blocks.prewarm_fieldsets()` = defaults + glyph + up to 8
-  field sets seen in real block requests (`data/ne/blocks/fieldsets.json`,
+  field sets seen in real block requests (`data/ne/nexb/fieldsets.json`,
   `remember_fieldset`), phase 3 the sample (skipped when its gen is
   current). A pass over an all-current corpus costs seconds, so new blocks
   are picked up within the hour of a product landing; never run in gunicorn.

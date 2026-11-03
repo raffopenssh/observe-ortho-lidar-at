@@ -35,7 +35,7 @@ Container ``NEXB`` v2 (little-endian)::
   ``X-Cells-Epoch`` (the ne-observe product epoch), ``X-Cells-Block``,
   ``X-Cells-Partial``.  Body ``Content-Encoding: zstd`` when the client
   accepts it (always prebuilt as one zstd frame on disk;
-  ``data/ne/blocks/<bi>_<bj>.<fh>.nexb.zst`` + ``.json`` meta), else inflated
+  ``data/ne/nexb/<bi>_<bj>.<fh>.nexb.zst`` + ``.json`` meta), else inflated
   and gzip'd by ``public_api``.
 
 Sample (``GET /api/v1/cells/sample?res=10&format=bin[&fields=…]``)
@@ -74,7 +74,7 @@ log = logging.getLogger('cells_blocks')
 
 ALGO = 'nexb-2'
 SAMPLE_ALGO = 'sample-1'
-BLOCK_DIR = ca.NE_DIR / 'blocks'
+BLOCK_DIR = ca.NE_DIR / 'nexb'          # NOT data/ne/blocks — that holds the split-KG .h3b products
 SAMPLE_DIR = ca.NE_DIR / 'sample'
 SAMPLE_CACHE = SAMPLE_DIR / 'cache'
 FIELDSETS_PATH = BLOCK_DIR / 'fieldsets.json'
@@ -198,8 +198,8 @@ def decode_block(blob: bytes) -> tuple[dict, np.ndarray, 'OrderedDict[str, np.nd
 # === SECTION: block store ===
 
 def _paths(bi: int, bj: int, fields) -> tuple[Path, Path]:
-    stem = BLOCK_DIR / f'{bi}_{bj}.{fields_hash(fields)}'
-    return stem.with_suffix('.nexb.zst'), stem.with_suffix('.json')
+    stem = f'{bi}_{bj}.{fields_hash(fields)}'
+    return BLOCK_DIR / f'{stem}.nexb.zst', BLOCK_DIR / f'{stem}.json'
 
 
 def stored_meta(bi: int, bj: int, fields) -> dict | None:
@@ -227,8 +227,8 @@ def store_block(bi: int, bj: int, fields, *, rebuild: bool = False) -> dict:
             'bins_n': [e['n'] for e in hdr['bins']], 'built_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             'build_ms': int((time.time() - t0) * 1000), 'algo': ALGO, 'zstd_level': ZSTD_LEVEL}
     BLOCK_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = zp.with_suffix('.tmp'); tmp.write_bytes(z); os.replace(tmp, zp)
-    tmp = mp.with_suffix('.tmp'); tmp.write_text(json.dumps(meta)); os.replace(tmp, mp)
+    tmp = zp.with_name(zp.name + '.tmp'); tmp.write_bytes(z); os.replace(tmp, zp)
+    tmp = mp.with_name(mp.name + '.tmp'); tmp.write_text(json.dumps(meta)); os.replace(tmp, mp)
     return meta
 
 
@@ -540,8 +540,8 @@ def build_sample(res: int = SAMPLE_DEFAULT_RES, *, force: bool = False, verbose:
             'bins_n': n_bins, 'bins_missing': n_missing, 'bins_stale_at_build': n_stale, 'algo': SAMPLE_ALGO,
             'built_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'seconds': round(time.time() - t0, 1),
             'default_fields': list(SAMPLE_DEFAULT_FIELDS), 'glyph_fields': list(GLYPH_FIELDS)}
-    tmp = zp.with_suffix('.tmp'); tmp.write_bytes(z); os.replace(tmp, zp)
-    tmp = mp.with_suffix('.tmp'); tmp.write_text(json.dumps(meta)); os.replace(tmp, mp)
+    tmp = zp.with_name(zp.name + '.tmp'); tmp.write_bytes(z); os.replace(tmp, zp)
+    tmp = mp.with_name(mp.name + '.tmp'); tmp.write_text(json.dumps(meta)); os.replace(tmp, mp)
     # drop slices of older generations
     try:
         for p in SAMPLE_CACHE.glob(f'r{res}-*.nex.zst'):
