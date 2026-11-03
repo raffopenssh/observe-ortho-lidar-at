@@ -66,6 +66,7 @@ min_reserve_peers, max_cache_only_peers}`), `director_state.json`,
 | ◦ `GET /director/barren_cells`, `POST …/clear` | 0.1° cells with no usable upstream data |
 | ◦ `GET /director/sweep[?kg=]`, `POST …/sweep` | `docs/sliver-sweep.md` |
 | `POST /director/restart_peer` | hard restart of a peer's processor |
+| `GET` / `POST /director/reboot_slot` | fleet-wide graceful host-reboot leases (`docs/host-maintenance.md`) |
 | `POST /api/v1/admin/restart_processor` / `…/disable_autostart` | local processor control |
 
 ```bash

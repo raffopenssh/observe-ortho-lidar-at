@@ -1984,6 +1984,162 @@ def _host_patch_startup_thread():
 threading.Thread(target=_host_patch_startup_thread, daemon=True, name='host-patch').start()
 
 
+# === SECTION: Host reboot (peers only, graceful) ===
+_HOST_REBOOT_PENDING = Path('data/host_reboot_pending')   # JSON; touched while draining
+_HOST_REBOOT_LAST = Path('data/host_reboot_last')         # JSON stamp of last reboot
+_HOST_REBOOT_PENDING_TTL = 30 * 60   # stale pending file (thread died) no longer gates starts
+
+
+def _host_reboot_pending_active() -> bool:
+    """True while the host-reboot drainer holds the processor-start gate
+    (file refreshed every loop; ignored once older than 30 min)."""
+    try:
+        return time.time() - _HOST_REBOOT_PENDING.stat().st_mtime < _HOST_REBOOT_PENDING_TTL
+    except Exception:
+        return False
+
+
+def _host_reboot_is_peer() -> bool:
+    """Only a worker pointed at a remote director (``SRTM_PRIMARY_URL``)
+    ever reboots itself; the director / the single VM never does."""
+    try:
+        if _config.single_vm() or _is_director_local() or _config.self_id() == 'primary':
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _host_reboot_busy(sp) -> str:
+    """Reason a reboot must wait right now ('' = clear)."""
+    if _processor_python_pids():
+        return 'processor running'
+    if sp.run(['systemctl', 'is-active', '--quiet', 'srtm-hostpatch'],
+              timeout=10).returncode == 0:
+        return 'host_patch running'
+    if sp.run(['pgrep', '-x', 'apt-get|apt|dpkg|unattended-upgr'],
+              capture_output=True, timeout=5).returncode == 0:
+        return 'apt/dpkg running'
+    return ''
+
+
+def _host_reboot_request_slot(reason: str) -> dict:
+    """Ask the director (``SRTM_PRIMARY_URL``) for one of the fleet-wide
+    reboot slots; authenticated like every peer→director call
+    (``peer_director._admin_headers`` = ``X-Operator-Token``)."""
+    import requests as _rq
+    import peer_director as _pdr
+    url = (_config.PRIMARY_URL or '').strip()
+    if not url:
+        return {'granted': False, 'error': 'no director url'}
+    r = _rq.post(url.rstrip('/') + '/api/v1/director/reboot_slot',
+                 json={'peer_id': _config.self_id(), 'reason': reason},
+                 headers=_pdr._admin_headers(), timeout=30)
+    if r.status_code != 200:
+        return {'granted': False, 'error': f'HTTP {r.status_code}'}
+    return r.json()
+
+
+def _host_reboot_thread():
+    """Peers only: reboot when ``/var/run/reboot-required`` is set (kernel /
+    libc from ``tools/host_patch.sh``), but only *gracefully*:
+
+    1. hold the processor-start gate (``data/host_reboot_pending`` →
+       ``processing/start`` answers 503 retry) and SIGTERM the processor
+       python parent once = "exit after the current KG" (never a hard stop;
+       a frontier KG may take many hours — we just wait);
+    2. once no processor / host_patch / apt / git sync is running, ask the
+       director for a fleet-wide reboot slot (``/director/reboot_slot``,
+       default 2 concurrent, 20 min lease) so peers reboot a couple at a
+       time, never as a herd;
+    3. ``systemctl reboot``. srv is enabled → comes back, the director
+       restarts the processor on its next tick (resume from checkpoints).
+
+    Guards: never on the primary / director; ≤1 reboot per 24 h per peer;
+    uptime ≥30 min; off switch ``data/host_reboot_off`` (also clears the
+    gate). See ``docs/host-maintenance.md -> Host reboot``."""
+    import random as _rnd, fcntl as _fc, subprocess as _sp
+    time.sleep(900 + _rnd.uniform(0, 300))
+    try:
+        lockf = open('data/host_reboot.lock', 'w')
+        _fc.flock(lockf, _fc.LOCK_EX | _fc.LOCK_NB)   # one gunicorn worker only
+    except Exception:
+        return
+    signalled: set = set()
+    slot_wait_since = None
+    while True:
+        nap = 600
+        try:
+            need = (_host_reboot_is_peer()
+                    and Path('/var/run/reboot-required').exists()
+                    and not Path('data/host_reboot_off').exists())
+            try:
+                last = time.time() - _HOST_REBOOT_LAST.stat().st_mtime
+            except Exception:
+                last = 1e9
+            try:
+                uptime = float(Path('/proc/uptime').read_text().split()[0])
+            except Exception:
+                uptime = 0.0
+            if not need or last < 24 * 3600 or uptime < 1800:
+                if _HOST_REBOOT_PENDING.exists():
+                    _HOST_REBOOT_PENDING.unlink(missing_ok=True)
+                    log.info('host_reboot: gate released (need=%s last=%.0fs uptime=%.0fs)',
+                             need, last, uptime)
+                signalled.clear()
+                slot_wait_since = None
+            else:
+                nap = 60
+                pend = {}
+                try:
+                    pend = json.loads(_HOST_REBOOT_PENDING.read_text())
+                except Exception:
+                    pend = {'since': time.time()}
+                    log.info('host_reboot: reboot-required → draining (graceful)')
+                pend['touched'] = time.time()
+                # Processor: SIGTERM each python parent once (exit after KG).
+                pids = _processor_python_pids()
+                fresh = [p for p in pids if p not in signalled
+                         and p not in (pend.get('signalled') or [])]
+                if fresh:
+                    _signal_processor_graceful()
+                    signalled.update(fresh)
+                    log.info('host_reboot: graceful stop sent to processor %s', fresh)
+                pend['signalled'] = sorted(set(pend.get('signalled') or []) | signalled)[-20:]
+                busy = _host_reboot_busy(_sp)
+                pend['waiting_for'] = busy or 'reboot slot'
+                _HOST_REBOOT_PENDING.write_text(json.dumps(pend))
+                if not busy:
+                    slot_wait_since = slot_wait_since or time.time()
+                    try:
+                        res = _host_reboot_request_slot('reboot-required')
+                    except Exception as e:
+                        res = {'granted': False, 'error': str(e)[:120]}
+                    if res.get('granted') and not _host_reboot_busy(_sp):
+                        _HOST_REBOOT_LAST.write_text(json.dumps(
+                            {'at': time.time(), 'drain_s': round(time.time() - pend.get('since', time.time()))}))
+                        log.warning('host_reboot: slot granted (%s) → systemctl reboot', res)
+                        _HOST_REBOOT_PENDING.unlink(missing_ok=True)
+                        time.sleep(2)
+                        _sp.run(['sudo', '-n', 'systemctl', 'reboot'], timeout=60)
+                        time.sleep(300)
+                    elif time.time() - slot_wait_since > 3 * 3600:
+                        # Director unreachable / slots never free: resume
+                        # work, try again later (24 h stamp = backoff).
+                        _HOST_REBOOT_LAST.write_text(json.dumps(
+                            {'at': time.time(), 'gave_up': res}))
+                        _HOST_REBOOT_PENDING.unlink(missing_ok=True)
+                        log.warning('host_reboot: no slot in 3 h (%s) — gate released, retry in 24 h', res)
+                else:
+                    slot_wait_since = None
+        except Exception as e:
+            log.warning('host_reboot: %s', e)
+        time.sleep(nap)
+
+
+threading.Thread(target=_host_reboot_thread, daemon=True, name='host-reboot').start()
+
+
 # === SECTION: Status push to director ===
 #
 # Every peer pushes its /processing/status payload to the director
@@ -4158,6 +4314,12 @@ def processing_start():
                          'override deliberately.'}), 403
     except Exception:
         pass
+    # Host-reboot drain (peers only): the processor was asked to exit at the
+    # KG boundary so the VM can reboot — don't let the director restart it
+    # in between. 503 + retry = the director simply tries again next tick.
+    if _host_reboot_pending_active() and not _is_director_local():
+        return jsonify({'error': 'host reboot pending (graceful drain) — retry',
+                        'retry': True, 'host_reboot': True}), 503
     if _processor_process is not None and _processor_process.poll() is None:
         return jsonify({'error': 'Processor already running', 'pid': _processor_process.pid}), 409
     # Also check if processor is running externally (e.g. via systemd or another start)
@@ -8858,6 +9020,66 @@ def admin_ne_tooling():
 
 # === SECTION: sliver sweep (sliver_sweep.py, docs/sliver-sweep.md) ===
 
+_REBOOT_SLOTS_FILE = Path('data/austria_processor/host_reboot_slots.json')
+
+
+@app.route('/api/v1/director/reboot_slot', methods=['POST', 'GET'])
+def director_reboot_slot():
+    """Peer → director: lease one of the fleet-wide host-reboot slots
+    (``app._host_reboot_thread``).  Auth: global ``_enforce_operator_gate``
+    (``/api/v1/director/`` prefix — loopback or ``X-Operator-Token``, the
+    same header every peer→director call carries).  The lease key is the
+    peer's ``peer_id`` (``config.self_id()``) as in ``peer_status``.  At most
+    ``host_reboot_max_parallel`` (knob, default 2) leases of
+    ``host_reboot_lease_s`` (default 1200 s) are live at once, so peers
+    reboot a couple at a time.  ``data/host_reboot_off`` on the director
+    refuses every slot (fleet-wide pause).  GET = current leases."""
+    import fcntl as _fc
+    if not _is_director_local():
+        return jsonify({'error': 'not director'}), 404
+    now = time.time()
+    lease_s = float(pd.knob(None, 'host_reboot_lease_s', 1200) or 1200)
+    maxp = int(pd.knob(None, 'host_reboot_max_parallel', 2) or 0)
+    _REBOOT_SLOTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(_REBOOT_SLOTS_FILE) + '.lock', 'w') as lf:
+        _fc.flock(lf, _fc.LOCK_EX)   # single-flight across gunicorn workers
+        try:
+            st = json.loads(_REBOOT_SLOTS_FILE.read_text())
+        except Exception:
+            st = {}
+        leases = {k: v for k, v in (st.get('leases') or {}).items()
+                  if now - float(v.get('at') or 0) < lease_s}
+        hist = (st.get('history') or [])[-200:]
+        if request.method == 'GET':
+            return jsonify({'leases': leases, 'max_parallel': maxp, 'lease_s': lease_s,
+                            'history': hist[-50:]})
+        body = request.get_json(silent=True) or {}
+        pid = str(body.get('peer_id') or '')[:40]
+        if not pid:
+            return jsonify({'error': 'peer_id required'}), 400
+        if pid == 'primary' or pid == _config.self_id():
+            return jsonify({'granted': False, 'error': 'the director never reboots via slot'}), 403
+        owner = pid
+        if owner in leases:
+            return jsonify({'granted': True, 'renewed': True, 'active': len(leases), 'max': maxp})
+        if Path('data/host_reboot_off').exists() or maxp <= 0:
+            return jsonify({'granted': False, 'reason': 'paused', 'active': len(leases), 'max': maxp})
+        if len(leases) >= maxp:
+            return jsonify({'granted': False, 'reason': 'busy', 'active': len(leases), 'max': maxp,
+                            'holders': sorted(v.get('peer') for v in leases.values())})
+        leases[owner] = {'at': now, 'peer': pid, 'reason': str(body.get('reason') or '')[:60]}
+        hist.append({'at': now, 'peer': pid})
+        tmp = _REBOOT_SLOTS_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps({'leases': leases, 'history': hist}))
+        tmp.replace(_REBOOT_SLOTS_FILE)
+    try:
+        director_event(f'host-reboot {pid}: slot granted ({len(leases)}/{maxp}), '
+                       f'processor drained — rebooting', peer=pid)
+    except Exception:
+        pass
+    return jsonify({'granted': True, 'active': len(leases), 'max': maxp})
+
+
 @app.route('/api/v1/director/sweep/result', methods=['POST'])
 def director_sweep_result():
     """Peer → primary: outcome of one sweep unit.  Query: ``unit``,
@@ -9595,6 +9817,10 @@ def _pkgstat_collect() -> dict:
             pass
     out['reboot_required'] = os.path.exists('/var/run/reboot-required')
     out['kernel'] = os.uname().release
+    try:
+        out['uptime_s'] = int(float(Path('/proc/uptime').read_text().split()[0]))
+    except Exception:
+        pass
     # pip pins (exact `==` lines only) vs what is importable right now
     pins, drift = {}, {}
     try:
@@ -9616,7 +9842,9 @@ def _pkgstat_collect() -> dict:
     out['pip'] = pins
     out['pip_drift'] = drift
     for _k, _f in (('host_patch', 'data/host_patch_state.json'),
-                   ('host_patch_launch', 'data/host_patch_launch')):
+                   ('host_patch_launch', 'data/host_patch_launch'),
+                   ('host_reboot_pending', 'data/host_reboot_pending'),
+                   ('host_reboot_last', 'data/host_reboot_last')):
         try:
             out[_k] = json.loads(Path(_f).read_text())
         except Exception:

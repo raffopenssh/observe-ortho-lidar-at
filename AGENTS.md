@@ -22,7 +22,7 @@ and setup: `README.md`. Security model: `SECURITY.md`.
 | partial products (missing cache layers) | `docs/product-repair.md` | `product_repair.py` |
 | label-id collision guard | `docs/label-mix.md` | `label_mix.py` |
 | sliver sweep (bbox-edge cells) | `docs/sliver-sweep.md` | `sliver_sweep.py` |
-| host patch audit (OS / pip pin drift per VM) | `docs/host-maintenance.md` | `app.py` (`/api/v1/admin/pkgstat`), `tools/fleet_pkgstat.py` |
+| host patch audit / auto-patch / graceful peer reboot | `docs/host-maintenance.md` | `app.py` (`/api/v1/admin/pkgstat`, `_host_patch_*`, `_host_reboot_*`), `tools/fleet_pkgstat.py`, `tools/host_patch.sh` |
 | BEV vector-tile context (`SRTM_BEV_VECTOR_CONTEXT`) | `docs/vct-pilot.md` | `vct_pilot.py`, `ne_build_tiled.py` |
 | licences / attribution strings | `docs/attributions.md` | `attributions.py` |
 | exceptions, logging, caches, conventions | `docs/cross-cutting-concerns.md` | — |
