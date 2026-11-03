@@ -23,5 +23,6 @@ scikit-image==0.26.0
 scikit-learn==1.8.0
 scipy==1.17.1
 shapely==2.1.2
+zstandard==0.22.0
 # dev
 pytest==9.2.0

@@ -261,11 +261,11 @@ grid25 + roof hints + ALS overlay), 50 ms warm; a 0.1° view = 16 requests
   `X-Cells-Partial: 1` when any bin is partial. Bins with no product
   underneath still get an (all-unknown) frame, so the client never has to
   special-case holes. `python3 cells_bins.py --block bi,bj` prints one.
-* **Precompute** — `cells-bins.timer` (**18:00 Europe/Vienna daily, 30 min
-  budget**, `python3 cells_bins.py --prewarm --budget-s 1800 --jobs 2`)
-  builds every bin of the manifest that is missing on disk (first) or whose
-  stored generation differs from the current one (after a KG re-ingest /
-  grid25 re-ingest), and resumes the next day until all of Austria (~16 k
+* **Precompute** — `cells-bins.timer` (**hourly, 50 min budget**,
+  `python3 cells_bins.py --prewarm --budget-s 3000 --jobs 2`; bins → blocks
+  → sample, see §6b) builds every bin of the manifest that is missing on
+  disk (first) or whose stored generation differs from the current one
+  (after a KG re-ingest / grid25 re-ingest), and resumes until all of Austria (~16 k
   bins, ~3.5 GB) is current. `python3 cells_bins.py --status` /
   `GET /cells/bins?status=1` → `{bins, stored_current, missing, stale,
   complete, last_run}`. The on-disk generation is read from the blob header

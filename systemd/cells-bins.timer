@@ -1,9 +1,9 @@
 [Unit]
-Description=daily cells_bins builder, 18:00 Europe/Vienna, 30 min budget (resumes until all bins are stored and current)
+Description=hourly cells_bins builder (bins → blocks → national sample), 50 min budget; resumes until every bin / block is stored and current
 
 [Timer]
-OnCalendar=*-*-* 18:00:00 Europe/Vienna
-RandomizedDelaySec=5m
+OnCalendar=hourly
+RandomizedDelaySec=3m
 Persistent=true
 
 [Install]

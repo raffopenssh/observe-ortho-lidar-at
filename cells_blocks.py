@@ -2,9 +2,8 @@
 national res-10 centre-child sample (``/api/v1/cells/sample``).
 
 Both are **derived from the stored 0.025° bins** (``cells_bins``) — no new
-per-cell computation.  umfeld-at's national glyph filter (their
-``docs/ne-filter.md`` §8) pulls the sample once per epoch and blocks per
-view; both must be cheap to serve (disk → send) and small on the wire.
+per-cell computation.  A downstream national glyph filter pulls the sample
+once per epoch and blocks per view; both must be cheap to serve (disk → send) and small on the wire.
 
 Blocks (``GET /api/v1/cells?bbox=<0.1° block>&format=bin&block=1[&fields=…]``)
 -------------------------------------------------------------------------
@@ -85,10 +84,10 @@ SAMPLE_DEFAULT_RES = 10
 MAX_FIELDSETS = 8
 SAMPLE_CACHE_FILES = 16
 
-# the nine columns umfeld-at's glyph filter asked for (their ne-filter.md §8)
+# the nine columns a downstream glyph filter uses
 GLYPH_FIELDS = ('bld_h_max', 'bld_h_p50', 'stories_max', 'roof_dom', 'canopy_h_p90',
                 'aspect_deg', 'slope_mean', 'slope_p90', 'elev_mean')
-# cheap extras (< ~2 MB each nationally, zstd) we hold but umfeld does not filter on yet
+# cheap extras (< ~2 MB each nationally, zstd) not used by the glyph filter yet
 SAMPLE_EXTRA_FIELDS = ('obs', 'terrain_src', 'bld_n', 'bld_area_sum', 'struct_h_max', 'canopy_h_p50',
                        'lc25', 'tree_n', 'dh_m', 'consistency', 'forest_loss_year', 'phenology',
                        'als_year_newest')
