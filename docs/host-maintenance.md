@@ -22,3 +22,23 @@ every VM); the local instance over loopback needs none.  On hosted VMs
 the kernel is usually managed by the provider (no `linux-image-*`
 package); `reboot_required` from libc6/apparmor is satisfied by restarting
 `srv`/`srv_public`.
+
+### Auto-apply on rollout (peers only)
+
+Every **peer** srv start (= every rollout wave restart, so paced by the
+director) runs `app._host_patch_startup_thread`: after 2 min + 0–10 min
+jitter, if pkgstat shows pending security updates, `requirements.txt` pin
+drift or apt lists > 72 h old, it launches `tools/host_patch.sh` as
+transient root unit `srtm-hostpatch` (`apt-get update && apt-get upgrade`
+non-interactive, confold, `NEEDRESTART_SUSPEND=1` so
+`austria_processor.service` is never restarted mid-KG; `pip install` of
+the drifted `==` pins as the service user into `.venv` — or `--user`
+without one; `apt-get clean`; then `systemctl restart srv`).  Needs
+passwordless `sudo systemd-run` for the service user, like the processor
+launcher.  The processor keeps running and picks up the new libs at its
+next KG.  Guards: never on the director / in single-VM mode
+(`config.single_vm()`), one launch per 6 h (`data/host_patch_launch`),
+flock across gunicorn workers, ≥ 2 GB free disk, off switch
+`data/host_patch_off`.  Result in `data/host_patch_state.json` →
+`host_patch` field of `/admin/pkgstat`; log `/tmp/host_patch.log` on the
+peer; `?q=host_patch` in `/process.txt`.

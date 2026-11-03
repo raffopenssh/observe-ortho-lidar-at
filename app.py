@@ -1931,6 +1931,59 @@ def _als_years_thread():
 threading.Thread(target=_als_years_thread, daemon=True, name='als-years').start()
 
 
+def _host_patch_startup_thread():
+    """One-shot per srv start on *peers*: apply pending apt upgrades +
+    requirements.txt ``==`` pin drift (``tools/host_patch.sh`` in a transient
+    root unit ``srtm-hostpatch``, ends with a restart of ``srv``).
+    Runs from the *new* code right after a rollout restart, so the
+    director's wave pacing paces it too; plus a 0-10 min jitter. Never on
+    the director / in single-VM mode (the operator patches that machine by
+    hand). Loop guard: at most one launch per 6 h. Off switch:
+    ``data/host_patch_off``. Audit: ``python3 tools/fleet_pkgstat.py``
+    (``host_patch`` field). See ``docs/host-maintenance.md -> Host patch``."""
+    import random as _rnd, fcntl as _fc, subprocess as _sp
+    time.sleep(120 + _rnd.uniform(0, 600))
+    repo = Path(__file__).resolve().parent
+    try:
+        if (_config.single_vm() or _is_director_local()
+                or (repo / 'data/host_patch_off').exists()):
+            return
+        stamp = repo / 'data/host_patch_launch'
+        lockf = open(repo / 'data/host_patch.lock', 'w')
+        try:
+            _fc.flock(lockf, _fc.LOCK_EX | _fc.LOCK_NB)  # one gunicorn worker only
+        except OSError:
+            return
+        if stamp.exists() and time.time() - stamp.stat().st_mtime < 6 * 3600:
+            return
+        if _sp.run(['systemctl', 'is-active', '--quiet', 'srtm-hostpatch'],
+                   timeout=10).returncode == 0:
+            return
+        st = _pkgstat_collect()
+        drift = st.get('pip_drift') or {}
+        need = (st.get('security_pending') or 0) > 0 or bool(drift) \
+            or (st.get('apt_lists_age_h') or 0) > 72
+        if not need:
+            return
+        import shutil as _sh
+        if _sh.disk_usage(str(repo)).free < 2 * 1024 ** 3:
+            log.warning('host_patch: skipped, <2 GB free')
+            return
+        pins = [f"{k}=={v['want']}" for k, v in sorted(drift.items()) if v.get('want')]
+        stamp.write_text(json.dumps({'at': time.time(), 'pins': pins,
+                                     'security_pending': st.get('security_pending')}))
+        import getpass as _gp
+        svc_user = _gp.getuser()   # the service user: pip --user + state file owner
+        r = _sp.run(['sudo', '-n', 'systemd-run', '--unit=srtm-hostpatch', '--collect',
+                     '--quiet', '/bin/bash', str(repo / 'tools/host_patch.sh'),
+                     str(repo), svc_user, *pins], capture_output=True, text=True, timeout=30)
+        log.info('host_patch: launched rc=%s sec_pending=%s pins=%s %s', r.returncode,
+                 st.get('security_pending'), pins, (r.stderr or '')[-200:])
+    except Exception as e:
+        log.warning('host_patch startup: %s', e)
+threading.Thread(target=_host_patch_startup_thread, daemon=True, name='host-patch').start()
+
+
 # === SECTION: Status push to director ===
 #
 # Every peer pushes its /processing/status payload to the director
@@ -9562,6 +9615,12 @@ def _pkgstat_collect() -> dict:
         out['pip_err'] = str(e)
     out['pip'] = pins
     out['pip_drift'] = drift
+    for _k, _f in (('host_patch', 'data/host_patch_state.json'),
+                   ('host_patch_launch', 'data/host_patch_launch')):
+        try:
+            out[_k] = json.loads(Path(_f).read_text())
+        except Exception:
+            pass
     out['at'] = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
     return out
 

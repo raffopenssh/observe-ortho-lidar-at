@@ -41,3 +41,7 @@ data/ne/
 data/*.db
 data/*.sqlite*
 .venv/
+data/host_patch_state.json
+data/host_patch_launch
+data/host_patch.lock
+data/host_patch_off
