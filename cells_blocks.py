@@ -483,7 +483,11 @@ def build_sample(res: int = SAMPLE_DEFAULT_RES, *, force: bool = False, verbose:
     """Reduce every stored bin to its centre-child rows → ``sample/r<res>.nex.zst``.
     Bins missing on disk are skipped (counted in ``bins_missing``) — the next
     prewarm pass builds them and the generation then differs → rebuild."""
-    t0 = time.time()
+    with cb._lock_for(('sample', res)):      # one builder at a time (timer + CLI)
+        return _build_sample_locked(res, force=force, verbose=verbose, budget_s=budget_s, t0=time.time())
+
+
+def _build_sample_locked(res, *, force, verbose, budget_s, t0):
     gen = sample_gen()
     old = sample_meta(res)
     if old and old.get('gen') == gen and not force:
