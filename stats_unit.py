@@ -14,9 +14,12 @@ running in a 2-thread pool and answers 202 until the cache is warm.
 """
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import logging
+import struct
+import zlib
 import sqlite3
 import threading
 import time
@@ -47,6 +50,10 @@ MAX_AGE = 600
 MEM_LRU_N = 4_096
 DB_MAX_ROWS = 30_000               # ≈ 1 KB each → ≤ 30 MB on disk
 FORMATS = ('json', 'flat', 'csv')
+CELLS_MAGIC = b'NEI1'                # POST unit=cells body: magic · u32 n · n×u64 LE res-12 ids (gzip'd)
+CELLS_MAX_N = 1_000_000
+CELLS_MAX_SCALE = 7 ** 6            # ≥ one res-12 cell standing for a whole res-6 cell
+CELLS_EXACT_AREA_MAX_R10 = 60_000   # per-r10 h3 area below this many parents, res-8 ancestor / 2401 above
 
 GROUPS = list(ne_h3.GROUPS)
 CONS = list(ca._CONSISTENCY_NAMES)       # 7 public verdict names
@@ -472,6 +479,116 @@ def unit_bbox(raw: str, wait_s: float) -> dict | None:
     return _envelope(unit, acc, ts, cells_total=int(ids.size), area_ha=area_ha)
 
 
+# === SECTION: cell lists (POST unit=cells, stats-envelope §6) ===
+
+def parse_cells_body(raw: bytes, encoding: str | None) -> np.ndarray:
+    """gzip'd ``NEI1`` · u32 n · n×u64 LE → sorted unique res-12 ids. Raises StatsError."""
+    if not raw:
+        raise StatsError(400, 'empty body (expected gzip\'d NEI1 cell list)')
+    enc = (encoding or '').lower()
+    max_raw = 8 + 8 * CELLS_MAX_N + 64
+    try:
+        if 'gzip' in enc or raw[:2] == b'\x1f\x8b':
+            d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            data = d.decompress(raw, max_raw + 1)
+            if d.unconsumed_tail:
+                raise StatsError(413, f'cell list > {CELLS_MAX_N} ids', max_n=CELLS_MAX_N)
+        else:
+            data = raw
+    except StatsError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise StatsError(400, f'bad gzip body: {e}')
+    if len(data) < 8 or data[:4] != CELLS_MAGIC:
+        raise StatsError(400, 'bad magic: body must start with "NEI1"', magic=data[:4].decode('latin1'))
+    n = struct.unpack('<I', data[4:8])[0]
+    if n > CELLS_MAX_N:
+        raise StatsError(413, f'cell list > {CELLS_MAX_N} ids', n=n, max_n=CELLS_MAX_N)
+    if len(data) < 8 + 8 * n:
+        raise StatsError(400, f'truncated body: header says {n} ids, got {(len(data) - 8) // 8}', n=n)
+    ids = np.frombuffer(data, dtype='<u8', count=n, offset=8).astype(np.uint64)
+    if n == 0:
+        return ids
+    if np.any(((ids >> np.uint64(52)) & np.uint64(0xF)) != np.uint64(ca.RES)):
+        bad = int(ids[((ids >> np.uint64(52)) & np.uint64(0xF)) != np.uint64(ca.RES)][0])
+        raise StatsError(400, f'all ids must be H3 res-{ca.RES}', bad_id=f'{bad:x}')
+    if not np.all(ids[1:] >= ids[:-1]):
+        ids = np.sort(ids)
+    return np.unique(ids) if np.any(ids[1:] == ids[:-1]) else ids
+
+
+def _cells_area_m2(ids: np.ndarray) -> float:
+    """Σ res-12 cell areas: exact per res-10 parent (as the chunk rule in ``_acc_from_table``),
+    res-8 ancestor / 7^4 for very long lists (≤ 0.5 % off, 49× fewer h3 calls)."""
+    if ids.size == 0:
+        return 0.0
+    hn = ca._h3n()
+    r10, cnt = np.unique(ne_h3.h3_parent_vec(ids, ca.CHUNK_RES), return_counts=True)
+    if r10.size <= CELLS_EXACT_AREA_MAX_R10:
+        par, div = r10, 49.0
+    else:
+        r8 = ne_h3.h3_parent_vec(r10, 8)
+        par, inv = np.unique(r8, return_inverse=True)
+        cnt = np.bincount(inv, weights=cnt, minlength=par.size)
+        div = 49.0 * 49.0
+    areas = np.array([hn.cell_area(int(x), unit='m^2') for x in par.tolist()]) / div
+    return float((areas * cnt).sum())
+
+
+def _scale_figures(fig: dict, scale: int) -> dict:
+    """× scale on every summed figure (``_ha`` / ``_n`` keys incl. the dotted groups);
+    means, ``_pct``, extremes and years untouched."""
+    if scale == 1:
+        return fig
+    out = OrderedDict()
+    for k, v in fig.items():
+        if k in ('cells_n', 'area_ha'):          # already n × scale / Σ areas × scale from the caller
+            out[k] = v
+        elif k.endswith(('_ha', '_n')) or k.startswith(('cover_ha.', 'consistency_ha.', 'consistency_n.')):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                out[k] = v
+            else:
+                out[k] = int(v) * scale if isinstance(v, int) else round(v * scale, 2)
+        else:
+            out[k] = v
+    return out
+
+
+def unit_cells(ids: np.ndarray, scale: int, wait_s: float, year: str | None = None) -> dict | None:
+    n = int(ids.size)
+    h = hashlib.sha256(ids.tobytes()).hexdigest()[:16]
+    bbox = ca._bbox_of_ids(ids) if n else (0.0, 0.0, 0.0, 0.0)
+    fp, _on, _miss = _fingerprint_bbox(*bbox) if n else ('empty', [], [])
+
+    def _compute() -> dict:
+        if n == 0:
+            a = _acc_empty(); a['want'] = 0; a['miss'] = []; a['pend'] = []; a['pfiles'] = []
+            return a
+        t, hdrs, meta = ca.select(ids, bbox)
+        a = _acc_from_table(t, hdrs)
+        a['miss'] = []          # bbox-of-list spans KGs the list never touches — report unknown cells instead
+        a['pend'] = []
+        a['pfiles'] = meta.get('partial_files') or []
+        a['want'] = n
+        a['list_area_m2'] = round(_cells_area_m2(ids), 1)
+        return a
+
+    r = _get_or_compute(f'cl:{h}:{n}', fp, _compute, wait_s=wait_s, persist=n > 20_000)
+    if r is None:
+        return None
+    acc, ts = r
+    unit = {'kind': 'cells', 'key': h, 'bbox': [round(x, 6) for x in bbox] if n else None, 'n': n, 'scale': scale}
+    if year:
+        unit['year'] = year
+    area_ha = (acc.get('list_area_m2') or 0.0) / 1e4 * scale
+    note = f'{n} listed cells × {scale}' if scale != 1 else None
+    env = _envelope(unit, acc, ts, cells_total=n * scale, area_ha=area_ha, note=note)
+    if scale != 1:
+        env['figures'] = _scale_figures(env['figures'], scale)
+        env['coverage']['cells_known'] = int(acc['kn']) * scale
+    return env
+
+
 # === SECTION: route ===
 
 def _filter_keys(fig: dict, keys: list[str] | None) -> dict:
@@ -521,13 +638,18 @@ def _on_err(e: StatsError):
     return r
 
 
-@stats_bp.route('/api/v1/stats/unit')
+@stats_bp.route('/api/v1/stats/unit', methods=['GET', 'POST'])
 def stats_unit_route():
     a = request.args
-    sel = [k for k in ('h3', 'kg', 'bbox') if a.get(k)]
-    if len(sel) != 1:
-        raise StatsError(400, 'exactly one of h3=, kg=, bbox= is required',
-                         example='/api/v1/stats/unit?kg=63330')
+    if request.method == 'POST':
+        if (a.get('unit') or 'cells') != 'cells':
+            raise StatsError(400, 'POST takes unit=cells with a gzip\'d NEI1 body (stats-envelope.md §6)')
+        sel = ['cells']
+    else:
+        sel = [k for k in ('h3', 'kg', 'bbox') if a.get(k)]
+        if len(sel) != 1:
+            raise StatsError(400, 'exactly one of h3=, kg=, bbox= is required',
+                             example='/api/v1/stats/unit?kg=63330')
     fmt = (a.get('format') or 'json').lower()
     if fmt not in FORMATS:
         raise StatsError(400, f'format must be one of {FORMATS}')
@@ -558,8 +680,22 @@ def stats_unit_route():
             pending = 1
         else:
             envs.append(env)
-    else:
+    elif kind == 'bbox':
         env = unit_bbox(a['bbox'], BUDGET_S)
+        multi = False
+        if env is None:
+            pending = 1
+        else:
+            envs.append(env)
+    else:
+        try:
+            scale = int(a.get('scale') or 1)
+        except ValueError:
+            raise StatsError(400, 'scale must be an integer')
+        if not 1 <= scale <= CELLS_MAX_SCALE:
+            raise StatsError(400, f'scale must be 1–{CELLS_MAX_SCALE}')
+        ids = parse_cells_body(request.get_data(cache=False), request.headers.get('Content-Encoding'))
+        env = unit_cells(ids, scale, BUDGET_S, year=(a.get('year') or '').strip() or None)
         multi = False
         if env is None:
             pending = 1
