@@ -311,7 +311,8 @@ computation; the only epoch/version signal is the existing `X-Cells-Epoch`
   columns `{bi, bj, gen, etag, bytes, stored, current, n, bins_n, complete}`
   for every block touching a published product; `bytes`/`n` null until
   prebuilt for that field set (`stored`), `current` = stored gen == gen.
-  ETag `"blocks-<generation>"`; `epoch=` ≠ current `X-Cells-Epoch` → 409
+  ETag `"blocks-<generation>"`; `epoch=` not an epoch still present in the
+  corpus (a block's own `X-Cells-Epoch` always is) → 409
   `{epoch}`. `?status=1` → builder/sample status (also on `/cells/bins?status=1`).
 * **`GET /api/v1/cells/sample?res=10&format=bin[&fields=glyph|default|*|a,b]`**
   — one row per res-10 cell of Austria = its res-12 **centre child**

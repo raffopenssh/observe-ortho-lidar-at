@@ -415,8 +415,13 @@ def index_status() -> dict:
             'generation': cells_generation()}
 
 
+def _epochs() -> list[str]:
+    """Every product epoch present in the corpus, ascending."""
+    return sorted({f['epoch'] for f in _files().values() if f.get('epoch')})
+
+
 def _epoch_pin() -> str | None:
-    eps = sorted({f['epoch'] for f in _files().values() if f.get('epoch')})
+    eps = _epochs()
     return eps[-1] if eps else None
 
 
@@ -1760,7 +1765,10 @@ def cells_blocks_manifest():
     fields = cells_bins.parse_fields(a.get('fields'))
     want = (a.get('epoch') or '').strip()
     cur = epoch_hdr(None)
-    if want and cur and want != cur:
+    # a block's own X-Cells-Epoch is the newest epoch of *its* products, which
+    # may trail the corpus pin while a new epoch lands — any epoch still on
+    # disk is current enough; only a vanished / unknown one is a 409.
+    if want and cur and want != cur and want not in _epochs():
         raise CellsError(409, f'epoch {want!r} is not current', epoch=cur)
     m = cells_blocks.manifest(fields)
     etag = f'"blocks-{m["generation"]}"'

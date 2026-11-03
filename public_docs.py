@@ -157,7 +157,7 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
     Prebuilt on disk and served zstd (send Accept-Encoding: zstd; else inflated + gzip): ≈ 0.7–1.1 MB per block
     for the 9 glyph fields, < 100 ms warm. ETag "B-<gen>-<hash>", X-Cells-Gen, X-Cells-Epoch, X-Cells-Ids: bitmap.
     Manifest: GET /api/v1/cells/blocks?fields=… → columns {{bi, bj, gen, etag, bytes, stored, current, n, bins_n,
-    complete}} (bytes null until prebuilt for that field set); epoch= must equal X-Cells-Epoch (else 409).
+    complete}} (bytes null until prebuilt for that field set); epoch= must be an epoch still in the corpus (else 409).
   /api/v1/cells/sample?res=10&format=bin[&fields=glyph|default|*|a,b,…]  → the NATIONAL SAMPLE for the glyph
     filter: one NEX1 row per res-10 cell of Austria = its res-12 centre child (cellToCenterChild(parent,12);
     parent = cellToParent(id,10)), ascending H3, every cell with DTM (terrain_src != 0), ≈ 5.6 M rows, ids

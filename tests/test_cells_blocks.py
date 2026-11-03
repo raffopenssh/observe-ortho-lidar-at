@@ -3,6 +3,7 @@ import sys, os, gzip, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import h3
+import pytest
 import cells_api as ca
 import cells_bins as cb
 import cells_blocks as cbl
@@ -15,7 +16,8 @@ def _stored_block():
     for i, j in st:
         per[(i // 4, j // 4)] = per.get((i // 4, j // 4), 0) + 1
     full = sorted(k for k, v in per.items() if v == 16)
-    assert full, 'no fully stored block on disk'
+    if not full:
+        pytest.skip('needs a fully stored 0.1° block on disk (python3 cells_bins.py --prewarm)')
     return full[len(full) // 2]
 
 
@@ -91,4 +93,7 @@ def test_routes():
 if __name__ == '__main__':
     for n, f in list(globals().items()):
         if n.startswith('test_'):
-            f(); print('ok', n)
+            try:
+                f(); print('ok', n)
+            except pytest.skip.Exception as e:
+                print('skip', n, e)
