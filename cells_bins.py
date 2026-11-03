@@ -65,7 +65,10 @@ log = logging.getLogger('cells_bins')
 
 # === SECTION: constants ===
 
-ALGO = 'nex-1'
+ALGO = 'nex-2'                   # nex-2 (2026-11-03): + tree_h_n / tree_h ragged apex-height lists
+GEN_ALGO = 'nex-1'               # part of the gen hash — NOT bumped for nex-2: frames of existing field lists are byte-identical,
+                                 # so every consumer cache keyed on X-Cells-Gen stays valid; blobs lacking a nex-2 column are rebuilt on demand
+RAGGED = {'tree_h': 'tree_h_n'}  # ragged column → its per-row count column (always emitted before it)
 MAGIC = b'NEX1'
 BLOCK_MAGIC = b'NEXB'
 BIN_DEG = 0.025
@@ -118,6 +121,10 @@ _f('struct_h_max', 'u8', '×0.5 m', U8_UNK, 'tallest man-made object of ANY type
 # --- trees (NET1 apices h ≥ 3 m) -------------------------------------------
 _f('canopy_h_p90', 'u8', '×0.5 m', U8_UNK, 'p90 of apex heights in the cell; 0 = no apex', 'net1')
 _f('canopy_h_p50', 'u8', '×0.5 m', U8_UNK, 'median apex height; 0 = no apex', 'net1')
+_f('tree_h_n', 'u16', 'count', None, 'exact number of apices (h ≥ 3 m) in the cell = length of its tree_h list (tree_n saturates at 255)', 'net1')
+_f('tree_h', 'u8', '×0.5 m', None, 'RAGGED: the apex heights of every cell back to back (1..254 ×0.5 m, same scale as tree_h_max), '
+   'SORTED ASCENDING within a cell; cell k owns tree_h[off[k]:off[k+1]] with off = [0, cumsum(tree_h_n)] — a height-range count '
+   'is two binary searches per cell; requesting tree_h always emits tree_h_n right before it', 'net1', shape='ragged')
 # --- 25 m grid (json_v2 landcover.grid25) for cells without a row ------------
 _f('lc25', 'u8', 'class code (header.lc25_legend)', U8_UNK, 'dominant segment class of the 25 m grid cell under the centre (0 = unclassified)', 'grid25')
 _f('lc25_frac', 'u8', '/255', U8_UNK, 'share of that 25 m cell in the dominant class', 'grid25')
@@ -236,7 +243,7 @@ def _gen(i: int, j: int, parts: list, stamps: list) -> str:
     published product in the bin + grid25 store stamps of every parent
     intersecting it (published or not)."""
     h = hashlib.sha256()
-    h.update(f'{ALGO}|{_green_fix.FIX_ID}|{i},{j}\n'.encode())
+    h.update(f'{GEN_ALGO}|{_green_fix.FIX_ID}|{i},{j}\n'.encode())
     h.update(json.dumps(sorted(parts)).encode()); h.update(json.dumps(sorted(stamps)).encode())
     return h.hexdigest()[:24]
 
@@ -345,6 +352,33 @@ def _per_cell_stats(cell_idx: np.ndarray, vals: np.ndarray, n: int):
     mx[has] = v[np.clip(ends - 1, 0, max(v.size - 1, 0))][has]
     p50[has] = v[i50][has]; p90[has] = v[i90][has]
     return mx, p50, p90, cnt
+
+
+def ragged_heights(cell_idx: np.ndarray, h_m: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
+    """(tree_h_n u16[n], tree_h u8[total]) — apex heights ×0.5 m (1..254), grouped
+    by cell in row order and sorted ascending inside each cell."""
+    q = np.clip(np.round(h_m * 2.0), 1, 254).astype(np.uint8)
+    o = np.lexsort((q, cell_idx))
+    cnt = np.bincount(cell_idx, minlength=n)
+    return np.minimum(cnt, 65535).astype('<u2'), np.ascontiguousarray(q[o])
+
+
+def ragged_offsets(counts: np.ndarray) -> np.ndarray:
+    off = np.zeros(counts.size + 1, np.int64); np.cumsum(counts, out=off[1:]); return off
+
+
+def ragged_take(counts: np.ndarray, blob: np.ndarray, sel: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Row subset (bool mask or index array, in output order) of a ragged column."""
+    counts = np.asarray(counts); blob = np.asarray(blob)
+    if sel.dtype == bool:
+        return counts[sel], blob[np.repeat(sel, counts)]
+    c = counts[sel].astype(np.int64)
+    starts = ragged_offsets(counts)[:-1][sel]
+    tot = int(c.sum())
+    if tot == 0:
+        return counts[sel], blob[:0]
+    idx = np.repeat(starts - (np.cumsum(c) - c), c) + np.arange(tot)
+    return counts[sel], blob[idx]
 
 
 def _roof_points(parent: str) -> tuple[np.ndarray, np.ndarray]:
@@ -506,13 +540,16 @@ def build_bin(i: int, j: int, inputs: dict | None = None) -> dict:
     cols['struct_h_max'] = _u8h(any_max, np.isfinite(any_max), unknown)
     # --- NET1 apices → canopy height percentiles ------------------------------
     c90 = np.full(N, np.nan); c50 = np.full(N, np.nan)
+    th_n = np.zeros(N, '<u2'); th = np.zeros(0, np.uint8)
     if len(tb):
         ci, words = tb.gather_trees()
         if words.size:
             h = ca.decode_trees(words)['h_m']
             _, c50, c90, _ = _per_cell_stats(pos[ci], h, N)
+            th_n, th = ragged_heights(pos[ci], h, N)
     cols['canopy_h_p90'] = _u8h(c90, np.isfinite(c90), unknown)
     cols['canopy_h_p50'] = _u8h(c50, np.isfinite(c50), unknown)
+    cols['tree_h_n'] = th_n; cols['tree_h'] = th
     cols['lc25'] = lc25; cols['lc25_frac'] = lcf; cols['canopy25'] = can25; cols['woody25'] = wood25
     # --- ALS years ------------------------------------------------------------
     ay_new = np.full(N, U16_UNK, '<u2'); ay_old = np.full(N, U16_UNK, '<u2')
@@ -541,15 +578,29 @@ def build_bin(i: int, j: int, inputs: dict | None = None) -> dict:
 def _col_spec(name: str, a: np.ndarray) -> dict:
     f = FIELDS[name]
     d = {'name': name, 'dtype': f['dtype'], 'bytes': int(a.nbytes), 'unit': f['unit']}
-    if f.get('shape'):
+    if f.get('shape') == 'ragged':
+        d['shape'] = 'ragged'; d['counts'] = RAGGED[name]; d['sorted'] = 'ascending within row'
+    elif f.get('shape'):
         d['shape'] = f['shape']
     if f.get('nodata') is not None:
         d['nodata'] = f['nodata']
     return d
 
 
+def with_ragged_counts(fields) -> list[str]:
+    """Field list with every ragged column's count column inserted right before it."""
+    out = []
+    for f in fields:
+        c = RAGGED.get(f)
+        if c and c not in out:
+            out.append(c)
+        if f not in out:
+            out.append(f)
+    return out
+
+
 def encode(hdr: dict, cols: 'OrderedDict[str, np.ndarray]', fields: list[str] | None = None, ids_enc: str = 'delta_u64') -> bytes:
-    names = ['id'] + [f for f in (fields or list(cols)) if f != 'id' and f in cols]
+    names = ['id'] + [f for f in with_ragged_counts(fields or list(cols)) if f != 'id' and f in cols]
     parts = []; specs = []
     for nm in names:
         a = cols[nm]
@@ -573,7 +624,7 @@ def decode(blob: bytes) -> tuple[dict, 'OrderedDict[str, np.ndarray]']:
     for c in hdr['columns']:
         nb = int(c['bytes'])
         a = np.frombuffer(blob[off:off + nb], NP_DT[c['dtype']])
-        if c.get('shape'):
+        if c.get('shape') and c['shape'] != 'ragged':
             a = a.reshape((n, *c['shape']))
         if c['name'] == 'id' and hdr.get('ids') == 'delta_u64':
             a = np.cumsum(a.astype(np.int64)).astype('<u8')
@@ -623,7 +674,7 @@ def stored_gen(i: int, j: int) -> str | None:
             if len(raw) < 8 + ln:          # header longer than the first 16 KiB inflate → full read
                 raw = zlib.decompress(p.read_bytes())
             h = json.loads(raw[8:8 + ln])
-            gen = h.get('gen') if h.get('algo') == ALGO else None
+            gen = h.get('gen') if h.get('algo') == ALGO else None   # older algo → 'missing' → rebuilt first by prewarm
     except Exception as e:  # noqa: BLE001
         log.debug('cells_bins: stored_gen %s: %s', p, e)
     with _stored_gen_guard:
@@ -633,23 +684,33 @@ def stored_gen(i: int, j: int) -> str | None:
     return gen
 
 
-def load_bin(i: int, j: int, *, rebuild: bool = False) -> tuple[dict, 'OrderedDict[str, np.ndarray]', dict]:
+COMPAT_ALGOS = ('nex-1',)        # older on-disk blobs still served for field lists they contain
+
+
+def load_bin(i: int, j: int, *, rebuild: bool = False, need=None) -> tuple[dict, 'OrderedDict[str, np.ndarray]', dict]:
     """Current blob for a bin: memory → disk (if its gen matches) → build.
-    Returns (hdr, cols, inputs)."""
+    Returns (hdr, cols, inputs).  A blob of an older algo is accepted (its
+    columns are byte-identical) unless a column in ``need`` is absent from it —
+    then it is rebuilt in place (and the prewarm rebuilds all of them anyway)."""
     inp = bin_inputs(i, j)
     key = (i, j, inp['gen'])
+    need = tuple(need or ())
+
+    def ok(hdr, cols):
+        return hdr.get('gen') == inp['gen'] and (hdr.get('algo') == ALGO or (hdr.get('algo') in COMPAT_ALGOS
+                                                                          and all(f in cols for f in need)))
     hit = None if rebuild else _blob_lru.get(key)
-    if hit is not None:
+    if hit is not None and ok(*hit):
         return hit[0], hit[1], inp
     with _lock_for((i, j)):
         hit = None if rebuild else _blob_lru.get(key)
-        if hit is not None:
+        if hit is not None and ok(*hit):
             return hit[0], hit[1], inp
         p = _path(i, j)
         if not rebuild and p.exists():
             try:
                 hdr, cols = decode(zlib.decompress(p.read_bytes()))
-                if hdr.get('gen') == inp['gen'] and hdr.get('algo') == ALGO:
+                if ok(hdr, cols):
                     _blob_lru.put(key, (hdr, cols))
                     return hdr, cols, inp
             except Exception as e:  # noqa: BLE001
@@ -757,7 +818,7 @@ def parse_fields(raw: str | None) -> list[str]:
     bad = [f for f in fs if f not in FIELDS]
     if bad:
         raise ca.CellsError(400, f'unknown bin fields {bad}', fields=[f for f in FIELDS if f != 'id'])
-    return [f for f in fs if f != 'id']
+    return with_ragged_counts([f for f in fs if f != 'id'])
 
 
 def _kgs_of_bin_sorted(inp):
@@ -767,7 +828,7 @@ def _kgs_of_bin_sorted(inp):
 def serve(i: int, j: int, fields: list[str], ids_enc: str, *, rebuild: bool = False) -> tuple[bytes, dict, str]:
     """→ (body, headers, etag) for a bin request.  Only the ETag check needs
     the generation; the blob is read lazily (304 never touches it)."""
-    hdr, cols, inp = load_bin(i, j, rebuild=rebuild)
+    hdr, cols, inp = load_bin(i, j, rebuild=rebuild, need=fields)
     body = encode(hdr, cols, fields, ids_enc)
     etag = bin_etag(hdr['gen'], fields, ids_enc)
     hx = {'X-Cells-Gen': hdr['gen'], 'X-Cells-Bin': f'{i},{j}',
@@ -803,7 +864,7 @@ def serve_block(bi: int, bj: int, fields: list[str], ids_enc: str, *, rebuild: b
     frames = []; entries = []; gens = []; kgs = set(); epochs = []; partial = False
     off = 0
     for i, j in block_bins(bi, bj):
-        hdr, cols, inp = load_bin(i, j, rebuild=rebuild)
+        hdr, cols, inp = load_bin(i, j, rebuild=rebuild, need=fields)
         fb = encode(hdr, cols, fields, ids_enc)
         entries.append({'i': i, 'j': j, 'off': off, 'len': len(fb), 'gen': hdr['gen'], 'n': int(hdr['n']),
                         'complete': bool(hdr.get('complete'))})
@@ -878,6 +939,11 @@ def dict_block() -> dict:
             'buildings': 'bld_* = objects of type roof / greenhouse / solar_panel (header.building_types); struct_h_max = any type; '
                          'stories_max uses the product rule max(1, round(h_max / 3 m))',
             'roof_dom': 'only where the product carries a roof hint (new_buildings features); 0 elsewhere — treat as unknown, not flat',
+            'tree_h': 'RAGGED apex-height lists (nex-2, 2026-11-03): tree_h_n (u16, exact count, same population as the trees layer: '
+                      'every apex h ≥ 3 m) then tree_h (u8 ×0.5 m, 1..254) — all cells\' lists back to back in row order, each sorted '
+                      'ascending; off = [0, cumsum(tree_h_n)], cell k = tree_h[off[k]:off[k+1]]; count in [a,b) = two searchsorted per cell. '
+                      'Only materialised when tree_h is in fields= (tree_h_n is auto-inserted before it); in NEXB v2 the rows of the 16 bins '
+                      'concatenate like every other column. Counts are sent instead of offsets because they zstd 3× smaller',
             'grid25': 'lc25 / lc25_frac / canopy25 / woody25 sample the 25 m product grid at the cell centre — available for '
                       'cells without an observation row too',
         },
@@ -940,7 +1006,7 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
             stop = True
             return
         try:
-            load_bin(*ij)
+            load_bin(*ij, rebuild=True)
             with lock:
                 n_built += 1
                 if verbose and n_built % 50 == 0:

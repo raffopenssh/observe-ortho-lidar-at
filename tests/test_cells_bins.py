@@ -107,7 +107,7 @@ def test_block_geometry():
 
 def test_block_container_roundtrip(monkeypatch):
     """serve_block = NEXB header + 16 frames, each byte-identical to encode() of the bin."""
-    def fake_load(i, j, rebuild=False):
+    def fake_load(i, j, rebuild=False, need=None):
         n = 3
         ids = np.array([i * 100 + j * 10 + k for k in range(n)], '<u8')
         cols = {'id': ids, 'obs': np.ones(n, np.uint8), 'elev_mean': np.full(n, i, '<u2')}
@@ -142,3 +142,38 @@ def test_stored_gen_header_peek(tmp_path, monkeypatch):
     hdr['gen'] = 'zzz'
     (tmp_path / '1_2.nex').write_bytes(zlib.compress(cb.encode(hdr, cols, None, 'delta_u64'), 6))
     assert cb.stored_gen(1, 2) == 'zzz'
+
+
+def test_ragged_heights_and_take():
+    cell = np.array([2, 0, 2, 2, 0])
+    h = np.array([10.0, 3.0, 4.0, 30.0, 12.25])
+    n, blob = cb.ragged_heights(cell, h, 4)
+    assert n.tolist() == [2, 0, 3, 0] and n.dtype == np.dtype('<u2')
+    assert blob.tolist() == [6, 24, 8, 20, 60]            # ×0.5 m, ascending within cell
+    off = cb.ragged_offsets(n)
+    assert off.tolist() == [0, 2, 2, 5, 5]
+    # mask subset
+    n2, b2 = cb.ragged_take(n, blob, np.array([True, False, True, False]))
+    assert n2.tolist() == [2, 3] and b2.tolist() == [6, 24, 8, 20, 60]
+    # index permutation
+    n3, b3 = cb.ragged_take(n, blob, np.array([2, 3, 0]))
+    assert n3.tolist() == [3, 0, 2] and b3.tolist() == [8, 20, 60, 6, 24]
+    assert cb.ragged_take(n, blob, np.array([1, 3]))[1].size == 0
+
+
+def test_ragged_codec_roundtrip():
+    ids = np.array([10, 11, 13], '<u8')
+    cols = {'id': ids, 'obs': np.array([1, 0, 1], np.uint8), 'tree_h_n': np.array([2, 0, 1], '<u2'),
+            'tree_h': np.array([6, 24, 60], np.uint8)}
+    hdr = {'n': 3, 'gen': 'g', 'epoch': '2026-10'}
+    assert cb.with_ragged_counts(['obs', 'tree_h']) == ['obs', 'tree_h_n', 'tree_h']
+    assert cb.parse_fields('tree_h,obs') == ['tree_h_n', 'tree_h', 'obs']
+    blob = cb.encode(hdr, cols, ['obs', 'tree_h'])
+    h, c = cb.decode(blob)
+    assert h['fields'] == ['obs', 'tree_h_n', 'tree_h']
+    spec = [x for x in h['columns'] if x['name'] == 'tree_h'][0]
+    assert spec['shape'] == 'ragged' and spec['counts'] == 'tree_h_n' and spec['bytes'] == 3
+    assert c['tree_h'].tolist() == [6, 24, 60] and c['tree_h_n'].tolist() == [2, 0, 1]
+    # without tree_h nothing ragged is emitted
+    h, c = cb.decode(cb.encode(hdr, cols, ['obs']))
+    assert list(c) == ['id', 'obs']

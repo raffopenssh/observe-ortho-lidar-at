@@ -85,3 +85,10 @@ if __name__ == '__main__':
     for n, f in list(globals().items()):
         if n.startswith('test_'):
             f(); print('ok', n)
+
+
+def test_tree_hh_band():
+    import cells_national as cn
+    h = np.array([3.0, 4.75, 5.0, 9.9, 10.0, 34.9, 35.0, 54.9, 55.0, 63.75])
+    assert cn.tree_hh_band(h).tolist() == [0, 0, 1, 1, 2, 6, 7, 10, 11, 11]
+    assert cn.TREE_HH_BANDS == 12 and cn.FIELDS['tree_hh']['shape'] == [12]

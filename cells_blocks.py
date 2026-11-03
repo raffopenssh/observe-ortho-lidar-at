@@ -72,7 +72,7 @@ log = logging.getLogger('cells_blocks')
 # === SECTION: constants ===
 
 ALGO = 'nexb-2'
-SAMPLE_ALGO = 'sample-1'
+SAMPLE_ALGO = 'sample-2'         # sample-2 (2026-11-03): + tree_h_n / tree_h ragged lists
 BLOCK_DIR = ca.NE_DIR / 'nexb'          # NOT data/ne/blocks — that holds the split-KG .h3b products
 SAMPLE_DIR = ca.NE_DIR / 'sample'
 SAMPLE_CACHE = SAMPLE_DIR / 'cache'
@@ -135,12 +135,12 @@ def _bitmap(n: int) -> bytes:
 def build_block(bi: int, bj: int, fields, *, rebuild: bool = False) -> tuple[dict, bytes, list[dict]]:
     """→ (header, raw NEXB v2 body, bin inputs).  Loads (builds if needed) the
     16 bins via :func:`cells_bins.load_bin`."""
-    fields = [f for f in fields if f != 'id']
+    fields = cb.with_ragged_counts([f for f in fields if f != 'id'])
     cols = {f: [] for f in fields}
     entries = []; gens = []; kgs = set(); epochs = []; inps = []
     row0 = 0; legend: dict = {}
     for i, j in cb.block_bins(bi, bj):
-        hdr, c, inp = cb.load_bin(i, j, rebuild=rebuild)
+        hdr, c, inp = cb.load_bin(i, j, rebuild=rebuild, need=fields)
         ids = np.ascontiguousarray(c['id']).astype(np.uint64)
         n = int(ids.size)
         x = int(np.bitwise_xor.reduce(ids)) if n else 0
@@ -188,7 +188,7 @@ def decode_block(blob: bytes) -> tuple[dict, np.ndarray, 'OrderedDict[str, np.nd
     for c in hdr['columns']:
         nb = int(c['bytes'])
         a = np.frombuffer(blob[off:off + nb], cb.NP_DT[c['dtype']])
-        if c.get('shape'):
+        if c.get('shape') and c['shape'] != 'ragged':
             a = a.reshape((n, *c['shape']))
         cols[c['name']] = a; off += nb
     return hdr, present, cols
@@ -233,7 +233,7 @@ def store_block(bi: int, bj: int, fields, *, rebuild: bool = False) -> dict:
 
 def serve_block(bi: int, bj: int, fields, *, rebuild: bool = False) -> tuple[bytes, dict, str, dict]:
     """→ (zstd body, headers, etag, meta).  Disk when current, else build+store."""
-    fields = [f for f in fields if f != 'id']
+    fields = cb.with_ragged_counts([f for f in fields if f != 'id'])
     gen, inps = current_gen(bi, bj)
     zp, _ = _paths(bi, bj, fields)
     meta = None if rebuild else stored_meta(bi, bj, fields)
@@ -267,7 +267,7 @@ def serve_block(bi: int, bj: int, fields, *, rebuild: bool = False) -> tuple[byt
 
 def quick_etag(bi: int, bj: int, fields) -> tuple[str, str, list[dict]]:
     gen, inps = current_gen(bi, bj)
-    return block_etag(gen, [f for f in fields if f != 'id']), gen, inps
+    return block_etag(gen, cb.with_ragged_counts([f for f in fields if f != 'id'])), gen, inps
 
 
 # === SECTION: field-set registry (what to prewarm) ===
@@ -487,64 +487,122 @@ def build_sample(res: int = SAMPLE_DEFAULT_RES, *, force: bool = False, verbose:
 
 
 def _build_sample_locked(res, *, force, verbose, budget_s, t0):
+    """Memory-bounded: pass 1 appends every bin's selected rows per field to a
+    spill file (bin order) and keeps only the ids; then the H3 permutation is
+    applied one column at a time while streaming straight into the zstd
+    writer.  Peak RSS ≈ ids + permutation + two columns (~150 MB) instead of
+    3 × the raw body (~1 GB) — the full-corpus rebuild after an algo / epoch
+    bump runs inside the 2.5 GB cells-bins cgroup together with the bin builder."""
     gen = sample_gen()
     old = sample_meta(res)
     if old and old.get('gen') == gen and not force:
         return dict(old, skipped=True)
     m = cb.manifest(); b = m['bins']
     fields = list(SAMPLE_STORED_FIELDS)
-    cols = {f: [] for f in ['id'] + fields}
+    spill = SAMPLE_DIR / f'spill-r{res}'
+    SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
+    if spill.exists():
+        for q in spill.iterdir():
+            q.unlink()
+    spill.mkdir(exist_ok=True)
+    fh = {f: open(spill / f, 'wb') for f in fields}
+    ids_parts = []
     n_bins = 0; n_missing = 0; n_stale = 0; n_rows = 0; epochs = set(); legend: dict = {}
     order = sorted(zip(b['i'], b['j'], b['gen']))
-    for k, (i, j, g) in enumerate(order):
-        if budget_s is not None and time.time() - t0 > budget_s:
-            return {'aborted': 'budget', 'bins_done': k, 'bins': len(order), 'seconds': round(time.time() - t0, 1)}
-        sg = cb.stored_gen(i, j)
-        if sg is None:
-            n_missing += 1
-            continue
-        if sg != g:
-            n_stale += 1
-        try:
-            hdr, c, _ = cb.load_bin(i, j)
-        except Exception as e:  # noqa: BLE001
-            log.warning('cells_blocks: sample bin %d_%d: %s', i, j, e)
-            n_missing += 1
-            continue
-        ids = np.ascontiguousarray(c['id']).astype(np.uint64)
-        sel = _sample_mask(ids, res) & (c['terrain_src'] != 0)
-        if not sel.any():
+    try:
+        for k, (i, j, g) in enumerate(order):
+            if budget_s is not None and time.time() - t0 > budget_s:
+                return {'aborted': 'budget', 'bins_done': k, 'bins': len(order), 'seconds': round(time.time() - t0, 1)}
+            sg = cb.stored_gen(i, j)
+            if sg is None:
+                n_missing += 1
+                continue
+            if sg != g:
+                n_stale += 1
+            try:
+                hdr, c, _ = cb.load_bin(i, j, need=fields)
+            except Exception as e:  # noqa: BLE001
+                log.warning('cells_blocks: sample bin %d_%d: %s', i, j, e)
+                n_missing += 1
+                continue
+            ids = np.ascontiguousarray(c['id']).astype(np.uint64)
+            sel = _sample_mask(ids, res) & (c['terrain_src'] != 0)
             n_bins += 1
-            continue
-        cols['id'].append(ids[sel])
+            if hdr.get('epoch'):
+                epochs.add(str(hdr['epoch']))
+            legend.update(hdr.get('lc25_legend') or {})
+            if not sel.any():
+                continue
+            ids_parts.append(ids[sel])
+            for f in fields:
+                if cb.FIELDS[f].get('shape') == 'ragged':
+                    a = cb.ragged_take(c[cb.RAGGED[f]], c[f], sel)[1]
+                else:
+                    a = c[f][sel]
+                fh[f].write(np.ascontiguousarray(a).tobytes())
+            n_rows += int(sel.sum())
+            if verbose and k % 2000 == 0:
+                print(f'  sample r{res}: bin {k}/{len(order)} rows={n_rows} … {time.time() - t0:.0f}s', flush=True)
         for f in fields:
-            cols[f].append(np.ascontiguousarray(c[f][sel]))
-        n_rows += int(sel.sum()); n_bins += 1
-        if hdr.get('epoch'):
-            epochs.add(str(hdr['epoch']))
-        legend.update(hdr.get('lc25_legend') or {})
-        if verbose and k % 2000 == 0:
-            print(f'  sample r{res}: bin {k}/{len(order)} rows={n_rows} … {time.time() - t0:.0f}s', flush=True)
-    out: 'OrderedDict[str, np.ndarray]' = OrderedDict()
-    ids = np.concatenate(cols['id']) if cols['id'] else np.zeros(0, np.uint64)
-    o = np.argsort(ids, kind='stable')
-    out['id'] = ids[o].astype('<u8')
-    for f in fields:
-        out[f] = (np.concatenate(cols[f]) if cols[f] else np.zeros(0, cb.NP_DT[cb.FIELDS[f]['dtype']]))[o]
-    del cols
-    epoch = max(epochs) if epochs else ca.epoch_hdr(None)
-    hdr = _sample_header(res, int(out['id'].size), gen, epoch, fields,
-                         {'lc25_legend': legend, 'bins_n': n_bins, 'bins_missing': n_missing, 'bins_stale_at_build': n_stale})
-    raw = cb.encode(hdr, out, fields, 'delta_u64')
-    z = zcompress(raw, SAMPLE_ZSTD_LEVEL)
-    SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
-    zp, mp = _sample_paths(res)
-    meta = {'res': res, 'gen': gen, 'epoch': epoch, 'n': hdr['n'], 'fields': fields, 'bytes': len(z), 'raw_bytes': len(raw),
-            'bins_n': n_bins, 'bins_missing': n_missing, 'bins_stale_at_build': n_stale, 'algo': SAMPLE_ALGO,
-            'built_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'seconds': round(time.time() - t0, 1),
-            'default_fields': list(SAMPLE_DEFAULT_FIELDS), 'glyph_fields': list(GLYPH_FIELDS)}
-    tmp = zp.with_name(zp.name + '.tmp'); tmp.write_bytes(z); os.replace(tmp, zp)
-    tmp = mp.with_name(mp.name + '.tmp'); tmp.write_text(json.dumps(meta)); os.replace(tmp, mp)
+            fh[f].close()
+        ids = np.concatenate(ids_parts) if ids_parts else np.zeros(0, np.uint64)
+        del ids_parts
+        o = np.argsort(ids, kind='stable')
+        n = int(ids.size)
+        epoch = max(epochs) if epochs else ca.epoch_hdr(None)
+        hdr = _sample_header(res, n, gen, epoch, fields,
+                             {'lc25_legend': legend, 'bins_n': n_bins, 'bins_missing': n_missing, 'bins_stale_at_build': n_stale})
+
+        def col(f):
+            return np.fromfile(spill / f, cb.NP_DT[cb.FIELDS[f]['dtype']])
+
+        specs = [cb._col_spec('id', ids)]
+        for f in fields:
+            fd = cb.FIELDS[f]
+            nb = (spill / f).stat().st_size
+            if fd.get('shape') != 'ragged' and fd.get('shape'):
+                nb = n * int(np.prod(fd['shape'])) * np.dtype(cb.NP_DT[fd['dtype']]).itemsize
+            specs.append(dict(cb._col_spec(f, np.zeros(0, cb.NP_DT[fd['dtype']])), bytes=int(nb)))
+        h = dict(hdr); h['ids'] = 'delta_u64'; h['columns'] = specs; h['fields'] = fields
+        hb = json.dumps(h, separators=(',', ':'), ensure_ascii=False).encode()
+        zp, mp = _sample_paths(res)
+        tmp = zp.with_name(zp.name + '.tmp')
+        raw_bytes = 0
+        with open(tmp, 'wb') as out, _z().ZstdCompressor(level=SAMPLE_ZSTD_LEVEL).stream_writer(out) as zw:
+            def put(bb):
+                nonlocal raw_bytes
+                raw_bytes += len(bb); zw.write(bb)
+            put(cb.MAGIC + struct.pack('<I', len(hb)) + hb)
+            put(np.diff(ids[o].astype(np.int64), prepend=0).astype('<u8').tobytes())
+            for f in fields:
+                fd = cb.FIELDS[f]
+                a = col(f)
+                if fd.get('shape') == 'ragged':
+                    a = cb.ragged_take(col(cb.RAGGED[f]), a, o)[1]
+                elif fd.get('shape'):
+                    a = a.reshape((n, *fd['shape']))[o]
+                else:
+                    a = a[o]
+                put(np.ascontiguousarray(a).tobytes()); del a
+        z_bytes = tmp.stat().st_size
+        os.replace(tmp, zp)
+        meta = {'res': res, 'gen': gen, 'epoch': epoch, 'n': n, 'fields': fields, 'bytes': z_bytes, 'raw_bytes': raw_bytes,
+                'bins_n': n_bins, 'bins_missing': n_missing, 'bins_stale_at_build': n_stale, 'algo': SAMPLE_ALGO,
+                'built_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'seconds': round(time.time() - t0, 1),
+                'default_fields': list(SAMPLE_DEFAULT_FIELDS), 'glyph_fields': list(GLYPH_FIELDS)}
+        tmp = mp.with_name(mp.name + '.tmp'); tmp.write_text(json.dumps(meta)); os.replace(tmp, mp)
+    finally:
+        for f in fh.values():
+            try:
+                f.close()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            for q in spill.iterdir():
+                q.unlink()
+            spill.rmdir()
+        except OSError:
+            pass
     # drop slices of older generations
     try:
         for p in SAMPLE_CACHE.glob(f'r{res}-*.nex.zst'):
@@ -569,7 +627,7 @@ def parse_sample_fields(raw: str | None) -> list[str]:
     bad = [f for f in fs if f not in SAMPLE_STORED_FIELDS]
     if bad:
         raise ca.CellsError(400, f'unknown sample fields {bad}', fields=list(SAMPLE_STORED_FIELDS))
-    return fs
+    return cb.with_ragged_counts(fs)
 
 
 _sample_lock = threading.Lock()

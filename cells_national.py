@@ -52,7 +52,7 @@ log = logging.getLogger('cells_national')
 
 # === SECTION: constants / field table ===
 
-ALGO = 'national-1'
+ALGO = 'national-2'              # national-2 (2026-11-03): + tree_hh (apices per 5 m height band)
 MAGIC = cb.MAGIC
 NAT_DIR = ca.NE_DIR / 'national'
 CACHE_DIR = NAT_DIR / 'cache'
@@ -116,6 +116,9 @@ _f('struct_h_max', 'u8', '×0.5 m', U8_UNK, 'mean over structure-holding childre
 _f('canopy_h_p90', 'u8', '×0.5 m', U8_UNK, 'mean over apex-holding children of the per-cell p90 apex height', 'mean', src='net1')
 _f('canopy_h_p50', 'u8', '×0.5 m', U8_UNK, 'mean over apex-holding children of the per-cell median apex height', 'mean', src='net1')
 _f('canopy_h_top', 'u8', '×0.5 m', U8_UNK, 'tallest apex anywhere in the cell (max)', 'max', src='net1')
+_f('tree_hh', 'u16', 'count per 5 m band (header.tree_hh_bands)', None,
+   'apices (h ≥ 3 m, every res-12 child, unsaturated) per height band: 0 = 3–5 m, 1 = 5–10 m, … k = 5k–5(k+1) m, 11 = 55 m+; '
+   'sum = tree_n (exact)', 'hist', shape=[12], src='net1')
 
 ALIASES = {'elev_m': 'elev_mean', 'slope': 'slope_mean', 'consistency': 'verdict', 'consistency_n': 'verdict'}
 DEFAULT_FIELDS = ('n_cells', 'n_obs', 'verdict', 'elev_mean', 'slope_mean', 'h_max', 'canopy', 'bld_h_max',
@@ -129,6 +132,14 @@ _ROW_SRC = {
     'dh_m': ('dh', -128), 'dtm_m': ('dtm', -128),
 }
 _BLD_TYPE_IDX = [ne_h3.BLD_TYPES.index(t) for t in cb.BUILDING_TYPES if t in ne_h3.BLD_TYPES]
+
+
+TREE_HH_BANDS = 12
+
+
+def tree_hh_band(h_m: np.ndarray) -> np.ndarray:
+    """5 m height band of an apex: 0 = 3–5 m, k = [5k, 5k+5) m for 1 ≤ k ≤ 10, 11 = 55 m+."""
+    return np.where(h_m < 5.0, 0, np.clip(np.floor(h_m / 5.0), 1, TREE_HH_BANDS - 1)).astype(np.int64)
 
 
 # === SECTION: H3 parent arithmetic ===
@@ -218,8 +229,11 @@ class Acc:
                 out['bld_h_top'] = top
         # --- NET1 -----------------------------------------------------------
         ci, words = t.gather_trees()
+        out['tree_hh'] = np.zeros((m, TREE_HH_BANDS), np.int64)
         if words.size:
             h = ca.decode_trees(words)['h_m']
+            band = tree_hh_band(h)
+            out['tree_hh'] = np.bincount(inv[ci] * TREE_HH_BANDS + band, minlength=m * TREE_HH_BANDS).reshape(m, TREE_HH_BANDS).astype(np.int64)
             hx, c50, c90, _ = cb._per_cell_stats(ci, h, n)
             has = np.isfinite(c90)
             out['canopy_h_p90.s'] = bc(has, np.nan_to_num(c90)); out['canopy_h_p90.c'] = bc(has)
@@ -349,6 +363,7 @@ def decode(blob: bytes) -> tuple[dict, 'OrderedDict[str, np.ndarray]']:
 def header_for(res: int, n: int, gen: str, epoch, extra: dict | None = None) -> dict:
     h = {'algo': ALGO, 'res': res, 'n': int(n), 'gen': gen, 'epoch': epoch, 'child_res': ca.RES,
          'groups': list(ne_h3.GROUPS), 'verdicts': list(ca._CONSISTENCY_NAMES),
+         'tree_hh_bands': ['3-5'] + [f'{5 * k}-{5 * k + 5}' for k in range(1, TREE_HH_BANDS - 1)] + ['55+'],
          'building_types': list(cb.BUILDING_TYPES), 'structure_types': list(ne_h3.BLD_TYPES),
          'semantics': 'per field the mean over the res-12 children where the field is non-null '
                       '(bld_*/canopy_h_*: children holding ≥ 1 object); verdict = counts per class; '

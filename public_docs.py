@@ -141,6 +141,11 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
     dtype, bytes, shape?, nodata?}}], ids: delta_u64|u64, complete, lc25_legend}} | column bytes in header
     order, rows sorted by cell id (ids delta-coded: first absolute, then differences; ids=u64 for raw).
     u8 half-metre columns: 0 = none in this observed cell, 1..254 ×0.5 m, 255 = cell never observed.
+    tree_h (RAGGED, since 2026-11-03): the per-cell apex-height lists — tree_h_n (u16, exact apex count, the
+    trees-layer population h ≥ 3 m) is auto-inserted before tree_h (u8 ×0.5 m, all cells' lists back to back
+    in row order, each SORTED ASCENDING); off = [0, cumsum(tree_h_n)], cell k = tree_h[off[k]:off[k+1]], a
+    height-range count = two searchsorted per cell. columns[] entry carries shape:"ragged", counts:"tree_h_n".
+    Only materialised when tree_h is in fields= (≈ +1 B per apex, ≈ +40 % on a glyph block zstd).
     fields=* for everything, ~17 k cells per bin, ≤ ~60 KB gz for the 9-field terrain+building set.
     Headers: ETag "b-<gen>-<fields>" (strong; If-None-Match → 304 without touching the blob),
     X-Cells-Gen = the bin generation — KEY YOUR COPY ON THIS (changes iff a contributing product changed;
@@ -164,7 +169,8 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
     delta-coded then planar columns with the bin dtypes / units / nodata (255 = unknown). fields=glyph =
     bld_h_max bld_h_p50 stories_max roof_dom canopy_h_p90 aspect_deg slope_mean slope_p90 elev_mean (≈ 26 MB zstd);
     default adds obs terrain_src bld_n bld_area_sum struct_h_max canopy_h_p50 lc25 tree_n dh_m consistency
-    forest_loss_year phenology als_year_newest (≈ +12 MB); * = every bin column except cover. Rebuilt by the hourly
+    forest_loss_year phenology als_year_newest (≈ +12 MB); * = every bin column except cover; tree_h (+ tree_h_n)
+    = the same ragged apex-height lists as the bins for the sampled cells (≈ +8 MB zstd). Rebuilt by the hourly
     builder only when the bin corpus changed. Headers: ETag "S-r10-<gen>-<fields>" (strong; If-None-Match → 304),
     X-Cells-Gen (key your copy on it), X-Cells-Epoch (the ne-observe product epoch), X-Cells-Built, Content-Encoding
     zstd when accepted. format=json / meta=1 → build meta. 404 + Retry-After before the first build. One pull per
@@ -177,7 +183,9 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
     n_cells / n_obs = children with a row / observed. Border cells deduplicated across products. Fields:
     n_cells n_obs verdict elev_mean slope_mean slope_p90 roughness tri tpi h_mean h_p90 h_max tree_h_max canopy
     ndvi_mean ndvi_amp dh_m dtm_m structures_cover cover[9] tree_n structures_n forest_loss_n bld_n bld_cells
-    bld_h_max bld_h_p50 bld_h_top bld_area_sum struct_h_max canopy_h_p90 canopy_h_p50 canopy_h_top (u32 = count/
+    bld_h_max bld_h_p50 bld_h_top bld_area_sum struct_h_max canopy_h_p90 canopy_h_p50 canopy_h_top tree_hh
+    (u16 × 12 = apices per 5 m height band summed over the children: band 0 = 3–5 m, k = 5k–5(k+1) m, 11 = 55 m+;
+    header.tree_hh_bands; sums to the exact tree_n) (u32 = count/
     area sums). No fields= → the whole table (pre-gzipped); fields= → a cached slice. Headers: ETag
     "n-r<res>-<gen>-<fields>", X-Cells-Gen (key your copy on it; rebuilt only when the corpus changed),
     X-Cells-Epoch, X-Cells-Built, Cache-Control max-age 86400. format=json (or meta=1) → build meta {gen, epoch,
