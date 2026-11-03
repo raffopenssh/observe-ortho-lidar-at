@@ -389,3 +389,34 @@ curl -s localhost:8100/api/v1/cells/dict | python3 -m json.tool | head
 Split-parent ingest and merge mechanics: `ne_ingest.py` (thread in
 `app.py`; `ne_ingest:` line in `/process.txt`; knob
 `POST /api/v1/director/config {"ne_ingest_enabled": false}` stops pulls).
+
+## 12c. Stats envelope cell lists — `POST /api/v1/stats/unit?unit=cells` (`stats_unit.py`, 2026-11-03)
+
+A sibling statistical NE service's `f=<expr>` filter knows the matching res-12
+cells; this service does not (the grammar spans all sibling services' columns). So for a filtered unit
+it POSTs the explicit cell set (spec: `stats-envelope.md §6`)
+instead of a unit key. Before this we answered 405 and the caller showed our
+columns as unavailable for every filtered row.
+
+* Body: gzip'd `"NEI1" · u32 n · n × u64 LE` res-12 ids, sorted ascending,
+  ≤ 1 M (`CELLS_MAX_N`; 413 above, 400 on bad magic / wrong res / truncated).
+  `parse_cells_body` bounds the inflate at 8 MB + ε so a gzip bomb cannot
+  grow past the limit.
+* `unit_cells(ids, scale)`: `ca.select(ids)` → `_acc_from_table` exactly as
+  bbox units; unknown ids simply have no row (`coverage.cells_known <
+  cells_total`, note "N cells outside any product"); the KG-missing note is
+  suppressed because the bbox-of-list spans KGs the list never touches.
+  Every listed cell weighs 1 — the `kg=` border weighting does not apply.
+* `scale` (default 1; 49 for the national 1-in-49 sample where one res-12
+  cell stands for its res-10 cell): `cells_n = n × scale`, `area_ha = Σ cell
+  areas × scale` (`_cells_area_m2`: exact per res-10 parent, res-8 ancestor
+  / 2401 above 60 k parents), `_scale_figures` multiplies every `_ha` / `_n`
+  figure (incl. `cover_ha.*`, `consistency_*`), leaves means / `_pct` /
+  extremes / years alone; `coverage.cells_known` is scaled too so
+  `complete` keeps its meaning.
+* Cache key `cl:<sha256(ids)[:16]>:<n>` + bbox fingerprint, persisted only
+  for n > 20 k; the usual 3.5 s budget → 202 + `Retry-After` for cold long
+  lists (0.1°×0.1° = 273 k cells: 3.6 s cold; its 1-in-49 sample: 0.4 s).
+* Invariant: the 49 res-12 children of a res-10 cell as a list ≡
+  `?h3=<that res-10 cell>` figure for figure; the full 0.1° list and its
+  1-in-49 sample × 49 agree within ~3 %.

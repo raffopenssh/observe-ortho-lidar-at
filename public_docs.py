@@ -227,6 +227,15 @@ STATS_TXT = """## Stats envelope — one flat JSON per spatial unit          #st
   format=csv  → header row + one row per unit (text/csv UTF-8, no BOM; first columns unit, coverage_complete)
           → Google Sheets =IMPORTDATA("{BASE}/api/v1/stats/unit?kg=63330&format=csv"), Excel Power Query.
   keys=cover_ha,als → only those figure keys (prefix match).
+  Cell lists (stats-envelope.md §6 — how a sibling statistical NE service asks for a FILTERED unit):
+          POST /api/v1/stats/unit?format=json&unit=cells[&scale=49][&year=]
+          Content-Type: application/octet-stream, Content-Encoding: gzip,
+          body (gzip'd): "NEI1" · u32 n · n × u64 little-endian H3 res-12 ids, sorted ascending, ≤ 1 M.
+          → the same envelope over exactly those cells: unit{{kind:"cells", key:<hash of the list>, n, scale}},
+          cells_n = n × scale, area_ha = Σ cell areas × scale, every _ha / _n figure summed × scale, means and
+          _pct unweighted; each listed cell counts 1 (no KG border weighting); ids without a row are skipped and
+          reported in coverage (cells_known < cells_total). 400 bad magic / non-res-12 id, 413 above 1 M ids;
+          year= is echoed only (no claim years here). A long list may answer 202 once, then it is cached.
   Ops: ETag + Cache-Control max-age=600, CORS *, gzip; warm answers < 10 ms, first touch of a KG / res-7 cell
   ~0.1–0.5 s; a cold res-5 cell (823 k cells) may answer 202 {{status:"computing", retry_after_s}} once —
   retry after Retry-After, the result is then cached. Consistency counts apply the read-time green-ground
