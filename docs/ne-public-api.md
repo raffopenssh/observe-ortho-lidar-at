@@ -420,3 +420,33 @@ columns as unavailable for every filtered row.
 * Invariant: the 49 res-12 children of a res-10 cell as a list ≡
   `?h3=<that res-10 cell>` figure for figure; the full 0.1° list and its
   1-in-49 sample × 49 agree within ~3 %.
+
+## 12d. Apex-height lists and national histogram (2026-11-03)
+
+* Bins, NEXB v2 blocks and the centre-child sample accept `tree_h`:
+  a ragged `u8` list per cell, ascending, in **0.5 m units** (1…254).
+  `tree_h_n` (`u16`, exact apex count) is automatically inserted before
+  it in the field list. Reconstruct offsets as `[0, cumsum(tree_h_n)]`;
+  `sum(tree_h_n) == len(tree_h)`. The column spec carries
+  `shape: "ragged", counts: "tree_h_n"`. These are apices from the
+  trees layer (height ≥ 3 m), not canopy pixels.
+* Bin storage algorithm is **`nex-2`**. Old-algorithm blobs count as
+  missing during prewarm; an on-demand request for the new column also
+  rebuilds an old blob. **No bin/block generation bump**: existing field
+  selections stay byte-identical. Request the explicit glyph column list
+  plus `tree_h` (the `glyph` alias alone does not include it).
+* The stored sample superset includes both columns, with algorithm
+  **`sample-2`** and a changed sample generation. The builder spills
+  selected rows per field to disk, retains ids and their permutation,
+  then streams one reordered column at a time into zstd. It does not
+  hold the complete decoded national table and encoded body together.
+* National aggregates use **`national-2`** and expose `tree_hh`:
+  `u16[12]` apex counts for bands 3–5 m, 5–10 m, …, 50–55 m,
+  55 m+ (`header.tree_hh_bands`). These are summed across child cells;
+  their sum matches `tree_n`.
+* The hourly job completes bins → blocks → sample; budget-limited
+  passes resume the remaining bins next hour. Check
+  `python3 cells_bins.py --status --quiet`, sample `?res=10&meta=1`,
+  and national `?res=9&meta=1`. Small stale counts between successful
+  hourly passes are expected while new products land; `current: false`
+  alone does not imply a failed build.

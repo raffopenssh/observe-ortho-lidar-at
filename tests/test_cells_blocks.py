@@ -53,6 +53,24 @@ def test_block_v2_codec_and_checksum():
     assert cbl.zdecompress(cbl.zcompress(raw)) == raw
 
 
+def test_block_ragged_tree_heights():
+    bi, bj = _stored_block()
+    fields = [*cbl.GLYPH_FIELDS, 'tree_h']
+    _, raw, _ = cbl.build_block(bi, bj, fields)
+    hdr, present, cols = cbl.decode_block(raw)
+    assert hdr['fields'] == [*cbl.GLYPH_FIELDS, 'tree_h_n', 'tree_h']
+    counts, heights = cols['tree_h_n'], cols['tree_h']
+    assert counts.size == hdr['n'] == present.size
+    assert int(counts.sum()) == heights.size
+    offsets = cb.ragged_offsets(counts)
+    starts = np.zeros(heights.size, dtype=bool)
+    starts[offsets[:-1][counts > 0]] = True
+    # Ignore comparisons across row boundaries (including empty rows).
+    assert np.all(heights[1:][~starts[1:]] >= heights[:-1][~starts[1:]])
+    spec = next(c for c in hdr['columns'] if c['name'] == 'tree_h')
+    assert spec['shape'] == 'ragged' and spec['counts'] == 'tree_h_n'
+
+
 def test_routes():
     import public_api
     c = public_api.app.test_client()
