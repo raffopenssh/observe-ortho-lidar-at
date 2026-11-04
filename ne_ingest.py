@@ -592,7 +592,12 @@ def merge_blocks(parent: str, block_paths: list[Path], out_path: Path, *, comple
 def _index_cells(path: Path) -> None:
     """Register a parent product in ``data/ne/cells.sqlite`` (public cells API
     chunk index, ``cells_api.index_file``).  Best-effort: a failure here never
-    blocks the ingest; ``python3 ne_ingest.py --rebuild`` rescans everything."""
+    blocks the ingest; ``python3 ne_ingest.py --rebuild`` rescans everything.
+    Dot-prefixed temp outputs (e.g. ``.<kg>.sweep_merge.h3b`` from
+    ``sliver_sweep``) are skipped — the caller indexes the final path after
+    ``os.replace``."""
+    if path.name.startswith("."):
+        return
     try:
         import cells_api
         cells_api.index_file(path)
