@@ -1979,36 +1979,51 @@ def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = Tr
     if n:
         out[hit] = ob[order[pos[hit]]]
     miss = np.flatnonzero(~hit)
+    # view cells this product holds but never observed (all-nodata row): a
+    # neighbour / an older product of ours may have seen them — borrow those
+    # too (2026-11-04; before, only cells absent from the product were)
+    unseen_here = np.zeros(0, np.int64)
+    if n and borrow:
+        from ne_ingest import row_observed as _ro
+        hit_idx = np.flatnonzero(hit)
+        unseen_here = hit_idx[~_ro(out[hit_idx])] if len(hit_idx) else unseen_here
     borrowed = 0
-    if len(miss) and borrow:
+    want_b = np.concatenate([miss, unseen_here]) if len(unseen_here) else miss
+    if len(want_b) and borrow:
         # cells the view holds but this product lacks are mostly boundary
         # cells a NEIGHBOUR product observed (umfeld's view moved them onto
         # this KG) — take their rows from the corpus instead of posting nodata
-        bids, brows = corpus_obs_rows(vids[miss], exclude_kg=hdr["kg"])
+        bids, brows = corpus_obs_rows(vids[want_b], exclude_kg=hdr["kg"])
         if len(bids):
-            pos_b = np.searchsorted(bids, vids[miss])
+            pos_b = np.searchsorted(bids, vids[want_b])
             pos_b = np.minimum(pos_b, len(bids) - 1)
-            hit_b = bids[pos_b] == vids[miss]
-            out[miss[hit_b]] = brows[pos_b[hit_b]]
+            hit_b = bids[pos_b] == vids[want_b]
+            out[want_b[hit_b]] = brows[pos_b[hit_b]]
             borrowed = int(hit_b.sum())
-            miss = miss[~hit_b]
+            got = set(want_b[hit_b].tolist())
+            miss = np.array([i for i in miss if i not in got], dtype=np.int64)
     for i in miss:
         out[i] = np.frombuffer(unseen_obs_row(int(vids[i])), np.uint8)
     raw = out.tobytes()
+    try:
+        from ne_ingest import row_observed as _ro2
+        blank = int((~_ro2(out)).sum()) if vn else 0     # rows umfeld will count as unobserved (blank_n)
+    except Exception:  # noqa: BLE001
+        blank = None
     h = dict(algo=ALGO_OBS, epoch=hdr["neo1"]["epoch"], source=OBS_SOURCE, kg=hdr["kg"], h3_res=H3_RES,
              cells_n=vn, groups=list(GROUPS), record=OBS_REC.format, record_bytes=OBS_REC.size,
              fields=list(OBS_FIELDS), units=dict(OBS_UNITS), phenology=list(PHENOLOGY_CODES),
              verdicts=list(VERDICTS), declared_digest=view.header.get("digest"),
              declared_source=view.header.get("source"),
              view_rekey={"dropped": int(n - int(hit.sum())), "filled": int(len(miss)), "borrowed": borrowed,
-                         "product_cells_n": int(n), "product_declared_digest": hdr["nec1"]["digest"]})
+                         "blank": blank, "product_cells_n": int(n), "product_declared_digest": hdr["nec1"]["digest"]})
     if green_fix:
         import ne_green_fix as _gf
         h["source"] = OBS_SOURCE_FIXED
         h.update(_gf.header_note(n_fix, n))
     st = (view.header.get("view") or {}).get("state")
     stats = {"cells_n": vn, "dropped": int(n - int(hit.sum())), "filled": int(len(miss)), "borrowed": borrowed,
-             "digest": digest_of(raw),
+             "blank": blank, "digest": digest_of(raw),
              "state": st, "view_digest": view.header.get("digest"), "hidden": (view.header.get("view") or {}).get("hidden")}
     return pack_section(MAGIC_OBS, h, raw), stats
 

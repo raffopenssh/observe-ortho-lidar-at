@@ -10,6 +10,7 @@ and setup: `README.md`. Security model: `SECURITY.md`.
 | operator API, async tasks, re-queueing | `docs/app.md` | `app.py` |
 | public read API, resource limits | `docs/public-api.md` | `public_api.py`, `public_docs.py`, `service_guard.py`, `mem_lru.py` |
 | NE cells (H3) — records, container, endpoints | `docs/ne-v24-design.md`, `docs/ne-public-api.md` | `ne_h3.py`, `cells_api.py`, `ne_ingest.py`, `cells_national.py` |
+| NE view-fill (every cell of the NE server's `/declared` view observed: corpus borrow → own-product union → sweep units on the view) | `docs/ne-viewfill.md` | `ne_viewfill.py`, `ne_ingest.consume_viewfill`, `sliver_sweep.plan_cells` |
 | public "this looks wrong" flags | `docs/public-flags.md` | `public_flags.py` |
 | the Austria-wide processor, tiles, checkpoints, splitting | `docs/austria-processor.md` | `austria_processor.py`, `kg_splitter.py`, `tile_checkpoint_registry.py` |
 | director (single machine / `SRTM_PEERS`) | `docs/peer-director.md` | `peer_director.py` |

@@ -52,3 +52,4 @@ data/host_patch.lock
 data/host_reboot_*
 data/host_reboot.lock
 data/austria_processor/host_reboot_slots.json*
+data/ne/

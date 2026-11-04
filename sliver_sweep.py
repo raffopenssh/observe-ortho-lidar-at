@@ -293,6 +293,107 @@ def _units_for(ll: np.ndarray, bbox_old: list, parent: str) -> list[dict]:
     return units
 
 
+def _cluster_cells(ll: np.ndarray, lat0: float) -> list[np.ndarray]:
+    """Connected components of *ll* (lat, lon rows) over a ``GAP_M`` grid
+    (8-neighbour bins) → index arrays, biggest first.  Used for interior /
+    anywhere cells (``plan_cells``), where the per-side strip logic of
+    :func:`_units_for` does not apply."""
+    if not len(ll):
+        return []
+    m_lat = 1 / 111_000.0
+    m_lon = 1 / (111_000.0 * max(0.2, np.cos(np.radians(lat0))))
+    bi = np.floor(ll[:, 0] / (GAP_M * m_lat)).astype(np.int64)
+    bj = np.floor(ll[:, 1] / (GAP_M * m_lon)).astype(np.int64)
+    keys = {}
+    for i, (a, b) in enumerate(zip(bi.tolist(), bj.tolist())):
+        keys.setdefault((a, b), []).append(i)
+    comp = {}
+    cid = 0
+    for k in keys:
+        if k in comp:
+            continue
+        stack = [k]; comp[k] = cid
+        while stack:
+            a, b = stack.pop()
+            for da in (-1, 0, 1):
+                for db in (-1, 0, 1):
+                    nb = (a + da, b + db)
+                    if nb in keys and nb not in comp:
+                        comp[nb] = cid; stack.append(nb)
+        cid += 1
+    groups = [[] for _ in range(cid)]
+    for k, idxs in keys.items():
+        groups[comp[k]].extend(idxs)
+    out = [np.asarray(g, dtype=np.int64) for g in groups]
+    out.sort(key=lambda g: -len(g))
+    return out
+
+
+def plan_cells(parent: str, ids: np.ndarray, source: str = "viewfill", bbox_fallback: list | None = None) -> dict:
+    """Queue sweep units over arbitrary unobserved cells of *parent* (not
+    only the bbox-revision strip): cluster → ≤ ``MAX_UNITS_PER_PARENT`` padded
+    unit bboxes appended to the parent's unit list (ids continue after the
+    highest existing ``-sw<k>`` so Zenodo add-on keys never collide), parent
+    → ``pending``.  Units already ``ok`` are kept (``integrate`` merges them
+    all).  A parent currently ``pending`` / ``dispatched`` is left alone
+    (``{"skipped": "in flight"}``) — the caller re-plans on its next pass.
+    Clusters beyond the cap are deferred (``deferred_cells``).  Dispatch /
+    peer build / result / integrate / confirm are the normal sweep path
+    (docs/sliver-sweep.md); ``plan_source`` records who asked."""
+    import h3.api.numpy_int as h3n
+    ids = np.unique(np.asarray(ids, dtype=np.uint64))
+    if not ids.size:
+        return {"planned": 0}
+    ll = np.array([h3n.cell_to_latlng(int(c)) for c in ids], dtype=float).reshape(-1, 2)
+    lat0 = float(ll[:, 0].mean())
+    m_lat = 1 / 111_000.0
+    m_lon = 1 / (111_000.0 * max(0.2, np.cos(np.radians(lat0))))
+    pad_lat = (PAD_M + CELL_R_M) * m_lat
+    pad_lon = (PAD_M + CELL_R_M) * m_lon
+    groups = _cluster_cells(ll, lat0)
+    with _Locked() as st:
+        k = st["kgs"].get(parent)
+        if k is None:
+            bb = bbox_fallback or _bbox_r1(parent)
+            if not bb:
+                return {"planned": 0, "error": "no bbox for parent"}
+            k = st["kgs"][parent] = {"rev": st.get("revision"), "bbox_old": list(bb), "bbox_new": list(bb),
+                                     "state": "wait", "attempts": 0, "units": []}
+        if k.get("state") in ("pending", "dispatched", "received"):
+            return {"planned": 0, "skipped": "in flight", "state": k["state"]}
+        units = [u for u in (k.get("units") or []) if u.get("state") == "ok"]
+        nxt = 1 + max([int(u["id"].rsplit("-sw", 1)[1]) for u in (k.get("units") or []) if "-sw" in str(u.get("id"))] or [0])
+        room = max(0, MAX_UNITS_PER_PARENT - len(units))
+        planned, deferred = 0, 0
+        for g in groups:
+            if planned >= room:
+                deferred += int(len(g)); continue
+            glat, glon = ll[g, 0], ll[g, 1]
+            units.append({"side": "V", "cells": int(len(g)),
+                          "bbox": [round(float(glon.min() - pad_lon), 6), round(float(glat.min() - pad_lat), 6),
+                                   round(float(glon.max() + pad_lon), 6), round(float(glat.max() + pad_lat), 6)],
+                          "id": f"{parent}-sw{nxt}", "state": "pending", "attempts": 0, "source": source,
+                          "declared": "view"})
+            nxt += 1; planned += 1
+        if not planned:
+            return {"planned": 0, "deferred_cells": deferred}
+        k.update(units=units, state="pending", attempts=0, plan_source=source, planned_at=_now(),
+                 unseen_out=int(ids.size), plan_cells=int(ids.size), plan_deferred=deferred)
+        k.pop("error", None)
+        st["stats"]["planned_cells"] = int(st["stats"].get("planned_cells") or 0) + int(ids.size) - deferred
+    log.info("sliver_sweep: %s: %d unit(s) planned over %d %s cells (%d deferred)", parent, planned, ids.size, source, deferred)
+    return {"planned": planned, "cells": int(ids.size), "deferred_cells": deferred}
+
+
+def _bbox_r1(parent: str) -> list | None:
+    try:
+        d = json.loads((_HERE / "kg_bbox_r1.json").read_text())
+        v = (d.get("bbox") or {}).get(parent)
+        return [float(x) for x in v] if v else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _nec1_source(parent: str, idx: dict | None) -> str:
     try:
         import ne_ingest
@@ -552,7 +653,8 @@ def spec_for(code: str, k: dict) -> dict:
     # reset attempt counter still reads as new.
     return {"parent": code, "bbox_new": k.get("bbox_new"), "bbox_old": k.get("bbox_old"),
             "attempt": int(k.get("attempts") or 0) + 10 * int(k.get("rerun") or 0),
-            "units": [{"id": u["id"], "bbox": u["bbox"], "cells": u.get("cells"), "side": u.get("side")}
+            "units": [{"id": u["id"], "bbox": u["bbox"], "cells": u.get("cells"), "side": u.get("side"),
+                       "declared": u.get("declared") or "lu"}
                       for u in k.get("units") or [] if _unit_open(u) or u.get("state") == "dispatched"]}
 
 
@@ -1242,6 +1344,7 @@ def peer_units(codes: list[str], kg_index: dict) -> list[dict]:
                      _n_blocks=len(units), bbox={"min_lon": w, "min_lat": s, "max_lon": e, "max_lat": n},
                      lat=(s + n) / 2, lon=(w + e) / 2, _sweep=True, _sweep_attempt=int(sp.get("attempt") or 0),
                      _sweep_cells=u.get("cells"), _sweep_side=u.get("side"),
+                     _sweep_declared=str(u.get("declared") or "lu"),
                      _parent_bbox=(tuple(float(x) for x in bn) if bn else None))
             out.append(d)
     return out

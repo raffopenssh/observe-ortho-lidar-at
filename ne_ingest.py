@@ -38,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 import time
 import zlib
@@ -446,9 +447,13 @@ def merge_blocks(parent: str, block_paths: list[Path], out_path: Path, *, comple
     # 2026-11-04 the chosen block's set was the output: a sliver-sweep unit
     # (lu-declared) merged into a bevdirect parent threw away every
     # bev-only observed cell (612 k cells over 1001 parents).
-    def _is_bev(f):
-        return str(f["nec1"].get("source") or "").startswith("bevdirect@")
-    bi0 = min(range(len(facts)), key=lambda i: (_is_bev(facts[i]), -facts[i]["cells_n"], i))
+    def _rank(f):
+        # reference preference: frozen lu (index-*) → bevdirect build → umfeld's
+        # chunk-log view (``chunks@…`` — what ne_viewfill sweep units build on;
+        # its cells join by union, it must not redefine the parent's layer)
+        src = str(f["nec1"].get("source") or "")
+        return 2 if src.startswith("chunks@") else 1 if src.startswith("bevdirect@") else 0
+    bi0 = min(range(len(facts)), key=lambda i: (_rank(facts[i]), -facts[i]["cells_n"], i))
     base = _read_compact(paths[bi0], want_rows=False)
     n = facts[bi0]["cells_n"]
     nec_digest = facts[bi0]["nec1"]["digest"]
@@ -638,8 +643,19 @@ def merge_dirty_parents(idx: dict, entries: dict, max_n: int = 10) -> list[dict]
             st["dirty"] = False
             continue
         complete = bool(live) and set(have) >= set(live) and _coverage_complete(parent, entries)
+        inputs = [path_for(b) for b in have]
+        own = idx["files"].get(parent) or {}
+        if own.get("kind") == "parent" and _committed(entries.get(f"{parent}_ne_h3b")) and path_for(parent).exists():
+            # mixed parent: an own (unsplit) product is part of the live set
+            # next to blocks — merging the blocks alone overwrote it (05003
+            # lost its west half, 2026-11-04); the file on disk joins the
+            # union (it is that product, or an earlier union that holds it)
+            inputs.append(path_for(parent))
+            st["own_in_merge"] = True
         try:
-            hdr = merge_blocks(parent, [path_for(b) for b in have], path_for(parent), complete=complete)
+            tmp_out = path_for(parent).with_name(f".{parent}.dirty_merge.h3b")
+            hdr = merge_blocks(parent, inputs, tmp_out, complete=complete)
+            os.replace(tmp_out, path_for(parent))
         except Exception as ex:  # noqa: BLE001
             log.warning("ne_ingest: merge %s failed: %s", parent, ex)
             st["merge_error"] = str(ex)[:200]; st["dirty"] = False
@@ -723,6 +739,109 @@ def recover_dropped(idx: dict, entries: dict) -> dict:
         ur.pop("remerge_codes", None); ur.pop("repull_codes", None)
         log.info("ne_ingest: union recovery finished: %s", ur)
     return ur
+
+
+# === SECTION: viewfill (ne_viewfill.py staged results) ===
+
+VIEWFILL_STAGED = NE_DIR / "viewfill" / "staged"
+VIEWFILL_PER_TICK = 40
+
+
+def consume_viewfill(idx: dict, entries: dict, max_n: int = VIEWFILL_PER_TICK) -> dict:
+    """Apply what ``ne_viewfill.py`` staged (runs inside ``run_tick`` under the
+    ingest lock, on the live index): ``staged/<kg>.json`` (+ ``<kg>.h3b``).
+
+    * staged h3b → replaces ``data/ne/<kg>.h3b`` **only if** the live file
+      still has the digest the builder merged from (``base_digest``; a sweep
+      integrate / fresh product in between wins and the entry is dropped —
+      the builder re-walks the KG), cells index + index rows updated like
+      ``sliver_sweep.integrate``;
+    * ``plan_cells`` → ``sliver_sweep.plan_cells`` (sweep units on the view);
+    * ``repost`` → ``NE server[kg].repost`` so ``confirm_NE server`` re-POSTs on the
+      view even when our file digest did not change (borrowed rows only).
+    Counters in ``idx.stats.viewfill``."""
+    import ne_h3
+    if not VIEWFILL_STAGED.exists():
+        return {}
+    files = sorted(VIEWFILL_STAGED.glob("?????.json"))[:max_n]
+    if not files:
+        return {}
+    vf = idx["stats"].setdefault("viewfill", {"applied": 0, "swapped": 0, "rejected": 0, "planned_kgs": 0,
+                                             "planned_cells": 0, "repost": 0, "errors": 0})
+    out = {"applied": 0, "swapped": 0, "rejected": 0, "planned": 0, "repost": 0}
+    for jf in files:
+        kg = jf.stem
+        h3b = VIEWFILL_STAGED / f"{kg}.h3b"
+        try:
+            rec = json.loads(jf.read_text())
+        except Exception as ex:  # noqa: BLE001
+            log.warning("ne_ingest viewfill: %s unreadable (%s) — dropped", jf.name, ex)
+            jf.unlink(missing_ok=True); h3b.unlink(missing_ok=True)
+            vf["errors"] += 1
+            continue
+        swapped = False
+        try:
+            if rec.get("staged_h3b") and h3b.exists():
+                p = path_for(kg)
+                live = None
+                try:
+                    live = str((ne_h3.read_h3b_header(p).get("neo1") or {}).get("digest") or "")
+                except Exception:  # noqa: BLE001
+                    pass
+                if live and rec.get("base_digest") and live != rec["base_digest"]:
+                    log.info("ne_ingest viewfill: %s live file moved on (%s ≠ staged base %s) — staged merge dropped",
+                             kg, live, rec["base_digest"])
+                    vf["rejected"] += 1; out["rejected"] += 1
+                else:
+                    rep = ne_h3.verify_h3b(h3b)
+                    if not rep.get("ok"):
+                        raise RuntimeError("verify: " + "; ".join(rep.get("errors") or [])[:160])
+                    hdr = rep["header"]
+                    os.replace(h3b, p)
+                    _index_cells(p)
+                    digest = (hdr.get("neo1") or {}).get("digest")
+                    stp = idx["parents"].setdefault(kg, {})
+                    stp.update(digest=digest, merged_at=_now(), dirty=False, cells_n=hdr.get("cells_n"),
+                               nec1_source=(hdr.get("nec1") or {}).get("source"),
+                               nec1_digest=(hdr.get("nec1") or {}).get("digest"),
+                               nec1_disagree=(len(hdr.get("nec1_disagree") or []) or None),
+                               cells_observed=(hdr.get("summary") or {}).get("observed", {}).get("cells_observed"),
+                               viewfill_at=_now(), viewfill_from=[m.get("src") for m in rec.get("merged_from") or []])
+                    stp.setdefault("complete", _coverage_complete(kg, entries))
+                    stp.pop("merge_error", None); stp.pop("green_fix", None)
+                    fp = idx["files"].get(kg)
+                    if fp:
+                        fp.update(nec1_source=stp["nec1_source"], nec1_digest=stp["nec1_digest"], neo1_digest=digest,
+                                  cells_n=hdr.get("cells_n"), merged_at=stp["merged_at"])
+                        fp.pop("green_fix", None)
+                    swapped = True
+                    vf["swapped"] += 1; out["swapped"] += 1
+                    log.info("ne_ingest viewfill: %s ← staged union (%s observed of %s, from %s) digest %s", kg,
+                             stp.get("cells_observed"), hdr.get("cells_n"),
+                             ",".join(f"{m.get('src')}:{m.get('covers')}" for m in rec.get("merged_from") or []), digest)
+            cells = rec.get("plan_cells") or []
+            if cells:
+                import sliver_sweep as _sls
+                r = _sls.plan_cells(kg, np.asarray(cells, dtype=np.uint64), source="viewfill")
+                if r.get("planned"):
+                    vf["planned_kgs"] += 1; vf["planned_cells"] += int(r.get("cells") or 0) - int(r.get("deferred_cells") or 0)
+                    out["planned"] += 1
+                else:
+                    log.info("ne_ingest viewfill: %s sweep plan not queued: %s", kg, r)
+            if rec.get("repost") or swapped:
+                c = idx.setdefault("NE server", {}).setdefault(kg, {})
+                c["repost"] = "viewfill"
+                c.update(post_attempts=0); c.pop("post_next", None)
+                vf["repost"] += 1; out["repost"] += 1
+            vf["applied"] += 1; out["applied"] += 1
+            vf["last"] = {"kg": kg, "at": _now(), "swapped": swapped, "blank": rec.get("blank"),
+                          "borrowable": rec.get("borrowable"), "residual": rec.get("residual_n")}
+        except Exception as ex:  # noqa: BLE001
+            log.warning("ne_ingest viewfill: %s failed: %s", kg, ex)
+            vf["errors"] += 1
+        finally:
+            jf.unlink(missing_ok=True); h3b.unlink(missing_ok=True)
+    return out
 
 
 # === SECTION: NE-server confirmation / (re)post ===
@@ -1011,6 +1130,20 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
                 out["obs_missing_due"] += 1
             else:
                 out["obs_missing_held"] += 1
+        # ne_viewfill staged a re-post (borrowed rows for blank view cells /
+        # staged union): forces one post on the view even when umfeld holds
+        # our current digest — the rows it holds are the old blank ones.
+        vf_due = bool(c.get("repost"))
+        if vf_due:
+            om_due = True
+            out["viewfill_due"] = int(out.get("viewfill_due") or 0) + 1
+        # ne_viewfill staged a re-post (borrowed rows for blank view cells /
+        # staged union): forces one post on the view even when the NE server holds
+        # our current digest — the rows it holds are the old blank ones.
+        vf_due = bool(c.get("repost"))
+        if vf_due:
+            om_due = True
+            out["viewfill_due"] = int(out.get("viewfill_due") or 0) + 1
         if ok and not om_due:
             if c.get("confirmed_digest") != want:
                 c.update(confirmed_digest=want, confirmed_at=_now(), post_attempts=0)
@@ -1054,7 +1187,7 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
         # the whole point of the sweep (docs/sliver-sweep.md).
         swept_at = str((idx["parents"].get(parent) or {}).get("swept_at") or "")
         sweep_fresh = bool(swept_at) and swept_at > str(c.get("confirmed_at") or "")
-        prio = (-1 if sweep_fresh else 0 if (on_index and has_view) else 1 if om_due else 2 if not have else 3,
+        prio = (-1 if (sweep_fresh or vf_due) else 0 if (on_index and has_view) else 1 if om_due else 2 if not have else 3,
                 -int((omx or {}).get("missing_n") or 0), 0 if has_view else 1, parent)
         cands.append((prio, parent, {"want": want, "have": have, "bev": bev, "bev_body": bev_body, "on_view": on_view,
                                      "has_view": has_view, "on_index": on_index, "c": c,
@@ -1185,6 +1318,13 @@ def run_tick(max_n: int = MAX_PER_TICK) -> dict:
         except Exception as ex:  # noqa: BLE001
             log.warning("ne_ingest stale-block journal: %s", ex)
         try:
+            r = consume_viewfill(idx, entries)
+            if r:
+                out["viewfill"] = r
+                _save_index(idx)
+        except Exception as ex:  # noqa: BLE001
+            log.warning("ne_ingest viewfill: %s", ex)
+        try:
             out["union_recovery"] = {k: v for k, v in recover_dropped(idx, entries).items() if not k.endswith("_codes")}
         except Exception as ex:  # noqa: BLE001
             log.warning("ne_ingest union recovery: %s", ex)
@@ -1261,10 +1401,12 @@ def status() -> dict:
                                            "bev_declared_mismatch", "bev_posted", "bev_post_failed",
                                            "needs_bevdirect", "day_cap_hold", "day_bytes", "obs_on_index", "on_view",
                                            "view_posted", "view_dropped", "view_filled", "view_borrowed", "no_view",
-                                           "obs_missing_due", "obs_missing_held", "obs_missing_listed", "recovery_hold", "candidates")},
+                                           "obs_missing_due", "obs_missing_held", "obs_missing_listed", "recovery_hold", "candidates",
+                                           "viewfill_due")},
         "view_pass": (idx.get("stats") or {}).get("view_pass"),
         "obs_missing": {k: v for k, v in ((idx.get("stats") or {}).get("obs_missing") or {}).items() if k != "kgs"},
         "union_recovery": (idx.get("stats") or {}).get("union_recovery"),
+        "viewfill": {k: v for k, v in ((idx.get("stats") or {}).get("viewfill") or {}).items()},
         "post_day": (idx.get("stats") or {}).get("post_day"),
         "green_fix": _green_fix_status(idx),
         "bev_post_fail_at": (idx.get("stats") or {}).get("bev_post_fail_at"),
@@ -1403,6 +1545,28 @@ def text_line(v: dict | None = None) -> str:
                   f" {ur.get('cells_dropped')} observed bev cells; union merge since 2026-11-04)")
         if um.get("needs_bevdirect"):
             s += f" · needs_bevdirect={um['needs_bevdirect']} (lu cell-set 409, parked — reprocess on a bev-mode peer)"
+        try:
+            import ne_viewfill as _nvf
+            vf = v.get("viewfill") or {}
+            s += ("\n    " + _nvf.text_line()
+                  + f" · tick: applied={vf.get('applied', 0)} swapped={vf.get('swapped', 0)} rejected={vf.get('rejected', 0)}"
+                  f" sweep={vf.get('planned_cells', 0)}c/{vf.get('planned_kgs', 0)}kg repost={vf.get('repost', 0)}"
+                  f" errors={vf.get('errors', 0)} due={um.get('viewfill_due', 0)}"
+                  " (ne_viewfill.py: every cell of the NE server's /declared view observed — corpus borrow → own products"
+                  " union → sweep units on the view; docs/ne-viewfill.md)")
+        except Exception as _ex:  # noqa: BLE001
+            s += f"\n    viewfill: {_ex}"
+        try:
+            import ne_viewfill as _nvf
+            vf = v.get("viewfill") or {}
+            s += ("\n    " + _nvf.text_line()
+                  + f" · tick: applied={vf.get('applied', 0)} swapped={vf.get('swapped', 0)} rejected={vf.get('rejected', 0)}"
+                  f" sweep={vf.get('planned_cells', 0)}c/{vf.get('planned_kgs', 0)}kg repost={vf.get('repost', 0)}"
+                  f" errors={vf.get('errors', 0)} due={um.get('viewfill_due', 0)}"
+                  " (ne_viewfill.py: every cell of umfeld's /declared view observed — corpus borrow → own products"
+                  " union → sweep units on the view; docs/ne-viewfill.md)")
+        except Exception as _ex:  # noqa: BLE001
+            s += f"\n    viewfill: {_ex}"
         fa = v.get("bev_post_fail_at")
         if fa and time.time() - float(fa) < 86400:
             s += f" LAST-FAIL {(time.time() - float(fa)) / 3600:.1f}h ago: {str(v.get('bev_post_fail_msg'))[:90]}"
