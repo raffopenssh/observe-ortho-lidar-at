@@ -25,7 +25,7 @@ flight_years 0) — NE server lists them under `revisit?kind=obs_missing`
   Inbound budget channel `viewfill` (knob `viewfill_mb_per_h`, default 5000 —
   effectively unlimited: at 400 the hourly run hit the budget after ~13 min /
   ~100 KGs, so the 1 765-KG walk would have taken ~18 h; 2026-11-04). `python3 ne_viewfill.py plan <kg>` = dry run.
-* `ne_ingest.consume_viewfill` — first step of `run_tick` (≤40 staged/tick):
+* `ne_ingest.consume_viewfill` — first step of `run_tick` (≤200 staged/tick — was 40, which starved the sweepers once the walk ran unthrottled):
   swaps the staged h3b **only if** the live file's NEO1 digest still equals
   the builder's `base_digest` (else `rejected`, re-walked next run), re-indexes
   cells (`_index_cells` → bins stale → `cells-bins.timer` rebuilds them),

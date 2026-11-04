@@ -744,7 +744,7 @@ def recover_dropped(idx: dict, entries: dict) -> dict:
 # === SECTION: viewfill (ne_viewfill.py staged results) ===
 
 VIEWFILL_STAGED = NE_DIR / "viewfill" / "staged"
-VIEWFILL_PER_TICK = 40
+VIEWFILL_PER_TICK = 200   # 2026-11-04: 40 left ~16 of 37 sweepers idle — staged results (≈25/min from the walk) must not queue behind the 5-min tick
 
 
 def consume_viewfill(idx: dict, entries: dict, max_n: int = VIEWFILL_PER_TICK) -> dict:
