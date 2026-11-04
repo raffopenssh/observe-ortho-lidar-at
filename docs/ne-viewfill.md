@@ -22,8 +22,9 @@ flight_years 0) — NE server lists them under `revisit?kind=obs_missing`
   **largest gap first**. Never writes `data/ne/index.json` or a live file:
   results go to `data/ne/viewfill/staged/<kg>.json` (+ `.h3b`); state in
   `data/ne/viewfill/state.json`; pulled own products in `viewfill/pulled/`.
-  Inbound budget channel `viewfill` (knob `viewfill_mb_per_h`, default 400 —
-  raised on purpose for this pass). `python3 ne_viewfill.py plan <kg>` = dry run.
+  Inbound budget channel `viewfill` (knob `viewfill_mb_per_h`, default 5000 —
+  effectively unlimited: at 400 the hourly run hit the budget after ~13 min /
+  ~100 KGs, so the 1 765-KG walk would have taken ~18 h; 2026-11-04). `python3 ne_viewfill.py plan <kg>` = dry run.
 * `ne_ingest.consume_viewfill` — first step of `run_tick` (≤40 staged/tick):
   swaps the staged h3b **only if** the live file's NEO1 digest still equals
   the builder's `base_digest` (else `rejected`, re-walked next run), re-indexes
