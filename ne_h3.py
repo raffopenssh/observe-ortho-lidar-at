@@ -1926,13 +1926,45 @@ def unseen_obs_row(cid: int) -> bytes:
                         NODATA_U8, NODATA_U8)
 
 
-def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = True) -> tuple[bytes, dict]:
+def corpus_obs_rows(ids: np.ndarray, exclude_kg: str | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Observed NEO1 rows for *ids* from the whole local corpus (``cells_api``
+    chunk index over ``data/ne/*.h3b`` — green-fixed at read time like the
+    public tier).  Returns ``(sorted ids found, rows (k, OBS_REC) uint8)``;
+    unobserved / unknown cells are simply absent.  Best-effort: any failure
+    yields an empty answer."""
+    ids = np.unique(np.asarray(ids, dtype=np.uint64))
+    empty = (np.zeros(0, np.uint64), np.zeros((0, OBS_REC.size), np.uint8))
+    if not ids.size:
+        return empty
+    try:
+        import cells_api
+        r10 = np.unique(h3_parent_vec(ids, CHUNK_RES))
+        chunks, _h = cells_api.chunks_for_r10(r10)
+        if exclude_kg:
+            chunks = [c for c in chunks if c.kg != exclude_kg]
+        t = cells_api.gather(chunks, ids)
+        if not len(t):
+            return empty
+        obs = t.obs
+        seen = (obs["hm"] != 255) | (obs["cover"].sum(axis=1) > 0)
+        rows = np.frombuffer(obs[seen].tobytes(), np.uint8).reshape(-1, OBS_REC.size)
+        return t.ids[seen].astype(np.uint64), rows
+    except Exception as ex:  # noqa: BLE001
+        log.warning("ne_h3: corpus row lookup failed (%s) — nothing borrowed", ex)
+        return empty
+
+
+def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = True,
+                         borrow: bool = True) -> tuple[bytes, dict]:
     """NEO1 section for POST /obs whose cell set is exactly *view*'s (the
     ``/declared`` NEC1): our rows re-keyed onto the view's ids in the view's
     order; cells the view lacks are dropped (they would 409 — superseded or
-    moved to a neighbour KG), view cells we never observed get an unseen
-    (all-nodata) row.  Returns ``(section, {cells_n, dropped, filled, digest,
-    state})``.  Header ``declared_digest/source`` name the view."""
+    moved to a neighbour KG), view cells this product lacks are *borrowed*
+    from the corpus when a neighbour product observed them
+    (:func:`corpus_obs_rows`), else get an unseen (all-nodata) row.
+    Returns ``(section, {cells_n, dropped, filled, borrowed, digest,
+    state})`` — ``filled`` = rows not in this product (borrowed + unseen).
+    Header ``declared_digest/source`` name the view."""
     hdr, obs, n_fix = neo1_rows_from_h3b(path, green_fix=green_fix)
     n = len(obs) // OBS_REC.size
     ob = np.frombuffer(obs, np.uint8).reshape(n, OBS_REC.size)
@@ -1947,6 +1979,19 @@ def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = Tr
     if n:
         out[hit] = ob[order[pos[hit]]]
     miss = np.flatnonzero(~hit)
+    borrowed = 0
+    if len(miss) and borrow:
+        # cells the view holds but this product lacks are mostly boundary
+        # cells a NEIGHBOUR product observed (umfeld's view moved them onto
+        # this KG) — take their rows from the corpus instead of posting nodata
+        bids, brows = corpus_obs_rows(vids[miss], exclude_kg=hdr["kg"])
+        if len(bids):
+            pos_b = np.searchsorted(bids, vids[miss])
+            pos_b = np.minimum(pos_b, len(bids) - 1)
+            hit_b = bids[pos_b] == vids[miss]
+            out[miss[hit_b]] = brows[pos_b[hit_b]]
+            borrowed = int(hit_b.sum())
+            miss = miss[~hit_b]
     for i in miss:
         out[i] = np.frombuffer(unseen_obs_row(int(vids[i])), np.uint8)
     raw = out.tobytes()
@@ -1955,14 +2000,15 @@ def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = Tr
              fields=list(OBS_FIELDS), units=dict(OBS_UNITS), phenology=list(PHENOLOGY_CODES),
              verdicts=list(VERDICTS), declared_digest=view.header.get("digest"),
              declared_source=view.header.get("source"),
-             view_rekey={"dropped": int(n - int(hit.sum())), "filled": int(len(miss)),
+             view_rekey={"dropped": int(n - int(hit.sum())), "filled": int(len(miss)), "borrowed": borrowed,
                          "product_cells_n": int(n), "product_declared_digest": hdr["nec1"]["digest"]})
     if green_fix:
         import ne_green_fix as _gf
         h["source"] = OBS_SOURCE_FIXED
         h.update(_gf.header_note(n_fix, n))
     st = (view.header.get("view") or {}).get("state")
-    stats = {"cells_n": vn, "dropped": int(n - int(hit.sum())), "filled": int(len(miss)), "digest": digest_of(raw),
+    stats = {"cells_n": vn, "dropped": int(n - int(hit.sum())), "filled": int(len(miss)), "borrowed": borrowed,
+             "digest": digest_of(raw),
              "state": st, "view_digest": view.header.get("digest"), "hidden": (view.header.get("view") or {}).get("hidden")}
     return pack_section(MAGIC_OBS, h, raw), stats
 

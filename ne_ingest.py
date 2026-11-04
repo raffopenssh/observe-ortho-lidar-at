@@ -436,11 +436,16 @@ def merge_blocks(parent: str, block_paths: list[Path], out_path: Path, *, comple
     # mode builds it per block (bevdirect viewport on each peer) they can
     # disagree — a BEV tile update between two blocks' runs, or one block on
     # the NE server's lu (DeclaredDeficient / relay fallback) and another on its
-    # own build.  Fallback: pick the declared layer with the MOST cells
-    # (lu-declared blocks first — the frozen index layer is the reference)
-    # and re-key every other block's rows by cell id onto it; observations
-    # of cells absent from the chosen set are dropped and counted
-    # (``nec1_disagree`` in the merged header, loud on /process.txt).
+    # own build.  Fallback: the merged declared layer is the UNION of every
+    # block's cells — the reference block (lu-declared first — the frozen
+    # index layer; then the one with the most cells) supplies the declared
+    # row of every cell it holds, the other blocks add the cells it lacks
+    # (with their own declared rows), and every block's observations are
+    # re-keyed by cell id onto that union.  Nothing observed is ever dropped
+    # (``nec1_union`` / ``nec1_disagree`` in the merged header).  Until
+    # 2026-11-04 the chosen block's set was the output: a sliver-sweep unit
+    # (lu-declared) merged into a bevdirect parent threw away every
+    # bev-only observed cell (612 k cells over 1001 parents).
     def _is_bev(f):
         return str(f["nec1"].get("source") or "").startswith("bevdirect@")
     bi0 = min(range(len(facts)), key=lambda i: (_is_bev(facts[i]), -facts[i]["cells_n"], i))
@@ -448,7 +453,38 @@ def merge_blocks(parent: str, block_paths: list[Path], out_path: Path, *, comple
     n = facts[bi0]["cells_n"]
     nec_digest = facts[bi0]["nec1"]["digest"]
     base_ids = _lu_ids(base["lu"], n)
-    base_id_bytes = np.frombuffer(base["lu"], np.uint8).reshape(n, ne_h3.LU_REC.size)[:, :8].copy()
+    union_added = []
+    lu_rows = np.frombuffer(base["lu"], np.uint8).reshape(n, ne_h3.LU_REC.size)
+    extra_ids = []; extra_rows = []
+    for bi, (p, f) in enumerate(zip(paths, facts)):
+        if bi == bi0 or (f["nec1"].get("digest") == nec_digest and f["cells_n"] == n):
+            continue
+        r = _read_compact(p, want_rows=False)
+        m = f["cells_n"]
+        ids = _lu_ids(r["lu"], m)
+        new = ~np.isin(ids, base_ids)
+        if extra_ids:
+            new &= ~np.isin(ids, np.concatenate(extra_ids))
+        if new.any():
+            extra_ids.append(ids[new])
+            extra_rows.append(np.frombuffer(r["lu"], np.uint8).reshape(m, ne_h3.LU_REC.size)[new].copy())
+            union_added.append({"block": p.stem, "source": f["nec1"].get("source"), "cells_added": int(new.sum())})
+        del r
+    if extra_ids:
+        all_ids = np.concatenate([base_ids] + extra_ids)
+        all_rows = np.concatenate([lu_rows] + extra_rows)
+        order = np.argsort(all_ids, kind="stable")
+        base_ids = all_ids[order]
+        lu_rows = np.ascontiguousarray(all_rows[order])
+        n = int(base_ids.size)
+        base["lu"] = lu_rows.tobytes()
+        nec_digest = ne_h3.digest_of(base["lu"] + base["k_raw"])
+        log.info("ne_ingest: %s: declared layers disagree — union of %d blocks = %d cells (+%d over %s)",
+                 parent, len(paths), n, sum(u["cells_added"] for u in union_added), paths[bi0].stem)
+        del all_ids, all_rows, order
+    base_id_bytes = lu_rows[:, :8].copy()
+    union_changed = bool(extra_ids)
+    del lu_rows, extra_ids, extra_rows
     rb = facts[bi0]["record_bytes"]
     tb, bb = int(rb.get("net1") or 4), int(rb.get("neb1") or 8)
     disagree = []
@@ -461,7 +497,8 @@ def merge_blocks(parent: str, block_paths: list[Path], out_path: Path, *, comple
 
     # pass 1 — NEO1 only: pick the best-observed block per cell
     for bi, (p, f) in enumerate(zip(paths, facts)):
-        r = base if bi == bi0 else _read_compact(p, want_lu=f["nec1"].get("digest") != nec_digest or f["cells_n"] != n, want_rows=False)
+        r = base if (bi == bi0 and not union_changed) else \
+            _read_compact(p, want_lu=f["nec1"].get("digest") != nec_digest or f["cells_n"] != n, want_rows=False)
         if f["nec1"].get("digest") == nec_digest and f["cells_n"] == n:
             obs = r["obs"]; src_row = None
             tn_b, bn_b = r["tree_n"], r["bld_n"]
@@ -491,9 +528,10 @@ def merge_blocks(parent: str, block_paths: list[Path], out_path: Path, *, comple
             rekey[bi] = src_row
             disagree.append({"block": p.stem, "nec1": f["nec1"].get("digest"), "cells_n": m,
                              "observed_dropped": dropped, "rekeyed": int(keep.sum())})
-            log.warning("ne_ingest: %s: block %s declared layer %s (%s cells, %s) ≠ chosen %s (%s cells, %s) — re-keyed by cell id, %d observed cells dropped",
-                        parent, p.stem, f["nec1"].get("digest"), m, f["nec1"].get("source"),
-                        nec_digest, n, facts[bi0]["nec1"].get("source"), dropped)
+            (log.warning if dropped else log.info)(
+                "ne_ingest: %s: block %s declared layer %s (%s cells, %s) ≠ merged %s (%s cells, union on %s) — re-keyed by cell id, %d observed cells dropped",
+                parent, p.stem, f["nec1"].get("digest"), m, f["nec1"].get("source"),
+                nec_digest, n, facts[bi0]["nec1"].get("source"), dropped)
         if merged_obs is None:
             merged_obs = obs.copy()      # nodata rows as the first block wrote them
         seen = row_observed(obs)
@@ -541,7 +579,8 @@ def merge_blocks(parent: str, block_paths: list[Path], out_path: Path, *, comple
     hdr = ne_h3.write_h3b(out_path, declared, obs, parent, pv,
                           extra_header={"merged_from": [p.stem for p in paths], "partial_cells": not complete,
                                         "parent_kg": parent, "block": None, "path": "ne_ingest.merge",
-                                        "nec1_disagree": disagree or None})
+                                        "nec1_disagree": disagree or None,
+                                        "nec1_union": union_added or None})
     chk = ne_h3.verify_h3b(out_path, expected_declared_digest=nec_digest)
     if not chk["ok"]:
         out_path.unlink(missing_ok=True)
@@ -622,6 +661,63 @@ def merge_dirty_parents(idx: dict, entries: dict, max_n: int = 10) -> list[dict]
                  st["cells_observed"], st["digest"])
         out.append({"parent": parent, "blocks": len(have), "complete": complete})
     return out
+
+
+# === SECTION: union recovery (sweep merges that dropped bev-only cells) ===
+
+def recover_dropped(idx: dict, entries: dict) -> dict:
+    """One-shot (per index) repair of parents whose merge dropped observed
+    cells (``nec1_disagree[].observed_dropped`` > 0 in the h3b header — the
+    pre-2026-11-04 rule kept only the reference block's cell set, so a
+    lu-declared sliver-sweep unit merged into a bevdirect parent discarded
+    every bev-only observed cell).  Split parents with their blocks on disk
+    are marked ``dirty`` (``merge_dirty_parents`` → union merge; the sweep
+    integrate then re-merges the units on digest drift); unsplit parents get
+    their ``files`` row un-pinned so :func:`pending` re-pulls the original
+    product (peer / Zenodo, inbound budget) — the drift re-merge follows.
+    Progress lives in ``idx["stats"]["union_recovery"]``."""
+    ur = idx["stats"].get("union_recovery")
+    if ur is None:
+        import ne_h3
+        t0 = time.time()
+        remerge, repull, dropped = [], [], 0
+        for k, v in list(idx["parents"].items()):
+            if not v.get("nec1_disagree"):
+                continue
+            try:
+                h = ne_h3.read_h3b_header(path_for(k))
+            except Exception:  # noqa: BLE001
+                continue
+            od = sum(int(x.get("observed_dropped") or 0) for x in (h.get("nec1_disagree") or []))
+            if not od:
+                continue
+            dropped += od
+            live = _live_blocks(k, entries)
+            if live and all(path_for(b).exists() for b in live):
+                v["dirty"] = True
+                remerge.append(k)
+            elif f"{k}_ne_h3b" in entries and idx["files"].get(k):
+                idx["files"][k]["uploaded_at"] = None      # → pending() pulls the original again
+                repull.append(k)
+            else:
+                log.warning("ne_ingest: union recovery: %s dropped %d cells but has neither blocks nor a parent product", k, od)
+        ur = {"started_at": _now(), "remerge": len(remerge), "repull": len(repull), "cells_dropped": dropped,
+              "remerge_codes": remerge, "repull_codes": repull, "scan_s": round(time.time() - t0, 1), "done": False}
+        idx["stats"]["union_recovery"] = ur
+        log.info("ne_ingest: union recovery: %d split parents to re-merge, %d unsplit to re-pull (%d observed cells dropped) in %.1fs",
+                 len(remerge), len(repull), dropped, ur["scan_s"])
+    if ur.get("done"):
+        return ur
+    st0 = str(ur.get("started_at") or "")
+    ur["remerge_done"] = sum(1 for k in ur.get("remerge_codes") or []
+                             if str((idx["parents"].get(k) or {}).get("merged_at") or "") > st0)
+    ur["repull_done"] = sum(1 for k in ur.get("repull_codes") or []
+                            if str((idx["files"].get(k) or {}).get("at") or "") > st0)
+    if ur["remerge_done"] >= ur["remerge"] and ur["repull_done"] >= ur["repull"]:
+        ur["done"] = True; ur["finished_at"] = _now()
+        ur.pop("remerge_codes", None); ur.pop("repull_codes", None)
+        log.info("ne_ingest: union recovery finished: %s", ur)
+    return ur
 
 
 # === SECTION: NE-server confirmation / (re)post ===
@@ -737,6 +833,60 @@ def _post_bare_on_view(parent: str, want: str, c: dict, green_fix: bool) -> tupl
     raise last  # pragma: no cover
 
 
+CONFIRM_RULE = "view-2026-11-04"   # bump → every parent's retry ladder is reset once
+OBS_MISSING_REFRESH_S = 3600       # the NE server recomputes obs_complete every 3 h (``obs_complete.every_s``)
+OBS_MISSING_MAX_POSTS = 3          # per (view_source, missing_n) situation — guards a post/relist loop
+
+
+def refresh_obs_missing(idx: dict, force: bool = False) -> dict:
+    """``GET /contrib/api/v1/ne/revisit?kind=obs_missing&all=1`` (ETag-conditional,
+    at most hourly) → ``idx["stats"]["obs_missing"]`` = ``{fetched_at, etag,
+    pass_at, kgs_n, cells_n, kgs: {kg: {missing_n, extra_n, view_source}}}``.
+    the NE server lists KGs whose observed layer lacks cells of today's declared
+    view (the view moved after our NEO1 was validated: re-baseline, bevdirect
+    edge fix, a neighbour's edge cells).  Never raises; the cached snapshot
+    is returned on any failure."""
+    cur = idx["stats"].get("obs_missing") or {}
+    now = time.time()
+    if not force and now - float(cur.get("fetched_ts") or 0) < OBS_MISSING_REFRESH_S:
+        return cur
+    try:
+        import requests
+        import ne_h3
+        if not ne_h3.ne_server_enabled():
+            return cur
+        h = dict(ne_h3._ne_server_headers())
+        if cur.get("etag"):
+            h["If-None-Match"] = cur["etag"]
+        r = requests.get(f"{ne_h3._ne_server_contrib_base()}/revisit", params={"kind": "obs_missing", "all": 1},
+                         headers=h, timeout=120)
+        if r.status_code == 304:
+            cur["fetched_ts"] = now
+            idx["stats"]["obs_missing"] = cur
+            return cur
+        r.raise_for_status()
+        d = r.json()
+        oc = d.get("obs_complete") or {}
+        kgs = {}
+        for x in d.get("obs_missing") or []:
+            kg = str(x.get("kg") or "").zfill(5)
+            if kg:
+                kgs[kg] = {"missing_n": int(x.get("missing_n") or 0), "extra_n": int(x.get("extra_n") or 0),
+                           "view_source": x.get("view_source")}
+        cur = {"fetched_at": _now(), "fetched_ts": now, "etag": r.headers.get("ETag"),
+               "pass_at": oc.get("pass_at") or d.get("generated_at"), "kgs_n": len(kgs),
+               "cells_n": int(oc.get("cells_obs_missing") or sum(v["missing_n"] for v in kgs.values())),
+               "kgs_no_obs": oc.get("kgs_no_obs"), "kgs": kgs}
+        idx["stats"]["obs_missing"] = cur
+        log.info("ne_ingest: the NE server obs_missing: %d KGs / %d cells (pass %s)", len(kgs), cur["cells_n"], cur["pass_at"])
+    except Exception as ex:  # noqa: BLE001
+        cur["fetched_ts"] = now
+        cur["error"] = str(ex)[:160]
+        idx["stats"]["obs_missing"] = cur
+        log.warning("ne_ingest: the NE server revisit?kind=obs_missing failed: %s", ex)
+    return cur
+
+
 def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
     """Compare the NE server's stored obs digest with ours for every parent on disk;
     (re)POST on miss / mismatch.  Returns counters.
@@ -765,7 +915,8 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
     out = {"checked": 0, "confirmed": 0, "missing": 0, "mismatch": 0, "posted": 0, "post_failed": 0,
            "pending_cells": 0, "bev_checked": 0, "bev_confirmed": 0, "bev_declared_mismatch": 0,
            "bev_posted": 0, "bev_post_failed": 0, "needs_bevdirect": 0, "day_cap_hold": 0,
-           "obs_on_index": 0, "on_view": 0, "view_posted": 0, "view_dropped": 0, "view_filled": 0, "no_view": 0}
+           "obs_on_index": 0, "on_view": 0, "view_posted": 0, "view_dropped": 0, "view_filled": 0, "view_borrowed": 0,
+           "no_view": 0, "obs_missing_due": 0, "obs_missing_held": 0, "obs_missing_listed": 0, "recovery_hold": 0}
     now = time.time()
     conf = idx.setdefault("ne_server", {})
     max_posts = int(_knob("ne_post_max_per_tick", max_posts))
@@ -785,12 +936,30 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
         vp["obs_on_index_now"] = int(mf["kgs_obs_on_index"])
         vp["manifest_at"] = mf.get("generated_at")
     # --- phase 1: classify every parent; collect post candidates with a priority
+    om = refresh_obs_missing(idx)
+    om_kgs = om.get("kgs") or {}
+    om_pass = str(om.get("pass_at") or "")
+    out["obs_missing_listed"] = len(om_kgs)
+    if idx["stats"].get("confirm_rule") != CONFIRM_RULE:
+        # rule change (2026-11-04: bev parents confirmed on the view too, struck-out
+        # ladders were the old NEC1-digest rule looping) → fresh retry budget once
+        for c0 in conf.values():
+            if c0.get("post_attempts"):
+                c0.update(post_attempts=0); c0.pop("post_next", None)
+        idx["stats"]["confirm_rule"] = CONFIRM_RULE
+    ur = idx["stats"].get("union_recovery") or {}
+    recovering = set() if ur.get("done") else (set(ur.get("remerge_codes") or []) | set(ur.get("repull_codes") or []))
+    st0 = str(ur.get("started_at") or "")
     cands: list[tuple[tuple, str, dict]] = []
     for parent in sorted({c for c in idx["files"] if not is_block(c)} | set(idx["parents"])):
         want = _our_digest(parent, idx, green_fix=green_fix)
         if not want:
             continue
         out["checked"] += 1
+        if parent in recovering and not (str((idx["parents"].get(parent) or {}).get("merged_at") or "") > st0
+                                         or str((idx["files"].get(parent) or {}).get("at") or "") > st0):
+            out["recovery_hold"] += 1
+            continue     # file still lacks the dropped bev cells — posting it would just bake nodata at the NE server
         rec = kgs.get(parent) or {}
         if not isinstance(rec, dict):
             rec = {}
@@ -801,6 +970,11 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
         bev = bool(src and str(src).startswith("bevdirect@"))
         has_view = _has_view(rec)
         on_index = bool(have) and str(obs.get("declared_source") or "").startswith("index-")
+        # a bare NEO1 posted on the NE server's /declared view: confirmed when the NE server
+        # holds exactly the rows we built on it for our current file digest
+        v = c.get("view") or {}
+        view_ok = bool(have) and have == v.get("obs_digest") and v.get("of") == want \
+            and not str(obs.get("declared_source") or "").startswith("index-")
         decl_ok = True
         ok = False
         if bev:
@@ -808,19 +982,31 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
             bev_digest = (rec.get("bev") or {}).get("digest")
             decl_ok = bool(nec_digest) and obs.get("declared_digest") == nec_digest and bev_digest == nec_digest
             c["bev"] = {"nec1": nec_digest, "ne_server_bev": bev_digest, "obs_declared": obs.get("declared_digest")}
-            ok = have == want and decl_ok
+            ok = (have == want and decl_ok) or view_ok
         elif has_view:
-            v = c.get("view") or {}
-            ok = bool(have) and have == v.get("obs_digest") and v.get("of") == want \
-                and str(obs.get("declared_source") or "").startswith("chunks@")
+            ok = view_ok and str(obs.get("declared_source") or "").startswith("chunks@")
             if ok:
                 out["on_view"] += 1
             elif on_index:
                 out["obs_on_index"] += 1
         else:
             out["no_view"] += 1
-            ok = have == want
-        if ok:
+            ok = have == want or view_ok
+        # the NE server's obs_complete pass: the view holds cells our obs lacks
+        omx = om_kgs.get(parent)
+        om_due = False
+        if ok and omx:
+            key = f"{omx.get('view_source')}:{omx.get('missing_n')}"
+            oc = c.get("obs_missing") or {}
+            if oc.get("key") != key:
+                om_due = True
+            elif str(oc.get("posted_at") or "") < om_pass and int(oc.get("attempts") or 0) < OBS_MISSING_MAX_POSTS:
+                om_due = True
+            if om_due:
+                out["obs_missing_due"] += 1
+            else:
+                out["obs_missing_held"] += 1
+        if ok and not om_due:
             if c.get("confirmed_digest") != want:
                 c.update(confirmed_digest=want, confirmed_at=_now(), post_attempts=0)
                 c.pop("post_next", None)
@@ -828,7 +1014,9 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
             if bev:
                 out["bev_confirmed"] += 1
             continue
-        if bev and have == want and not decl_ok:
+        if om_due:
+            pass
+        elif bev and have == want and not decl_ok:
             out["bev_declared_mismatch"] += 1
         else:
             out["missing" if not have else "mismatch"] += 1
@@ -846,15 +1034,26 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
             continue     # bare NEO1 can never match the NE server's lu cell set — needs a bevdirect NEC1 (see below)
         if float(c.get("post_next") or 0) > now or int(c.get("post_attempts") or 0) >= POST_MAX_ATTEMPTS:
             continue
-        # the NE server's order: obs_on_index (has_view first) → missing → mismatch;
+        # Which body: a bevdirect parent whose NEC1 the NE server does not hold yet
+        # (bev digest ≠ ours) posts NEC1+NEO1 so the NE server gets the declared
+        # layer; everything else posts a bare NEO1 re-keyed onto the NE server's
+        # /declared view (the set the NE server validates against — bev parents
+        # included: the NE server re-keys even a NEC1+NEO1 post onto its view and
+        # answers with the view's declared_digest, which is why the old
+        # "obs.declared_digest == our NEC1" rule looped 1004 parents).
+        bev_body = bev and (rec.get("bev") or {}).get("digest") != nec_digest and not c.get("bev_body_refused")
+        on_view = not bev_body and (has_view or bool(rec.get("declared")) or bev or bool(omx))
+        # the NE server's order: obs_on_index (has_view first) → obs_missing → missing → mismatch;
         # a freshly swept parent (sliver_sweep integrated after the last
         # confirmation) jumps the mismatch backlog — the strip cells are
         # the whole point of the sweep (docs/sliver-sweep.md).
         swept_at = str((idx["parents"].get(parent) or {}).get("swept_at") or "")
         sweep_fresh = bool(swept_at) and swept_at > str(c.get("confirmed_at") or "")
-        prio = (-1 if sweep_fresh else 0 if (on_index and has_view) else 1 if not have else 2, 0 if has_view else 1, parent)
-        cands.append((prio, parent, {"want": want, "have": have, "bev": bev, "has_view": has_view,
-                                     "on_index": on_index, "c": c}))
+        prio = (-1 if sweep_fresh else 0 if (on_index and has_view) else 1 if om_due else 2 if not have else 3,
+                -int((omx or {}).get("missing_n") or 0), 0 if has_view else 1, parent)
+        cands.append((prio, parent, {"want": want, "have": have, "bev": bev, "bev_body": bev_body, "on_view": on_view,
+                                     "has_view": has_view, "on_index": on_index, "c": c,
+                                     "om": (dict(omx, key=f"{omx.get('view_source')}:{omx.get('missing_n')}") if om_due else None)}))
     # --- phase 2: POST in priority order within the tick / day budgets
     cands.sort(key=lambda t: t[0])
     posts = 0
@@ -866,34 +1065,40 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
             out["day_cap_hold"] += 1
             continue     # NE-server per-token daily volume — resumes at 00:00 UTC
         want, have, bev, has_view, c = k["want"], k["have"], k["bev"], k["has_view"], k["c"]
-        why = "missing" if not have else ("on-index" if k["on_index"] and has_view else
-                                          ("declared-mismatch" if have == want else "mismatch"))
+        bev_body, on_view, omx = k["bev_body"], k["on_view"], k["om"]
+        why = ("obs-missing" if omx else "missing" if not have else
+               "on-index" if k["on_index"] and has_view else
+               "declared-mismatch" if have == want else "mismatch")
         try:
             gap = POST_MIN_GAP_S - (time.time() - last_post)
             if gap > 0:
                 time.sleep(gap)
             last_post = time.time()
             st = None
-            if bev:
+            if bev_body:
                 sec = ne_h3.neo1_section_from_h3b(path_for(parent), green_fix=green_fix)
                 nec = ne_h3.nec1_section_from_h3b(path_for(parent))
                 r = ne_h3.post_observed(parent, sec, nec1_section=nec)
                 nbytes = len(sec) + len(nec)
-            elif has_view:
+            elif on_view:
                 r, sec, st = _post_bare_on_view(parent, want, c, green_fix)
                 nbytes = len(sec)
                 c["view"] = {"of": want, "obs_digest": st["digest"], "state": st["state"], "view_digest": st["view_digest"],
                              "cells_n": st["cells_n"], "dropped": st["dropped"], "filled": st["filled"],
-                             "hidden": st.get("hidden"), "at": _now()}
+                             "borrowed": st.get("borrowed", 0), "hidden": st.get("hidden"), "at": _now()}
                 c.pop("needs_bevdirect_view", None)
                 out["view_posted"] += 1
                 out["view_dropped"] += int(st["dropped"]); out["view_filled"] += int(st["filled"])
+                out["view_borrowed"] += int(st.get("borrowed") or 0)
                 vp = idx["stats"].setdefault("view_pass", {})
                 vp["posted"] = int(vp.get("posted") or 0) + 1
                 vp["cells_filled"] = int(vp.get("cells_filled") or 0) + int(st["filled"])
+                vp["cells_borrowed"] = int(vp.get("cells_borrowed") or 0) + int(st.get("borrowed") or 0)
                 vp["cells_dropped"] = int(vp.get("cells_dropped") or 0) + int(st["dropped"])
                 if k["on_index"]:
                     vp["reposted_on_index"] = int(vp.get("reposted_on_index") or 0) + 1
+                if omx:
+                    vp["reposted_obs_missing"] = int(vp.get("reposted_obs_missing") or 0) + 1
                 vp["last_at"] = _now()
                 if isinstance(r, dict) and r.get("declared_layer") == "lu":
                     log.warning("ne_ingest: NEO1 %s answered declared_layer=lu on the view path — pipeline bug? %s",
@@ -909,20 +1114,31 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
                      posted_at=_now(), post_result=str(r)[:160])
             c.pop("post_error", None)
             c["post_next"] = now + 600          # re-check after the NE server rescans (30 s) + slack
+            if omx:
+                oc = c.get("obs_missing") or {}
+                c["obs_missing"] = {"key": omx["key"], "missing_n": omx.get("missing_n"), "posted_at": _now(),
+                                    "pass_at": om_pass, "borrowed": int((st or {}).get("borrowed") or 0),
+                                    "unseen": int((st or {}).get("filled") or 0),
+                                    "attempts": (int(oc.get("attempts") or 0) + 1) if oc.get("key") == omx["key"] else 1}
+                c.update(post_attempts=0)       # an obs_missing re-post is not a retry of a failed confirm
             out["posted"] += 1
             idx["stats"]["posts"] = int(idx["stats"].get("posts") or 0) + 1
-            if bev:
+            if bev_body:
                 out["bev_posted"] += 1
                 c["lu_diff"] = r.get("lu_diff") if isinstance(r, dict) else None
             log.info("ne_ingest: NEO1 %s %s at the NE server (ours %s, theirs %s) — posted%s: %s", parent, why, want, have,
-                     " as NEC1+NEO1" if bev else (f" on view {st['state']} (cells={st['cells_n']} dropped={st['dropped']}"
-                                                  f" filled={st['filled']} hidden={st.get('hidden')})" if st else ""),
+                     " as NEC1+NEO1" if bev_body else (f" on view {st['state']} (cells={st['cells_n']} dropped={st['dropped']}"
+                                                       f" borrowed={st.get('borrowed', 0)} unseen={st['filled']} hidden={st.get('hidden')})" if st else ""),
                      str(r)[:120])
         except Exception as ex:  # noqa: BLE001
             n = int(c.get("post_attempts") or 0) + 1
             c.update(post_attempts=n, post_error=str(ex)[:200], post_next=now + POST_BACKOFF_S * (2 ** min(n, 4)))
             out["post_failed"] += 1
-            if not bev and " 409" in str(ex) and ("cell set" in str(ex) or has_view):
+            if bev_body and " 400" in str(ex):
+                # the NE server refuses our NEC1 (e.g. a union layer after a block/sweep merge) — the
+                # view path carries the observations without it
+                c["bev_body_refused"] = _now()
+            if not bev_body and " 409" in str(ex) and ("cell set" in str(ex) or has_view):
                 # our (lu-declared) cell set ≠ the NE server's lu and the NE server has no bev
                 # layer for this KG: retrying the bare NEO1 is pointless — the
                 # KG needs a bevdirect NEC1 in front of the obs (reprocess on
@@ -933,12 +1149,12 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
                 out["needs_bevdirect"] += 1
                 log.warning("ne_ingest: NEO1 %s parked: bare NEO1 cell set ≠ NE server %s and no bev layer — "
                             "needs a bevdirect NEC1+NEO1 product", parent, "view" if has_view else "lu")
-            if bev:
+            if bev_body:
                 out["bev_post_failed"] += 1
                 idx["stats"]["bev_post_fail_at"] = now
                 idx["stats"]["bev_post_fail_msg"] = f"{parent}: {str(ex)[:160]}"
             log.warning("ne_ingest: NEO1 post %s%s failed (attempt %d): %s", parent,
-                        " (NEC1+NEO1)" if bev else (" (on view)" if has_view else ""), n, str(ex)[:160])
+                        " (NEC1+NEO1)" if bev_body else (" (on view)" if on_view else ""), n, str(ex)[:160])
     out["candidates"] = len(cands)
     idx["stats"]["ne_server_last"] = dict(out, at=_now())
     return out
@@ -963,6 +1179,10 @@ def run_tick(max_n: int = MAX_PER_TICK) -> dict:
                 _save_index(idx)
         except Exception as ex:  # noqa: BLE001
             log.warning("ne_ingest stale-block journal: %s", ex)
+        try:
+            out["union_recovery"] = {k: v for k, v in recover_dropped(idx, entries).items() if not k.endswith("_codes")}
+        except Exception as ex:  # noqa: BLE001
+            log.warning("ne_ingest union recovery: %s", ex)
         todo = pending(entries, idx)
         out["pending"] = len(todo)
         mb_h = float(_knob("ne_ingest_mb_per_h", MB_PER_H_DEFAULT))
@@ -1035,8 +1255,11 @@ def status() -> dict:
                                            "post_failed", "pending_cells", "at", "bev_checked", "bev_confirmed",
                                            "bev_declared_mismatch", "bev_posted", "bev_post_failed",
                                            "needs_bevdirect", "day_cap_hold", "day_bytes", "obs_on_index", "on_view",
-                                           "view_posted", "view_dropped", "view_filled", "no_view", "candidates")},
+                                           "view_posted", "view_dropped", "view_filled", "view_borrowed", "no_view",
+                                           "obs_missing_due", "obs_missing_held", "obs_missing_listed", "recovery_hold", "candidates")},
         "view_pass": (idx.get("stats") or {}).get("view_pass"),
+        "obs_missing": {k: v for k, v in ((idx.get("stats") or {}).get("obs_missing") or {}).items() if k != "kgs"},
+        "union_recovery": (idx.get("stats") or {}).get("union_recovery"),
         "post_day": (idx.get("stats") or {}).get("post_day"),
         "green_fix": _green_fix_status(idx),
         "bev_post_fail_at": (idx.get("stats") or {}).get("bev_post_fail_at"),
@@ -1155,9 +1378,24 @@ def text_line(v: dict | None = None) -> str:
         if vp or um.get("obs_on_index") is not None:
             s += (f"\n    view_pass(ne-change §4b): NE server kgs_obs_on_index {vp.get('obs_on_index_before')}→{vp.get('obs_on_index_now')}"
                   f" · ours: on_view_ok={um.get('on_view')} obs_on_index={um.get('obs_on_index')} no_view={um.get('no_view')}"
-                  f" · posted_on_view={vp.get('posted') or 0} (of which on-index {vp.get('reposted_on_index') or 0})"
-                  f" cells filled={vp.get('cells_filled') or 0} dropped={vp.get('cells_dropped') or 0}"
+                  f" · posted_on_view={vp.get('posted') or 0} (of which on-index {vp.get('reposted_on_index') or 0},"
+                  f" obs-missing {vp.get('reposted_obs_missing') or 0})"
+                  f" cells borrowed={vp.get('cells_borrowed') or 0} unseen={vp.get('cells_filled') or 0}"
+                  f" dropped={vp.get('cells_dropped') or 0}"
                   f" since {vp.get('started_at')} last {vp.get('last_at')} · ?q=on+view for rows")
+        omx = v.get("obs_missing") or {}
+        if omx.get("kgs_n") is not None or um.get("obs_missing_listed"):
+            s += (f"\n    obs_missing(NE-server revisit): listed={omx.get('kgs_n')} KGs / {omx.get('cells_n')} cells"
+                  f" (pass {omx.get('pass_at')}, no_obs={omx.get('kgs_no_obs')}) · ours: due={um.get('obs_missing_due')}"
+                  f" held={um.get('obs_missing_held')} — view cells a neighbour observed are borrowed from the corpus,"
+                  f" the rest post as unseen (sweep territory)")
+            if omx.get("error"):
+                s += f" LAST-ERR {omx['error'][:80]}"
+        ur = v.get("union_recovery") or {}
+        if ur and not ur.get("done"):
+            s += (f"\n    union_recovery: {ur.get('remerge_done', 0)}/{ur.get('remerge', 0)} split parents re-merged,"
+                  f" {ur.get('repull_done', 0)}/{ur.get('repull', 0)} unsplit re-pulled, {um.get('recovery_hold')} posts held (sweep merge dropped"
+                  f" {ur.get('cells_dropped')} observed bev cells; union merge since 2026-11-04)")
         if um.get("needs_bevdirect"):
             s += f" · needs_bevdirect={um['needs_bevdirect']} (lu cell-set 409, parked — reprocess on a bev-mode peer)"
         fa = v.get("bev_post_fail_at")
