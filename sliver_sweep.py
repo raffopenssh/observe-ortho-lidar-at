@@ -72,7 +72,8 @@ HOLD_RECHECK_S = 15 * 60        # a unit on hold (openEO cell not cached) is re-
 HOLD_MAX_CELLS = 40             # cap on held cells handed to the director's prewarm.repair_cells plan per tick
 _CACHE_CHECK_TTL_S = 10 * 60    # CopernicusTileCache / HansenTileCache instance reuse (ZIP index parse is costly)
 SCAN_PER_TICK = 400
-INTEGRATE_PER_TICK = 6
+INTEGRATE_PER_TICK = 40         # cap per ingest tick; INTEGRATE_BUDGET_S stops earlier (2026-11-04: 6/tick left 677 parents received-not-integrated)
+INTEGRATE_BUDGET_S = 150.0      # wall-clock budget for merges per tick (a merge is 3-20 s)
 SWEEP_PEERS_DEFAULT = 4
 SWEEP_PER_PEER_DEFAULT = 3
 
@@ -959,7 +960,13 @@ def integrate(idx: dict, entries: dict | None = None, max_n: int = INTEGRATE_PER
             elif s == "done" and k.get("integrated_digest") and _file_digest(code, idx) not in (None, k["integrated_digest"]) \
                     and sweep_paths(code, st, entries):
                 cands.append(code)
+        # oldest received first (dict order = planning order starved the
+        # 7xxxx parents while low codes kept arriving)
+        cands.sort(key=lambda c: _ts(st["kgs"][c].get("received_at") or st["kgs"][c].get("done_at") or "") or 0.0)
+        t_start = time.time()
         for code in cands[:max_n]:
+            if done and time.time() - t_start > INTEGRATE_BUDGET_S:
+                break
             k = st["kgs"][code]
             paths = sweep_paths(code, st, entries)
             parent_p = _parent_path(code)

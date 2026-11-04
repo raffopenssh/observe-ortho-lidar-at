@@ -56,6 +56,24 @@ import public_segmentation as _ps   # ROUTES allow-list shared with the public t
 import feedback_db
 import quality_flags
 
+# === SECTION: background-thread guard ===
+# app.py is imported as a *library* by side processes (ne-viewfill.timer via
+# ``ne_ingest._coverage_complete`` → ``_kg_coverage_complete``, CLI tools).
+# Without this guard every such import also started the peer-sync fanout,
+# search-index init, ingest loops, director bootstrap … in that process
+# (2026-11-04: the hourly viewfill walk pushed cache manifests to 50 peers
+# from a nice-15 side job).  ``SRTM_APP_LIB_ONLY=1`` keeps the module pure.
+_APP_LIB_ONLY = os.environ.get('SRTM_APP_LIB_ONLY') == '1'
+
+
+def _start_bg(target, name=None):
+    """Start a daemon thread unless this process only wants app.py as a library."""
+    if _APP_LIB_ONLY:
+        return None
+    t = threading.Thread(target=target, daemon=True, name=name)
+    t.start()
+    return t
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
@@ -903,7 +921,7 @@ def _init_search_index():
                 log.warning('Search index watch: %s', e)
     except Exception as e:
         log.warning('Search index init failed: %s', e)
-threading.Thread(target=_init_search_index, daemon=True).start()
+_start_bg(_init_search_index)
 
 
 def _get_peer_urls():
@@ -1865,7 +1883,7 @@ def _sync_peer_data():
         _peer_sync_state_save()
         time.sleep(PEER_SYNC_INTERVAL_S)
 
-threading.Thread(target=_sync_peer_data, daemon=True, name='peer-sync').start()
+_start_bg(_sync_peer_data, name='peer-sync')
 
 
 # --- v2 ingest: fleet _json_v2 products → data/kg_v2_store.db (primary only) ---
@@ -1889,7 +1907,7 @@ def _v2_ingest_thread():
         except Exception:
             return False
     _v2i.loop(_should_run)
-threading.Thread(target=_v2_ingest_thread, daemon=True, name='v2-ingest').start()
+_start_bg(_v2_ingest_thread, name='v2-ingest')
 
 
 # --- NE ingest: fleet <code>_ne.h3b products → data/ne/ (primary only) ---
@@ -1913,7 +1931,7 @@ def _ne_ingest_thread():
         except Exception:
             return False
     _nei.loop(_should_run)
-threading.Thread(target=_ne_ingest_thread, daemon=True, name='ne-ingest').start()
+_start_bg(_ne_ingest_thread, name='ne-ingest')
 
 
 # --- ALS acquisition years: per-KG block cache backfill (primary only, als_years.py) ---
@@ -1928,7 +1946,7 @@ def _als_years_thread():
         _aly.start_backfill_thread(_should_run)
     except Exception as _e:  # noqa: BLE001
         log.debug('als_years thread: %s', _e)
-threading.Thread(target=_als_years_thread, daemon=True, name='als-years').start()
+_start_bg(_als_years_thread, name='als-years')
 
 
 def _host_patch_startup_thread():
@@ -1981,7 +1999,7 @@ def _host_patch_startup_thread():
                  st.get('security_pending'), pins, (r.stderr or '')[-200:])
     except Exception as e:
         log.warning('host_patch startup: %s', e)
-threading.Thread(target=_host_patch_startup_thread, daemon=True, name='host-patch').start()
+_start_bg(_host_patch_startup_thread, name='host-patch')
 
 
 # === SECTION: Host reboot (peers only, graceful) ===
@@ -2137,7 +2155,7 @@ def _host_reboot_thread():
         time.sleep(nap)
 
 
-threading.Thread(target=_host_reboot_thread, daemon=True, name='host-reboot').start()
+_start_bg(_host_reboot_thread, name='host-reboot')
 
 
 # === SECTION: Status push to director ===
@@ -2560,8 +2578,7 @@ def _peer_status_push_loop():
             time.sleep(PEER_PUSH_INTERVAL_S)
 
 
-threading.Thread(target=_peer_status_push_loop, daemon=True,
-                 name='peer-status-push').start()
+_start_bg(_peer_status_push_loop, name='peer-status-push')
 
 
 # === SECTION: Role-data eviction (free disk on demoted peers) ===
@@ -2883,8 +2900,7 @@ def _role_data_eviction_loop():
         time.sleep(ROLE_EVICT_TICK_SECONDS)
 
 
-threading.Thread(target=_role_data_eviction_loop, daemon=True,
-                 name='role-data-evict').start()
+_start_bg(_role_data_eviction_loop, name='role-data-evict')
 
 
 MAX_AREA_SQM = 25_000_000  # 25 km²
@@ -8349,8 +8365,7 @@ def _combined_log_ticker():
         _time.sleep(30)
 
 
-threading.Thread(target=_combined_log_ticker, daemon=True,
-                 name='combined-log-ticker').start()
+_start_bg(_combined_log_ticker, name='combined-log-ticker')
 
 
 # === SECTION: srv memory sampler ===
@@ -8409,7 +8424,7 @@ def _srv_mem_ticker():
         _time.sleep(300)
 
 
-threading.Thread(target=_srv_mem_ticker, daemon=True, name='srv-mem-ticker').start()
+_start_bg(_srv_mem_ticker, name='srv-mem-ticker')
 
 
 @app.route('/api/v1/director/log/history')
@@ -10174,7 +10189,7 @@ def _start_director():
         return
     d = pd.get_director()
     d.start()
-threading.Thread(target=_start_director, daemon=True).start()
+_start_bg(_start_director)
 
 
 # === SECTION: Search index API endpoints ===
@@ -21521,7 +21536,7 @@ def _orphan_sweep_thread():
     _resume_orphaned_tasks_once()
 
 
-threading.Thread(target=_orphan_sweep_thread, daemon=True, name='task-orphan-sweep').start()
+_start_bg(_orphan_sweep_thread, name='task-orphan-sweep')
 
 
 if __name__ == '__main__':

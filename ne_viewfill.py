@@ -500,6 +500,9 @@ def text_line() -> str:
 
 if __name__ == "__main__":
     import argparse
+    # app.py is only needed as a library here (_kg_coverage_complete) — keep
+    # its peer-sync / ingest / director threads out of this side process
+    os.environ.setdefault("SRTM_APP_LIB_ONLY", "1")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["run", "plan", "status"])

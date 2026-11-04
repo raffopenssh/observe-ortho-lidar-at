@@ -24,13 +24,16 @@ flight_years 0) — NE server lists them under `revisit?kind=obs_missing`
   `data/ne/viewfill/state.json`; pulled own products in `viewfill/pulled/`.
   Inbound budget channel `viewfill` (knob `viewfill_mb_per_h`, default 5000 —
   effectively unlimited: at 400 the hourly run hit the budget after ~13 min /
-  ~100 KGs, so the 1 765-KG walk would have taken ~18 h; 2026-11-04). `python3 ne_viewfill.py plan <kg>` = dry run.
+  ~100 KGs, so the 1 765-KG walk would have taken ~18 h; 2026-11-04). `python3 ne_viewfill.py plan <kg>` = dry run. The CLI sets `SRTM_APP_LIB_ONLY=1`
+  before touching `app.py` (`ne_ingest._coverage_complete` imports it): without it
+  the side process also ran app's peer-sync fanout / ingest loops / director
+  bootstrap (`app._start_bg`, 2026-11-04).
 * `ne_ingest.consume_viewfill` — first step of `run_tick` (≤200 staged/tick — was 40, which starved the sweepers once the walk ran unthrottled):
   swaps the staged h3b **only if** the live file's NEO1 digest still equals
   the builder's `base_digest` (else `rejected`, re-walked next run), re-indexes
   cells (`_index_cells` → bins stale → `cells-bins.timer` rebuilds them),
   updates index rows (`viewfill_at`, `viewfill_from`), queues `plan_cells`,
-  sets `NE server[kg].repost="viewfill"` → `confirm_NE server` posts it at top
+  sets `ne_server[kg].repost="viewfill"` → `confirm_ne_server` posts it at top
   priority even when NE server already holds our digest (the rows it holds are
   the blank ones).
 * Sweep units with `declared: "view"` (spec → `_sweep_declared` → peer
@@ -55,5 +58,9 @@ curl -s 'http://localhost:8000/process.txt?q=viewfill&log=200'
 
 Expect: corpus/union cases converge within a few ticks after each hourly
 walk; residual (sweep) cells follow the sweeper cadence (`docs/sliver-sweep.md`).
+Throughput chain once the walk is done (2026-11-04 tuning): staged → `consume_viewfill`
+(≤200/tick) → `confirm_ne_server` re-POSTs (`ne_post_max_per_tick`, 30→50; the ingest
+tick takes ~12 min, so ~250 posts/h; `ne_post_gib_per_day` caps the day) and sweep
+results → `sliver_sweep.integrate` (oldest received first, ≤40/tick in 150 s).
 A KG walked with nothing left is not re-walked for 7 days (`RECHECK_S`); the
 same residual set is not re-queued for 7 days (`REPLAN_S`).

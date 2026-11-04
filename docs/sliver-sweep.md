@@ -45,7 +45,7 @@ worker: sliver_sweep.peer_units → kg dicts {kg_code '63308-sw1', _parent_kg_co
    → POST /api/v1/director/sweep/result?unit&parent&status&cells&products (body = h3b)
    status ok | nodata (outside LiDAR coverage / 0 cells) | failed
 director accept_result: verify_h3b → data/ne/sweeps/<unit>.h3b; all units in → received
-integrate (ne_ingest tick, ≤6/tick): ne_ingest.merge_blocks(parent, [parent.h3b] + sweeps)
+integrate (ne_ingest tick, oldest received first, ≤40/tick within a 150 s budget — was 6/tick until 2026-11-04): ne_ingest.merge_blocks(parent, [parent.h3b] + sweeps)
    (per cell the best-observed source wins; interior cells untouched) → done
 ```
 
