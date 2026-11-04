@@ -1315,6 +1315,17 @@ def run_tick(max_n: int = MAX_PER_TICK) -> dict:
             import stale_blocks as _sb
             if _sb.consume_ne_journal(idx, entries):
                 _save_index(idx)
+            # drop failure records whose product is gone (status=removed /
+            # re-uploaded): they can never be retried and only inflate the
+            # ``failed=`` counter on /process.txt
+            stale = [c for c, f in (idx.get("failed") or {}).items()
+                     if not _committed(entries.get(c + "_ne_h3b") or {})
+                     or (entries[c + "_ne_h3b"].get("uploaded_at") != f.get("uploaded_at"))]
+            if stale:
+                for c in stale:
+                    idx["failed"].pop(c, None)
+                log.info("ne_ingest: pruned %d stale failure record(s): %s", len(stale), ",".join(sorted(stale))[:200])
+                _save_index(idx)
         except Exception as ex:  # noqa: BLE001
             log.warning("ne_ingest stale-block journal: %s", ex)
         try:
