@@ -99,6 +99,20 @@ window below the floor (`max(20 KB/s, 0.25 × median of recent PUTs)`),
 skipped once ≥ 90 % is sent; at most one slow abort per file. Test:
 `tests/test_put_watchdog.py`.
 
+## Zenodo multipart uploads — probed 2026-11-04, NOT usable (don't build yet)
+
+zenodo.org (InvenioRDM v13) accepts the multipart *init*
+(`POST /api/records/<id>/draft/files` with `transfer:{type:"M",parts,part_size}` → 201,
+`links.parts[]` + `links.commit`, record id == deposition id, same bucket, `storage_class:"L"`),
+but every part `PUT …/content/<n>` and the `commit` answer **403 Permission denied**, even on a
+fresh draft with 512 KB parts (0.5 s). That's not our token: the single-file RDM path
+(`POST draft/files [{key}]` → `PUT …/content` → `commit`) returns 200 with the same token. The legacy
+bucket `?uploads=` API (`Client._multipart_upload`) returns 405 and is hard-disabled
+(`use_multipart = False`). Re-probe: fresh throwaway deposition, 3×512 KB parts, expect 200 on
+part PUTs. Only then is the opt-in knob plan (`zenodo_multipart*` director knobs, fallback to
+single PUT) worth building. One 5 MB part stream measured ~116 KB/s from the primary vs the
+fleet's ~35 KB/s per-PUT median, but that's one probe and not a like-for-like comparison.
+
 ## Failure modes
 
 | symptom | cause / handling |
