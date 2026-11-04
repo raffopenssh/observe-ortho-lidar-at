@@ -42,7 +42,7 @@ flight_years 0) — NE server lists them under `revisit?kind=obs_missing`
 ## Reading it
 
 `/process.txt` → `ne_ingest:` block, `viewfill:` sub-line:
-`walked / blank / borrowable / staged / sweep=<cells>c/<kg>kg / residual / waiting`
+`kgs=<walked>/<parents> left eta=~Nh (runs @walked/run)` — walk ETA, nothing else needed for a progress check — then `walked / blank / borrowable / staged / sweep=<cells>c/<kg>kg / residual / waiting`
 (builder totals) · `tick: applied swapped rejected sweep repost errors due`
 (ingest side) · `view_pass … viewfill N` = forced re-posts done. Sweep units
 show up in `sweep:` as `-sw<k>` units with `source=viewfill`.

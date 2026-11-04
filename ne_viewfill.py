@@ -469,7 +469,14 @@ def text_line() -> str:
     try:
         s = status()
         st, lr = s["stats"], s.get("last_run") or {}
-        return (f"viewfill: walked={st.get('walked', 0)} blank={st.get('blank', 0)} borrowable={st.get('borrowable', 0)}"
+        # walk ETA: parents with an h3b not yet walked (within RECHECK_S) ÷ KGs per hourly run
+        total = sum(1 for _ in NE_DIR.glob("?????.h3b"))
+        left = max(0, total - int(s.get("kgs_walked") or 0))
+        per_run = int(lr.get("walked") or 0)
+        runs = -(-left // per_run) if per_run else None
+        eta = f"~{runs}h ({runs} runs @{per_run}/run)" if runs is not None else "n/a"
+        return (f"viewfill: kgs={s.get('kgs_walked', 0)}/{total} left={left} eta={eta}"
+                f" | walked={st.get('walked', 0)} blank={st.get('blank', 0)} borrowable={st.get('borrowable', 0)}"
                 f" staged={st.get('staged', 0)} sweep={st.get('planned_cells', 0)}c/{st.get('planned_kgs', 0)}kg"
                 f" residual={st.get('residual', 0)} errors={st.get('errors', 0)} waiting={s['staged_waiting']}"
                 f" last_run={lr.get('at', '-')} ({lr.get('walked', 0)} walked, {lr.get('candidates', 0)} cand"
