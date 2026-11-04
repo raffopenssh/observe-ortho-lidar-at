@@ -763,7 +763,9 @@ def consume_viewfill(idx: dict, entries: dict, max_n: int = VIEWFILL_PER_TICK) -
     import ne_h3
     if not VIEWFILL_STAGED.exists():
         return {}
-    files = sorted(VIEWFILL_STAGED.glob("?????.json"))[:max_n]
+    # FIFO by mtime — sorting by name starved the 7xxxx parents while the
+    # builder re-staged low codes every hour (2026-11-04: 72009 waited 4 h+)
+    files = sorted(VIEWFILL_STAGED.glob("?????.json"), key=lambda f: f.stat().st_mtime)[:max_n]
     if not files:
         return {}
     vf = idx["stats"].setdefault("viewfill", {"applied": 0, "swapped": 0, "rejected": 0, "planned_kgs": 0,
@@ -1191,7 +1193,7 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
                 -int((omx or {}).get("missing_n") or 0), 0 if has_view else 1, parent)
         cands.append((prio, parent, {"want": want, "have": have, "bev": bev, "bev_body": bev_body, "on_view": on_view,
                                      "has_view": has_view, "on_index": on_index, "c": c,
-                                     "om": (dict(omx, key=f"{omx.get('view_source')}:{omx.get('missing_n')}") if om_due else None)}))
+                                     "om": (dict(omx, key=f"{omx.get('view_source')}:{omx.get('missing_n')}") if (om_due and omx) else None)}))
     # --- phase 2: POST in priority order within the tick / day budgets
     cands.sort(key=lambda t: t[0])
     posts = 0

@@ -312,6 +312,15 @@ def process(kg: str, entries: dict | None = None, idx: dict | None = None, *, st
                view_etag=view.header.get("_etag"))
     ids, seen, digest = _ids_observed(p)
     row.update(file_n=int(ids.size), file_observed=int(seen.size), base_digest=digest)
+    # Nothing moved since the last walk (same view ETag, same file digest, no
+    # error) → the previous result still stands; re-walking only re-staged a
+    # duplicate repost every hour for the ~6 800 NE-server-listed parents.
+    if (prev.get("ts") and time.time() - float(prev["ts"]) < RECHECK_S and not prev.get("error")
+            and prev.get("view_etag") and prev.get("view_etag") == row.get("view_etag")
+            and prev.get("base_digest") == digest):
+        row.update(skip="unchanged", blank=prev.get("blank"), residual_n=prev.get("residual_n"),
+                   residual_digest=prev.get("residual_digest"), planned_ts=prev.get("planned_ts"))
+        return row
     gap = np.setdiff1d(vids, seen, assume_unique=True)
     row["blank"] = int(gap.size)                       # what NE server counts as blank + missing today
     if not gap.size:
@@ -471,10 +480,13 @@ def text_line() -> str:
         st, lr = s["stats"], s.get("last_run") or {}
         # walk ETA: parents with an h3b not yet walked (within RECHECK_S) ÷ KGs per hourly run
         total = sum(1 for _ in NE_DIR.glob("?????.h3b"))
-        left = max(0, total - int(s.get("kgs_walked") or 0))
+        # parents never walked are simply not candidates (no gap known) — the
+        # walk is "done" when the last run got through its candidate list
+        left = max(0, int(lr.get("candidates") or 0) - int(lr.get("walked") or 0) - int(lr.get("skipped") or 0)) \
+            if lr.get("budget_stop") else 0
         per_run = int(lr.get("walked") or 0)
-        runs = -(-left // per_run) if per_run else None
-        eta = f"~{runs}h ({runs} runs @{per_run}/run)" if runs is not None else "n/a"
+        runs = -(-left // per_run) if (left and per_run) else 0
+        eta = f"~{runs}h" if left else "done"
         return (f"viewfill: kgs={s.get('kgs_walked', 0)}/{total} left={left} eta={eta}"
                 f" | walked={st.get('walked', 0)} blank={st.get('blank', 0)} borrowable={st.get('borrowable', 0)}"
                 f" staged={st.get('staged', 0)} sweep={st.get('planned_cells', 0)}c/{st.get('planned_kgs', 0)}kg"
