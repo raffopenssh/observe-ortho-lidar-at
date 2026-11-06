@@ -947,18 +947,30 @@ def _has_view(rec: dict) -> bool:
     return str(_view_of(rec)[0] or "").startswith("chunks@")
 
 
-def _post_bare_on_view(parent: str, want: str, c: dict, green_fix: bool) -> tuple[dict, bytes, dict]:
+def _post_bare_on_view(parent: str, want: str, c: dict, green_fix: bool,
+                       held: str | None = None) -> tuple[dict, bytes, dict]:
     """Bare NEO1 re-keyed onto the NE server's ``/declared`` view (ne-change.md §4b):
     fetch → rebuild → POST; a 409 that carries ``view{}`` means the view moved
     between GET and POST → refetch once and rebuild.  Returns
-    ``(server answer, posted section, rekey stats)``.  Raises on failure."""
+    ``(server answer, posted section, rekey stats)``.  Raises on failure.
+
+    *held* = the obs digest the NE server's manifest holds for the KG right now.
+    When the body we just rebuilt on the view has that digest, the NE server already
+    has exactly these rows (a POST whose record we lost — restart mid-tick —
+    or a tick on a stale manifest): the view GET (~0.2 MB) is all it costs,
+    no POST, and the caller confirms from the returned stats
+    (``answer["unchanged"] is True``)."""
     import ne_h3
     last = None
     for attempt in range(2):
         view = ne_h3.fetch_declared_view(parent)
         if view is None:
-            raise ne_h3.NEError(f"NE server {parent}/declared: 404 (KG holds nothing)")
+            raise ne_h3.NEError(f"the NE server {parent}/declared: 404 (KG holds nothing)")
         sec, st = ne_h3.neo1_section_on_view(path_for(parent), view, green_fix=green_fix)
+        if held and st.get("digest") == held:
+            log.info("ne_ingest: NEO1 %s already at the NE server on view %s (digest %s) — record recovered, no POST",
+                     parent, st.get("state"), held)
+            return {"unchanged": True, "recovered": True, "cells_n": st["cells_n"]}, b"", st
         try:
             return ne_h3.post_observed(parent, sec), sec, st
         except ne_h3.NEError as ex:
@@ -1284,7 +1296,16 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
     cands.sort(key=lambda t: t[0])
     posts = 0
     last_post = 0.0
+    last_save = time.time()
     for _prio, parent, k in cands:
+        # Checkpoint the post records every ~60 s: the tick's index write
+        # only happened after the whole loop, so a srv restart / exception
+        # mid-loop (200 posts ≈ 4 min) forgot every POST of the tick and the
+        # next tick re-sent identical bodies (2026-11-06).
+        if time.time() - last_save > 60:
+            idx["stats"]["umfeld_last"] = dict(out, at=_now(), partial=True)
+            _save_index(idx)
+            last_save = time.time()
         if posts >= max_posts:
             break
         if pd["bytes"] >= day_cap:
@@ -1302,14 +1323,17 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
                 time.sleep(gap)
             last_post = time.time()
             st = None
+            recovered = False
             if bev_body:
                 sec = ne_h3.neo1_section_from_h3b(path_for(parent), green_fix=green_fix)
                 nec = ne_h3.nec1_section_from_h3b(path_for(parent))
                 r = ne_h3.post_observed(parent, sec, nec1_section=nec)
                 nbytes = len(sec) + len(nec)
             elif on_view:
-                r, sec, st = _post_bare_on_view(parent, want, c, green_fix)
+                r, sec, st = _post_bare_on_view(parent, want, c, green_fix,
+                                                held=None if (k.get("cov_due") or c.get("repost")) else have)
                 nbytes = len(sec)
+                recovered = bool(isinstance(r, dict) and r.get("recovered"))
                 c["view"] = {"of": want, "obs_digest": st["digest"], "state": st["state"], "view_digest": st["view_digest"],
                              "cells_n": st["cells_n"], "dropped": st["dropped"], "filled": st["filled"],
                              "borrowed": st.get("borrowed", 0), "blank": st.get("blank"), "coverage": st.get("coverage"),
@@ -1343,6 +1367,11 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
                 sec = ne_h3.neo1_section_from_h3b(path_for(parent), green_fix=green_fix)
                 r = ne_h3.post_observed(parent, sec)
                 nbytes = len(sec)
+            if recovered:
+                c.update(confirmed_digest=want, confirmed_at=_now(), post_attempts=0, posted_digest=want)
+                c.pop("post_next", None)
+                out["recovered"] = int(out.get("recovered") or 0) + 1
+                continue       # no POST happened: no budget, no ladder step, no obs_missing record
             posts += 1
             pd["bytes"] += nbytes
             pd["posts"] += 1
@@ -1519,7 +1548,7 @@ def status() -> dict:
                                            "needs_bevdirect", "day_cap_hold", "day_bytes", "obs_on_index", "on_view",
                                            "view_posted", "view_dropped", "view_filled", "view_borrowed", "no_view",
                                            "obs_missing_due", "obs_missing_held", "obs_missing_listed", "recovery_hold", "candidates",
-                                           "viewfill_due", "nodata_held", "unswept_held", "coverage_due", "coverage_posted")},
+                                           "viewfill_due", "nodata_held", "unswept_held", "coverage_due", "coverage_posted", "recovered")},
         "view_pass": (idx.get("stats") or {}).get("view_pass"),
         "obs_missing": {k: v for k, v in ((idx.get("stats") or {}).get("obs_missing") or {}).items() if k != "kgs"},
         "union_recovery": (idx.get("stats") or {}).get("union_recovery"),
@@ -1635,6 +1664,7 @@ def text_line(v: dict | None = None) -> str:
               f" viewfill {um.get('viewfill_due') or 0}; mismatch={um.get('mismatch')} missing={um.get('missing')}"
               f" held nodata/unswept/obs_missing={um.get('nodata_held') or 0}/{um.get('unswept_held') or 0}/{um.get('obs_missing_held') or 0})"
               f" · last tick posted={um.get('posted')}/{int(_knob('ne_post_max_per_tick', 50))} failed={um.get('post_failed')}"
+              f" recovered(already at umfeld, no POST)={um.get('recovered') or 0}"
               f" · today {int(pdy.get('posts') or 0)} POSTs {(pdy.get('bytes') or 0) / 2 ** 30:.2f}/{cap:.0f} GiB (≤2/s)"
               f" unbuilt={um.get('pending_cells')} swept_posted={um.get('coverage_posted') or 0}")
         if um.get("day_cap_hold"):

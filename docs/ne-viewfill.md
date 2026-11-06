@@ -117,6 +117,12 @@ totals) · `tick: applied swapped rejected sweep repost errors due` (ingest
 side) · `view_pass … viewfill N` = forced re-posts done. Sweep units show up
 in `sweep:` as `-sw<k>` units with `source=viewfill`.
 
+No repeats: the post loop checkpoints `data/ne/index.json` every 60 s (a
+restart mid-tick used to forget the whole tick's posts), and before every
+view POST the rebuilt body's digest is compared with the obs digest the NE
+server's manifest holds — equal ⇒ `recovered=` (view GET only, no POST,
+confirmed). So even a lost record costs 0.2 MB, never a re-send.
+
 Rate limits toward the NE server (`ne_ingest`): ≤2 POST/s (`POST_MIN_GAP_S`),
 `ne_post_max_per_tick` posts per tick (default 50; 200 only for a one-off
 drain, put it back), `ne_post_gib_per_day` (10 GiB, mirrored on the NE server's
