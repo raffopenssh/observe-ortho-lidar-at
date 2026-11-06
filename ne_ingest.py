@@ -1664,7 +1664,7 @@ def text_line(v: dict | None = None) -> str:
               f" viewfill {um.get('viewfill_due') or 0}; mismatch={um.get('mismatch')} missing={um.get('missing')}"
               f" held nodata/unswept/obs_missing={um.get('nodata_held') or 0}/{um.get('unswept_held') or 0}/{um.get('obs_missing_held') or 0})"
               f" · last tick posted={um.get('posted')}/{int(_knob('ne_post_max_per_tick', 50))} failed={um.get('post_failed')}"
-              f" recovered(already at umfeld, no POST)={um.get('recovered') or 0}"
+              f" recovered(already at NE server, no POST)={um.get('recovered') or 0}"
               f" · today {int(pdy.get('posts') or 0)} POSTs {(pdy.get('bytes') or 0) / 2 ** 30:.2f}/{cap:.0f} GiB (≤2/s)"
               f" unbuilt={um.get('pending_cells')} swept_posted={um.get('coverage_posted') or 0}")
         if um.get("day_cap_hold"):
