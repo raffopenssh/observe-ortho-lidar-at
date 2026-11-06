@@ -1997,8 +1997,12 @@ def view_coverage(kg: str, ctx: dict | None = None) -> str | None:
     unless BOTH hold:
 
     * the parent's sweep is **closed**: ``sliver_sweep.json kgs[kg].state ==
-      "done"``, every unit ``ok`` (no pending / dispatched / hold / failed unit),
-      nothing ``unswept`` and no cluster deferred at plan time (``plan_deferred``);
+      "done"`` (every unit ``ok`` — no pending / dispatched / hold / failed
+      unit, nothing ``unswept``, no cluster deferred at plan time
+      (``plan_deferred``)) **or ``"clean"``** (scanned, nothing unseen to
+      sweep — 2026-11-06: 2 367 clean parents sat listed with 1–6 elev-only
+      rows each, which umfeld counts blank although the pipeline did run
+      over them; exactly the "observed nothing" the swept flag describes);
     * the view-fill walk left **residual only**: ``viewfill/state.json kgs[kg]``
       exists, walked without error, no staged result waiting for the ingest
       tick, and its residual (cells nobody observed) is either 0 or was handed
@@ -2010,7 +2014,7 @@ def view_coverage(kg: str, ctx: dict | None = None) -> str | None:
     kg = str(kg).zfill(5)
     ctx = ctx or coverage_context()
     k = (ctx.get("sweep") or {}).get(kg)
-    if not isinstance(k, dict) or k.get("state") != "done":
+    if not isinstance(k, dict) or k.get("state") not in ("done", "clean"):
         return None
     units = k.get("units") or []
     if any(u.get("state") != "ok" for u in units) or int(k.get("unswept") or 0) or int(k.get("plan_deferred") or 0):

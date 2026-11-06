@@ -1173,7 +1173,12 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
             c["bev"] = {"nec1": nec_digest, "ne_server_bev": bev_digest, "obs_declared": obs.get("declared_digest")}
             ok = (have == want and decl_ok) or view_ok
         elif has_view:
-            ok = view_ok and str(obs.get("declared_source") or "").startswith("chunks@")
+            # the NE server validates the post against its chunk view (``chunks@…``)
+            # or, when it holds a bevdirect NEC1 for the KG, against that layer
+            # (``bevdirect@…``) — both are "the view"; only ``index-…`` is the old
+            # lu set.  (2026-11-06: 868 parents sat at mismatch forever because
+            # only ``chunks@`` counted — ~6 identical re-posts each per 3 h.)
+            ok = view_ok
             if ok:
                 out["on_view"] += 1
             elif on_index:
