@@ -5221,6 +5221,7 @@ def _get_completed_kgs() -> set:
     """
     data_dir = Path('data/austria_processor')
     completed = set()
+    removed_json: set = set()
     manifest_path = data_dir / 'zenodo_manifest.json'
     if manifest_path.exists():
         try:
@@ -5228,13 +5229,26 @@ def _get_completed_kgs() -> set:
             m = json_cache.load(manifest_path) or {}
             entries = m.get('entries', m)
             for key in entries:
-                if key.endswith('_json') and 'error' not in entries[key].get('status', ''):
-                    completed.add(key.replace('_json', ''))
+                if not key.endswith('_json'):
+                    continue
+                _e = entries[key] or {}
+                _st = str(_e.get('status') or '')
+                if 'error' in _st:
+                    continue
+                # ``status=removed`` (size 0) = product deleted on Zenodo
+                # (same rule as the coverage oracle) — the KG needs a
+                # re-run, so it must not be advertised as completed.
+                if _st == 'removed' or not int(_e.get('size') or 0):
+                    removed_json.add(key.replace('_json', ''))
+                    continue
+                completed.add(key.replace('_json', ''))
         except Exception:
             pass
     json_dir = data_dir / 'json'
     if json_dir.exists():
         for jf in json_dir.glob('*.json'):
+            if jf.stem in removed_json:
+                continue   # stale local copy of a removed product
             completed.add(jf.stem)
     # Drop tombstoned KGs (force-requeued by operator).
     try:

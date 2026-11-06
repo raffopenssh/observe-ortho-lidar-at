@@ -11435,18 +11435,59 @@ class PeerDirector:
         return sorted(common)
 
     def _cell_for_bbox(self, bb: dict) -> tuple[float, float, float, float] | None:
-        """Return the cached cell that fully contains *bb*, or None."""
+        """Return the cached cell that fully contains *bb*; for a
+        straddler (bbox crossing a planning-cell edge) the cached cell
+        holding its centroid; else None."""
         s = bb.get('min_lat') or bb.get('south')
         n = bb.get('max_lat') or bb.get('north')
         w = bb.get('min_lon') or bb.get('west')
         e = bb.get('max_lon') or bb.get('east')
         if None in (s, n, w, e):
             return None
-        for cs, cn, cw, ce in self._cached_cells():
+        cells = self._cached_cells()
+        for cs, cn, cw, ce in cells:
             if (s >= cs - 1e-9 and n <= cn + 1e-9
                     and w >= cw - 1e-9 and e <= ce + 1e-9):
                 return (cs, cn, cw, ce)
+        cy, cx = (s + n) / 2.0, (w + e) / 2.0
+        for cs, cn, cw, ce in cells:
+            if cs - 1e-9 <= cy < cn - 1e-9 and cw - 1e-9 <= cx < ce - 1e-9:
+                return (cs, cn, cw, ce)
         return None
+
+    @staticmethod
+    def _bbox_covered_by_cells(s: float, n: float, w: float, e: float,
+                               cells) -> bool:
+        """True when every planning cell the bbox (s,n,w,e) intersects is
+        in *cells* (an iterable of (s,n,w,e) tuples aligned to the
+        FRONTIER_CELL_LAT × FRONTIER_CELL_LON grid).
+
+        The old "bbox inside ONE cached cell" test silently excluded
+        every *straddler* KG (bbox crossing a 0.5°/1° cell edge, ~6 % of
+        all KGs) from the cache-only whitelist for the whole run; once
+        the frontier had drained the single-cell KGs, the tail of the
+        run (2026-11-06: 57 of the last 59 KGs) sat fully cached but
+        undispatchable while 45 cache-only peers idled.
+        """
+        import math as _m
+        lat_step, lon_step = FRONTIER_CELL_LAT, FRONTIER_CELL_LON
+        if lat_step <= 0 or lon_step <= 0:
+            return False
+        cset = {(round(a, 4), round(b, 4), round(c, 4), round(d, 4))
+                for a, b, c, d in cells}
+        lat0 = _m.floor((s + 1e-9) / lat_step)
+        lat1 = _m.floor((n - 1e-9) / lat_step)
+        lon0 = _m.floor((w + 1e-9) / lon_step)
+        lon1 = _m.floor((e - 1e-9) / lon_step)
+        if lat1 < lat0 or lon1 < lon0:
+            return False
+        for i in range(lat0, lat1 + 1):
+            for j in range(lon0, lon1 + 1):
+                key = (round(i * lat_step, 4), round((i + 1) * lat_step, 4),
+                       round(j * lon_step, 4), round((j + 1) * lon_step, 4))
+                if key not in cset:
+                    return False
+        return True
 
     def _cell_fingerprint(self, cs: float, cn: float,
                           cw: float, ce: float) -> str:
@@ -12175,11 +12216,15 @@ class PeerDirector:
 
             def _within_cells(s: float, n: float,
                               w: float, e: float) -> bool:
+                # Fast path: bbox inside one cached cell. Otherwise a
+                # straddler — accept when every intersected planning
+                # cell is cached (is_kg_fully_cached() below is still
+                # the per-tile authority).
                 for cs, cn, cw, ce in cached_cells:
                     if (s >= cs - 1e-9 and n <= cn + 1e-9
                             and w >= cw - 1e-9 and e <= ce + 1e-9):
                         return True
-                return False
+                return self._bbox_covered_by_cells(s, n, w, e, cached_cells)
 
             cache_miss_excluded = self._cache_miss_excluded()
             if cache_miss_excluded:
