@@ -3876,8 +3876,19 @@ class PeerDirector:
             if not rates:
                 agg[kind] = 0.0
                 continue
-            if kind == 'auth' or not use_pctl:
+            if kind == 'auth':
                 agg[kind] = max(rates)
+            elif not use_pctl:
+                # Small fleet: ``max`` — but once ≥3 peers report, ask
+                # for corroboration (2nd-highest). At the tail of the
+                # run (2026-11-06: 6 running peers, 45 idle) a single
+                # peer's two NDVI 500s in 5 min (0.4/min = copernicus
+                # saturation) pinned the fleet factor at 0.2 → frontier
+                # cap 9→2, cache-only cap 60→14 — fewer peers running →
+                # still ``max`` → stuck. One peer can be unlucky; two
+                # peers seeing the same upstream push back is a signal.
+                xs = sorted(rates)
+                agg[kind] = xs[-2] if len(xs) >= 3 else xs[-1]
             else:
                 # 90th percentile via nearest-rank.
                 xs = sorted(rates)
