@@ -57,6 +57,12 @@ blank_n > 0`.  Same rows with a flipped flag = digest-neutral header rewrite
 
 Observer side:
 
+* **Blank rule = the NE server's** (2026-11-06): `ne_ingest.row_blank_ne` =
+  `obs_lu == 0 & h_mean == 255`, elevation ignored. `neo1_section_on_view`
+  counts `blank` and picks borrow candidates with it. Before, `row_observed`
+  (elev counts as seen) said `blank=0` for ~2 400 KGs holding 1–6 elev-only
+  rows each → no `coverage="swept"` flag → listed forever. Verified by hand:
+  03008 (blank_n 3) → 2 rows borrowed, 1 flagged → `blank_n 0 / nodata_n 1`.
 * **`ne_h3.view_coverage(kg)`** decides (`ne_h3.coverage_context()` reads
   `sliver_sweep.json` + `viewfill/state.json` + the staged dir once per
   tick): `"swept"` iff the sweep is closed (`state=="done"`, all units `ok`,

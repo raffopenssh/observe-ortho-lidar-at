@@ -2059,9 +2059,9 @@ def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = Tr
     # too (2026-11-04; before, only cells absent from the product were)
     unseen_here = np.zeros(0, np.int64)
     if n and borrow:
-        from ne_ingest import row_observed as _ro
+        from ne_ingest import row_blank_ne as _rb
         hit_idx = np.flatnonzero(hit)
-        unseen_here = hit_idx[~_ro(out[hit_idx])] if len(hit_idx) else unseen_here
+        unseen_here = hit_idx[_rb(out[hit_idx])] if len(hit_idx) else unseen_here
     borrowed = 0
     want_b = np.concatenate([miss, unseen_here]) if len(unseen_here) else miss
     if len(want_b) and borrow:
@@ -2081,8 +2081,8 @@ def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = Tr
         out[i] = np.frombuffer(unseen_obs_row(int(vids[i])), np.uint8)
     raw = out.tobytes()
     try:
-        from ne_ingest import row_observed as _ro2
-        blank = int((~_ro2(out)).sum()) if vn else 0     # rows the NE server will count as unobserved (blank_n)
+        from ne_ingest import row_blank_ne as _rb2
+        blank = int(_rb2(out).sum()) if vn else 0     # rows the NE server will count as blank_n (lu 0 & h_mean 255; elev ignored)
     except Exception:  # noqa: BLE001
         blank = None
     if coverage == "auto":
