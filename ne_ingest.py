@@ -36,6 +36,7 @@ docs/ne-primary-api.md).
 from __future__ import annotations
 
 import hashlib
+import calendar
 import json
 import logging
 import os
@@ -1095,7 +1096,16 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
     ``bev_*`` counters feed the VTC ramp gate."""
     import ne_h3
     import ne_rollout
-    mf = ne_rollout.refresh_ne_manifest() or {}
+    # the NE server's delta manifest keys on updated_at, which its 3-hourly
+    # obs_complete pass does not bump when it only recounts obs.blank_n/nodata_n
+    # → after a new pass the merged copy carries stale blank_n for thousands of
+    # parents (each one a spurious coverage re-post).  A pass newer than our
+    # last full body → refetch the full manifest once (~10 MB).
+    om0 = (idx["stats"].get("obs_missing") or {})
+    _full_at = ne_rollout.ne_manifest_full_at()
+    _full = bool(_full_at) and str(om0.get("pass_at") or "") > _full_at \
+        and time.time() - calendar.timegm(time.strptime(_full_at, "%Y-%m-%dT%H:%M:%SZ")) > 1800
+    mf = ne_rollout.refresh_ne_manifest(full=_full) or {}
     kgs = mf.get("kgs") or {}
     if not kgs:
         return {"skipped": "no NE-server manifest"}
@@ -1386,6 +1396,13 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
                 c.update(post_attempts=0)       # a forced re-post of confirmed rows is not a failed-confirm retry
             if k.get("cov_due"):
                 c.update(post_attempts=0)       # same for the digest-neutral swept header re-post
+                if not (c.get("coverage_post") or {}).get("of") == want:
+                    # the body carried no flag (our blank rule saw 0 rows while
+                    # the NE server's stale blank_n said otherwise): record the
+                    # attempt anyway so this digest is never coverage-posted
+                    # twice (2026-11-06: 2.3k parents re-POSTed every tick for hours)
+                    c["coverage_post"] = {"of": want, "view_digest": (st or {}).get("view_digest"), "coverage": None,
+                                          "blank": (st or {}).get("blank"), "at": _now(), "answer": None}
             if omx:
                 oc = c.get("obs_missing") or {}
                 c["obs_missing"] = {"key": omx["key"], "missing_n": omx.get("missing_n"), "posted_at": _now(),

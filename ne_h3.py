@@ -2041,9 +2041,10 @@ def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = Tr
     digest, state})`` — ``filled`` = rows not in this product (borrowed +
     unseen).  Header ``declared_digest/source`` name the view.
     *coverage*: ``"auto"`` → :func:`view_coverage` decides whether the header
-    carries ``view_rekey.coverage="swept"`` (only when the body has blank
-    rows — the flag is moot otherwise and a header flip is a re-post the NE server
-    would store); ``None`` → never; ``"swept"`` → force."""
+    carries ``view_rekey.coverage="swept"`` (whenever the sweep is closed —
+    the NE server's blank rule also counts elev-only rows ours ignores, so the
+    flag is stamped regardless of our local ``blank``); ``None`` → never;
+    ``"swept"`` → force."""
     hdr, obs, n_fix = neo1_rows_from_h3b(path, green_fix=green_fix)
     n = len(obs) // OBS_REC.size
     ob = np.frombuffer(obs, np.uint8).reshape(n, OBS_REC.size)
@@ -2090,7 +2091,11 @@ def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = Tr
     except Exception:  # noqa: BLE001
         blank = None
     if coverage == "auto":
-        coverage = view_coverage(hdr["kg"]) if blank else None
+        # stamp whenever the sweep is closed — not only when *our* blank rule
+        # (lu 0 & h_mean 255, elev ignored) sees rows: the NE server counts
+        # elev-only rows as blank too, so a body we call blank-free can still
+        # be listed (2026-11-06: 2.3k clean parents looped on exactly that)
+        coverage = view_coverage(hdr["kg"])
     if coverage is not None and coverage != COVERAGE_SWEPT:
         raise ValueError(f"view_rekey.coverage={coverage!r}: the NE server accepts only {COVERAGE_SWEPT!r}")
     h = dict(algo=ALGO_OBS, epoch=hdr["neo1"]["epoch"], source=OBS_SOURCE, kg=hdr["kg"], h3_res=H3_RES,

@@ -403,6 +403,15 @@ def refresh_ne_manifest(max_age_s: int = 600, full: bool = False) -> dict | None
         return prev or None
 
 
+def ne_manifest_full_at() -> str:
+    """ISO UTC of the last *full* umfeld manifest body we hold ("" if none)."""
+    try:
+        ts = float(json.loads(NE_MANIFEST_CACHE.read_text()).get("full_at_ts") or 0)
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)) if ts else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def ne_built_codes(mf: dict | None = None) -> set[str]:
     mf = mf if mf is not None else refresh_ne_manifest()
     if not mf:

@@ -69,8 +69,9 @@ Observer side:
   `unswept==0`, `plan_deferred==0` — `docs/sliver-sweep.md → Closed sweep`)
   **and** the view-fill walk left *residual only* (row walked without error,
   nothing staged, `residual_n==0` or handed to the sweep via `planned_ts` /
-  `residual_held`).  `neo1_section_on_view(coverage="auto")` stamps it only
-  when the body has blank rows; stats carry `blank` + `coverage`, so do
+  `residual_held`).  `neo1_section_on_view(coverage="auto")` stamps it whenever
+  `view_coverage` says swept (not only when *our* blank rule sees rows —
+  the NE server also counts elev-only rows as blank); stats carry `blank` + `coverage`, so do
   `idx.ne_server[kg].view` and the `on view … coverage=swept` log line.
 * **`ne_ingest.confirm_ne_server`**: `refresh_obs_missing` keeps `blank_n`,
   `nodata_n`, `coverage` per listed KG and the NE server's `kgs_obs_nodata` /
@@ -142,3 +143,19 @@ tick takes ~12 min, so ~250 posts/h; `ne_post_gib_per_day` caps the day) and swe
 results → `sliver_sweep.integrate` (oldest received first, ≤40/tick in 150 s).
 A KG walked with nothing left is not re-walked for 7 days (`RECHECK_S`); the
 same residual set is not re-queued for 7 days (`REPLAN_S`).
+
+### Coverage re-post loop (2026-11-06, fixed)
+
+The NE server's delta manifest (`?since=`) keys on `updated_at`, which its
+3-hourly `obs_complete` pass does **not** bump when it only recounts
+`obs.blank_n` / `obs.nodata_n`.  Our merged copy therefore kept `blank_n≥1`
+for ~2.3k clean parents whose fresh full manifest said 0 → `coverage_due`
+every tick, and the body we rebuilt had `blank=0` by our rule so no flag was
+stamped, no `coverage_post` recorded, and the same ~0.3 MB body was re-POSTed
+every tick (`NEO1 <kg> coverage-swept … coverage=-` repeating with identical
+digests is the signature).  Three guards now: (1) a `coverage_post` record is
+written after every cov_due post even when the body carried no flag — one
+coverage post per file digest, full stop; (2) `coverage="auto"` stamps on any
+closed sweep; (3) `ne_ingest` refetches the **full** manifest (~10 MB) once
+when the server's `pass_at` is newer than our last full body (≥30 min apart) —
+`ne_rollout.ne_manifest_full_at()`.
