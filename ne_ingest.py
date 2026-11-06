@@ -1340,8 +1340,17 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
                 r = ne_h3.post_observed(parent, sec, nec1_section=nec)
                 nbytes = len(sec) + len(nec)
             elif on_view:
-                r, sec, st = _post_bare_on_view(parent, want, c, green_fix,
-                                                held=None if (k.get("cov_due") or c.get("repost")) else have)
+                # The "already at umfeld" shortcut is only worth it when a POST
+                # would change nothing: an obs umfeld still keys on the old lu
+                # index (``declared_source index-…``) is re-keyed onto the view
+                # *only by a POST*, and a pair (ours, theirs) that was recovered
+                # once and still shows up here needs the POST too — otherwise
+                # ~200 parents cost a ~0.2 MB view GET every tick forever
+                # (2026-11-06: ~240 MB/h, the top line of net_stats).
+                rv = c.get("recovered") or {}
+                shortcut = not (k.get("cov_due") or c.get("repost") or k.get("on_index")
+                                or (rv.get("of") == want and rv.get("have") == have))
+                r, sec, st = _post_bare_on_view(parent, want, c, green_fix, held=have if shortcut else None)
                 nbytes = len(sec)
                 recovered = bool(isinstance(r, dict) and r.get("recovered"))
                 c["view"] = {"of": want, "obs_digest": st["digest"], "state": st["state"], "view_digest": st["view_digest"],
@@ -1379,6 +1388,7 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
                 nbytes = len(sec)
             if recovered:
                 c.update(confirmed_digest=want, confirmed_at=_now(), post_attempts=0, posted_digest=want)
+                c["recovered"] = {"of": want, "have": have, "at": _now()}
                 c.pop("post_next", None)
                 out["recovered"] = int(out.get("recovered") or 0) + 1
                 continue       # no POST happened: no budget, no ladder step, no obs_missing record
