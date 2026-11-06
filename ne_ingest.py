@@ -327,12 +327,13 @@ def row_observed(obs: np.ndarray) -> np.ndarray:
 
 def row_blank_ne(obs: np.ndarray) -> np.ndarray:
     """Per NEO1 row: does the NE server count it as blank (``blank_n`` /
-    ``nodata_n``)?  Its rule is ``obs_lu == 0 and h_mean == 255`` —
-    elevation does not count (2026-11-06: ~2 400 KGs sat listed with 1–6
+    ``nodata_n``)?  Its rule (``neObsBlankRule``, ne-change.md §5b) is
+    ``obs_lu == 0 and h_mean == 255 and flight_years == 0`` — elevation and
+    every other field are ignored (2026-11-06: ~2 400 KGs sat listed with 1–6
     elev-only rows each; our :func:`row_observed` called them observed, so
     the view post never carried ``coverage="swept"``)."""
     lu_mass = obs[:, 8:17].astype(np.int32).sum(axis=1)
-    return (lu_mass == 0) & (obs[:, 19] == 255)
+    return (lu_mass == 0) & (obs[:, 19] == 255) & (obs[:, 28] == 0)
 
 
 def summary_from_rows(declared, obs_raw: bytes, trees_n: int, bld_n: int, epoch: str) -> dict:
