@@ -1000,8 +1000,11 @@ def refresh_obs_missing(idx: dict, force: bool = False) -> dict:
     is returned on any failure."""
     cur = idx["stats"].get("obs_missing") or {}
     now = time.time()
-    if not force and now - float(cur.get("fetched_ts") or 0) < OBS_MISSING_REFRESH_S:
+    legacy = any("blank_n" not in v for v in (cur.get("kgs") or {}).values())   # snapshot from before the nodata fields
+    if not force and not legacy and now - float(cur.get("fetched_ts") or 0) < OBS_MISSING_REFRESH_S:
         return cur
+    if legacy:
+        cur.pop("etag", None)
     try:
         import requests
         import ne_h3
