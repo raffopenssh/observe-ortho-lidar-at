@@ -92,13 +92,35 @@ Observer side:
 
 ## Reading it
 
-`/process.txt` → `ne_ingest:` block: `ne_server_confirm: … mismatch= nodata_held= unswept_held=
-swept_repost(due/posted)= server_nodata=<kgs>kg/<cells>c blank=<kgs>kg` (the NE server totals
-from the revisit `obs_complete{}`, `?` until its first pass); `viewfill:` sub-line:
-`kgs=<walked>/<parents> left eta=~Nh (runs @walked/run)` — walk ETA, nothing else needed for a progress check — then `walked / blank / borrowable / staged / sweep=<cells>c/<kg>kg / residual / waiting`
-(builder totals) · `tick: applied swapped rejected sweep repost errors due`
-(ingest side) · `view_pass … viewfill N` = forced re-posts done. Sweep units
-show up in `sweep:` as `-sw<k>` units with `source=viewfill`.
+`/process.txt` → `ne_ingest:` block, two lines with different clocks:
+
+* `umfeld_confirm(ours, tick HH:MMZ)` — **our** queue, refreshed every ingest
+  tick (~6 min): `ok=<confirmed>/<checked> to_post=<rest> (due=…: obs_missing /
+  swept / viewfill; mismatch= missing= held nodata/unswept/obs_missing=…)` ·
+  `last tick posted=<n>/<ne_post_max_per_tick> failed=` · `today <n> POSTs
+  <GiB>/<cap> GiB (≤2/s)`. Healthy drain: `to_post` falls by ~`posted` per
+  tick, `failed=0`, `mismatch` near 0 (a stuck `mismatch` = identical bodies
+  re-posted every 10 min — the 2026-11-06 `chunks@`-only bug). `held
+  unswept` = blank rows waiting for an *open* sweep; clean/done sweeps are
+  not held.
+* `umfeld_pass(theirs, obs_complete every 3h, last HH:MMZ)` — **the NE server's**
+  totals `blank=<kgs>kg nodata=<kgs>kg/<cells>c listed(obs_missing)=…`,
+  recomputed only at its pass; up to 3 h behind our posts. A flat `blank=`
+  right after a drain is *not* evidence that posts don't land — spot-check
+  one KG live: `revisit?kind=obs_missing&kg=<code>&refresh=1` (`obs_kg.blank_n`
+  0 / `nodata_n` > 0 / `coverage swept`).
+
+`viewfill:` sub-line: `kgs=<walked>/<parents> left eta=~Nh (runs @walked/run)`
+— walk ETA, nothing else needed for a progress check — then `walked / blank /
+borrowable / staged / sweep=<cells>c/<kg>kg / residual / waiting` (builder
+totals) · `tick: applied swapped rejected sweep repost errors due` (ingest
+side) · `view_pass … viewfill N` = forced re-posts done. Sweep units show up
+in `sweep:` as `-sw<k>` units with `source=viewfill`.
+
+Rate limits toward the NE server (`ne_ingest`): ≤2 POST/s (`POST_MIN_GAP_S`),
+`ne_post_max_per_tick` posts per tick (default 50; 200 only for a one-off
+drain, put it back), `ne_post_gib_per_day` (10 GiB, mirrored on the NE server's
+token cap → `DAY-CAP-HOLD` when hit, resumes 00:00 UTC).
 
 ```bash
 python3 ne_viewfill.py status

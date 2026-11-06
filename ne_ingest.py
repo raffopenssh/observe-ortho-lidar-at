@@ -1614,7 +1614,7 @@ def green_fix_lines(limit: int = 20) -> list[str]:
 
 def text_line(v: dict | None = None) -> str:
     v = v if v is not None else status()
-    um = v.get("ne_server") or {}
+    um = v.get("NE server") or {}
     s = (f"ne_ingest: corpus={v['parents']}p+{v['blocks']}b {v['corpus_mb']}MB merged={v['merged_parents']}"
          f"({v['merged_complete']} complete) pending={v['pending']} ({v['pending_mb']}MB)"
          f" budget={v['used_mb_h']}/{v['budget_mb_h']}MB/h src peer={v['pulled_peer']} zenodo={v['pulled_zenodo']}")
@@ -1624,44 +1624,51 @@ def text_line(v: dict | None = None) -> str:
         s += f" failed={v['failed']}"
     if um.get("checked") is not None:
         omx0 = v.get("obs_missing") or {}
-        s += (f"\n    ne_server_confirm: ok={um.get('confirmed')}/{um.get('checked')} missing={um.get('missing')}"
-              f" mismatch={um.get('mismatch')} nodata_held={um.get('nodata_held') or 0} unswept_held={um.get('unswept_held') or 0}"
-              f" swept_repost(due/posted)={um.get('coverage_due') or 0}/{um.get('coverage_posted') or 0}"
-              f" server_nodata={omx0.get('kgs_obs_nodata') if omx0.get('kgs_obs_nodata') is not None else '?'}kg/"
-              f"{omx0.get('cells_obs_nodata') if omx0.get('cells_obs_nodata') is not None else '?'}c"
-              f" blank={omx0.get('kgs_obs_blank') if omx0.get('kgs_obs_blank') is not None else '?'}kg"
-              f" reposted={v.get('posts')} unbuilt={um.get('pending_cells')}")
+        pdy = v.get("post_day") or {}
+        due = int(um.get("obs_missing_due") or 0) + int(um.get("coverage_due") or 0) + int(um.get("viewfill_due") or 0)
+        not_ok = int(um.get("checked") or 0) - int(um.get("confirmed") or 0)
+        cap = float(_knob('ne_post_gib_per_day', POST_GIB_PER_DAY))
+        # Line 1 = OUR side, refreshed every ingest tick (~6 min): what still
+        # has to go to NE server and how fast it is going.
+        s += (f"\n    umfeld_confirm(ours, tick {str(um.get('at') or '')[11:16]}Z): ok={um.get('confirmed')}/{um.get('checked')}"
+              f" to_post={not_ok} (due={due}: obs_missing {um.get('obs_missing_due') or 0}, swept {um.get('coverage_due') or 0},"
+              f" viewfill {um.get('viewfill_due') or 0}; mismatch={um.get('mismatch')} missing={um.get('missing')}"
+              f" held nodata/unswept/obs_missing={um.get('nodata_held') or 0}/{um.get('unswept_held') or 0}/{um.get('obs_missing_held') or 0})"
+              f" · last tick posted={um.get('posted')}/{int(_knob('ne_post_max_per_tick', 50))} failed={um.get('post_failed')}"
+              f" · today {int(pdy.get('posts') or 0)} POSTs {(pdy.get('bytes') or 0) / 2 ** 30:.2f}/{cap:.0f} GiB (≤2/s)"
+              f" unbuilt={um.get('pending_cells')} swept_posted={um.get('coverage_posted') or 0}")
+        if um.get("day_cap_hold"):
+            s += f" DAY-CAP-HOLD {um['day_cap_hold']} waiting"
         if um.get("bev_checked"):
             s += (f" · bev(NEC1+NEO1): ok={um.get('bev_confirmed')}/{um.get('bev_checked')}"
                   f" declared_mismatch={um.get('bev_declared_mismatch')} post_failed={um.get('bev_post_failed')}")
+        # Line 2 = UMFELD's side: its obs_complete pass runs every 3 h, so
+        # blank/nodata/listed lag our posts by up to one pass — don't read a
+        # flat blank= as "posts not landing" before the next pass_at.
+        if omx0.get("kgs_n") is not None or um.get("obs_missing_listed"):
+            s += (f"\n    umfeld_pass(theirs, obs_complete every 3h, last {str(omx0.get('pass_at') or '?')[11:16]}Z — lags our posts):"
+                  f" blank={omx0.get('kgs_obs_blank') if omx0.get('kgs_obs_blank') is not None else '?'}kg"
+                  f" nodata={omx0.get('kgs_obs_nodata') if omx0.get('kgs_obs_nodata') is not None else '?'}kg/"
+                  f"{omx0.get('cells_obs_nodata') if omx0.get('cells_obs_nodata') is not None else '?'}c"
+                  f" listed(obs_missing)={omx0.get('kgs_n')} KGs/{omx0.get('cells_n')} cells no_obs={omx0.get('kgs_no_obs')}"
+                  f" · blank rows → borrowed from a neighbour or, on a closed/clean sweep, posted with coverage=swept (→ nodata_n);"
+                  f" verify one: revisit?kind=obs_missing&kg=<code>&refresh=1")
+            if omx0.get("error"):
+                s += f" LAST-ERR {omx0['error'][:80]}"
         gf = v.get("green_fix") or {}
         if gf:
-            s += (f"\n    green_fix({gf.get('id')}{'' if gf.get('enabled') else ' OFF'}): ne_server_confirmed="
+            s += (f"\n    green_fix({gf.get('id')}{'' if gf.get('enabled') else ' OFF'}): umfeld_confirmed="
                   f"{gf.get('confirmed')}/{gf.get('computed')} parents, {gf.get('cells_touched')} cells bau/alpen→gruen"
                   f" (read-time override, files untouched; ne_green_fix.py)")
-        pdy = v.get("post_day") or {}
-        s += (f"\n    resync(by digest): today {int(pdy.get('posts') or 0)} POSTs {(pdy.get('bytes') or 0) / 2 ** 20:.0f} MiB"
-              f" (cap {float(_knob('ne_post_gib_per_day', POST_GIB_PER_DAY)):.1f} GiB/day, ≤2/s)")
-        if um.get("day_cap_hold"):
-            s += f" DAY-CAP-HOLD {um['day_cap_hold']} waiting"
         vp = v.get("view_pass") or {}
         if vp or um.get("obs_on_index") is not None:
             s += (f"\n    view_pass(ne-change §4b): NE server kgs_obs_on_index {vp.get('obs_on_index_before')}→{vp.get('obs_on_index_now')}"
                   f" · ours: on_view_ok={um.get('on_view')} obs_on_index={um.get('obs_on_index')} no_view={um.get('no_view')}"
                   f" · posted_on_view={vp.get('posted') or 0} (of which on-index {vp.get('reposted_on_index') or 0},"
-                  f" obs-missing {vp.get('reposted_obs_missing') or 0}, swept {vp.get('reposted_coverage') or 0})"
+                  f" obs-missing {vp.get('reposted_obs_missing') or 0}, viewfill {vp.get('reposted_viewfill') or 0}, swept {vp.get('reposted_coverage') or 0})"
                   f" cells borrowed={vp.get('cells_borrowed') or 0} unseen={vp.get('cells_filled') or 0}"
                   f" dropped={vp.get('cells_dropped') or 0}"
                   f" since {vp.get('started_at')} last {vp.get('last_at')} · ?q=on+view for rows")
-        omx = v.get("obs_missing") or {}
-        if omx.get("kgs_n") is not None or um.get("obs_missing_listed"):
-            s += (f"\n    obs_missing(NE-server revisit): listed={omx.get('kgs_n')} KGs / {omx.get('cells_n')} cells"
-                  f" (pass {omx.get('pass_at')}, no_obs={omx.get('kgs_no_obs')}) · ours: due={um.get('obs_missing_due')}"
-                  f" held={um.get('obs_missing_held')} nodata_held={um.get('nodata_held') or 0} unswept_held={um.get('unswept_held') or 0}"
-                  f" — view cells a neighbour observed are borrowed from the corpus, the rest post as unseen;"
-                  f" a closed sweep stamps view_rekey.coverage=swept (the NE server counts them nodata_n, not blank_n)")
-            if omx.get("error"):
-                s += f" LAST-ERR {omx['error'][:80]}"
         ur = v.get("union_recovery") or {}
         if ur and not ur.get("done"):
             s += (f"\n    union_recovery: {ur.get('remerge_done', 0)}/{ur.get('remerge', 0)} split parents re-merged,"
@@ -1669,17 +1676,6 @@ def text_line(v: dict | None = None) -> str:
                   f" {ur.get('cells_dropped')} observed bev cells; union merge since 2026-11-04)")
         if um.get("needs_bevdirect"):
             s += f" · needs_bevdirect={um['needs_bevdirect']} (lu cell-set 409, parked — reprocess on a bev-mode peer)"
-        try:
-            import ne_viewfill as _nvf
-            vf = v.get("viewfill") or {}
-            s += ("\n    " + _nvf.text_line()
-                  + f" · tick: applied={vf.get('applied', 0)} swapped={vf.get('swapped', 0)} rejected={vf.get('rejected', 0)}"
-                  f" sweep={vf.get('planned_cells', 0)}c/{vf.get('planned_kgs', 0)}kg repost={vf.get('repost', 0)}"
-                  f" errors={vf.get('errors', 0)} due={um.get('viewfill_due', 0)}"
-                  " (ne_viewfill.py: every cell of the NE server's /declared view observed — corpus borrow → own products"
-                  " union → sweep units on the view; docs/ne-viewfill.md)")
-        except Exception as _ex:  # noqa: BLE001
-            s += f"\n    viewfill: {_ex}"
         try:
             import ne_viewfill as _nvf
             vf = v.get("viewfill") or {}
