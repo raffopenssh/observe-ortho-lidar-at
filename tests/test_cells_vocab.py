@@ -66,7 +66,7 @@ def test_dict_and_record_vocabulary():
     c = app.test_client()
     body = c.get('/api/v1/cells/dict').get_data(as_text=True)
     assert not _hits(body), 'forbidden words in /api/v1/cells/dict'
-    files = sorted(cells_api.NE_DIR.glob('*.h3b'))
+    files = sorted(p for p in cells_api.NE_DIR.glob('*.h3b') if not p.name.startswith('.'))
     if not files or not cells_api.INDEX_DB.exists():
         return
     kg = files[0].stem

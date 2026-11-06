@@ -448,7 +448,7 @@ def merge_blocks(parent: str, block_paths: list[Path], out_path: Path, *, comple
     # (lu-declared) merged into a bevdirect parent threw away every
     # bev-only observed cell (612 k cells over 1001 parents).
     def _rank(f):
-        # reference preference: frozen lu (index-*) → bevdirect build → umfeld's
+        # reference preference: frozen lu (index-*) → bevdirect build → the NE server's
         # chunk-log view (``chunks@…`` — what ne_viewfill sweep units build on;
         # its cells join by union, it must not redefine the parent's layer)
         src = str(f["nec1"].get("source") or "")
@@ -961,7 +961,33 @@ def _post_bare_on_view(parent: str, want: str, c: dict, green_fix: bool) -> tupl
 
 CONFIRM_RULE = "view-2026-11-04"   # bump → every parent's retry ladder is reset once
 OBS_MISSING_REFRESH_S = 3600       # the NE server recomputes obs_complete every 3 h (``obs_complete.every_s``)
-OBS_MISSING_MAX_POSTS = 3          # per (view_source, missing_n) situation — guards a post/relist loop
+LADDER_RESET = "nodata-2026-11-06"  # one-shot: struck-out (post_attempts ≥ POST_MAX_ATTEMPTS) parents get a fresh ladder
+OBS_MISSING_MAX_POSTS = 3          # per (view_source, missing_n, extra_n, blank_n) situation — guards a post/relist loop
+
+
+def _om_key(omx: dict) -> str:
+    """The NE-server-side *situation* an obs_missing re-post answers; a new key
+    = a fresh ``OBS_MISSING_MAX_POSTS`` budget.  ``blank_n`` is part of it
+    since the NE server counts swept padding as ``nodata_n`` (2026-11-06): the
+    blank→nodata flip after our swept post changes the key, a relist with
+    the same numbers does not."""
+    return f"{omx.get('view_source')}:{omx.get('missing_n')}:{omx.get('extra_n') or 0}:{omx.get('blank_n') if omx.get('blank_n') is not None else '-'}"
+
+
+def _nodata_settled(omx: dict | None, obs: dict) -> bool:
+    """The NE server already holds every blank row of this KG as *swept nodata* —
+    nothing a re-post could change: no view drift (``missing_n == extra_n
+    == 0``) and the unswept count ``blank_n`` is 0 or equals ``nodata_n``
+    (both exposed only by a server that knows the flag; otherwise False).
+    Looks at the revisit row first, then at ``manifest.kgs[kg].obs``."""
+    for src in (omx or {}, obs or {}):
+        if src.get("nodata_n") is None:
+            continue
+        if int(src.get("missing_n") or 0) or int(src.get("extra_n") or 0):
+            return False
+        b = src.get("blank_n")
+        return b is None or int(b) == 0 or int(b) == int(src["nodata_n"])
+    return False
 
 
 def refresh_obs_missing(idx: dict, force: bool = False) -> dict:
@@ -997,12 +1023,21 @@ def refresh_obs_missing(idx: dict, force: bool = False) -> dict:
         for x in d.get("obs_missing") or []:
             kg = str(x.get("kg") or "").zfill(5)
             if kg:
+                # blank_n = unswept padding rows, nodata_n = blank rows of a post
+                # flagged view_rekey.coverage="swept" (NE server 2026-11-06); older
+                # the NE server answers carry neither → None (not 0: "unknown")
                 kgs[kg] = {"missing_n": int(x.get("missing_n") or 0), "extra_n": int(x.get("extra_n") or 0),
-                           "view_source": x.get("view_source")}
+                           "blank_n": (int(x["blank_n"]) if x.get("blank_n") is not None else None),
+                           "nodata_n": (int(x["nodata_n"]) if x.get("nodata_n") is not None else None),
+                           "coverage": x.get("coverage"), "view_source": x.get("view_source")}
         cur = {"fetched_at": _now(), "fetched_ts": now, "etag": r.headers.get("ETag"),
                "pass_at": oc.get("pass_at") or d.get("generated_at"), "kgs_n": len(kgs),
                "cells_n": int(oc.get("cells_obs_missing") or sum(v["missing_n"] for v in kgs.values())),
-               "kgs_no_obs": oc.get("kgs_no_obs"), "kgs": kgs}
+               "kgs_no_obs": oc.get("kgs_no_obs"), "kgs": kgs,
+               # NE-server-side totals of the swept/unswept split (None on an older the NE server)
+               "kgs_obs_blank": oc.get("kgs_obs_blank"), "cells_obs_blank": oc.get("cells_obs_blank"),
+               "kgs_obs_nodata": oc.get("kgs_obs_nodata"), "cells_obs_nodata": oc.get("cells_obs_nodata"),
+               "passes": oc.get("passes")}
         idx["stats"]["obs_missing"] = cur
         log.info("ne_ingest: the NE server obs_missing: %d KGs / %d cells (pass %s)", len(kgs), cur["cells_n"], cur["pass_at"])
     except Exception as ex:  # noqa: BLE001
@@ -1042,8 +1077,10 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
            "pending_cells": 0, "bev_checked": 0, "bev_confirmed": 0, "bev_declared_mismatch": 0,
            "bev_posted": 0, "bev_post_failed": 0, "needs_bevdirect": 0, "day_cap_hold": 0,
            "obs_on_index": 0, "on_view": 0, "view_posted": 0, "view_dropped": 0, "view_filled": 0, "view_borrowed": 0,
-           "no_view": 0, "obs_missing_due": 0, "obs_missing_held": 0, "obs_missing_listed": 0, "recovery_hold": 0}
+           "no_view": 0, "obs_missing_due": 0, "obs_missing_held": 0, "obs_missing_listed": 0, "recovery_hold": 0,
+           "nodata_held": 0, "unswept_held": 0, "coverage_due": 0, "coverage_posted": 0, "viewfill_due": 0}
     now = time.time()
+    cov_ctx = ne_h3.coverage_context(force=True)       # sweep + viewfill state, once per tick
     conf = idx.setdefault("ne_server", {})
     max_posts = int(_knob("ne_post_max_per_tick", max_posts))
     day = time.strftime("%Y-%m-%d", time.gmtime())
@@ -1073,6 +1110,18 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
             if c0.get("post_attempts"):
                 c0.update(post_attempts=0); c0.pop("post_next", None)
         idx["stats"]["confirm_rule"] = CONFIRM_RULE
+    if idx["stats"].get("ladder_reset") != LADDER_RESET:
+        # 2026-11-06: ~730 view_ok parents sat at post_attempts ≥ 6 — every
+        # hourly viewfill re-stage counted as a failed-confirm retry (fixed
+        # below: a forced re-post resets the ladder like an obs_missing one).
+        # Give them one fresh ladder so the swept re-post can go out.
+        n_reset = 0
+        for c0 in conf.values():
+            if int(c0.get("post_attempts") or 0) >= POST_MAX_ATTEMPTS and not c0.get("needs_bevdirect"):
+                c0.update(post_attempts=0); c0.pop("post_next", None); n_reset += 1
+        idx["stats"]["ladder_reset"] = LADDER_RESET
+        idx["stats"]["ladder_reset_n"] = n_reset
+        log.info("ne_ingest: %s — reset the retry ladder of %d struck-out parent(s)", LADDER_RESET, n_reset)
     ur = idx["stats"].get("union_recovery") or {}
     recovering = set() if ur.get("done") else (set(ur.get("remerge_codes") or []) | set(ur.get("repull_codes") or []))
     st0 = str(ur.get("started_at") or "")
@@ -1121,24 +1170,42 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
         # the NE server's obs_complete pass: the view holds cells our obs lacks
         omx = om_kgs.get(parent)
         om_due = False
+        cov_due = False
+        # coverage we would stamp on a view post right now (None = unswept / unknown)
+        cov_now = ne_h3.view_coverage(parent, cov_ctx) if (has_view or bev or omx) else None
         if ok and omx:
-            key = f"{omx.get('view_source')}:{omx.get('missing_n')}"
+            key = _om_key(omx)
             oc = c.get("obs_missing") or {}
-            if oc.get("key") != key:
+            drift = bool(int(omx.get("missing_n") or 0) or int(omx.get("extra_n") or 0))
+            held = None
+            if _nodata_settled(omx, obs):
+                held = "nodata_held"      # listed for swept nodata only (transition snapshot) — a re-post is a no-op
+            elif not drift and omx.get("blank_n") is not None and int(omx.get("blank_n") or 0) and not cov_now:
+                # blank rows nobody observed yet and the sweep is still open: the
+                # same rows again would just relist — the sweep integrate changes
+                # our digest and triggers the real re-post
+                held = "unswept_held"
+            elif oc.get("key") != key:
                 om_due = True
             elif str(oc.get("posted_at") or "") < om_pass and int(oc.get("attempts") or 0) < OBS_MISSING_MAX_POSTS:
                 om_due = True
+            else:
+                held = "obs_missing_held"
             if om_due:
                 out["obs_missing_due"] += 1
             else:
-                out["obs_missing_held"] += 1
-        # ne_viewfill staged a re-post (borrowed rows for blank view cells /
-        # staged union): forces one post on the view even when umfeld holds
-        # our current digest — the rows it holds are the old blank ones.
-        vf_due = bool(c.get("repost"))
-        if vf_due:
-            om_due = True
-            out["viewfill_due"] = int(out.get("viewfill_due") or 0) + 1
+                out[held] += 1
+        if ok and not om_due and cov_now and str(obs.get("coverage") or "") != cov_now:
+            # the NE server holds our rows but without the swept flag while blank rows
+            # exist (its header echo view_rekey.blank, or the revisit row says
+            # so): one digest-neutral header re-post per file digest
+            vr = obs.get("view_rekey") or {}
+            blank_held = int(vr.get("blank") or 0) or int((omx or {}).get("blank_n") or 0) or int(obs.get("blank_n") or 0)
+            cp = c.get("coverage_post") or {}
+            if blank_held and cp.get("of") != want:
+                cov_due = True
+                om_due = True
+                out["coverage_due"] += 1
         # ne_viewfill staged a re-post (borrowed rows for blank view cells /
         # staged union): forces one post on the view even when the NE server holds
         # our current digest — the rows it holds are the old blank ones.
@@ -1189,11 +1256,11 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
         # the whole point of the sweep (docs/sliver-sweep.md).
         swept_at = str((idx["parents"].get(parent) or {}).get("swept_at") or "")
         sweep_fresh = bool(swept_at) and swept_at > str(c.get("confirmed_at") or "")
-        prio = (-1 if (sweep_fresh or vf_due) else 0 if (on_index and has_view) else 1 if om_due else 2 if not have else 3,
+        prio = (-1 if (sweep_fresh or vf_due) else 0 if (on_index and has_view) else 1 if (om_due and not cov_due) else 2 if not have else 3 if have != want else 4,
                 -int((omx or {}).get("missing_n") or 0), 0 if has_view else 1, parent)
         cands.append((prio, parent, {"want": want, "have": have, "bev": bev, "bev_body": bev_body, "on_view": on_view,
-                                     "has_view": has_view, "on_index": on_index, "c": c,
-                                     "om": (dict(omx, key=f"{omx.get('view_source')}:{omx.get('missing_n')}") if (om_due and omx) else None)}))
+                                     "has_view": has_view, "on_index": on_index, "c": c, "cov_due": cov_due,
+                                     "om": (dict(omx, key=_om_key(omx)) if (om_due and omx) else None)}))
     # --- phase 2: POST in priority order within the tick / day budgets
     cands.sort(key=lambda t: t[0])
     posts = 0
@@ -1206,7 +1273,8 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
             continue     # NE-server per-token daily volume — resumes at 00:00 UTC
         want, have, bev, has_view, c = k["want"], k["have"], k["bev"], k["has_view"], k["c"]
         bev_body, on_view, omx = k["bev_body"], k["on_view"], k["om"]
-        why = ("obs-missing" if omx else "missing" if not have else
+        why = ("coverage-swept" if k.get("cov_due") else "viewfill" if c.get("repost") else
+               "obs-missing" if omx else "missing" if not have else
                "on-index" if k["on_index"] and has_view else
                "declared-mismatch" if have == want else "mismatch")
         try:
@@ -1225,7 +1293,16 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
                 nbytes = len(sec)
                 c["view"] = {"of": want, "obs_digest": st["digest"], "state": st["state"], "view_digest": st["view_digest"],
                              "cells_n": st["cells_n"], "dropped": st["dropped"], "filled": st["filled"],
-                             "borrowed": st.get("borrowed", 0), "hidden": st.get("hidden"), "at": _now()}
+                             "borrowed": st.get("borrowed", 0), "blank": st.get("blank"), "coverage": st.get("coverage"),
+                             "hidden": st.get("hidden"), "at": _now()}
+                if st.get("coverage"):
+                    c["coverage_post"] = {"of": want, "view_digest": st["view_digest"], "coverage": st["coverage"],
+                                          "blank": st.get("blank"), "at": _now(),
+                                          "answer": {kk: r.get(kk) for kk in ("coverage", "coverage_changed", "previous_coverage", "unchanged")}
+                                          if isinstance(r, dict) else None}
+                    out["coverage_posted"] += 1
+                    vp0 = idx["stats"].setdefault("view_pass", {})
+                    vp0["reposted_coverage"] = int(vp0.get("reposted_coverage") or 0) + 1
                 c.pop("needs_bevdirect_view", None)
                 out["view_posted"] += 1
                 out["view_dropped"] += int(st["dropped"]); out["view_filled"] += int(st["filled"])
@@ -1254,6 +1331,13 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
                      posted_at=_now(), post_result=str(r)[:160])
             c.pop("post_error", None)
             c["post_next"] = now + 600          # re-check after the NE server rescans (30 s) + slack
+            if c.pop("repost", None):
+                c["reposted_viewfill_at"] = _now()
+                vp = idx["stats"].setdefault("view_pass", {})
+                vp["reposted_viewfill"] = int(vp.get("reposted_viewfill") or 0) + 1
+                c.update(post_attempts=0)       # a forced re-post of confirmed rows is not a failed-confirm retry
+            if k.get("cov_due"):
+                c.update(post_attempts=0)       # same for the digest-neutral swept header re-post
             if omx:
                 oc = c.get("obs_missing") or {}
                 c["obs_missing"] = {"key": omx["key"], "missing_n": omx.get("missing_n"), "posted_at": _now(),
@@ -1268,7 +1352,8 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
                 c["lu_diff"] = r.get("lu_diff") if isinstance(r, dict) else None
             log.info("ne_ingest: NEO1 %s %s at the NE server (ours %s, theirs %s) — posted%s: %s", parent, why, want, have,
                      " as NEC1+NEO1" if bev_body else (f" on view {st['state']} (cells={st['cells_n']} dropped={st['dropped']}"
-                                                       f" borrowed={st.get('borrowed', 0)} unseen={st['filled']} hidden={st.get('hidden')})" if st else ""),
+                                                       f" borrowed={st.get('borrowed', 0)} unseen={st['filled']} blank={st.get('blank')}"
+                                                       f" coverage={st.get('coverage') or '-'} hidden={st.get('hidden')})" if st else ""),
                      str(r)[:120])
         except Exception as ex:  # noqa: BLE001
             n = int(c.get("post_attempts") or 0) + 1
@@ -1415,7 +1500,7 @@ def status() -> dict:
                                            "needs_bevdirect", "day_cap_hold", "day_bytes", "obs_on_index", "on_view",
                                            "view_posted", "view_dropped", "view_filled", "view_borrowed", "no_view",
                                            "obs_missing_due", "obs_missing_held", "obs_missing_listed", "recovery_hold", "candidates",
-                                           "viewfill_due")},
+                                           "viewfill_due", "nodata_held", "unswept_held", "coverage_due", "coverage_posted")},
         "view_pass": (idx.get("stats") or {}).get("view_pass"),
         "obs_missing": {k: v for k, v in ((idx.get("stats") or {}).get("obs_missing") or {}).items() if k != "kgs"},
         "union_recovery": (idx.get("stats") or {}).get("union_recovery"),
@@ -1519,8 +1604,14 @@ def text_line(v: dict | None = None) -> str:
     if v.get("failed"):
         s += f" failed={v['failed']}"
     if um.get("checked") is not None:
+        omx0 = v.get("obs_missing") or {}
         s += (f"\n    ne_server_confirm: ok={um.get('confirmed')}/{um.get('checked')} missing={um.get('missing')}"
-              f" mismatch={um.get('mismatch')} reposted={v.get('posts')} unbuilt={um.get('pending_cells')}")
+              f" mismatch={um.get('mismatch')} nodata_held={um.get('nodata_held') or 0} unswept_held={um.get('unswept_held') or 0}"
+              f" swept_repost(due/posted)={um.get('coverage_due') or 0}/{um.get('coverage_posted') or 0}"
+              f" server_nodata={omx0.get('kgs_obs_nodata') if omx0.get('kgs_obs_nodata') is not None else '?'}kg/"
+              f"{omx0.get('cells_obs_nodata') if omx0.get('cells_obs_nodata') is not None else '?'}c"
+              f" blank={omx0.get('kgs_obs_blank') if omx0.get('kgs_obs_blank') is not None else '?'}kg"
+              f" reposted={v.get('posts')} unbuilt={um.get('pending_cells')}")
         if um.get("bev_checked"):
             s += (f" · bev(NEC1+NEO1): ok={um.get('bev_confirmed')}/{um.get('bev_checked')}"
                   f" declared_mismatch={um.get('bev_declared_mismatch')} post_failed={um.get('bev_post_failed')}")
@@ -1539,7 +1630,7 @@ def text_line(v: dict | None = None) -> str:
             s += (f"\n    view_pass(ne-change §4b): NE server kgs_obs_on_index {vp.get('obs_on_index_before')}→{vp.get('obs_on_index_now')}"
                   f" · ours: on_view_ok={um.get('on_view')} obs_on_index={um.get('obs_on_index')} no_view={um.get('no_view')}"
                   f" · posted_on_view={vp.get('posted') or 0} (of which on-index {vp.get('reposted_on_index') or 0},"
-                  f" obs-missing {vp.get('reposted_obs_missing') or 0})"
+                  f" obs-missing {vp.get('reposted_obs_missing') or 0}, swept {vp.get('reposted_coverage') or 0})"
                   f" cells borrowed={vp.get('cells_borrowed') or 0} unseen={vp.get('cells_filled') or 0}"
                   f" dropped={vp.get('cells_dropped') or 0}"
                   f" since {vp.get('started_at')} last {vp.get('last_at')} · ?q=on+view for rows")
@@ -1547,8 +1638,9 @@ def text_line(v: dict | None = None) -> str:
         if omx.get("kgs_n") is not None or um.get("obs_missing_listed"):
             s += (f"\n    obs_missing(NE-server revisit): listed={omx.get('kgs_n')} KGs / {omx.get('cells_n')} cells"
                   f" (pass {omx.get('pass_at')}, no_obs={omx.get('kgs_no_obs')}) · ours: due={um.get('obs_missing_due')}"
-                  f" held={um.get('obs_missing_held')} — view cells a neighbour observed are borrowed from the corpus,"
-                  f" the rest post as unseen (sweep territory)")
+                  f" held={um.get('obs_missing_held')} nodata_held={um.get('nodata_held') or 0} unswept_held={um.get('unswept_held') or 0}"
+                  f" — view cells a neighbour observed are borrowed from the corpus, the rest post as unseen;"
+                  f" a closed sweep stamps view_rekey.coverage=swept (the NE server counts them nodata_n, not blank_n)")
             if omx.get("error"):
                 s += f" LAST-ERR {omx['error'][:80]}"
         ur = v.get("union_recovery") or {}
@@ -1576,7 +1668,7 @@ def text_line(v: dict | None = None) -> str:
                   + f" · tick: applied={vf.get('applied', 0)} swapped={vf.get('swapped', 0)} rejected={vf.get('rejected', 0)}"
                   f" sweep={vf.get('planned_cells', 0)}c/{vf.get('planned_kgs', 0)}kg repost={vf.get('repost', 0)}"
                   f" errors={vf.get('errors', 0)} due={um.get('viewfill_due', 0)}"
-                  " (ne_viewfill.py: every cell of umfeld's /declared view observed — corpus borrow → own products"
+                  " (ne_viewfill.py: every cell of the NE server's /declared view observed — corpus borrow → own products"
                   " union → sweep units on the view; docs/ne-viewfill.md)")
         except Exception as _ex:  # noqa: BLE001
             s += f"\n    viewfill: {_ex}"

@@ -42,9 +42,53 @@ flight_years 0) — NE server lists them under `revisit?kind=obs_missing`
   `merge_blocks` ranks `chunks@…` NEC1 last as reference, so a view-built unit
   joins by union and never redefines the parent's declared layer.
 
+## Observed nodata — `view_rekey.coverage="swept"` (NE server 2026-11-06)
+
+Blank rows that are *genuinely* nothing (open water — 91119 Bodensee holds
+~18 k —, ALS seams) would list a KG under `obs_missing` forever.  the NE server now
+accepts, inside the NEO1 header's `view_rekey` block, `coverage: "swept"`
+(the only value; anything else → 400; absent = unswept): the body's blank rows
+then count as `nodata_n` (totals `kgs_obs_nodata` / `cells_obs_nodata`), never
+as `blank_n`, and the KG is listed only while `missing_n > 0 || extra_n > 0 ||
+blank_n > 0`.  Same rows with a flipped flag = digest-neutral header rewrite
+(`coverage_changed:true`); the manifest echoes `obs.coverage`, `obs.blank_n`,
+`obs.nodata_n` and the `view_rekey{}` as posted (counts refresh with the NE server's
+3-hourly `obs_complete` pass, `?refresh=1` is not wired to it).
+
+Observer side:
+
+* **`ne_h3.view_coverage(kg)`** decides (`ne_h3.coverage_context()` reads
+  `sliver_sweep.json` + `viewfill/state.json` + the staged dir once per
+  tick): `"swept"` iff the sweep is closed (`state=="done"`, all units `ok`,
+  `unswept==0`, `plan_deferred==0` — `docs/sliver-sweep.md → Closed sweep`)
+  **and** the view-fill walk left *residual only* (row walked without error,
+  nothing staged, `residual_n==0` or handed to the sweep via `planned_ts` /
+  `residual_held`).  `neo1_section_on_view(coverage="auto")` stamps it only
+  when the body has blank rows; stats carry `blank` + `coverage`, so do
+  `idx.ne_server[kg].view` and the `on view … coverage=swept` log line.
+* **`ne_ingest.confirm_ne_server`**: `refresh_obs_missing` keeps `blank_n`,
+  `nodata_n`, `coverage` per listed KG and the NE server's `kgs_obs_nodata` /
+  `cells_obs_nodata` / `kgs_obs_blank` totals.  The obs_missing memo key is
+  `view_source:missing_n:extra_n:blank_n` (`_om_key`).  A listed KG is
+  **`nodata_held`** when `_nodata_settled` (no drift, `blank_n` 0 or ==
+  `nodata_n`) — a re-post would be a no-op; **`unswept_held`** when only
+  `blank_n>0` and the sweep is still open — the integrate changes our digest
+  and triggers the real re-post.  **`coverage_due`**: the NE server holds our rows
+  unflagged (`obs.coverage != "swept"`) while blank rows exist and we would
+  flag now → one header re-post per file digest (`idx.ne_server[kg].coverage_post`,
+  lowest priority, `why=coverage-swept`).  Forced re-posts (viewfill,
+  coverage) reset `post_attempts` like an obs_missing post — the hourly
+  viewfill re-stage used to count as a failed-confirm retry and struck ~730
+  `view_ok` parents out at `POST_MAX_ATTEMPTS`; `LADDER_RESET` gave them one
+  fresh ladder (one-shot, `stats.ladder_reset_n`).
+* Dry run: `python3 ne_viewfill.py plan <kg>` (residual) +
+  `python3 -c 'import ne_h3;print(ne_h3.view_coverage("<kg>"))'`.
+
 ## Reading it
 
-`/process.txt` → `ne_ingest:` block, `viewfill:` sub-line:
+`/process.txt` → `ne_ingest:` block: `ne_server_confirm: … mismatch= nodata_held= unswept_held=
+swept_repost(due/posted)= server_nodata=<kgs>kg/<cells>c blank=<kgs>kg` (the NE server totals
+from the revisit `obs_complete{}`, `?` until its first pass); `viewfill:` sub-line:
 `kgs=<walked>/<parents> left eta=~Nh (runs @walked/run)` — walk ETA, nothing else needed for a progress check — then `walked / blank / borrowable / staged / sweep=<cells>c/<kg>kg / residual / waiting`
 (builder totals) · `tick: applied swapped rejected sweep repost errors due`
 (ingest side) · `view_pass … viewfill N` = forced re-posts done. Sweep units

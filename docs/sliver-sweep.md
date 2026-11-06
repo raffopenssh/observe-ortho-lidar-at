@@ -111,6 +111,28 @@ Knobs (`director_config.json`): `sliver_sweep` (bool, default on),
 then `failed` — check `?q=sweep` and `python3 sliver_sweep.py plan <kg>`.
 <!-- VERIFY: the scan needs a declared NE cell layer for the parent (optional upstream service or SRTM_BEV_VECTOR_CONTEXT); without one the sweep stays idle. -->
 
+## Closed sweep ⇒ observed nodata at the NE server (2026-11-06)
+
+A parent's sweep is **closed** when `sliver_sweep.json kgs[kg].state ==
+"done"`, every unit is `ok` (no pending / dispatched / hold / failed), `unswept
+== 0` and `plan_deferred == 0`.  `ne_h3.view_coverage(kg)` combines that with
+the view-fill state (`docs/ne-viewfill.md → Observed nodata`) and stamps the
+next NEO1 view post with `view_rekey.coverage="swept"` — the NE server then counts the
+post's blank rows as `nodata_n` (open water, ALS seams) instead of `blank_n`
+and stops listing the KG under `revisit?kind=obs_missing`.  Consequences for
+the sweep side:
+
+* `plan_cells` caps **one planning pass** at `MAX_UNITS_PER_PARENT`; kept
+  `ok` units no longer eat the room (before, a parent with 8 ok units could
+  never re-plan its deferred cells — 6 parents sat at `plan_deferred>0`,
+  65114 among them, and could never be flagged swept).
+* A `failed` / `hold` unit keeps the parent unswept → no flag; `_reopen_unswept`
+  re-plans it after `RESWEEP_COOLDOWN_S`, the integrate changes the digest and
+  the ingest re-posts (flag then decided afresh).
+* `python3 -c 'import ne_h3; print(ne_h3.view_coverage("65114"))'` answers the
+  question "why is this KG still listed with blank_n>0" — `None` means an open
+  unit, deferred cells, or a view-fill result still staged.
+
 ## Invariants
 
 * Sweep units never touch the retry queue, strikes, completed sets or

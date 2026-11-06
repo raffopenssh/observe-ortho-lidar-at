@@ -364,7 +364,12 @@ def plan_cells(parent: str, ids: np.ndarray, source: str = "viewfill", bbox_fall
             return {"planned": 0, "skipped": "in flight", "state": k["state"]}
         units = [u for u in (k.get("units") or []) if u.get("state") == "ok"]
         nxt = 1 + max([int(u["id"].rsplit("-sw", 1)[1]) for u in (k.get("units") or []) if "-sw" in str(u.get("id"))] or [0])
-        room = max(0, MAX_UNITS_PER_PARENT - len(units))
+        # the cap bounds one planning pass (peer work per dispatch), not the
+        # parent's lifetime: integrated ``ok`` units are kept for the merge but
+        # must not eat the room, else a parent with 8 ok units could never
+        # re-plan its deferred cells (6 parents stuck with plan_deferred>0,
+        # 2026-11-06 — blocks the swept-coverage flag, docs/ne-viewfill.md)
+        room = MAX_UNITS_PER_PARENT
         planned, deferred = 0, 0
         for g in groups:
             if planned >= room:

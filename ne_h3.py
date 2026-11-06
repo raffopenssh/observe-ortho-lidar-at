@@ -1954,17 +1954,92 @@ def corpus_obs_rows(ids: np.ndarray, exclude_kg: str | None = None) -> tuple[np.
         return empty
 
 
+COVERAGE_SWEPT = "swept"      # the only value the NE server accepts for view_rekey.coverage (anything else → 400)
+_COV_CTX: dict = {"ts": 0.0, "sweep": None, "vf": None, "staged": frozenset()}
+_COV_CTX_TTL_S = 120
+
+
+def coverage_context(force: bool = False) -> dict:
+    """Read-only snapshot of the two states :func:`view_coverage` consults —
+    ``sliver_sweep.json`` → ``kgs``, ``data/ne/viewfill/state.json`` → ``kgs``
+    and the set of staged viewfill results not yet consumed.  Cached for
+    :data:`_COV_CTX_TTL_S` so a 50-post tick reads both files once."""
+    now = time.time()
+    if not force and _COV_CTX["sweep"] is not None and now - _COV_CTX["ts"] < _COV_CTX_TTL_S:
+        return _COV_CTX
+    sweep: dict = {}
+    vf: dict = {}
+    staged: set[str] = set()
+    try:
+        d = json.loads((DATA_DIR / "austria_processor" / "sliver_sweep.json").read_text())
+        sweep = d.get("kgs") or {}
+    except Exception:  # noqa: BLE001
+        sweep = {}
+    try:
+        d = json.loads((NE_DIR / "viewfill" / "state.json").read_text())
+        vf = d.get("kgs") or {}
+    except Exception:  # noqa: BLE001
+        vf = {}
+    try:
+        staged = {p.stem for p in (NE_DIR / "viewfill" / "staged").glob("*.json") if not p.name.startswith(".")}
+    except Exception:  # noqa: BLE001
+        staged = set()
+    _COV_CTX.update(ts=now, sweep=sweep, vf=vf, staged=frozenset(staged))
+    return _COV_CTX
+
+
+def view_coverage(kg: str, ctx: dict | None = None) -> str | None:
+    """``"swept"`` when every blank row a view post of *kg* would carry has
+    been run through the pipeline and observed nothing (open water, ALS seams)
+    — the NE server then counts them as ``nodata_n`` instead of ``blank_n`` and stops
+    listing the KG under ``revisit?kind=obs_missing`` (docs/ne-viewfill.md →
+    Observed nodata).  ``None`` (= omit the header key, today's behaviour)
+    unless BOTH hold:
+
+    * the parent's sweep is **closed**: ``sliver_sweep.json kgs[kg].state ==
+      "done"``, every unit ``ok`` (no pending / dispatched / hold / failed unit),
+      nothing ``unswept`` and no cluster deferred at plan time (``plan_deferred``);
+    * the view-fill walk left **residual only**: ``viewfill/state.json kgs[kg]``
+      exists, walked without error, no staged result waiting for the ingest
+      tick, and its residual (cells nobody observed) is either 0 or was handed
+      to the sweep (``planned_ts`` / ``residual_held``) — i.e. there is no
+      corpus borrow or own-product union still pending that would turn a
+      blank row into an observed one.
+
+    Never raises; unknown parents → ``None``."""
+    kg = str(kg).zfill(5)
+    ctx = ctx or coverage_context()
+    k = (ctx.get("sweep") or {}).get(kg)
+    if not isinstance(k, dict) or k.get("state") != "done":
+        return None
+    units = k.get("units") or []
+    if any(u.get("state") != "ok" for u in units) or int(k.get("unswept") or 0) or int(k.get("plan_deferred") or 0):
+        return None
+    v = (ctx.get("vf") or {}).get(kg)
+    if not isinstance(v, dict) or v.get("error") or v.get("residual_n") is None:
+        return None
+    if kg in (ctx.get("staged") or ()):
+        return None
+    if int(v.get("residual_n") or 0) and not (v.get("planned_ts") or v.get("residual_held")):
+        return None
+    return COVERAGE_SWEPT
+
+
 def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = True,
-                         borrow: bool = True) -> tuple[bytes, dict]:
+                         borrow: bool = True, coverage: str | None = "auto") -> tuple[bytes, dict]:
     """NEO1 section for POST /obs whose cell set is exactly *view*'s (the
     ``/declared`` NEC1): our rows re-keyed onto the view's ids in the view's
     order; cells the view lacks are dropped (they would 409 — superseded or
     moved to a neighbour KG), view cells this product lacks are *borrowed*
     from the corpus when a neighbour product observed them
     (:func:`corpus_obs_rows`), else get an unseen (all-nodata) row.
-    Returns ``(section, {cells_n, dropped, filled, borrowed, digest,
-    state})`` — ``filled`` = rows not in this product (borrowed + unseen).
-    Header ``declared_digest/source`` name the view."""
+    Returns ``(section, {cells_n, dropped, filled, borrowed, blank, coverage,
+    digest, state})`` — ``filled`` = rows not in this product (borrowed +
+    unseen).  Header ``declared_digest/source`` name the view.
+    *coverage*: ``"auto"`` → :func:`view_coverage` decides whether the header
+    carries ``view_rekey.coverage="swept"`` (only when the body has blank
+    rows — the flag is moot otherwise and a header flip is a re-post the NE server
+    would store); ``None`` → never; ``"swept"`` → force."""
     hdr, obs, n_fix = neo1_rows_from_h3b(path, green_fix=green_fix)
     n = len(obs) // OBS_REC.size
     ob = np.frombuffer(obs, np.uint8).reshape(n, OBS_REC.size)
@@ -1991,7 +2066,7 @@ def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = Tr
     want_b = np.concatenate([miss, unseen_here]) if len(unseen_here) else miss
     if len(want_b) and borrow:
         # cells the view holds but this product lacks are mostly boundary
-        # cells a NEIGHBOUR product observed (umfeld's view moved them onto
+        # cells a NEIGHBOUR product observed (the NE server's view moved them onto
         # this KG) — take their rows from the corpus instead of posting nodata
         bids, brows = corpus_obs_rows(vids[want_b], exclude_kg=hdr["kg"])
         if len(bids):
@@ -2007,9 +2082,13 @@ def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = Tr
     raw = out.tobytes()
     try:
         from ne_ingest import row_observed as _ro2
-        blank = int((~_ro2(out)).sum()) if vn else 0     # rows umfeld will count as unobserved (blank_n)
+        blank = int((~_ro2(out)).sum()) if vn else 0     # rows the NE server will count as unobserved (blank_n)
     except Exception:  # noqa: BLE001
         blank = None
+    if coverage == "auto":
+        coverage = view_coverage(hdr["kg"]) if blank else None
+    if coverage is not None and coverage != COVERAGE_SWEPT:
+        raise ValueError(f"view_rekey.coverage={coverage!r}: the NE server accepts only {COVERAGE_SWEPT!r}")
     h = dict(algo=ALGO_OBS, epoch=hdr["neo1"]["epoch"], source=OBS_SOURCE, kg=hdr["kg"], h3_res=H3_RES,
              cells_n=vn, groups=list(GROUPS), record=OBS_REC.format, record_bytes=OBS_REC.size,
              fields=list(OBS_FIELDS), units=dict(OBS_UNITS), phenology=list(PHENOLOGY_CODES),
@@ -2017,13 +2096,15 @@ def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = Tr
              declared_source=view.header.get("source"),
              view_rekey={"dropped": int(n - int(hit.sum())), "filled": int(len(miss)), "borrowed": borrowed,
                          "blank": blank, "product_cells_n": int(n), "product_declared_digest": hdr["nec1"]["digest"]})
+    if coverage:
+        h["view_rekey"]["coverage"] = coverage
     if green_fix:
         import ne_green_fix as _gf
         h["source"] = OBS_SOURCE_FIXED
         h.update(_gf.header_note(n_fix, n))
     st = (view.header.get("view") or {}).get("state")
     stats = {"cells_n": vn, "dropped": int(n - int(hit.sum())), "filled": int(len(miss)), "borrowed": borrowed,
-             "blank": blank, "digest": digest_of(raw),
+             "blank": blank, "coverage": coverage, "digest": digest_of(raw),
              "state": st, "view_digest": view.header.get("digest"), "hidden": (view.header.get("view") or {}).get("hidden")}
     return pack_section(MAGIC_OBS, h, raw), stats
 
