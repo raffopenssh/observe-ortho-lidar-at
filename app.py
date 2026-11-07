@@ -1964,8 +1964,16 @@ def _sync_peer_data():
                                     _pst['cm_pushed_max'] = _local_max
                                 if _pfull:
                                     _pst['cm_push_full_ts'] = time.time()
-                                if _ps_max:
-                                    _pst['ps_pushed_max'] = _ps_max
+                                if _ps_max and _ps_delta:
+                                    try:
+                                        _ack = rr.json().get('product_status_applied')
+                                    except Exception:
+                                        _ack = None
+                                    if _ack is not None:
+                                        _pst['ps_pushed_max'] = _ps_max
+                                    else:
+                                        _pst.pop('ps_pushed_max', None)
+                                        _pushed_ps -= len(_ps_delta)
                                 _pushed_n += 1
                                 _pushed_files += len(_delta)
                                 _pushed_ps += len(_ps_delta)
@@ -4230,9 +4238,11 @@ def processing_cache_manifest():
                 log.debug('cache_manifest sync: drop-journal merge failed: %s', _e)
         # Same transport for the primary's removed/stripped product records
         # (``_product_status_rider``) -> our zenodo_manifest.json.
+        _ps_ack = None
         if isinstance(incoming.get('product_status'), dict):
             try:
                 _n_ps = _apply_product_status(incoming['product_status'])
+                _ps_ack = int(_n_ps)
                 if _n_ps:
                     log.info('cache_manifest sync: %d product record(s) marked '
                              'removed/stripped from the primary', _n_ps)
@@ -4320,7 +4330,15 @@ def processing_cache_manifest():
           log.info('Cache manifest: merged %d entries (%d ZIP), %d zip index invalidated',
                    updated, updated_zip, _n_inv)
 
-      return jsonify({'updated': updated, 'total_files': len(local_files)})
+      # ``product_status_applied`` is the rider ack: the primary only
+      # advances its per-peer ``ps_pushed_max`` watermark when it sees
+      # the key (2026-11-07: the full rider went out before the peers
+      # had the merge code, the watermark advanced anyway and the fleet
+      # never got the removals until the next 6-h full push).
+      _resp = {'updated': updated, 'total_files': len(local_files)}
+      if _ps_ack is not None:
+          _resp['product_status_applied'] = _ps_ack
+      return jsonify(_resp)
     except Exception as e:
         log.warning('Cache manifest PUT failed: %s', e)
         return jsonify({'error': str(e)}), 500
