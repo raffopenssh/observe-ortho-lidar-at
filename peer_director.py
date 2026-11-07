@@ -2744,7 +2744,19 @@ def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
     # racing the same KG — e.g. at100 (cache-only whitelist) + at102
     # (frontier queue) both starting 40318 15s apart.
     queue = _claim_dispatch(queue, peer_url)
+    _drop = sorted(exclude) if exclude else []
     if not queue:
+        if _drop:
+            # Nothing to push, but the peer's *local* retry queue may
+            # still hold an excluded code from an earlier sync — purge
+            # it, or the peer runs it anyway (34009-east, 2026-11-07).
+            try:
+                requests.post(
+                    peer_url.rstrip('/') + '/api/v1/processing/queue',
+                    json={'kgs': [], 'drop': _drop},
+                    timeout=PEER_TIMEOUT_CONTROL, headers=_admin_headers())
+            except Exception:
+                pass
         return {'status': 'empty_queue', 'synced': 0}
 
     # Identify tombstoned codes (force-requeued KGs that are locally
@@ -2791,10 +2803,19 @@ def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
         if normal_queue:
             r = requests.post(
                 peer_url.rstrip('/') + '/api/v1/processing/queue',
-                json={'kgs': normal_queue, 'position': 0, 'skip_processed': True},
+                json={'kgs': normal_queue, 'position': 0, 'skip_processed': True,
+                      'drop': _drop},
                 timeout=PEER_TIMEOUT_CONTROL,
             headers=_admin_headers())
             result = r.json()
+        elif _drop:
+            try:
+                requests.post(
+                    peer_url.rstrip('/') + '/api/v1/processing/queue',
+                    json={'kgs': [], 'drop': _drop},
+                    timeout=PEER_TIMEOUT_CONTROL, headers=_admin_headers())
+            except Exception:
+                pass
         # Then push tombstoned codes at position 0 — ends up in front,
         # ahead of the normal codes, preserving the original ordering.
         if tombstoned_in_queue:

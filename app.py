@@ -6199,19 +6199,39 @@ def processing_queue_add():
     new_codes = data.get('kgs') or data.get('kg_codes') or data.get('queue', [])
     if isinstance(new_codes, str):
         new_codes = [new_codes]
-    if not isinstance(new_codes, list) or not new_codes:
+    if not isinstance(new_codes, list) or (not new_codes and not data.get('drop')):
         return jsonify({'error': 'kgs must be a non-empty array of KG codes'}), 400
     new_codes = [str(c).strip() for c in new_codes if str(c).strip()]
     position = data.get('position', -1)
     skip_processed = data.get('skip_processed', True)
     keep_products = bool(data.get('keep_products')) and not skip_processed
     gone_keys = {str(k) for k in (data.get('gone_keys') or []) if str(k).strip()}
+    # ``drop``: codes the director reserved for *other* peers. They are
+    # purged from this peer's local retry_queue.json (incl. blocks of a
+    # dropped parent) — the director's exclude only ever filtered what
+    # it *pushed*, so a code that landed here hours earlier survived
+    # every restart as a local priority item ("outside this peer's cells
+    # — running them anyway") and at205 + at233 both started 34009-east
+    # five seconds apart (2026-11-07).
+    drop = {str(c).strip() for c in (data.get('drop') or []) if str(c).strip()}
 
     retry_path = Path('data/austria_processor/retry_queue.json')
     try:
         codes = json.loads(retry_path.read_text()) if retry_path.exists() else []
     except Exception:
         codes = []
+    dropped = []
+    if drop:
+        def _dropped(c):
+            c = str(c)
+            return c in drop or any(c.startswith(d + '-') for d in drop)
+        dropped = [c for c in codes if _dropped(c)]
+        if dropped:
+            codes = [c for c in codes if not _dropped(c)]
+            retry_path.write_text(json.dumps(codes))
+            log.info('Priority queue: dropped %d code(s) reserved for other peers: %s',
+                     len(dropped), dropped[:10])
+        new_codes = [c for c in new_codes if not _dropped(c)]
 
     # Optionally filter out already-processed; otherwise tombstone their manifest entries
     skipped = []
@@ -6412,6 +6432,7 @@ def processing_queue_add():
         return jsonify({
             'status': 'nothing_to_add',
             'skipped_processed': skipped,
+            'dropped': dropped,
             'queue_length': len(codes),
         })
 
@@ -6455,6 +6476,7 @@ def processing_queue_add():
         'moved_from_existing': moved,
         'skipped_processed': skipped,
         'tombstoned': tombstoned,
+        'dropped': dropped,
         'queue_length': len(codes),
     })
 
