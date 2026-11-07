@@ -53,7 +53,7 @@ ALGO_TREES = "obs-trees-1"
 ALGO_BLD = "obs-bld-1"
 ALGO_DECLARED = "ne-cells-2"          # the frozen NE server algo we accept
 OBS_SOURCE = "srtm-lidar-at@2.4"
-OBS_SOURCE_FIXED = "srtm-lidar-at@2.4.1"   # NEO1 export with the green-ground override applied (ne_green_fix; epoch unchanged)
+OBS_SOURCE_FIXED = "srtm-lidar-at@2.4.2"   # NEO1 export with the read-time overrides applied (ne_green_fix: tree + green rule; epoch unchanged)
 H3_RES = 12
 CHUNK_RES = 10
 
@@ -1819,22 +1819,28 @@ def verify_h3b(path: str | Path, expected_declared_digest: str | None = None) ->
             "trees_n": len(trees) // 4, "bld_n": len(bld) // 8, "header": hdr}
 
 
-def neo1_rows_from_h3b(path: str | Path, green_fix: bool = True) -> tuple[dict, bytes, int]:
+def neo1_rows_from_h3b(path: str | Path, green_fix: bool = True,
+                       counts: dict | None = None) -> tuple[dict, bytes, int]:
     """``(header, neo1_rows, n_fixed)`` of a product file.  With *green_fix*
-    (default) the read-time green-ground override (``ne_green_fix``) is
-    applied per chunk — the file itself is never modified."""
+    (default) the read-time overrides (``ne_green_fix``: tree rule, then
+    green rule) are applied per chunk — the file itself is never modified.
+    *counts* (optional dict) receives the per-rule split ``{"tree": n, "green": n}``."""
     hdr = read_h3b_header(path)
     obs = bytearray()
-    n_fix = 0
+    n_fix = n_tree = 0
     if green_fix:
         import ne_green_fix as _gf
     for ch in hdr["chunks"]:
         part = read_h3b_chunk(path, hdr, ch)
         o = part["obs"]
         if green_fix:
-            o, k = _gf.fix_rows(o, part["lu"])
-            n_fix += k
+            o, kt, kg = _gf.fix_rows_detail(o, part["lu"])
+            n_fix += kt + kg
+            n_tree += kt
         obs += o
+    if counts is not None:
+        counts["tree"] = n_tree
+        counts["green"] = n_fix - n_tree
     return hdr, bytes(obs), n_fix
 
 
@@ -1842,7 +1848,8 @@ def neo1_section_from_h3b(path: str | Path, green_fix: bool = True) -> bytes:
     """Re-create the NEO1 section (for POST /obs) from a product file.
     ``green_fix`` applies the read-time override (``ne_green_fix``; header
     keys ``green_fix*`` document it)."""
-    hdr, obs, n_fix = neo1_rows_from_h3b(path, green_fix=green_fix)
+    cnt: dict = {}
+    hdr, obs, n_fix = neo1_rows_from_h3b(path, green_fix=green_fix, counts=cnt)
     h = dict(algo=ALGO_OBS, epoch=hdr["neo1"]["epoch"], source=OBS_SOURCE, kg=hdr["kg"], h3_res=H3_RES,
              cells_n=hdr["cells_n"], groups=list(GROUPS), record=OBS_REC.format, record_bytes=OBS_REC.size,
              fields=list(OBS_FIELDS), units=dict(OBS_UNITS), phenology=list(PHENOLOGY_CODES),
@@ -1851,7 +1858,7 @@ def neo1_section_from_h3b(path: str | Path, green_fix: bool = True) -> bytes:
     if green_fix:
         import ne_green_fix as _gf
         h["source"] = OBS_SOURCE_FIXED      # the NE server's manifest shows which KGs carry the corrected export
-        h.update(_gf.header_note(n_fix, hdr["cells_n"]))
+        h.update(_gf.header_note(n_fix, hdr["cells_n"], cnt.get("tree")))
     als = _als_header_for(hdr, obs)
     if als:
         h["als_years"] = als                # header only — digest covers the rows, no re-post needed
@@ -2045,7 +2052,8 @@ def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = Tr
     the NE server's blank rule also counts elev-only rows ours ignores, so the
     flag is stamped regardless of our local ``blank``); ``None`` → never;
     ``"swept"`` → force."""
-    hdr, obs, n_fix = neo1_rows_from_h3b(path, green_fix=green_fix)
+    cnt: dict = {}
+    hdr, obs, n_fix = neo1_rows_from_h3b(path, green_fix=green_fix, counts=cnt)
     n = len(obs) // OBS_REC.size
     ob = np.frombuffer(obs, np.uint8).reshape(n, OBS_REC.size)
     ours = ob[:, :8].copy().view("<u8").reshape(n)
@@ -2110,7 +2118,7 @@ def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = Tr
     if green_fix:
         import ne_green_fix as _gf
         h["source"] = OBS_SOURCE_FIXED
-        h.update(_gf.header_note(n_fix, n))
+        h.update(_gf.header_note(n_fix, n, cnt.get("tree")))
     st = (view.header.get("view") or {}).get("state")
     stats = {"cells_n": vn, "dropped": int(n - int(hit.sum())), "filled": int(len(miss)), "borrowed": borrowed,
              "blank": blank, "coverage": coverage, "digest": digest_of(raw),
@@ -2118,9 +2126,10 @@ def neo1_section_on_view(path: str | Path, view: "Section", green_fix: bool = Tr
     return pack_section(MAGIC_OBS, h, raw), stats
 
 
-def neo1_fixed_digest(path: str | Path) -> tuple[str, int]:
-    """``(digest of the green-fixed NEO1 rows, n cells touched)``."""
-    _, obs, n_fix = neo1_rows_from_h3b(path, green_fix=True)
+def neo1_fixed_digest(path: str | Path, counts: dict | None = None) -> tuple[str, int]:
+    """``(digest of the fixed NEO1 rows, n cells touched)``; *counts* receives
+    the tree/green split (see :func:`neo1_rows_from_h3b`)."""
+    _, obs, n_fix = neo1_rows_from_h3b(path, green_fix=True, counts=counts)
     return digest_of(obs), n_fix
 
 

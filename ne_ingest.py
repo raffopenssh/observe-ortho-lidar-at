@@ -906,12 +906,14 @@ def _our_digest(parent: str, idx: dict, green_fix: bool = True) -> str | None:
     _gf_budget[0] -= 1
     try:
         import ne_h3
-        d, n = ne_h3.neo1_fixed_digest(path_for(parent))
+        cnt: dict = {}
+        d, n = ne_h3.neo1_fixed_digest(path_for(parent), counts=cnt)
     except Exception as ex:  # noqa: BLE001
         log.warning("ne_ingest: green-fix digest %s failed: %s", parent, ex)
         return raw
     if tgt is not None:
-        tgt["green_fix"] = {"id": ne_green_fix.FIX_ID, "of": raw, "digest": d, "cells": int(n)}
+        tgt["green_fix"] = {"id": ne_green_fix.FIX_ID, "of": raw, "digest": d, "cells": int(n),
+                            "tree_cells": int(cnt.get("tree") or 0)}
     return d
 
 
@@ -1593,7 +1595,7 @@ def _green_fix_status(idx: dict) -> dict:
     have a fixed digest computed, how many of those NE-server confirmed."""
     import ne_green_fix
     conf = idx.get("ne_server") or {}
-    n = done = cells = 0
+    n = done = cells = tree_cells = 0
     for parent in {c for c in idx["files"] if not is_block(c)} | set(idx["parents"]):
         tgt, _ = _disk_row(parent, idx)
         gf = (tgt or {}).get("green_fix") or {}
@@ -1601,10 +1603,11 @@ def _green_fix_status(idx: dict) -> dict:
             continue
         n += 1
         cells += int(gf.get("cells") or 0)
+        tree_cells += int(gf.get("tree_cells") or 0)
         if (conf.get(parent) or {}).get("confirmed_digest") == gf.get("digest"):
             done += 1
     return {"id": ne_green_fix.FIX_ID, "enabled": bool(_knob("ne_green_fix", True)),
-            "computed": n, "confirmed": done, "cells_touched": cells}
+            "computed": n, "confirmed": done, "cells_touched": cells, "tree_cells_touched": tree_cells}
 
 
 def green_fix_lines(limit: int = 20) -> list[str]:
@@ -1621,7 +1624,7 @@ def green_fix_lines(limit: int = 20) -> list[str]:
     now = time.time()
     rows_conf, rows_wait = [], []
     by = {"confirmed": 0, "posted": 0, "queued": 0, "struck_out": 0, "over_cap": 0, "parked": 0, "no_fix": 0}
-    cells = 0
+    cells = tree_cells = 0
     parents = {c for c in idx["files"] if not is_block(c)} | set(idx["parents"])
     for parent in parents:
         tgt, _ = _disk_row(parent, idx)
@@ -1630,6 +1633,7 @@ def green_fix_lines(limit: int = 20) -> list[str]:
             by["no_fix"] += 1
             continue
         cells += int(gf.get("cells") or 0)
+        tree_cells += int(gf.get("tree_cells") or 0)
         c = conf.get(parent) or {}
         want = gf.get("digest")
         if c.get("confirmed_digest") == want:
@@ -1649,9 +1653,11 @@ def green_fix_lines(limit: int = 20) -> list[str]:
                               int(c.get("post_attempts") or 0), float(c.get("post_next") or 0)))
     pdy = st.get("post_day") or {}
     cap = float(_knob("ne_post_gib_per_day", POST_GIB_PER_DAY))
-    out = [f"green_fix detail ({ne_green_fix.FIX_ID}{'' if _knob('ne_green_fix', True) else ' OFF'}, ndvi≥{ne_green_fix.NDVI_MIN} & not road/bare → "
+    out = [f"green_fix detail ({ne_green_fix.FIX_ID}{'' if _knob('ne_green_fix', True) else ' OFF'}; tree rule first: LiDAR crown_frac≥{ne_green_fix.TREE_CROWN_MIN:g} & "
+           f"h_p90≥{ne_green_fix.TREE_HP90_MIN:g} m & not road/bare → {'+'.join(ne_green_fix.TREE_MOVE_GROUPS)}→{ne_green_fix.TREE_TARGET_GROUP}; "
+           f"then ndvi≥{ne_green_fix.NDVI_MIN} & not road/bare → "
            f"{'+'.join(ne_green_fix.MOVE_GROUPS)}→{ne_green_fix.TARGET_GROUP}; read-time only, files untouched):",
-           f"    parents fixed={len(parents) - by['no_fix']}/{len(parents)} cells_moved={cells:,} · NE-server confirmed={by['confirmed']} "
+           f"    parents fixed={len(parents) - by['no_fix']}/{len(parents)} cells_moved={cells:,} (tree→wald {tree_cells:,}, green→gruen {cells - tree_cells:,}) · NE server confirmed={by['confirmed']} "
            f"posted(awaiting manifest)={by['posted']} queued={by['queued']} struck_out={by['struck_out']} over_cap(body>NE server /obs cap, ne_h3.OBS_BODY_CAP)={by['over_cap']} parked(needs_bevdirect)={by['parked']} "
            f"no_fix_digest_yet={by['no_fix']} (computed {_knob('ne_green_fix_compute_per_tick', GF_COMPUTE_PER_TICK)}/tick)",
            f"    budget: today {int(pdy.get('posts') or 0)} POSTs {(pdy.get('bytes') or 0) / 2 ** 20:.0f}/{cap * 1024:.0f} MiB · "
@@ -1715,8 +1721,10 @@ def text_line(v: dict | None = None) -> str:
         gf = v.get("green_fix") or {}
         if gf:
             s += (f"\n    green_fix({gf.get('id')}{'' if gf.get('enabled') else ' OFF'}): umfeld_confirmed="
-                  f"{gf.get('confirmed')}/{gf.get('computed')} parents, {gf.get('cells_touched')} cells bau/alpen→gruen"
-                  f" (read-time override, files untouched; ne_green_fix.py)")
+                  f"{gf.get('confirmed')}/{gf.get('computed')} parents, {gf.get('cells_touched')} cells moved"
+                  f" (tree_fix {gf.get('tree_cells_touched') or 0} alpen/bau/gruen→wald by LiDAR crown, green_fix"
+                  f" {int(gf.get('cells_touched') or 0) - int(gf.get('tree_cells_touched') or 0)} bau/alpen→gruen by S2 NDVI;"
+                  f" read-time overrides, files untouched; ne_green_fix.py)")
         vp = v.get("view_pass") or {}
         if vp or um.get("obs_on_index") is not None:
             s += (f"\n    view_pass(ne-change §4b): NE server kgs_obs_on_index {vp.get('obs_on_index_before')}→{vp.get('obs_on_index_now')}"

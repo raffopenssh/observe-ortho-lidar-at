@@ -228,6 +228,35 @@ obs_lu[alpen]` moves to `obs_lu[gruen]`, verdict recomputed. Applied in
 headers is pre-fix (documented). Test `tests/test_ne_green_fix.py`; audit
 one file: `python3 ne_green_fix.py data/ne/63330.h3b`.
 
+### LiDAR tree override (`ne_green_fix.py` tree rule, 2026-11-07)
+
+Where the BEV ortho operate 2023160 is hazy / low-NIR (seam at lat 47.218,
+lower Inn valley: 84011, 84015, 80007, 80001, 80003, 84002 …) segv2 labels
+closed forest `rock` (→ `alpen`, sometimes `bau`); the green rule then
+turned that into `gruen` — grassland over real forest (cell
+`8c1f88472a0b3ff`, KG 80007: alpen=250 but h_max 13.5 m, h_p90 10.5 m,
+crown_frac 33 %, 5 apices). Classifier error; the LiDAR columns of the same
+NEO1 row are flight-independent and correct, so the fix lives in the same
+read-time module, applied **before** the green rule, same call sites, same
+`FIX_ID` (`green-2+tree-1`) — no file rewritten, deterministic, idempotent:
+
+* rule (`ne_green_fix.tree_mask`): `crown_frac` (byte 24) ≥ 0.3 and `h_p90`
+  (byte 20) ≥ 8 m and phenology ≠ `road_or_bare` → `obs_lu[alpen] +
+  obs_lu[bau] + obs_lu[gruen]` → `obs_lu[wald]`, verdict recomputed
+  (`forest_loss` → `consistent` where Wald is declared; `unknown` stays).
+* thresholds (national sample, 7.4 M cells): real forest has crown p5 0.22 /
+  p25 0.43 and h_p90 p5 9.5 m — `crown ≥ 0.5 & h_max ≥ 5 m` caught only 65 %
+  of it; this rule catches 88 % of forest, 6.9 % of pure gruen / alpen
+  (treed pasture, forest edges), 0.7 % acker, ~0 % bau. Corpus-wide: 19 %
+  of all cells, 11 of 143 wald-free KGs get > 1 % touched.
+* header: `tree_fix_rule`, `tree_fix_cells` next to `green_fix*`;
+  `/api/v1/cells` meta `tree_fix_rule`; `/process.txt` `green_fix(...)`
+  sub-line shows `tree_fix N` separately. The FIX_ID bump invalidates every
+  cached fixed digest, so parents whose rows changed re-POST to the NE
+  server on the normal paced ladder (`ne_post_max_per_tick`).
+* audit: `python3 ne_green_fix.py data/ne/<kg>.h3b` → `tree_touched`,
+  `wald_cells`; tests `python3 tests/test_ne_green_fix.py`.
+
 ## 6. Multi-KG summary `/api/v1/kgs/summary`
 
 Scope (exactly one): `codes=63330,63331,…` (≤ 500), `gemeinde=61630`

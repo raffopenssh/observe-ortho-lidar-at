@@ -613,8 +613,8 @@ def _load_chunk(kg: str, row: dict, hdr: dict) -> Chunk:
     else:
         parts = {'obs': raw[o1:o2], 'trees': raw[o2:o3], 'bld': raw[o3:o3 + b * r3]}
         ctx_rows = raw[:o1]
-    # read-time green-ground override (bau/alpen on S2-green cells → gruen);
-    # the file is untouched — see ne_green_fix.py
+    # read-time overrides (tree rule: alpen/bau/gruen under a LiDAR canopy → wald;
+    # green rule: bau/alpen on S2-green cells → gruen); the file is untouched — see ne_green_fix.py
     parts['obs'], _ = _green_fix.fix_rows(parts["obs"], ctx_rows)
     ch = Chunk(kg, row, parts)
     _lru_put(_chunk_lru, key, ch, CHUNK_LRU_N)
@@ -1381,6 +1381,7 @@ def _pub_header_base(h: dict, kg: str) -> dict:
         'neo1_digest': h.get('neo1_digest'), 'partial_cells': bool(h.get('partial_cells')),
         'green_fix': _green_fix.FIX_ID,
         'green_fix_rule': _green_fix.header_note(0, 0)['green_fix_rule'] + ' (applied at read time; summary.observed_ha is pre-fix)',
+        'tree_fix_rule': _green_fix.header_note(0, 0)['tree_fix_rule'],
         'attribution': ATTRIBUTION, 'license': 'CC-BY-4.0', 'license_url': LICENSE_URL,
         'docs': '/api/v1/docs/llm.txt#cells', 'source_service': 'srtm-lidar-at',
     }
