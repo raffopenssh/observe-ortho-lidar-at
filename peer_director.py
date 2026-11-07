@@ -2417,6 +2417,43 @@ def get_peer_status(peer_url: str | None, peer_id: str = '') -> dict:
         return {'state': 'unreachable', 'error': str(e)}
 
 
+def _parent_geometrically_done(code: str, entries: dict | None) -> bool | None:
+    """Coverage-oracle verdict for a *parent* KG: ``True`` when its committed
+    ``_json`` products (plain and/or blocks of ANY historical layout) cover
+    the parent bbox, ``False`` when there is a real hole, ``None`` when the
+    oracle is unavailable.
+
+    Why not the search-index ``processed`` flag: the index flips a parent
+    to ``processed=1`` as soon as ONE block JSON exists
+    (``search_index._enrich_kg_from_blocks``), so a half-done split parent
+    (67204: 2 of 6 blocks, 2026-11-07 — 74 such parents / 138 cached
+    blocks) looked "done" to the cache-only whitelist and sat on the
+    frontiers alone at ~3.6 KG/h while 40 cache-only peers idled. And why
+    not plain block-set membership: layouts drift with strikes (91123 was
+    finished as 6 blocks, today's layout wants 8 doubled ones), so a
+    set check calls a geometrically complete parent pending and the
+    frontier pinned to its cell restart-loops into quarantine."""
+    try:
+        from app import _kg_coverage_complete as _cc
+        if entries is None:
+            return None
+        return bool(_cc(code, entries)[0])
+    except Exception:
+        return None
+
+
+def _manifest_entries_ro() -> dict | None:
+    try:
+        mf_path = DATA_DIR / 'zenodo_manifest.json'
+        if not mf_path.exists():
+            return None
+        import json_cache
+        raw = json_cache.load(mf_path) or {}
+        return raw.get('entries', raw) or {}
+    except Exception:
+        return None
+
+
 def get_peer_log(peer_url: str | None, lines: int = 50) -> list[str]:
     """Get recent log lines from a peer."""
     if peer_url is None:
@@ -11086,6 +11123,7 @@ class PeerDirector:
                 return all_cells
             from kg_splitter import maybe_split_kg
             pending_cells: set[tuple[float, float, float, float]] = set()
+            _mf_ent = None
             for kg in kgs:
                 code = kg.get('kg_code')
                 bb = kg.get('bbox') or {}
@@ -11115,6 +11153,17 @@ class PeerDirector:
                         b.get('kg_code') not in completed
                         and b.get('kg_code') not in failed
                         for b in blocks)
+                    # Layout drift: the parent may be covered by blocks
+                    # of an OLDER split layout (91123 done as 6 blocks,
+                    # today's plan says 8). The processor skips those via
+                    # claim collision, so a frontier pinned here finds
+                    # 0 items and restart-loops into quarantine — ask the
+                    # geometric oracle before calling the cell pending.
+                    if has_work:
+                        if _mf_ent is None:
+                            _mf_ent = _manifest_entries_ro() or {}
+                        if _parent_geometrically_done(code, _mf_ent) is True:
+                            has_work = False
                 else:
                     has_work = True
                 if has_work:
@@ -12170,6 +12219,7 @@ class PeerDirector:
             kgs = []
             if kg_list_path.exists():
                 kgs = json.loads(kg_list_path.read_text())
+            _kg_by_code_cache = {k.get('kg_code'): k for k in kgs if k.get('kg_code')}
 
             try:
                 from app import _get_completed_kgs
@@ -12207,6 +12257,19 @@ class PeerDirector:
             # etc.). Deliberate re-processing still flows through the
             # frontier retry queue (which honours tombstones); cache-only
             # backfill must never re-touch a KG the index already calls done.
+            #
+            # BUT (2026-11-07): ``processed=1`` is set as soon as ONE block
+            # JSON exists, so a half-done split parent (67204: 2/6 blocks)
+            # is "processed" with a real hole — 74 such parents / 138
+            # fully-cached blocks were invisible to 40 idle cache-only
+            # peers and crawled through the frontiers at 3.6/h. The guard
+            # now asks the geometric coverage oracle
+            # (``_parent_geometrically_done``): processed parents whose
+            # current-layout blocks are all done stay excluded cheaply;
+            # the rest are excluded only when the oracle says their
+            # products (any historical layout) cover the bbox. Half-done
+            # parents pass through; the block-level ``_get_completed_kgs``
+            # exclusion below keeps their finished siblings out.
             processed_codes: set = set()
             try:
                 import search_index as _si
@@ -12217,6 +12280,29 @@ class PeerDirector:
             except Exception as _e:
                 log.debug('Cache-ready processed-flag guard skipped: %s', _e)
             if processed_codes:
+                _mf_ent = _manifest_entries_ro()
+                _half_done: list[str] = []
+                if _mf_ent is not None:
+                    try:
+                        from kg_splitter import maybe_split_kg as _msk
+                    except Exception:
+                        _msk = None
+                    for _pc in sorted(processed_codes - completed):
+                        _kg = _kg_by_code_cache.get(_pc)
+                        try:
+                            _blocks = _msk(_kg) if (_msk and _kg) else []
+                        except Exception:
+                            _blocks = []
+                        if len(_blocks) > 1 and all(
+                                b.get('kg_code') in completed for b in _blocks):
+                            continue  # every current-layout block done
+                        if _parent_geometrically_done(_pc, _mf_ent) is False:
+                            _half_done.append(_pc)
+                    if _half_done:
+                        processed_codes = processed_codes - set(_half_done)
+                        log.info('Cache-ready scan: %d processed=1 parent(s) have a '
+                                 'coverage hole — kept on the whitelist: %s',
+                                 len(_half_done), ' '.join(_half_done[:12]))
                 completed = completed | processed_codes
 
             try:

@@ -33,6 +33,22 @@ operator APIs (`X-Operator-Token`, `SRTM_OPERATOR_TOKEN` shared).
    only, never from a request path.
 7. Save `director_state.json`.
 
+Completion guard (2026-11-07): a parent is dropped from the whitelist when
+(a) it is in `_get_completed_kgs()` (plain `_json`), (b) every block of its
+*current* split layout is completed, or (c) the search index says
+`processed=1` **and** the geometric coverage oracle
+(`app._kg_coverage_complete` via `_parent_geometrically_done`) confirms
+its committed products cover the bbox. The old guard used `processed=1`
+alone, but the index flips that as soon as *one* block JSON lands — 74
+half-done split parents (138 fully-cached blocks) were invisible to the
+cache-only pool and crawled through the frontiers at ~3.6/h. Half-done
+parents now pass through; the block-level exclusion in the dispatcher keeps
+their finished siblings out. `_frontier_cells()` applies the same oracle so
+layout-drift parents (91123 done as 6 blocks, today's plan 8) no longer make
+a cell look pending and restart-loop a frontier into quarantine. Log line:
+`Cache-ready scan: N processed=1 parent(s) have a coverage hole — kept on
+the whitelist`.
+
 Modes (`POST /director/mode {mode}`): `auto` (default), `manual` (no
 automatic start / plan), `paused`.
 
