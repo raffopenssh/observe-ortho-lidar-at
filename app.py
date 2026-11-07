@@ -1239,6 +1239,85 @@ def _peer_sync_state_save() -> None:
         pass
 
 
+_PRODUCT_STATUS_RIDER_STATES = ('removed', 'stripped')
+
+
+def _product_status_rider() -> dict:
+    """Compact ``{manifest_key: [status, uploaded_at, size]}`` of every
+    product record the primary marked ``removed`` / ``stripped`` (legacy
+    clean-up, stale_blocks, operator DELETEs). These edits originate on the
+    primary and have no other primary->peer path (peers only peer-sync
+    among themselves). Rides the 5-min cache_manifest delta PUT; the peer
+    merges it into its ``zenodo_manifest.json`` (``_apply_product_status``).
+    """
+    try:
+        import json_cache
+        m = json_cache.load(Path('data/austria_processor/zenodo_manifest.json')) or {}
+        ents = m.get('entries', m) or {}
+    except Exception:
+        return {}
+    out = {}
+    for k, v in ents.items():
+        if not isinstance(v, dict):
+            continue
+        st = str(v.get('status') or '')
+        if st in _PRODUCT_STATUS_RIDER_STATES and v.get('uploaded_at'):
+            out[k] = [st, str(v['uploaded_at']), int(v.get('size') or 0)]
+    return out
+
+
+def _apply_product_status(incoming: dict) -> int:
+    """Peer side of ``_product_status_rider``: overwrite status / size /
+    uploaded_at of local product records when the rider is strictly newer
+    (``_manifest_entry_newer``). Unknown keys get a minimal record so
+    ``_get_completed_kgs`` / the processor see the removal. Returns the
+    number of records changed."""
+    if not isinstance(incoming, dict) or not incoming:
+        return 0
+    mp = Path('data/austria_processor/zenodo_manifest.json')
+    try:
+        md = json.loads(mp.read_text()) if mp.exists() else {}
+    except Exception:
+        md = {}
+    ents = md.get('entries') if isinstance(md.get('entries'), dict) else None
+    if ents is None:
+        ents = {}
+        md = {'entries': ents}
+    n = 0
+    for k, v in incoming.items():
+        if not (isinstance(v, (list, tuple)) and len(v) >= 2):
+            continue
+        st, ts = str(v[0]), str(v[1])
+        if st not in _PRODUCT_STATUS_RIDER_STATES or not ts:
+            continue
+        cur = ents.get(k)
+        new = dict(cur) if isinstance(cur, dict) else {'key': k}
+        new['status'] = st
+        new['uploaded_at'] = ts
+        new['size'] = int(v[2]) if len(v) > 2 else 0
+        if st == 'removed':
+            new['size'] = 0
+            new.setdefault('removed_at', ts)
+        if _manifest_entry_newer(cur, new):
+            ents[k] = new
+            n += 1
+    if n:
+        import tempfile as _tf
+        mp.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = _tf.mkstemp(dir=mp.parent, suffix='.tmp', prefix='.manifest_')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(md, f, indent=2, sort_keys=True)
+            os.replace(tmp, mp)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    return n
+
+
 def _gzip_put_json(req, url: str, obj: dict, timeout, headers=None):
     """PUT ``obj`` as gzipped JSON; fall back to plain JSON once if the
     peer can't inflate it (pre-rollout code)."""
@@ -1822,8 +1901,20 @@ def _sync_peer_data():
                             if k in local_cm}
                     _top_hash = hashlib.md5(
                         json.dumps(_top, sort_keys=True, default=str).encode()).hexdigest()
+                    # Product-manifest status rider (primary only): the
+                    # primary's removed/stripped product records never
+                    # reached the fleet (peers don't peer-sync from the
+                    # primary), so every peer kept e.g. ``12362_json`` as
+                    # a live v1 product and advertised it ``completed`` --
+                    # the hole was unschedulable fleet-wide (2026-11-07).
+                    # Compact ``{key: [status, uploaded_at, size]}``,
+                    # delta by uploaded_at per peer, full set only on the
+                    # 6-h full push (~9k entries, ~100 KB gz).
+                    _ps_all = _product_status_rider() if _is_director_local() else {}
+                    _ps_max = max((v[1] for v in _ps_all.values()), default='')
                     _pushed_n = 0
                     _pushed_files = 0
+                    _pushed_ps = 0
                     for peer_url in peer_urls:
                         _pst = _PEER_SYNC_STATE.setdefault(peer_url, {})
                         _wm = _pst.get('cm_pushed_max')
@@ -1834,8 +1925,13 @@ def _sync_peer_data():
                         else:
                             _delta = {k: v for k, v in _lf.items()
                                       if isinstance(v, dict) and (v.get('updated_at') or '') >= _wm}
+                        _ps_wm = _pst.get('ps_pushed_max')
+                        if _pfull or not _ps_wm:
+                            _ps_delta = _ps_all
+                        else:
+                            _ps_delta = {k: v for k, v in _ps_all.items() if v[1] >= _ps_wm}
                         _top_same = _pst.get('cm_pushed_top') == _top_hash
-                        if not _delta and _top_same:
+                        if not _delta and _top_same and not _ps_delta:
                             continue
                         # Ship the top block (prewarm / circuit / 35 KB
                         # shard registry) only when it changed for this
@@ -1847,6 +1943,8 @@ def _sync_peer_data():
                         else:
                             _body = dict(_top)
                         _body['files'] = _delta
+                        if _ps_delta:
+                            _body['product_status'] = _ps_delta
                         try:
                             # PUT is admin-token protected on peers: without
                             # the header every push 401'd silently, the
@@ -1866,13 +1964,16 @@ def _sync_peer_data():
                                     _pst['cm_pushed_max'] = _local_max
                                 if _pfull:
                                     _pst['cm_push_full_ts'] = time.time()
+                                if _ps_max:
+                                    _pst['ps_pushed_max'] = _ps_max
                                 _pushed_n += 1
                                 _pushed_files += len(_delta)
+                                _pushed_ps += len(_ps_delta)
                         except Exception as e:
                             log.debug('Peer sync: cache manifest push to %s failed: %s', peer_url, e)
                     if _pushed_n:
-                        log.info('Peer sync: cache manifest delta pushed to %d peer(s), %d file entries',
-                                 _pushed_n, _pushed_files)
+                        log.info('Peer sync: cache manifest delta pushed to %d peer(s), %d file entries, '
+                                 '%d product-status entries', _pushed_n, _pushed_files, _pushed_ps)
 
             except Exception as e:
                 log.warning('Peer sync: cache manifest sync failed: %s', e)
@@ -4127,6 +4228,16 @@ def processing_cache_manifest():
                              'live tombstone(s)', _n_ev)
             except Exception as _e:
                 log.debug('cache_manifest sync: drop-journal merge failed: %s', _e)
+        # Same transport for the primary's removed/stripped product records
+        # (``_product_status_rider``) -> our zenodo_manifest.json.
+        if isinstance(incoming.get('product_status'), dict):
+            try:
+                _n_ps = _apply_product_status(incoming['product_status'])
+                if _n_ps:
+                    log.info('cache_manifest sync: %d product record(s) marked '
+                             'removed/stripped from the primary', _n_ps)
+            except Exception as _e:
+                log.warning('cache_manifest sync: product-status merge failed: %s', _e)
 
         # Tile store v2 shard registry (zenodo_tiles): union, first writer wins.
         if isinstance(incoming.get('shards'), dict):
@@ -5212,6 +5323,9 @@ def processing_prioritize():
     })
 
 
+LOCAL_JSON_ORPHAN_GRACE_S = 24 * 3600
+
+
 def _get_completed_kgs() -> set:
     """Return set of KG codes that have been successfully processed.
 
@@ -5246,9 +5360,21 @@ def _get_completed_kgs() -> set:
             pass
     json_dir = data_dir / 'json'
     if json_dir.exists():
+        # A local JSON without a committed manifest ``_json`` only counts
+        # while it is fresh (the write->upload window). An old orphan is a
+        # failed upload that was re-queued (at240 kept 31030.json from a
+        # 2026-10-08 Zenodo outage and advertised it ``completed`` to the
+        # whole fleet for a month -- nobody could schedule the KG).
+        _fresh_before = time.time() - LOCAL_JSON_ORPHAN_GRACE_S
         for jf in json_dir.glob('*.json'):
             if jf.stem in removed_json:
                 continue   # stale local copy of a removed product
+            if jf.stem not in completed:
+                try:
+                    if jf.stat().st_mtime < _fresh_before:
+                        continue   # orphan: no committed product, not in flight
+                except OSError:
+                    continue
             completed.add(jf.stem)
     # Drop tombstoned KGs (force-requeued by operator).
     try:

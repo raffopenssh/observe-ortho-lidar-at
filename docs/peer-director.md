@@ -103,3 +103,13 @@ curl -s -XPOST -H 'Content-Type: application/json' -d '{"ne_ingest_enabled":fals
   `SRTM_SECRETS_DIR`).
 * Zenodo writes from any machine are serialised through the lock
   (`docs/zenodo-cache.md`).
+
+* **The primary is absent from every `peer_urls.txt`**, so peers never pull the primary's
+  manifest. Primary-originated edits ride the 5-min `cache_manifest` delta PUT: the tombstone
+  drop journal and the **product-status rider** `product_status = {key: [status, uploaded_at,
+  size]}` for every `removed` / `stripped` record (`app._product_status_rider` → peer
+  `_apply_product_status`, delta per peer by `uploaded_at`, ~124 KB gz full set every 6 h).
+* **Completed-claim hygiene** (`app._get_completed_kgs`, processor `completed_codes`): a
+  `status=removed`/size-0 `_json` is not a product; a local `json/<code>.json` without a
+  committed record counts only for `LOCAL_JSON_ORPHAN_GRACE_S` (24 h) — an older orphan is a
+  failed upload that was re-queued and must not be advertised to peers as completed.

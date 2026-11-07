@@ -11595,11 +11595,31 @@ def main():
         except Exception as _e:
             log.warning("Could not read tombstones: %s", _e)
 
+    # Mirrors app._get_completed_kgs: a ``status=removed`` / size-0 record
+    # is NOT a product (12362_json removed 2026-10-30 sat here as
+    # "completed" on every peer -> unschedulable hole), and a local JSON
+    # without a committed record only counts while fresh (a re-queued
+    # failed upload leaves the file behind; at240/31030, 2026-10-08).
     completed_codes = set()
+    _removed_codes = set()
     for key in manifest.keys():
         if key.endswith("_json"):
-            completed_codes.add(key.replace("_json", ""))
+            _e = manifest.get(key)
+            _c = key.replace("_json", "")
+            if _e is not None and (str(getattr(_e, "status", "") or "") == "removed"
+                                   or not int(getattr(_e, "size", 0) or 0)):
+                _removed_codes.add(_c)
+                continue
+            completed_codes.add(_c)
+    _fresh_before = time.time() - 24 * 3600
     for jf in JSON_DIR.glob("*.json"):
+        if jf.stem in _removed_codes or jf.stem in completed_codes:
+            continue
+        try:
+            if jf.stat().st_mtime < _fresh_before:
+                continue
+        except OSError:
+            continue
         completed_codes.add(jf.stem)
     if tombstoned_kgs:
         re_count = len(completed_codes & tombstoned_kgs)
