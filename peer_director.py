@@ -13532,11 +13532,19 @@ class PeerDirector:
         # always add the parent for any block we see.
         import re as _re
         in_progress: set[str] = set()
+        # Codes literally seen on a peer (block or unsplit parent) — as
+        # opposed to parents implied by a running block. The pre-expansion
+        # whitelist filter must only drop these: dropping an implied parent
+        # starves its idle siblings (2026-11-07: 87011 had 1/12 blocks
+        # running and 11 cache-ready blocks never dispatched while 30
+        # cache-only peers sat COMPLETE for >12 h).
+        in_progress_direct: set[str] = set()
         def _mark(code):
             if not code:
                 return
             s = str(code)
             in_progress.add(s)
+            in_progress_direct.add(s)
             m = _re.match(r'^(\d+)-[a-z][-a-z0-9]*$', s)
             if m:
                 in_progress.add(m.group(1))
@@ -13602,8 +13610,11 @@ class PeerDirector:
                     _mark(fps.get('in_progress'))
             except Exception:
                 pass
-        # Filter the whitelist before partitioning.
-        whitelist = [k for k in whitelist if k not in in_progress]
+        # Filter the whitelist before partitioning. Parents that are only
+        # *implied* in-progress by one running block stay — the block
+        # expansion below hands out their idle siblings and skips the
+        # claimed one.
+        whitelist = [k for k in whitelist if k not in in_progress_direct]
         if v2_codes:
             # Re-fill now that claims are known: drop in-flight codes
             # *before* the cap and size the batch to the worker count
@@ -13695,7 +13706,8 @@ class PeerDirector:
                             continue
                         expanded.append(bc)
                 else:
-                    expanded.append(code)
+                    if code not in in_progress:
+                        expanded.append(code)
             if n_block_excl:
                 log.info('Cache-only whitelist: dropped %d split-block code(s) '
                          'already completed or cache-missed (block-level guard)',
@@ -13710,6 +13722,7 @@ class PeerDirector:
                 return
         except Exception as e:
             log.warning('Block expansion failed (continuing with parent codes): %s', e)
+            whitelist = [k for k in whitelist if k not in in_progress]
         if v2_codes:
             whitelist = whitelist + [c for c in v2_codes if c not in set(whitelist)]
             if not whitelist:
