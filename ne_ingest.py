@@ -164,7 +164,11 @@ def pending(entries: dict | None = None, idx: dict | None = None) -> list[tuple[
             # by ``sliver_sweep.integrate`` — never a block of the layout.
             continue
         have = files.get(code) or {}
-        if have.get("uploaded_at") == e.get("uploaded_at") and path_for(code).exists():
+        if have.get("uploaded_at") == e.get("uploaded_at") and (path_for(code).exists() or have.get("evicted")):
+            # ``evicted``: the block was merged into the parent union and its
+            # local copy dropped (``evict_merged_blocks``); the Zenodo archive
+            # is the copy.  ``merge_dirty_parents`` clears the flag when the
+            # parent needs a re-merge → re-pulled here next tick.
             continue
         f = failed.get(code) or {}
         if f.get("uploaded_at") == e.get("uploaded_at") and int(f.get("n") or 0) >= MAX_FAILS:
@@ -647,6 +651,17 @@ def merge_dirty_parents(idx: dict, entries: dict, max_n: int = 10) -> list[dict]
         if not st.get("dirty") or len(out) >= max_n:
             continue
         live = _live_blocks(parent, entries)
+        evicted = [b for b in live if (idx["files"].get(b) or {}).get("evicted") and not path_for(b).exists()]
+        if evicted:
+            # never merge a subset over the union on disk: un-evict (→ pending()
+            # restores them from peer / Zenodo) and keep the parent dirty
+            for b in evicted:
+                idx["files"][b].pop("evicted", None)
+            st["restore_wait"] = len(evicted)
+            log.info("ne_ingest: %s dirty but %d merged block(s) evicted — restoring from archive before the merge",
+                     parent, len(evicted))
+            continue
+        st.pop("restore_wait", None)
         have = [b for b in live if (idx["files"].get(b) and path_for(b).exists())]
         if not have:
             # older layout on disk only (blocks no longer live) — use whatever is on disk
@@ -693,6 +708,68 @@ def merge_dirty_parents(idx: dict, entries: dict, max_n: int = 10) -> list[dict]
                  parent, len(have), "complete" if complete else "partial", hdr["cells_n"],
                  st["cells_observed"], st["digest"])
         out.append({"parent": parent, "blocks": len(have), "complete": complete})
+    return out
+
+
+# === SECTION: eviction (merged block inputs → Zenodo archive) ===
+
+EVICT_MIN_AGE_S = 3 * 86400   # a parent's union must have been stable this long
+EVICT_PER_TICK = 400
+
+
+def evict_merged_blocks(idx: dict, entries: dict, max_n: int = EVICT_PER_TICK,
+                        min_age_s: float = EVICT_MIN_AGE_S) -> dict:
+    """Drop local ``blocks/<b>.h3b`` files that are already folded into a
+    *complete, clean* parent union (``data/ne/<parent>.h3b``, the file the
+    public cells API serves) and whose bytes are archived on Zenodo
+    (``<b>_ne_h3b`` committed, checksum == our md5).  Nothing the public
+    tier reads is touched — blocks are merge inputs only.  The ``files``
+    row keeps ``evicted=True``; a later re-merge restores them first
+    (``merge_dirty_parents`` → ``pending``).  Knob ``ne_evict_enabled``."""
+    out = {"evicted": 0, "bytes": 0, "kept": 0}
+    if not bool(_knob("ne_evict_enabled", True)):
+        out["disabled"] = True
+        return out
+    now = time.time()
+    for parent, st in idx["parents"].items():
+        if out["evicted"] >= max_n:
+            break
+        if not st.get("complete") or st.get("dirty") or st.get("restore_wait") or not st.get("merged_at"):
+            continue
+        try:
+            age = now - calendar.timegm(time.strptime(st["merged_at"], "%Y-%m-%dT%H:%M:%SZ"))
+        except Exception:  # noqa: BLE001
+            continue
+        if age < min_age_s or not path_for(parent).exists():
+            continue
+        merged = set(st.get("blocks") or [])
+        for b in _live_blocks(parent, entries):
+            p = path_for(b)
+            if not p.exists():
+                continue
+            f = idx["files"].get(b) or {}
+            e = entries.get(f"{b}_ne_h3b") or {}
+            ok = (b in merged and _committed(e) and f.get("uploaded_at") == e.get("uploaded_at")
+                  and f.get("md5") and str(e.get("checksum") or "") == f"md5:{f['md5']}"
+                  and int(e.get("size") or 0) == int(f.get("size") or -1))
+            if not ok:
+                out["kept"] += 1
+                continue
+            try:
+                sz = p.stat().st_size
+                p.unlink()
+            except OSError:
+                continue
+            f["evicted"] = True; f["evicted_at"] = _now()
+            out["evicted"] += 1; out["bytes"] += sz
+            if out["evicted"] >= max_n:
+                break
+    if out["evicted"]:
+        s = idx["stats"]
+        s["evicted_blocks"] = int(s.get("evicted_blocks") or 0) + out["evicted"]
+        s["evicted_bytes"] = int(s.get("evicted_bytes") or 0) + out["bytes"]
+        log.info("ne_ingest: evicted %d merged block file(s), %.1f MB (archived on Zenodo; kept %d)",
+                 out["evicted"], out["bytes"] / 1e6, out["kept"])
     return out
 
 
@@ -1524,6 +1601,12 @@ def run_tick(max_n: int = MAX_PER_TICK) -> dict:
         except Exception as ex:  # noqa: BLE001
             log.warning("ne_ingest merge pass: %s", ex)
         try:
+            ev = evict_merged_blocks(idx, entries)
+            if ev.get("evicted"):
+                out["evicted"] = ev["evicted"]
+        except Exception as ex:  # noqa: BLE001
+            log.warning("ne_ingest evict pass: %s", ex)
+        try:
             # Sliver sweep (sliver_sweep.py): refresh the NE server's bbox_changes,
             # plan units for complete parents, merge received sweep h3bs
             # into the parent files → confirm_ne_server below sees the new
@@ -1556,6 +1639,8 @@ def status() -> dict:
     blocks = [c for c in files if is_block(c)]
     todo = pending(entries, idx)
     corpus_bytes = sum(int(f.get("size") or 0) for f in files.values())
+    evicted_n = sum(1 for f in files.values() if f.get("evicted"))
+    evicted_bytes = sum(int(f.get("size") or 0) for f in files.values() if f.get("evicted"))
     pend_bytes = sum(int(e.get("size") or 0) for _, e in todo)
     merged = idx["parents"]
     um = (idx.get("stats") or {}).get("ne_server_last") or {}
@@ -1563,6 +1648,8 @@ def status() -> dict:
         "parents": len(parents), "blocks": len(blocks), "corpus_mb": round(corpus_bytes / 1e6, 1),
         "merged_parents": len([p for p in merged.values() if p.get("digest")]),
         "merged_complete": len([p for p in merged.values() if p.get("complete")]),
+        "evicted_blocks": evicted_n, "evicted_mb": round(evicted_bytes / 1e6, 1),
+        "restore_wait": len([p for p in merged.values() if p.get("restore_wait")]),
         "pending": len(todo), "pending_mb": round(pend_bytes / 1e6, 1),
         "failed": len(idx.get("failed") or {}),
         "used_mb_h": round(inbound_budget.used_mb(CHANNEL), 1),
@@ -1684,6 +1771,10 @@ def text_line(v: dict | None = None) -> str:
         s += " DISABLED"
     if v.get("failed"):
         s += f" failed={v['failed']}"
+    if v.get("evicted_blocks"):
+        s += f" evicted={v['evicted_blocks']}b/{v['evicted_mb']}MB"
+        if v.get("restore_wait"):
+            s += f"(restoring {v['restore_wait']}p)"
     if um.get("checked") is not None:
         omx0 = v.get("obs_missing") or {}
         pdy = v.get("post_day") or {}

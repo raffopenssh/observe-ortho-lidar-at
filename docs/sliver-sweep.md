@@ -142,3 +142,4 @@ the sweep side:
   exists on the worker (`_v2_keep`), even though it is complete.
 * `SRTM_APP_IMPORT_ONLY=1` (set by the CLI) stops `app.py` from starting a
   director thread when imported for `_kg_coverage_complete`.
+

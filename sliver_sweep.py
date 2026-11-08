@@ -988,6 +988,18 @@ def integrate(idx: dict, entries: dict | None = None, max_n: int = INTEGRATE_PER
             if not parent_p.exists():
                 k.update(state="wait", error="parent h3b vanished")
                 continue
+            # evicted units (``evict_integrated_units``) come back from the
+            # Zenodo archive RESTORE_PER_CALL at a time — never merge a
+            # subset (the parent may just have been re-merged from blocks
+            # without any sweep cells); wait for the full set.
+            missing = [u["id"] for u in (k.get("units") or []) if u.get("state") == "ok"
+                       and not (SWEEP_DIR / f"{u['id']}.h3b").exists()
+                       and ne_ingest._committed(entries.get(f"{u['id']}_ne_h3b"))]
+            if missing:
+                k["restore_wait"] = len(missing)
+                log.info("sliver_sweep: integrate %s waits for %d archived unit(s) to be restored", code, len(missing))
+                continue
+            k.pop("restore_wait", None)
             tmp = NE_DIR / f".{code}.sweep_merge.h3b"
             try:
                 complete = ne_ingest._coverage_complete(code, entries)
@@ -1062,6 +1074,73 @@ def tick(idx: dict, entries: dict) -> dict:
         out["reopened"] = _reopen_unswept()
     except Exception as ex:  # noqa: BLE001
         log.warning("sliver_sweep: reopen failed: %s", ex)
+    try:
+        ev = evict_integrated_units(idx, entries)
+        if ev.get("evicted"):
+            out["evicted"] = ev["evicted"]
+    except Exception as ex:  # noqa: BLE001
+        log.warning("sliver_sweep: evict failed: %s", ex)
+    return out
+
+
+EVICT_MIN_AGE_S = 3 * 86400
+EVICT_PER_TICK = 300
+
+
+def evict_integrated_units(idx: dict, entries: dict, max_n: int = EVICT_PER_TICK,
+                           min_age_s: float = EVICT_MIN_AGE_S) -> dict:
+    """Drop ``data/ne/sweeps/<unit>.h3b`` files of ``done`` parents whose
+    units are integrated into the parent h3b (``integrated_digest`` == the
+    file on disk, done for ≥ *min_age_s*) and archived on Zenodo
+    (``<unit>_ne_h3b`` committed, checksum == the file's md5).  The parent
+    union the public API serves is untouched; ``sweep_paths`` restores units
+    from the archive when a re-integration needs them.  Knob
+    ``sweep_evict_enabled``."""
+    out = {"evicted": 0, "bytes": 0, "kept": 0}
+    if not bool(_knob("sweep_evict_enabled", True)):
+        out["disabled"] = True
+        return out
+    import hashlib
+    import ne_ingest
+    now = time.time()
+    with _Locked() as st:
+        for code, k in st["kgs"].items():
+            if out["evicted"] >= max_n:
+                break
+            if k.get("state") != "done" or not k.get("integrated_digest") or k.get("restore_wait"):
+                continue
+            if k["integrated_digest"] != _file_digest(code, idx):
+                continue
+            done_ts = _ts(k.get("done_at") or "") or 0.0
+            if now - done_ts < min_age_s:
+                continue
+            for u in k.get("units") or []:
+                p = SWEEP_DIR / f"{u['id']}.h3b"
+                if u.get("state") != "ok" or not p.exists():
+                    continue
+                e = entries.get(f"{u['id']}_ne_h3b") or {}
+                if not ne_ingest._committed(e) or int(e.get("size") or 0) != p.stat().st_size:
+                    out["kept"] += 1
+                    continue
+                md5 = hashlib.md5(p.read_bytes()).hexdigest()
+                if str(e.get("checksum") or "") != f"md5:{md5}":
+                    out["kept"] += 1
+                    continue
+                sz = p.stat().st_size
+                try:
+                    p.unlink()
+                except OSError:
+                    continue
+                u["evicted_at"] = _now()
+                out["evicted"] += 1; out["bytes"] += sz
+                if out["evicted"] >= max_n:
+                    break
+        if out["evicted"]:
+            s = st.setdefault("stats", {})
+            s["evicted_units"] = int(s.get("evicted_units") or 0) + out["evicted"]
+            s["evicted_bytes"] = int(s.get("evicted_bytes") or 0) + out["bytes"]
+            log.info("sliver_sweep: evicted %d integrated unit file(s), %.1f MB (archived on Zenodo; kept %d)",
+                     out["evicted"], out["bytes"] / 1e6, out["kept"])
     return out
 
 
@@ -1206,6 +1285,8 @@ def text_lines(v: dict | None = None) -> list[str]:
             + (f" unswept={v['unswept_cells']:,}({v['unswept_parents']}p)" if v.get("unswept_cells") else "")
             + (f" hold={v['hold_units']}u/{v['hold_cells']}cells→repair_cells" if v.get("hold_units") else "")
             + f" · @{v['rate_per_h']}/h eta={eta}"
+            + (f" · evicted={(v.get('stats') or {}).get('evicted_units')}u/{int((v.get('stats') or {}).get('evicted_bytes') or 0) // 1_000_000}MB"
+               if (v.get('stats') or {}).get('evicted_units') else "")
             + (f" (scan backlog={v['scan_backlog']:,}p @{v['scan_rate_per_h']}/h)" if v.get("scan_backlog") else "")
             + " "
             f"· contrib re-posted={v['contrib_confirmed']}/{by.get('done', 0)}")
