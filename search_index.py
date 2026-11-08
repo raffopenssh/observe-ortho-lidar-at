@@ -1874,6 +1874,35 @@ class SearchIndex:
         if n_reset:
             log.info('sync_manifest_links: reset %d processed row(s) without a '
                      'live _json (retired residue)', n_reset)
+        # Reverse direction: a parent whose ``_json`` IS live but whose row
+        # says processed=0.  The reset above fires when the ``_json_v2``
+        # ingest (processed=1) lands a few seconds *before* the peer's
+        # ``_json`` record reaches this manifest (upload order json_v2 →
+        # json) — and nothing ever flipped it back because the v2 ingest
+        # is idempotent (blob already stored).  Seven KGs (19035, 62103,
+        # 62313, 66243, 68216, 77255, 81003) sat at 7841/7850 for a week
+        # that way (2026-11-08).  Re-run the incremental update for them
+        # from the stored v2 doc / local JSON — cheap, bounded per pass.
+        n_heal = 0
+        try:
+            with self._write_lock:
+                c = self._conn()
+                rows = c.execute(
+                    'SELECT kg_code FROM kg WHERE processed=0 OR processed IS NULL'
+                ).fetchall()
+            stale = [r[0] for r in rows if r[0] in live_json][:50]
+            for parent in stale:
+                try:
+                    self.update_kg(parent, manifest=manifest)
+                    n_heal += 1
+                except Exception as e:
+                    log.debug('sync_manifest_links heal %s: %s', parent, e)
+        except Exception as e:
+            log.debug('sync_manifest_links heal pass: %s', e)
+        if n_heal:
+            log.info('sync_manifest_links: re-indexed %d parent(s) with a live '
+                     '_json but processed=0 (json_v2-before-json reset race)',
+                     n_heal)
         return n
 
     @staticmethod

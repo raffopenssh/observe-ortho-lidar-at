@@ -1483,6 +1483,61 @@ class Client:
                         depo_id, key, exc)
             return False
 
+    def _reusable_target(self, existing, key: str):
+        """Return *existing* when its deposition can still take a PUT, else
+        ``None`` (caller creates a fresh deposit).
+
+        Two ways a manifest pointer goes dead while the GET probe still
+        answers 200:
+
+        * ``status=removed`` — the v2.4 clean-up / ``stale_blocks`` asked
+          Zenodo to DELETE it.  For a *published* record the API answers
+          404 (only drafts are deletable) which the clean-up counted as
+          "gone", so the deposition lives on, published and read-only.
+        * ``submitted=True`` — the deposition was published (early-2026
+          products were).  Its bucket is locked: a PUT answers 404 after
+          the body has been streamed, which the retry ladder reads as a
+          network failure and burns 6 x ~10 min per attempt.  12362
+          (Viessling) looped through three peers for 10 h this way on
+          2026-11-08 and held the last Austrian cell open.
+        """
+        if existing is None or not existing.depo_id:
+            return None
+        if str(getattr(existing, "status", "") or "") == "removed":
+            log.warning("Manifest entry %s is status=removed (depo %d) — "
+                        "creating a fresh deposit instead of reusing it",
+                        key, existing.depo_id)
+            return None
+        try:
+            resp = self._do_request(
+                "GET",
+                self._url(f"/api/deposit/depositions/{existing.depo_id}"),
+                max_retries=0,
+            )
+        except ZenodoError as exc:
+            if exc.status_code == 404:
+                log.warning(
+                    "Existing deposition %d for key=%s is gone (404) — "
+                    "creating a fresh deposit instead of re-uploading to a "
+                    "dead bucket", existing.depo_id, key,
+                )
+                return None
+            # Non-404 (transient/auth) errors: keep the pointer and let the
+            # normal replace path + its retries handle it.
+            return existing
+        try:
+            info = resp.json() or {}
+        except Exception:  # noqa: BLE001
+            return existing
+        if info.get("submitted") or str(info.get("state") or "") == "done":
+            log.warning(
+                "Existing deposition %d for key=%s is published (state=%s, "
+                "submitted=%s) — bucket is read-only; creating a fresh deposit",
+                existing.depo_id, key, info.get("state"), info.get("submitted"),
+            )
+            return None
+        return existing
+
     def upload(
         self,
         key: str,
@@ -1525,7 +1580,7 @@ class Client:
         file_bytes = local_path.read_bytes()
         md5_hex = hashlib.md5(file_bytes).hexdigest()
 
-        existing = manifest.get(key)
+        existing = self._reusable_target(manifest.get(key), key)
 
         if existing is not None and existing.depo_id:
             # ------ update existing deposition ------------------------------
@@ -1706,33 +1761,9 @@ class Client:
         # multipart was a separate, broken mitigation.
         use_multipart = False
 
-        existing = manifest.get(key)
-
-        # Guard against a deleted/vanished deposition. An operator (or the
-        # orphan-tombstone cleanup) may have deleted the draft this manifest
-        # entry points at. Reusing it then 404-wedges: every PUT to the dead
-        # bucket fails (`depo_status:404`) and the 6-attempt retry chain just
-        # spins for ~10 min before giving up, leaving the KG un-uploaded and
-        # the peer stuck re-trying forever on subsequent runs. Probe the
-        # deposition first; if it's gone, drop the stale manifest pointer and
-        # fall through to create a fresh deposit.
-        if existing is not None and existing.depo_id:
-            try:
-                self._do_request(
-                    "GET",
-                    self._url(f"/api/deposit/depositions/{existing.depo_id}"),
-                    max_retries=0,
-                )
-            except ZenodoError as exc:
-                if exc.status_code == 404:
-                    log.warning(
-                        "Existing deposition %d for key=%s is gone (404) — "
-                        "creating a fresh deposit instead of re-uploading to a "
-                        "dead bucket", existing.depo_id, key,
-                    )
-                    existing = None
-                # Non-404 (transient/auth) errors: keep the existing pointer
-                # and let the normal replace path + its retries handle it.
+        # Guard against a deleted / published / status=removed deposition:
+        # reusing one 404-wedges every PUT (see _reusable_target).
+        existing = self._reusable_target(manifest.get(key), key)
 
         if existing is not None and existing.depo_id:
             # ------ update existing deposition ----------------------------

@@ -568,6 +568,20 @@ def _is_read_timeout(exc_str: str) -> bool:
     return any(s in exc_str for s in _TIMEOUT_SIGNS)
 
 
+# openEO's Spark backend kills any single sync job after 15 min
+# ("SPARK_JOB_CANCELLED ... runaway job ... cancelled after PT15M", HTTP 500).
+# For a few high-alpine 0.1° cells (Brenner: 81201/81206/87104, 2026-11-07)
+# that happens *deterministically* for certain months (2024-03/04/06): the
+# full-cell month can't finish in 15 min no matter how often it's retried.
+# It is a server-side timeout, not a transient error, so it is handled like
+# our own read timeout: arm quadrant mode and fetch the month as 2x2.
+_RUNAWAY_SIGNS = ('SPARK_JOB_CANCELLED', 'runaway job', 'cancelled after PT')
+
+
+def _is_runaway(exc_str: str) -> bool:
+    return any(s in exc_str for s in _RUNAWAY_SIGNS)
+
+
 def _sync_split_active() -> bool:
     try:
         until = float(_SYNC_SPLIT_FILE.read_text().strip() or 0)
@@ -2373,11 +2387,13 @@ def get_ndvi_timeseries(
                         try:
                             _dl_cube(bbox, tmp_month)
                         except Exception as fe:
-                            if not _is_read_timeout(str(fe)):
+                            if not (_is_read_timeout(str(fe)) or _is_runaway(str(fe))):
                                 raise
-                            # Full cell too slow for openEO right now —
-                            # arm split mode and retry this month as
-                            # quadrants straight away.
+                            # Full cell too slow for openEO right now
+                            # (our read timeout, or the server's own
+                            # 15-min Spark runaway kill) — arm split
+                            # mode and retry this month as quadrants
+                            # straight away.
                             _sync_split_arm(str(fe))
                             tmp_month.unlink(missing_ok=True)
                             _dl_quadrants(tmp_month)
@@ -2489,6 +2505,13 @@ def get_ndvi_timeseries(
                     or "Server error" in exc_str
                     or "max connections" in exc_str
                 )
+                if _is_runaway(exc_str) and attempt >= 1:
+                    # Already retried once (as quadrants, split mode is
+                    # armed by now): a second 15-min server kill means
+                    # the month is simply too heavy — skip it (harmonics
+                    # tolerate a missing month) instead of 3 x 15 min.
+                    logger.warning("NDVI %s: openEO runaway kill twice — skipping month", label)
+                    return label, exc
                 if _retryable and attempt < max_retries_per_cred:
                     attempt += 1
                     wait_secs = 15 * attempt
@@ -2586,7 +2609,14 @@ def get_ndvi_timeseries(
                 # read-timeouts that survived quadrant splitting) separately
                 # from 402: it indicates the openeo origin is overloaded,
                 # not that our credential is exhausted.
-                if any(s in exc_str for s in ('500', '502', '503', '504',
+                if _is_runaway(exc_str):
+                    # Per-request heaviness (server killed *our* job at
+                    # 15 min), not an origin outage: skip the month, keep
+                    # going — must not trip the cascade breaker, which
+                    # would defer the KG every ~3 h forever (81201-south
+                    # x3, 2026-11-07/08).
+                    consecutive_5xx = 0
+                elif any(s in exc_str for s in ('500', '502', '503', '504',
                                               'Bad Gateway', 'Gateway Time',
                                               'Service Unavailable',
                                               'Server error',
