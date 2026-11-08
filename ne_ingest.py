@@ -645,8 +645,39 @@ def _coverage_complete(parent: str, entries: dict) -> bool:
         return False
 
 
+def heal_incomplete_merges(idx: dict, entries: dict, max_n: int = 10) -> list[str]:
+    """Re-dirty merged parents stuck at ``complete: false`` although the
+    coverage oracle now calls the parent complete and every live block is on
+    disk.  Happens when the last block's ``_json`` lands seconds after the
+    merge read its manifest snapshot (12362, 2026-11-08: merged 07:05:44,
+    coverage complete since 07:04:53) — the file keeps ``partial_cells``
+    and ``_our_digest`` never posts it to umfeld."""
+    out: list[str] = []
+    for parent, st in list(idx["parents"].items()):
+        if len(out) >= max_n:
+            break
+        if st.get("complete") or st.get("dirty") or st.get("restore_wait") or not st.get("merged_at"):
+            continue
+        live = _live_blocks(parent, entries)
+        if not live or not all(path_for(b).exists() for b in live):
+            continue
+        if not _coverage_complete(parent, entries):
+            continue
+        st["dirty"] = True
+        st["heal_complete_at"] = _now()
+        out.append(parent)
+    if out:
+        log.info("ne_ingest: re-merging %d parent(s) whose coverage completed after the merge: %s",
+                 len(out), ", ".join(out))
+    return out
+
+
 def merge_dirty_parents(idx: dict, entries: dict, max_n: int = 10) -> list[dict]:
     out = []
+    try:
+        heal_incomplete_merges(idx, entries)
+    except Exception as ex:  # noqa: BLE001
+        log.warning("ne_ingest heal pass: %s", ex)
     for parent, st in list(idx["parents"].items()):
         if not st.get("dirty") or len(out) >= max_n:
             continue
