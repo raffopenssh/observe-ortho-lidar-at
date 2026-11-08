@@ -394,7 +394,11 @@ FRONTIER_MAX_PARALLEL = int(os.environ.get('FRONTIER_MAX_PARALLEL', '20'))
 # pending item count (parents + split blocks). Peers already de-duplicate
 # via the cross-peer claim check + the director's dup-KG reconciler, and
 # tile store v2 writes are idempotent per tile, so sharing a cell is safe.
-FRONTIER_ENDGAME_PER_CELL = int(os.environ.get('FRONTIER_ENDGAME_PER_CELL', '4'))
+# 8 (was 4, 2026-11-08): the last cell of the run held 8 straggler blocks
+# (81201 ×2, 81206 ×1, 87104 ×5) while 4 ran and ~45 peers idled — the
+# per-cell cap is only a ceiling, the Σ min(cap, pending items) bound
+# still keeps frontiers ≤ real work.
+FRONTIER_ENDGAME_PER_CELL = int(os.environ.get('FRONTIER_ENDGAME_PER_CELL', '8'))
 PRODUCT_REPAIR_MAX_CELLS = 40
 PRODUCT_REPAIR_MAX_CODES = 300
 # Repair cells stay published while hourly openEO read-timeouts are
