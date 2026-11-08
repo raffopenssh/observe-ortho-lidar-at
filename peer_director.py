@@ -387,6 +387,14 @@ FRONTIER_CELL_LON = float(os.environ.get('FRONTIER_CELL_LON', '1.0'))
 #: (~4× the Sep 2026 openEO load at 20; capacity factor + ramp still
 #: scale within it). Raise once openEO / credit burn is observed stable.
 FRONTIER_MAX_PARALLEL = int(os.environ.get('FRONTIER_MAX_PARALLEL', '20'))
+# End-game cell sharing: when the number of planning cells with pending
+# work drops below the credential capacity (the last few KGs of a run all
+# sit in one or two cells), several frontiers may share ONE cell — at most
+# ``FRONTIER_ENDGAME_PER_CELL`` per cell and never more than that cell's
+# pending item count (parents + split blocks). Peers already de-duplicate
+# via the cross-peer claim check + the director's dup-KG reconciler, and
+# tile store v2 writes are idempotent per tile, so sharing a cell is safe.
+FRONTIER_ENDGAME_PER_CELL = int(os.environ.get('FRONTIER_ENDGAME_PER_CELL', '4'))
 PRODUCT_REPAIR_MAX_CELLS = 40
 PRODUCT_REPAIR_MAX_CODES = 300
 # Repair cells stay published while hourly openEO read-timeouts are
@@ -10552,8 +10560,23 @@ class PeerDirector:
         # Cap on how many disjoint cells we can hand out. With ~14
         # non-empty cells across Austria this should never bind
         # — cred capacity is the real ceiling.
-        cap_cells = max(1, len(self._frontier_cells()))
+        cells = self._frontier_cells()
+        cap_cells = max(1, len(cells))
+        # End-game: fewer cells than cred capacity → let frontiers share
+        # cells, bounded by the pending item count per cell.
+        if cap_cells < cap_creds:
+            cap_cells = max(cap_cells, self._endgame_cell_slots(cells))
         return max(1, min(cap_creds, cap_cells, FRONTIER_MAX_PARALLEL))
+
+    def _endgame_cell_slots(self, cells) -> int:
+        """Total frontier slots when cells may be shared (see
+        ``FRONTIER_ENDGAME_PER_CELL``): Σ min(per_cell_cap, pending items)."""
+        items = getattr(self, '_frontier_cell_items', None) or {}
+        per = max(1, FRONTIER_ENDGAME_PER_CELL)
+        total = 0
+        for c in cells:
+            total += max(1, min(per, int(items.get(tuple(c), 1))))
+        return total
 
     def _assign_cred_indices(self, frontier_ids: list[str], cfg: dict,
                               prior: dict | None = None,
@@ -11144,6 +11167,9 @@ class PeerDirector:
                 return all_cells
             from kg_splitter import maybe_split_kg
             pending_cells: set[tuple[float, float, float, float]] = set()
+            # Pending item count per cell (parent = 1, split parent =
+            # number of pending blocks) — feeds end-game cell sharing.
+            cell_items: dict[tuple, int] = {}
             _mf_ent = None
             for kg in kgs:
                 code = kg.get('kg_code')
@@ -11160,7 +11186,7 @@ class PeerDirector:
                     if c[0] <= lat < c[1] and c[2] <= lon < c[3]:
                         cell = c
                         break
-                if cell is None or cell in pending_cells:
+                if cell is None:
                     continue
                 if code in completed:
                     # Parent done as a whole — nothing pending here.
@@ -11169,11 +11195,13 @@ class PeerDirector:
                     blocks = maybe_split_kg(kg)
                 except Exception:
                     blocks = []
+                n_items = 1
                 if len(blocks) > 1:
-                    has_work = any(
-                        b.get('kg_code') not in completed
-                        and b.get('kg_code') not in failed
-                        for b in blocks)
+                    n_items = sum(
+                        1 for b in blocks
+                        if b.get('kg_code') not in completed
+                        and b.get('kg_code') not in failed)
+                    has_work = n_items > 0
                     # Layout drift: the parent may be covered by blocks
                     # of an OLDER split layout (91123 done as 6 blocks,
                     # today's plan says 8). The processor skips those via
@@ -11189,6 +11217,8 @@ class PeerDirector:
                     has_work = True
                 if has_work:
                     pending_cells.add(cell)
+                    cell_items[cell] = cell_items.get(cell, 0) + n_items
+            self._frontier_cell_items = cell_items
             cells = [c for c in all_cells
                      if c in pending_cells and c not in barren]
             if not cells:
@@ -12899,6 +12929,38 @@ class PeerDirector:
                             log.warning(
                                 'Strip-hog graceful stop on %s failed: '
                                 '%s', _target, e)
+            if unassigned and not leftover and strips:
+                # End-game cell sharing (see FRONTIER_ENDGAME_PER_CELL):
+                # every cell is taken but credentialed candidates are
+                # starving. Hand each of them a *copy* of the cell with
+                # the most spare pending items, bounded per cell by
+                # min(FRONTIER_ENDGAME_PER_CELL, pending items). Peers
+                # de-duplicate blocks via the cross-peer claim check.
+                _items = getattr(self, '_frontier_cell_items', None) or {}
+                _holders: dict[tuple, int] = {}
+                for _pid, _sl in strip_plan.items():
+                    for _s in _sl or []:
+                        _holders[tuple(_s)] = _holders.get(tuple(_s), 0) + 1
+                _shared: list[str] = []
+                for pid in list(unassigned):
+                    if not cred_plan.get(pid):
+                        continue
+                    best, best_spare = None, 0
+                    for s in strips:
+                        st = tuple(s)
+                        cap = min(max(1, FRONTIER_ENDGAME_PER_CELL),
+                                  max(1, int(_items.get(st, 1))))
+                        spare = cap - _holders.get(st, 0)
+                        if spare > best_spare:
+                            best, best_spare = st, spare
+                    if best is None:
+                        break
+                    strip_plan[pid] = [list(best)]
+                    _holders[best] = _holders.get(best, 0) + 1
+                    _shared.append('%s→%g-%g/%g-%g' % ((pid,) + best))
+                if _shared:
+                    unassigned = [p for p in unassigned if p not in strip_plan]
+                    log.info('End-game cell sharing: %s', ', '.join(_shared))
             if unassigned and leftover:
                 base = len(leftover) // len(unassigned)
                 extra = len(leftover) % len(unassigned)
