@@ -10570,6 +10570,12 @@ class PeerDirector:
         # cells, bounded by the pending item count per cell.
         if cap_cells < cap_creds:
             cap_cells = max(cap_cells, self._endgame_cell_slots(cells))
+        # Remember whether *work* (pending items), not credentials, is
+        # the binding term — the capacity throttle is skipped then (see
+        # the caller: a handful of straggler blocks is far below the
+        # fleet load the factor was tuned for).
+        self._frontier_work_bound = bool(cap_cells < cap_creds
+                                         and cap_cells < FRONTIER_MAX_PARALLEL)
         return max(1, min(cap_creds, cap_cells, FRONTIER_MAX_PARALLEL))
 
     def _endgame_cell_slots(self, cells) -> int:
@@ -12469,7 +12475,18 @@ class PeerDirector:
         # max_par was already ≥ 1 — we always allow the active frontier.
         _factor = float(state_copy.get('capacity_factor',
                                         self._capacity_ema))
-        if max_par > 0:
+        # End-game exemption (2026-11-08): when max_par is already bound
+        # by the pending item count (the last cell's straggler blocks,
+        # ≤ FRONTIER_ENDGAME_PER_CELL per cell), the Copernicus-warning
+        # driven factor would park the last 3 of 8 blocks for hours while
+        # ~45 peers idle — that load is a fraction of the ≥20-frontier
+        # regime the factor was tuned for, so launch all of them.
+        if max_par > 0 and getattr(self, '_frontier_work_bound', False):
+            if _factor < 1.0:
+                log.info('capacity factor %.2f ignored — frontier count %d '
+                         'is work-bound (end-game stragglers)',
+                         _factor, max_par)
+        elif max_par > 0:
             max_par_throttled = max(1, int(round(max_par * _factor)))
             if max_par_throttled < max_par:
                 log.info(
