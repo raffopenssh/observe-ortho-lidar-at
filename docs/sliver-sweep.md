@@ -133,6 +133,19 @@ the sweep side:
   question "why is this KG still listed with blank_n>0" — `None` means an open
   unit, deferred cells, or a view-fill result still staged.
 
+## Endgame (2026-11-09)
+
+* With `ready_kgs=0` and no v2 unit the cache-only orchestrator used to
+  return before the sweep assign; `pending_count()` now counts open sweep
+  parents as work, and frontiers are no longer (re)started once nothing is
+  pending, so idle peers reach the assign.
+* A settled unit re-reported by a peer (stale `sweep_spec.json` + local
+  retry queue after a restart) is answered `{duplicate, drop}`; the
+  processor calls `peer_forget(parent[, unit])` after every accepted report
+  and the director clears the spec of peers that no longer hold parents.
+* Nothing left anywhere → director run-complete hold
+  (`docs/peer-director.md → Run-complete hold`).
+
 ## Invariants
 
 * Sweep units never touch the retry queue, strikes, completed sets or

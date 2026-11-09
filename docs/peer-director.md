@@ -143,3 +143,27 @@ Symptoms and what they really mean:
 Do **not** hand-start processors or `update_peers` across the fleet to
 "unstick" the endgame — one stale claim + one quarantined cell is the
 whole story 9 times out of 10, and both self-heal or take two POSTs.
+
+## Run-complete hold (whole run finished, Nov 2026)
+
+Driven by work exhaustion, not reachability. `_run_complete_checks` (local
+files only): `kg_pending` (`_frontier_cells()` → `_frontier_pending_total`),
+`retry_queue`, `peers_in_kg`, `sweep` (`sliver_sweep.status()`: pending /
+dispatched / received / units_open / hold / scan_backlog), `viewfill`
+(budget-stopped walk with candidates left), `v2_dispatch`, `repair_fixable`
+(pending-without-cells does not block). All clear for `RUN_COMPLETE_AFTER_S`
+(10 min) → `state['run_complete'] = {active, since, …}`; the loop then only
+runs the primary-park enforcer — no status fanout, bandwidth polls, frontier /
+cache-only / sweep starts, update waves; `app._sync_peer_data` skips its 5-min
+fanout. Re-check every `RUN_COMPLETE_RECHECK_S` (5 min); the first open item
+wakes it (`_wake_from_run_complete`). Auto mode only. `/process.txt`:
+`run_complete:` line (`not yet — open: {…}` before it triggers) +
+`RUN-COMPLETE` health flag.
+
+**Frontier starts stop first**: `_frontier_work_exhausted()` (0 pending
+KG/blocks + empty retry queue) → no parallel-frontier starts, an idle active
+frontier is demoted (cred/strip plan released) instead of re-issued a dead
+plan, no replacement, stopped parallel slots released. Idle peers fall through
+to the cache-only orchestrator (sweeps, repairs; `sliver_sweep.pending_count()`
+keeps it alive past its "whitelist drained" returns), then to the hold.
+
