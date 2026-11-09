@@ -9033,6 +9033,10 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         # Zenodo cache around this peer's owning cell so cache-only peers
         # can find whole KGs ready. Gated + bounded by the director via
         # the synced 'prewarm' flag; no-op in cache-only mode.
+        # Visible as its own step: before 2026-11-09 the dashboard kept
+        # showing the previous step ("legacy_cleanup") for the whole
+        # post-KG Copernicus fetch (25 min on at11 when openEO was slow).
+        _report_step("prewarm", "post-KG Copernicus cache fill (repair cells / frontier densify)")
         try:
             prewarm_cell_tiles(kg, obs_year)
         except Exception as _pwe:
@@ -12681,6 +12685,16 @@ def main():
                     _rep = _sls.peer_report(kg, result, seconds=time.time() - t_kg)
                 except Exception as _swe:  # noqa: BLE001
                     _rep = {"ok": False, "status": "failed", "error": str(_swe)[:120]}
+                if _rep.get("ok"):
+                    # Reported → forget the unit locally (whole parent when
+                    # the director says it is already settled) so a restart
+                    # does not re-run it from the stale spec (42119-sw3 loop).
+                    try:
+                        _resp = _rep.get("resp") or {}
+                        _sls.peer_forget(kg.get("_parent_kg_code") or kg_code,
+                                         None if (_resp.get("drop") or _resp.get("stale")) else kg_code)
+                    except Exception:  # noqa: BLE001
+                        pass
                 _st = _rep.get("status")
                 _cells = ((result or {}).get("ne") or {}).get("cells_observed")
                 _prd = str((result or {}).get("sweep_products") or "")

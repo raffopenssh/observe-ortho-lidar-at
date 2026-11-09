@@ -664,6 +664,20 @@ def spec_for(code: str, k: dict) -> dict:
                       for u in k.get("units") or [] if _unit_open(u) or u.get("state") == "dispatched"]}
 
 
+def pending_count() -> int:
+    """Parents in ``pending`` with ≥1 open unit (what ``assign`` would hand
+    out) — the director's cache-only orchestrator treats this as work so
+    sweeps still dispatch when no cache-ready KG / v2 unit is left."""
+    if not enabled():
+        return 0
+    try:
+        st = load_state()
+        return sum(1 for k in (st.get("kgs") or {}).values()
+                   if k.get("state") == "pending" and any(_unit_open(u) for u in k.get("units") or []))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def assign(workers: list[str], in_progress: set | None = None,
            n_peers: int | None = None, prefer: list[str] | None = None,
            busy: set | None = None) -> dict:
@@ -790,6 +804,19 @@ def accept_result(unit: str, parent: str, peer: str, attempt: int, status: str,
             # peer log a FAILED report for work nobody is waiting for.
             st["stats"]["stale"] = int(st["stats"].get("stale") or 0) + 1
             return {"ok": True, "unit": unit, "status": status, "stale": True,
+                    "parent_state": k.get("state")}
+        if u.get("state") in ("ok", "nodata") and k.get("state") in ("done", "received") \
+                and not any(x.get("state") in ("pending", "dispatched") for x in k.get("units") or []):
+            # Duplicate: the unit (and its parent) already settled.  A peer
+            # whose local sweep_spec.json / retry queue still carried the
+            # parent re-ran the unit on every processor restart (42119-sw3 on
+            # at12, 2026-11-09: 4.6 MB + a parent re-merge + umfeld re-POST
+            # every 3 min).  Accept quietly, change nothing, tell the peer to
+            # drop the parent (``drop``: sliver_sweep.peer_forget).
+            st["stats"]["duplicate"] = int(st["stats"].get("duplicate") or 0) + 1
+            log.info("sliver_sweep: %s duplicate result from %s ignored (parent %s %s)",
+                     unit, peer, parent, k.get("state"))
+            return {"ok": True, "unit": unit, "status": status, "duplicate": True, "drop": True,
                     "parent_state": k.get("state")}
         if status == "ok":
             if not body:
@@ -1417,6 +1444,43 @@ def peer_specs() -> dict:
         return (json.loads(PEER_SPEC_FILE.read_text()) or {}).get("specs") or {}
     except Exception:
         return {}
+
+
+def peer_forget(parent: str, unit: str | None = None) -> bool:
+    """Peer side: drop *unit* from the local spec of *parent* (the whole
+    parent when *unit* is None or it was the last unit) and the parent from
+    the local retry queue once no unit is left.  Called after a unit was
+    reported, so a processor restart does not re-run it from the stale
+    spec (the director only PUTs specs to peers that still hold open
+    parents).  Returns True when the parent was removed entirely."""
+    try:
+        specs = peer_specs()
+        sp = specs.get(str(parent))
+        gone = False
+        if sp is None:
+            gone = True
+        else:
+            units = [u for u in (sp.get("units") or []) if unit is not None and u.get("id") != unit]
+            if units:
+                sp["units"] = units
+            else:
+                specs.pop(str(parent), None)
+                gone = True
+            peer_store_spec(specs)
+        if gone:
+            rq = DATA_DIR / "retry_queue.json"
+            try:
+                codes = json.loads(rq.read_text()) if rq.exists() else []
+            except Exception:
+                codes = []
+            if str(parent) in codes:
+                tmp = rq.with_suffix(".tmp")
+                tmp.write_text(json.dumps([c for c in codes if c != str(parent)]))
+                tmp.replace(rq)
+        return gone
+    except Exception as ex:  # noqa: BLE001
+        log.debug("peer_forget %s/%s: %s", parent, unit, ex)
+        return False
 
 
 def peer_units(codes: list[str], kg_index: dict) -> list[dict]:

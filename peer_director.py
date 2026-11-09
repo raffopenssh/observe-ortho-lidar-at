@@ -643,6 +643,18 @@ UNREACHABLE_FAILOVER_THRESHOLD = 3
 # keeps serving the interactive app / dashboard untouched throughout.
 FLEET_DORMANT_AFTER_S = 15 * 60
 FLEET_DORMANT_PROBE_INTERVAL_S = 300
+# Run-complete hold (Nov 2026 endgame): when the whole run is done — no
+# pending KG/block anywhere, empty retry queue, no open sliver-sweep /
+# viewfill / v2-dispatch work, nothing repairable, no peer inside a KG —
+# the director stops orchestrating instead of restart-looping idle
+# frontiers into quarantine. Like the dormant hold it skips the per-tick
+# status fanout + bandwidth polls (pushed heartbeats only) and
+# ``app._sync_peer_data`` skips its 5-min fanout. Wake is automatic the
+# moment any work appears again (queue POST, umfeld change → sweep unit,
+# viewfill plan, repair cells cached) — re-checked every
+# RUN_COMPLETE_RECHECK_S from local state files only.
+RUN_COMPLETE_AFTER_S = int(os.environ.get('RUN_COMPLETE_AFTER_S', str(10 * 60)))
+RUN_COMPLETE_RECHECK_S = int(os.environ.get('RUN_COMPLETE_RECHECK_S', '300'))
 # How long to keep a peer out of rotation after a local Zenodo network
 # failure (the same peer hitting the same network problem on retry would
 # loop forever).  Cleared automatically when not_before passes.
@@ -4512,6 +4524,7 @@ class PeerDirector:
                    '_cache_ready_cache',
                    'active_peer', 'mode', 'last_switch',
                    'fleet_dormant', 'fleet_last_reachable_ts',
+                   'run_complete',
                    'bev_pause', 'bev_pause_history',
                    'bev_pool_escalation', 'bev_pool_probes',
                    'ip_pools', 'ip_pools_history',
@@ -5033,6 +5046,7 @@ class PeerDirector:
             'peer_meta': state.get('peer_meta') or {},
             # BEV outage + IP-pool stats (surfaced in /process.txt).
             'fleet_dormant': state.get('fleet_dormant') or {},
+            'run_complete': {k: v for k, v in (state.get('run_complete') or {}).items() if not k.startswith('_')},
             'zenodo_circuit': {k: v for k, v in (state.get('zenodo_circuit') or {}).items() if not k.startswith('_')},
             'cache_reconcile': state.get('cache_reconcile') or {},
             'bev_pause': state.get('bev_pause') or {},
@@ -5975,6 +5989,180 @@ class PeerDirector:
             'resuming orchestration' % (','.join(woken_by),
                                         dorm.get('since')),
             level='warning')
+
+
+    # --- Run-complete hold mode (whole run finished) -------------------
+    def _run_complete_checks(self, statuses: dict | None) -> dict:
+        """Is there any work left for the fleet?  Cheap, local-file based.
+        Returns ``{"ok": bool, "open": {check: detail…}, "at": iso}`` —
+        ``ok`` only when every check is clear."""
+        open_: dict = {}
+        try:
+            self._frontier_cells()
+            tot = getattr(self, '_frontier_pending_total', None)
+            if tot is None:
+                open_['kg_scan'] = 'no completion evidence'
+            elif tot > 0:
+                open_['kg_pending'] = tot
+        except Exception as e:  # noqa: BLE001
+            open_['kg_scan'] = str(e)[:80]
+        try:
+            rq = DATA_DIR / 'retry_queue.json'
+            codes = json.loads(rq.read_text()) if rq.exists() else []
+            if codes:
+                open_['retry_queue'] = len(codes)
+        except Exception:
+            pass
+        try:
+            busy = [pid for pid, ps in (statuses or {}).items()
+                    if isinstance(ps, dict) and ((ps.get('current_kg') or {}).get('code'))
+                    and str(ps.get('state') or ps.get('processor_state') or '') in
+                    ('running', 'processing', 'paused', 'pausing', 'paused_bw')]
+            if busy:
+                open_['peers_in_kg'] = sorted(busy)[:6]
+        except Exception:
+            pass
+        try:
+            import sliver_sweep as _sls
+            if _sls.enabled():
+                sw = _sls.status()
+                by = sw.get('by_state') or {}
+                n = sum(int(by.get(k) or 0) for k in ('pending', 'dispatched', 'received'))
+                n += int(sw.get('units_open') or 0) + int(sw.get('hold_units') or 0) \
+                    + int(sw.get('scan_backlog') or 0)
+                if n:
+                    open_['sweep'] = {k: by.get(k, 0) for k in ('pending', 'dispatched', 'received')} | {
+                        'units_open': sw.get('units_open'), 'hold': sw.get('hold_units'),
+                        'scan_backlog': sw.get('scan_backlog')}
+        except Exception as e:  # noqa: BLE001
+            open_['sweep'] = str(e)[:80]
+        try:
+            import ne_viewfill as _nvf
+            lr = (_nvf.status().get('last_run') or {})
+            if lr.get('budget_stop'):
+                left = max(0, int(lr.get('candidates') or 0) - int(lr.get('walked') or 0)
+                           - int(lr.get('skipped') or 0))
+                if left:
+                    open_['viewfill'] = left
+        except Exception:
+            pass
+        try:
+            dsp = ((self.state.get('v2') or {}).get('dispatch') or {})
+            n = int(dsp.get('candidates_total') or 0) + int(dsp.get('fast_total') or 0) \
+                + len(dsp.get('assigned') or [])
+            if n:
+                open_['v2_dispatch'] = n
+        except Exception:
+            pass
+        try:
+            import product_repair as _pr
+            fx = int((_pr.summary(rows=0) or {}).get('fixable') or 0)
+            if fx:
+                open_['repair_fixable'] = fx
+        except Exception:
+            pass
+        return {'ok': not open_, 'open': open_,
+                'at': datetime.now(timezone.utc).isoformat(timespec='seconds')}
+
+    def _update_run_complete(self, statuses: dict | None) -> bool:
+        """Enter / keep / leave the run-complete hold.  Returns True while
+        the director should skip orchestration (nothing left to do)."""
+        now = time.time()
+        rc = dict(self.state.get('run_complete') or {})
+        mode = read_director_mode(self.state.get('mode', 'auto'))
+        if mode != 'auto':
+            return False
+        if rc.get('active'):
+            if now - float(rc.get('_checked_ts') or 0) < RUN_COMPLETE_RECHECK_S:
+                return True
+            chk = self._run_complete_checks(statuses)
+            rc['_checked_ts'] = now
+            rc['last_check'] = chk
+            if chk['ok']:
+                with self._lock:
+                    self.state['run_complete'] = rc
+                return True
+            self._wake_from_run_complete(chk['open'])
+            return False
+        # not active: evaluate at the recheck cadence (the scan is cached
+        # 5 min anyway) and require the condition to hold continuously.
+        if now - float(rc.get('_checked_ts') or 0) < min(60, RUN_COMPLETE_RECHECK_S):
+            return False
+        chk = self._run_complete_checks(statuses)
+        rc['_checked_ts'] = now
+        rc['last_check'] = chk
+        if not chk['ok']:
+            rc.pop('clear_since_ts', None)
+            with self._lock:
+                self.state['run_complete'] = rc
+            return False
+        first = float(rc.get('clear_since_ts') or 0) or now
+        rc['clear_since_ts'] = first
+        if now - first < RUN_COMPLETE_AFTER_S:
+            with self._lock:
+                self.state['run_complete'] = rc
+            return False
+        since = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        rc.update(active=True, since=since, entries=int(rc.get('entries') or 0) + 1)
+        rc.pop('woke_at', None); rc.pop('woken_by', None)
+        with self._lock:
+            self.state['run_complete'] = rc
+            self.state['parallel_frontiers_active'] = []
+        log.warning('RUN COMPLETE: no pending KG / queue / sweep / viewfill / v2 / '
+                    'repair work and no peer inside a KG for %d min — director on '
+                    'hold (heartbeats only, re-check every %d min). Wakes on any new work.',
+                    RUN_COMPLETE_AFTER_S // 60, RUN_COMPLETE_RECHECK_S // 60)
+        _emit_director_event(
+            'run complete: nothing left to orchestrate (KGs, queue, sweep, viewfill, '
+            'v2 dispatch, repairs all clear for %dm) — director on hold, peer fanout '
+            'suspended; re-checks local state every %dm and wakes on new work'
+            % (RUN_COMPLETE_AFTER_S // 60, RUN_COMPLETE_RECHECK_S // 60), level='warning')
+        try:
+            self._stop_idle_processors_for_hold(statuses)
+        except Exception:
+            log.exception('run-complete: stopping idle processors failed')
+        return True
+
+    def _stop_idle_processors_for_hold(self, statuses: dict | None) -> None:
+        """Ask processors that are running but idle (no KG) to stop — a
+        processor with an empty queue exits by itself, this only shortens
+        the tail.  Never touches a peer inside a KG (the hold requires none)."""
+        n = 0
+        for p in self.cfg.get('peers', []):
+            ps = (statuses or {}).get(p['id']) or {}
+            if not p.get('url') or not isinstance(ps, dict):
+                continue
+            if str(ps.get('state') or '') not in ('running', 'processing'):
+                continue
+            if (ps.get('current_kg') or {}).get('code'):
+                continue
+            try:
+                stop_peer_processor(p['url'])
+                n += 1
+            except Exception as e:  # noqa: BLE001
+                log.debug('run-complete stop %s: %s', p['id'], e)
+        if n:
+            log.info('run-complete: asked %d idle processor(s) to stop', n)
+
+    def _wake_from_run_complete(self, open_: dict) -> None:
+        rc = dict(self.state.get('run_complete') or {})
+        if not rc.get('active'):
+            return
+        now_iso = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        rc.update(active=False, woke_at=now_iso, woken_by=open_)
+        rc.pop('clear_since_ts', None)
+        with self._lock:
+            self.state['run_complete'] = rc
+        with _PEER_CB_LOCK:
+            _PEER_CB.clear()
+        with self._lock:
+            self.state['_bandwidth_backoff'] = {}
+            self.state['_bandwidth_misses'] = {}
+        log.warning('RUN-COMPLETE WAKE: new work %s (on hold since %s) — resuming orchestration',
+                    json.dumps(open_, default=str)[:200], rc.get('since'))
+        _emit_director_event(
+            'run complete → wake: new work %s (hold since %s) — resuming orchestration'
+            % (json.dumps(open_, default=str)[:160], rc.get('since')), level='warning')
 
     def _fleet_dormant_probe(self) -> None:
         """Light reachability sweep while dormant. Every
@@ -11229,6 +11417,9 @@ class PeerDirector:
                     pending_cells.add(cell)
                     cell_items[cell] = cell_items.get(cell, 0) + n_items
             self._frontier_cell_items = cell_items
+            # Fleet-wide pending item count — the run-complete hold
+            # (_run_complete_checks) reads this; 0 = run finished.
+            self._frontier_pending_total = sum(cell_items.values())
             cells = [c for c in all_cells
                      if c in pending_cells and c not in barren]
             if not cells:
@@ -13547,7 +13738,19 @@ class PeerDirector:
                          V2_UPGRADE_FILL_BELOW_READY,
                          ', v24_first' if self._v24_first(cfg) else '', len(v2_codes),
                          (self.state.get('_v2_cand_cache') or {}).get('total', 0))
-        if not whitelist and not v2_codes:
+        # Sliver-sweep parents waiting for a worker count as cache-only
+        # work too: before 2026-11-09 both "whitelist drained" returns
+        # below fired first, so at the end of the run (ready_kgs=0,
+        # v2 cand=0) 8 pending parents / 14 open units sat for 7 h while
+        # 25 sweep-capable workers idled — the sweep assign lives at the
+        # bottom of this orchestrator and was never reached.
+        _sweep_pending = 0
+        try:
+            import sliver_sweep as _sls_pc
+            _sweep_pending = _sls_pc.pending_count()
+        except Exception:  # noqa: BLE001
+            _sweep_pending = 0
+        if not whitelist and not v2_codes and not _sweep_pending:
             # Nothing to do for cache-only peers.  Stop any that are
             # running (they'd otherwise idle-loop a fresh subprocess).
             # Use a graceful stop so the peer finishes its current KG
@@ -13734,7 +13937,7 @@ class PeerDirector:
                 whitelist, cfg, exclude=in_progress,
                 min_units=2 * _n_workers + 2)
         v2_codes = [k for k in v2_codes if k not in in_progress]
-        if not whitelist and not v2_codes:
+        if not whitelist and not v2_codes and not _sweep_pending:
             log.info('Cache-only orchestrate: whitelist drained after excluding '
                      '%d in-progress KGs', len(in_progress))
             return
@@ -14018,6 +14221,20 @@ class PeerDirector:
                 if _new:
                     _emit_director_event(f"sweep: {_pid} ← {len(_codes)} parent(s) "
                                          f"({', '.join(_new[:4])}{'…' if len(_new) > 4 else ''})", peer=_pid)
+            # Peers that held sweep parents last tick but none now: clear
+            # their spec (one tiny PUT) so a processor restart cannot
+            # re-run settled units from the stale sweep_spec.json
+            # (42119-sw3 on at12 every 3 min, 2026-11-09).
+            for _pid in list((self.state.get('sweep_pushed') or {}).keys()):
+                if _pid in _sw:
+                    continue
+                _pp = get_peer_by_id(cfg, _pid)
+                if not _pp:
+                    continue
+                try:
+                    _push_sweep_spec(_pp['url'], {})
+                except Exception as _e:  # noqa: BLE001
+                    log.debug('sweep spec clear on %s failed: %s', _pid, _e)
             with self._lock:
                 self.state['sweep_pushed'] = {pid: list(sp.keys()) for pid, sp in _sw.items()}
         except Exception as _e:  # noqa: BLE001
@@ -14486,7 +14703,9 @@ class PeerDirector:
                     pass
                 _was_dormant = bool(
                     (self.state.get('fleet_dormant') or {}).get('active'))
-                if not _was_dormant:
+                _was_complete = bool(
+                    (self.state.get('run_complete') or {}).get('active'))
+                if not (_was_dormant or _was_complete):
                     self._update_bandwidth()
                 # Credential revalidation moved off the director loop
                 # into a dedicated daemon thread (see _oidc_reval_loop)
@@ -14504,8 +14723,8 @@ class PeerDirector:
                     )
                     _peers = list(self.cfg.get('peers', []))
                     _statuses: dict[str, dict] = {}
-                    if _was_dormant:
-                        # Dormant: no network fanout. Evaluate pushed
+                    if _was_dormant or _was_complete:
+                        # Dormant / run-complete: no network fanout. Evaluate pushed
                         # heartbeats only (a rebooting peer pushes to
                         # us within ~30 s and wakes the fleet); the
                         # probe sweep below covers push-less peers.
@@ -14647,6 +14866,24 @@ class PeerDirector:
                         self._fleet_dormant_probe()
                     except Exception:
                         log.exception('dormant probe sweep failed')
+                    with self._lock:
+                        save_director_state(self.state)
+                    time.sleep(DIRECTOR_POLL_INTERVAL)
+                    continue
+                # Run-complete gate: whole run finished → hold (no
+                # frontier/cache-only/sweep starts, no fanout). Pushed
+                # heartbeats are still evaluated; wakes on new work.
+                try:
+                    _complete = self._update_run_complete(
+                        locals().get('_statuses') or {})
+                except Exception:
+                    log.exception('run-complete tracking failed')
+                    _complete = False
+                if _complete:
+                    try:
+                        self._enforce_primary_park()
+                    except Exception:
+                        log.exception('primary park enforce failed')
                     with self._lock:
                         save_director_state(self.state)
                     time.sleep(DIRECTOR_POLL_INTERVAL)

@@ -1392,7 +1392,11 @@ def _sync_peer_data():
                 _ds = json.loads(Path(
                     'data/austria_processor/director_state.json'
                 ).read_text())
-                if (_ds.get('fleet_dormant') or {}).get('active'):
+                if (_ds.get('fleet_dormant') or {}).get('active') \
+                        or (_ds.get('run_complete') or {}).get('active'):
+                    # run_complete: whole run finished (director hold) —
+                    # the 5-min cache_manifest/peers fanout was ~35 MB/h
+                    # of the metered primary for nothing.
                     time.sleep(300)
                     continue
             except Exception:
@@ -19405,6 +19409,25 @@ def process_txt():
             f'(by {",".join(_dorm.get("woken_by") or [])}; '
             f'was dormant since {_dorm.get("since", "?")})'
         )
+    _rc = d.get('run_complete') or {}
+    if _rc.get('active'):
+        _health['run_complete'] = _rc
+        out.append(
+            f'run_complete: since {_rc.get("since", "?")} — nothing left to orchestrate '
+            f'(KGs, queue, sweep, viewfill, v2 dispatch, repairs clear); director on hold, '
+            f'peer fanout + cache_manifest sync suspended; re-checks every 5m, wakes on new work '
+            f'(last check {(_rc.get("last_check") or {}).get("at", "?")})'
+        )
+    elif _rc.get('woke_at'):
+        out.append(
+            f'run_complete: woke {_rc.get("woke_at")} on {json.dumps(_rc.get("woken_by") or {}, default=str)[:160]} '
+            f'(hold since {_rc.get("since", "?")})'
+        )
+    elif (_rc.get('last_check') or {}).get('open'):
+        out.append(
+            f'run_complete: not yet — open: {json.dumps(_rc["last_check"]["open"], default=str)[:200]} '
+            f'(checked {_rc["last_check"].get("at", "?")})'
+        )
     sh = d.get('shadow_peer')
     if sh:
         _sp_ts = d.get('shadow_last_push_ts') or 0
@@ -21603,6 +21626,10 @@ def process_txt():
             _flags.append(
                 'FLEET-DORMANT(since '
                 + str(_health['dormant'].get('since', '?')) + ')')
+        if _health.get('run_complete'):
+            _flags.append(
+                'RUN-COMPLETE(hold since '
+                + str(_health['run_complete'].get('since', '?')) + ')')
         if _health.get('edge_unreachable'):
             _flags.append(
                 'EDGE-INBOUND-UNREACHABLE(since '
