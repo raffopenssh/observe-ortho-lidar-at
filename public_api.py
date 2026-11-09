@@ -339,16 +339,52 @@ def heightfield():
     return _json(payload, st, max_age=3600)
 
 
+def _flag_arg(name: str, default: bool) -> bool:
+    v = request.args.get(name)
+    if v is None or v == '':
+        return default
+    return str(v).strip().lower() not in ('0', 'false', 'no', 'off')
+
+
 @app.route('/api/v1/trees/bbox')
 def trees_bbox():
+    """Tree apices (default) or structures (``objects=structures``) in a bbox,
+    tallest first, straight from the NE cells corpus.  ``realistic=0`` turns
+    the plausibility / flag filter off.  ``ready`` is honest: false while a KG
+    of the bbox is still pending or the cells index is unusable."""
     bb, err = _bbox_or_err()
     if err:
         return err
+    kind = (request.args.get('objects') or request.args.get('kind') or 'trees').strip().lower()
+    if kind in ('structure', 'structures', 'buildings', 'nontree', 'non_tree'):
+        kind = 'structures'
+    if kind not in ('trees', 'structures'):
+        return _err('objects must be trees | structures', 400)
+    types = None
+    if request.args.get('types'):
+        types = {t.strip().lower() for t in request.args['types'].split(',') if t.strip()}
+    realistic = _flag_arg('realistic', True)
+    import ne_trees
     try:
-        t = lq.trees_bbox(*bb, min_height=float(request.args.get('min_height', lq.TREE_H_MIN)),
-                          limit=int(request.args.get('limit', 2000)))
+        t = lq.trees_bbox(*bb, min_height=float(request.args.get('min_height', 0)),
+                          limit=int(request.args.get('limit', 2000)), realistic=realistic, kind=kind, types=types)
     except Exception as e:  # noqa: BLE001
         return _err(str(e), 500)
+    key = 'trees' if kind == 'trees' else 'structures'
+    ready = bool(t['ready'])
+    extra = {}
+    if not t['trees']:
+        st = ne_trees.status()
+        if not st['ok']:
+            ready = False
+            extra['error'] = st.get('error') or 'cells index unusable'
+            extra['retry_after_s'] = 600
+    if t['pending_kgs']:
+        extra['pending_kgs'] = t['pending_kgs']; extra['retry_after_s'] = 300
+    if t['not_processed']:
+        extra['not_processed'] = t['not_processed']
+    meta = dict(docs.TREES_META if kind == 'trees' else docs.STRUCTURES_META, realistic=realistic,
+                chunks_scanned=t['chunks_scanned'], ms=t['ms'])
     fmt = request.args.get('format', 'json')
     if fmt == 'geojson':
         fc = {'type': 'FeatureCollection',
@@ -356,11 +392,11 @@ def trees_bbox():
                             'properties': {k: v for k, v in x.items() if k not in ('lon', 'lat')}}
                            for x in t['trees']],
               'meta': _meta(count=len(t['trees']), truncated=t['truncated'], dropped_qa=t['dropped_qa'],
-                            kgs=t['kgs'], **docs.TREES_META)}
+                            kgs=t['kgs'], ready=ready, **extra, **meta)}
         return _json(fc)
-    return _json({'bbox': list(bb), 'trees': t['trees'], 'count': len(t['trees']),
+    return _json({'bbox': list(bb), 'objects': kind, key: t['trees'], 'count': len(t['trees']),
                   'truncated': t['truncated'], 'dropped_qa': t['dropped_qa'], 'kgs': t['kgs'],
-                  'ready': bool(t['kgs']), 'meta': _meta(**docs.TREES_META)})
+                  'ready': ready, **extra, 'meta': _meta(**meta)})
 
 
 @app.route('/api/v1/landmarks/bbox')

@@ -41,8 +41,6 @@ NATURAL = {'tree', 'shrub', 'grass', 'hedge', 'water', 'crop', 'orchard', 'viney
 WOODY = {'tree', 'shrub', 'hedge', 'orchard'}
 
 # Realistic-tree gate (what siedler used to apply client-side, now here).
-TREE_H_MIN, TREE_H_MAX = 3.0, 60.0
-TREE_RF_MIN = 0.5
 FLAG_SEVERITIES = ('high', 'critical')
 
 # Man-made verticals worth showing as landmarks: type → (min_h, max_h).
@@ -51,7 +49,6 @@ LANDMARK_TYPES = {'roof': (18.0, 60.0), 'mast': (15.0, 120.0),
 LANDMARK_RF_MIN = 0.6
 
 MAX_BBOX_DEG2 = 0.03        # ~ 25 × 10 km — larger viewports should tile
-MAX_TREES = 2000
 
 
 # --------------------------------------------------------------------------
@@ -361,31 +358,20 @@ def _is_flagged(pts: set, lon, lat) -> bool:
 # --------------------------------------------------------------------------
 # trees / landmarks / buildings in bbox
 # --------------------------------------------------------------------------
-def trees_bbox(w, s, e, n, min_height=TREE_H_MIN, limit=MAX_TREES, kg_rows=None) -> dict:
-    kg_rows = kg_rows if kg_rows is not None else kgs_in_bbox(w, s, e, n)
-    codes = [k['kg_code'] for k in kg_rows]
-    if not codes:
-        return {'trees': [], 'kgs': [], 'dropped_qa': 0, 'truncated': False}
-    lim = max(1, min(int(limit), MAX_TREES))
-    min_h = max(TREE_H_MIN, float(min_height))
-    rows = idx().execute(
-        'SELECT kg_code, lon, lat, h_m, crown_d_m, rf_conf FROM kg_trees '
-        'WHERE kg_code IN (%s) AND lon >= ? AND lon <= ? AND lat >= ? AND lat <= ? '
-        'AND h_m >= ? AND h_m <= ? ORDER BY h_m DESC LIMIT ?' % ','.join('?' * len(codes)),
-        (*codes, w, e, s, n, min_h, TREE_H_MAX, lim * 2 + 50)).fetchall()
-    flagged = {c: flagged_points(c, 'top_tree') for c in codes}
-    out = []; dropped = 0
-    for kg, lon, lat, h, crown, rf in rows:
-        if rf is not None and rf < TREE_RF_MIN:
-            dropped += 1; continue
-        if _is_flagged(flagged[kg], lon, lat):
-            dropped += 1; continue
-        out.append({'lon': round(lon, 7), 'lat': round(lat, 7), 'height_m': r(h, 1),
-                    'crown_d_m': r(crown, 1), 'confidence': r(rf, 2), 'kg_code': kg})
-        if len(out) > lim:
-            break
-    trunc = len(out) > lim
-    return {'trees': out[:lim], 'kgs': codes, 'dropped_qa': dropped, 'truncated': trunc}
+def trees_bbox(w, s, e, n, min_height=0.0, limit=2000, kg_rows=None, realistic=True,
+               kind='trees', types=None) -> dict:
+    """Tree apices (or ``kind='structures'``) in a bbox, tallest first, read
+    straight from the NE cells corpus via :mod:`ne_trees` (the legacy
+    ``kg_trees`` table is empty since the Kataster purge).  ``realistic``
+    applies the data-derived plausibility rules + both flag stores.  Output
+    keeps the public field names (lon/lat/height_m/crown_d_m/confidence/kg_code)."""
+    import ne_trees
+    r = ne_trees.points_bbox(w, s, e, n, kind, min_height=float(min_height),
+                             limit=limit, realistic=realistic, types=types)
+    key = 'trees' if kind == 'trees' else 'structures'
+    return {'trees': r[key], 'kgs': r['kgs'], 'dropped_qa': r['dropped_qa'], 'truncated': r['truncated'],
+            'ready': r['ready'], 'pending_kgs': r['pending_kgs'], 'not_processed': r['not_processed'],
+            'realistic': r['realistic'], 'chunks_scanned': r['chunks_scanned'], 'ms': r['ms'], 'kind': kind}
 
 
 def landmarks_bbox(w, s, e, n, kg_rows=None) -> dict:
@@ -646,8 +632,8 @@ def landscape_bbox(w, s, e, n, *, want_trees=True, want_buildings=True,
             'height_mean_m': r(sum(hs) / len(hs), 1) if hs else None,
             'tallest': [{k: v for k, v in x.items() if k != 'kg_code'} for x in t['trees'][:10]],
             'dropped_qa': t['dropped_qa'],
-            'note': 'sampled apices (the tallest few per ~0.1 ha; index keeps h ≥ 20 m); '
-                    'QA-filtered: implausible / mast-like / low-confidence trees removed',
+            'note': 'tallest apices from the NE cells corpus (every apex h ≥ 3 m); '
+                    'realistic set: saturated / spike-like (mast, turbine) / flagged apices removed',
         }
     if want_buildings:
         b = buildings_bbox(w, s, e, n, limit=200, kg_rows=processed)

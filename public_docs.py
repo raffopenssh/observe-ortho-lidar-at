@@ -27,10 +27,21 @@ ALPHA_NOTE = 'alpha — field names and limits may still move between epochs'
 
 
 TREES_META = {
-    'note': 'Sampled tree apices from the LiDAR nDSM: the tallest few per ~0.1 ha, index keeps '
-            'h ≥ 20 m nationwide (so min_height < 20 returns no extra trees). QA-filtered here: '
-            'mast-like / implausible / low-confidence apices removed — this is the realistic set.',
-    'complete': False,
+    'note': 'Every tree apex of the LiDAR nDSM (h ≥ 3 m, 0.25 m steps, ceiling 63.75 m) read from the '
+            'NE cells corpus, tallest first. realistic=1 (default) drops what the data say are not '
+            'trees: the saturated ≥ 60 m bin (~90 % masts / wind turbines / cranes), local spikes '
+            '≥ 45 m (h/p90 of the ~1.5 ha chunk > 1.6 or > 15 m above the next apex), and apices in '
+            'cells with an open/confirmed public flag (too_tall / spurious / artifact / misplaced / '
+            'wrong_height) or a high/critical QA flag. realistic=0 returns the raw set. '
+            'confidence is null (no RF score per apex in the corpus); crown_d_m from crown_m2.',
+    'complete': True,
+}
+STRUCTURES_META = {
+    'note': 'Non-tree objects (objects=structures): every segmented structure with LiDAR heights from '
+            'the NE cells corpus — roof, greenhouse, solar_panel, mast, wind_turbine, substation, '
+            'bridge, wall, fence — tallest first. types=mast,wind_turbine filters. realistic=1 drops '
+            'per-type implausible heights, confidence < 0.2 and flagged cells. Centroids only, no outlines.',
+    'complete': True,
 }
 
 CELLS_TXT = """## Cells (H3 res 12, ~300 m² hexagons) — what we measured, per cell       #cells
@@ -384,12 +395,16 @@ HTTP 202 with retry_after_s — repeat later, don't poll in a loop. Coverage: /a
 
 ## Trees, landmarks, buildings (points in a bbox)
 
-GET /api/v1/trees/bbox?bbox=…[&min_height=20][&limit=2000][&format=geojson]
-    QA-filtered tree apices: {{lon, lat, height_m, crown_d_m, confidence, kg_code}}, tallest first.
-    Realistic set: mast-like / implausible (> 60 m) / low-confidence apices are removed by our
-    QA rules before you see them (dropped_qa tells how many). The index holds the tallest few
-    apices per ~0.1 ha with h ≥ 20 m — it is a SAMPLE for map decoration and giant-tree finding,
-    not a full inventory (meta.complete=false). crown_d_m only for single-crown segments.
+GET /api/v1/trees/bbox?bbox=…[&min_height=3][&limit=2000][&realistic=1][&objects=trees|structures][&types=…][&format=geojson]
+    Tree apices {{lon, lat, height_m, crown_d_m, crown_m2, species, vitality, ndsm_only, confidence,
+    cell, kg_code}}, tallest first, from the NE cells corpus (EVERY apex h ≥ 3 m — a full
+    inventory, meta.complete=true; ≤ limit, truncated:true when more exist). realistic=1 (default)
+    removes what the height distribution says are not trees: the saturated ≥ 60 m bin, local
+    spikes ≥ 45 m (masts, wind turbines, cranes) and flagged cells — dropped_qa counts them;
+    realistic=0 gives the raw apices. objects=structures returns the non-tree objects instead
+    ({{type, lon, lat, height_m, height_robust_m, area_m2, confidence, dh_m, cell, kg_code}};
+    types=mast,wind_turbine,roof,… to filter). ready:false (+ pending_kgs / retry_after_s or
+    error) when a KG of the bbox is not on disk yet or the index is unusable — never a silent 0.
 GET /api/v1/landmarks/bbox?bbox=…
     Tall man-made verticals worth a map symbol: roof 18–60 m (church towers, silos, high-rises),
     mast 15–120 m, wind_turbine 40–200 m, bridge 20–120 m. {{type, lon, lat, height_m, area_sqm,

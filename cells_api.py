@@ -269,6 +269,11 @@ def index_file(path: str | Path, *, conn: sqlite3.Connection | None = None) -> d
             raise
     _header_cache_drop(kg)
     _files_cache['t'] = 0.0
+    try:                                   # per-chunk tallest apex / structure (ne_trees accelerator)
+        import ne_trees
+        ne_trees.index_kg(kg)
+    except Exception as ex:  # noqa: BLE001
+        log.warning('cells index %s: hmax hook: %s', kg, ex)
     try:
         als_years.index_file(p)      # per-KG ALS year block cache (keyed on neo1_digest)
     except Exception as ex:  # noqa: BLE001
