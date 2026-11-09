@@ -53,7 +53,8 @@ STRUCT_CONF_MIN = 0.2
 NEGATIVE_CLAIMS = ('too_tall', 'spurious', 'artifact', 'misplaced', 'wrong_height')
 FLAG_LAYERS = {'trees': ('trees', 'cells.trees'), 'structures': ('structures', 'cells.structures', 'landmarks', 'buildings')}
 LEGACY_FLAG_KIND = {'trees': 'top_tree', 'structures': 'top_by_type'}
-MAX_LIMIT = 2000
+MAX_LIMIT = 20000              # hard cap; default 2000 (a 5 km² alpine tile holds >2000 apices ≥ 35 m)
+DEFAULT_LIMIT = 2000
 MAX_AREA_DEG2 = 0.25
 CHUNK_BUDGET = 6000             # hard cap on chunk inflations per request (~1.5 s cold)
 EDGE_PAD_DEG = 0.0015           # ~110 m: r10 cells whose centre is just outside still hold bbox objects
@@ -269,14 +270,24 @@ def _decode(kind: str, ch) -> tuple[np.ndarray, np.ndarray, dict]:
     return h, cell_idx, d
 
 
-def points_bbox(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int = MAX_LIMIT,
-                realistic: bool = True, types: set | None = None) -> dict:
-    """All objects of ``kind`` in bbox, tallest first, ≤ limit."""
+def points_bbox(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int = DEFAULT_LIMIT,
+                realistic: bool = True, types: set | None = None, max_height: float | None = None) -> dict:
+    """All objects of ``kind`` in bbox, tallest first, ≤ limit.
+
+    ``max_height`` makes a half-open window ``min_height <= h < max_height``
+    so adjacent bands (20–25, 25–30 …) partition the apices without
+    double-counting.  The chunk accelerator still applies: chunks are walked
+    by their tallest object, chunks whose max is below ``min_height`` end
+    the scan, and once ``limit`` window objects are in hand no chunk whose
+    max cannot beat the limit-th one is opened."""
     if kind not in KINDS:
         raise ValueError(f'kind must be one of {KINDS}')
     t0 = time.time()
     lim = max(1, min(int(limit), MAX_LIMIT))
     min_h = max(0.0, float(min_height))
+    max_h = None if max_height is None else float(max_height)
+    if max_h is not None and max_h <= min_h:
+        raise ValueError('max_height must be greater than min_height')
     kgs_all = ca._kgs_intersecting(w, s, e, n)
     files = ca._files()
     kgs_have = [k for k in kgs_all if k in files]
@@ -342,6 +353,8 @@ def points_bbox(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit:
         if hs.size == 0:
             continue
         m = hs >= min_h
+        if max_h is not None:
+            m &= hs < max_h
         if realistic:
             if kind == 'trees':
                 m &= hs < TREE_H_SATURATED
@@ -407,16 +420,19 @@ def points_bbox(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit:
                 break
     truncated = len(out) > lim or not exhausted
     return {'kind': kind, 'trees' if kind == 'trees' else 'structures': out[:lim], 'kgs': kgs_have,
+            'min_height': min_h, 'max_height': max_h, 'limit': lim,
             'pending_kgs': pending, 'not_processed': not_proc, 'dropped_qa': dropped,
             'realistic': bool(realistic), 'truncated': truncated, 'chunks_scanned': scanned,
             'chunks_in_bbox': len(rows), 'ms': round((time.time() - t0) * 1000, 1),
             'ready': bool(kgs_have) and not pending}
 
 
-def trees_bbox(w, s, e, n, min_height: float = 0.0, limit: int = MAX_LIMIT, realistic: bool = True) -> dict:
-    return points_bbox(w, s, e, n, 'trees', min_height=min_height, limit=limit, realistic=realistic)
+def trees_bbox(w, s, e, n, min_height: float = 0.0, limit: int = DEFAULT_LIMIT, realistic: bool = True,
+               max_height: float | None = None) -> dict:
+    return points_bbox(w, s, e, n, 'trees', min_height=min_height, limit=limit, realistic=realistic, max_height=max_height)
 
 
-def structures_bbox(w, s, e, n, min_height: float = 0.0, limit: int = MAX_LIMIT, realistic: bool = True,
-                    types: set | None = None) -> dict:
-    return points_bbox(w, s, e, n, 'structures', min_height=min_height, limit=limit, realistic=realistic, types=types)
+def structures_bbox(w, s, e, n, min_height: float = 0.0, limit: int = DEFAULT_LIMIT, realistic: bool = True,
+                    types: set | None = None, max_height: float | None = None) -> dict:
+    return points_bbox(w, s, e, n, 'structures', min_height=min_height, limit=limit, realistic=realistic, types=types,
+                       max_height=max_height)

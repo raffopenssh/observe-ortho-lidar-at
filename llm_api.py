@@ -176,30 +176,42 @@ def _bbox_args():
 
 @bp.route('/api/v1/trees/bbox')
 def trees_bbox():
+    """Private-tier mirror of the public route (same engine: ne_trees over the
+    NE cells corpus; legacy ``kg_trees`` is empty since the Kataster purge).
+    Keeps the h_m / rf_conf field names of the old contract."""
     try:
         w, s, e, n = _bbox_args()
     except Exception:
         return jsonify({'error': 'west,south,east,north (or bbox=w,s,e,n) required'}), 400
     if (e - w) * (n - s) > 0.25:
         return jsonify({'error': 'bbox too large (max 0.25 deg²)'}), 400
-    min_h = float(request.args.get('min_height', 20) or 20)
+    import ne_trees
+    min_h = float(request.args.get('min_height', 0) or 0)
+    max_h = request.args.get('max_height')
+    max_h = float(max_h) if max_h not in (None, '') else None
     limit = int(request.args.get('limit', 2000) or 2000)
-    idx = _idx()
-    r = idx.query_trees_bbox(w, s, e, n, min_height=min_h, limit=limit)
-    trees = [{'lon': t[2], 'lat': t[3], 'h_m': t[4], 'crown_d_m': t[5],
-              'rf_conf': t[6], 'kg_code': t[0]} for t in r['rows']]
-    pending = pending_kgs_in_bbox(w, s, e, n, idx)
+    if max_h is not None and max_h <= min_h:
+        return jsonify({'error': 'max_height must be greater than min_height'}), 400
+    if limit > ne_trees.MAX_LIMIT:
+        return jsonify({'error': f'limit must be <= {ne_trees.MAX_LIMIT}'}), 400
+    realistic = str(request.args.get('realistic', '1')).lower() not in ('0', 'false', 'no', 'off')
+    r = ne_trees.trees_bbox(w, s, e, n, min_height=min_h, max_height=max_h, limit=limit, realistic=realistic)
+    trees = [{'lon': t['lon'], 'lat': t['lat'], 'h_m': t['height_m'], 'crown_d_m': t['crown_d_m'],
+              'rf_conf': None, 'kg_code': t['kg_code'], 'cell': t['cell']} for t in r['trees']]
     body = {
         'trees': trees, 'count': len(trees), 'truncated': r['truncated'],
-        'ready': not pending, 'kgs': r['kgs'], 'min_height': min_h,
-        'limit': min(limit, 2000),
-        'source': 'index kg_trees: sampled tallest apices (~0.1 ha sampling; '
-                  'full apex set via POST /api/v3/trees)',
-        'complete': False,
+        'ready': r['ready'], 'kgs': r['kgs'], 'min_height': min_h, 'max_height': max_h,
+        'limit': min(limit, ne_trees.MAX_LIMIT), 'realistic': realistic, 'dropped_qa': r['dropped_qa'],
+        'source': 'NE cells corpus (data/ne/*.h3b) via ne_trees — every apex h ≥ 3 m, tallest first',
+        'complete': True,
     }
-    if pending:
-        body['pending_kgs'] = pending
+    if r['pending_kgs']:
+        body['pending_kgs'] = r['pending_kgs']
         body['retry_after_s'] = 300
-    if not r['kgs'] and not pending:
+    if not trees:
+        st = ne_trees.status()
+        if not st['ok']:
+            body['ready'] = False; body['error'] = st.get('error')
+    if not r['kgs'] and not r['pending_kgs']:
         body['coverage'] = 'none'
     return jsonify(body)

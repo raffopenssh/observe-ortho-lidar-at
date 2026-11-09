@@ -395,10 +395,14 @@ HTTP 202 with retry_after_s — repeat later, don't poll in a loop. Coverage: /a
 
 ## Trees, landmarks, buildings (points in a bbox)
 
-GET /api/v1/trees/bbox?bbox=…[&min_height=3][&limit=2000][&realistic=1][&objects=trees|structures][&types=…][&format=geojson]
+GET /api/v1/trees/bbox?bbox=…[&min_height=3][&max_height=…][&limit=2000][&realistic=1][&objects=trees|structures][&types=…][&format=geojson]
     Tree apices {{lon, lat, height_m, crown_d_m, crown_m2, species, vitality, ndsm_only, confidence,
     cell, kg_code}}, tallest first, from the NE cells corpus (EVERY apex h ≥ 3 m — a full
-    inventory, meta.complete=true; ≤ limit, truncated:true when more exist). realistic=1 (default)
+    inventory, meta.complete=true; ≤ limit, truncated:true when more exist). limit default 2000,
+    max 20000 (400 above that). min_height / max_height form a half-open window
+    min_height <= h < max_height, so adjacent bands (20–25, 25–30 …) partition the apices without
+    overlap — fetch a dense tile band by band instead of one huge call; meta echoes min_height,
+    max_height, limit, max_limit. realistic=1 (default)
     removes what the height distribution says are not trees: the saturated ≥ 60 m bin, local
     spikes ≥ 45 m (masts, wind turbines, cranes) and flagged cells — dropped_qa counts them;
     realistic=0 gives the raw apices. objects=structures returns the non-tree objects instead

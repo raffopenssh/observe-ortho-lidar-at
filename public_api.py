@@ -366,8 +366,19 @@ def trees_bbox():
     realistic = _flag_arg('realistic', True)
     import ne_trees
     try:
-        t = lq.trees_bbox(*bb, min_height=float(request.args.get('min_height', 0)),
-                          limit=int(request.args.get('limit', 2000)), realistic=realistic, kind=kind, types=types)
+        min_h = float(request.args.get('min_height') or 0)
+        max_h = request.args.get('max_height')
+        max_h = float(max_h) if max_h not in (None, '') else None
+        limit = int(request.args.get('limit') or ne_trees.DEFAULT_LIMIT)
+    except ValueError:
+        return _err('min_height / max_height / limit must be numbers', 400)
+    if max_h is not None and max_h <= min_h:
+        return _err('max_height must be greater than min_height (window is min_height <= h < max_height)', 400)
+    if limit > ne_trees.MAX_LIMIT:
+        return _err(f'limit must be <= {ne_trees.MAX_LIMIT}', 400)
+    try:
+        t = lq.trees_bbox(*bb, min_height=min_h, max_height=max_h, limit=limit,
+                          realistic=realistic, kind=kind, types=types)
     except Exception as e:  # noqa: BLE001
         return _err(str(e), 500)
     key = 'trees' if kind == 'trees' else 'structures'
@@ -384,7 +395,8 @@ def trees_bbox():
     if t['not_processed']:
         extra['not_processed'] = t['not_processed']
     meta = dict(docs.TREES_META if kind == 'trees' else docs.STRUCTURES_META, realistic=realistic,
-                chunks_scanned=t['chunks_scanned'], ms=t['ms'])
+                min_height=t['min_height'], max_height=t['max_height'], limit=t['limit'],
+                max_limit=ne_trees.MAX_LIMIT, chunks_scanned=t['chunks_scanned'], ms=t['ms'])
     fmt = request.args.get('format', 'json')
     if fmt == 'geojson':
         fc = {'type': 'FeatureCollection',

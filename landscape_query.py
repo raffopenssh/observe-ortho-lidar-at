@@ -359,7 +359,7 @@ def _is_flagged(pts: set, lon, lat) -> bool:
 # trees / landmarks / buildings in bbox
 # --------------------------------------------------------------------------
 def trees_bbox(w, s, e, n, min_height=0.0, limit=2000, kg_rows=None, realistic=True,
-               kind='trees', types=None) -> dict:
+               kind='trees', types=None, max_height=None) -> dict:
     """Tree apices (or ``kind='structures'``) in a bbox, tallest first, read
     straight from the NE cells corpus via :mod:`ne_trees` (the legacy
     ``kg_trees`` table is empty since the Kataster purge).  ``realistic``
@@ -367,9 +367,10 @@ def trees_bbox(w, s, e, n, min_height=0.0, limit=2000, kg_rows=None, realistic=T
     keeps the public field names (lon/lat/height_m/crown_d_m/confidence/kg_code)."""
     import ne_trees
     r = ne_trees.points_bbox(w, s, e, n, kind, min_height=float(min_height),
-                             limit=limit, realistic=realistic, types=types)
+                             limit=limit, realistic=realistic, types=types, max_height=max_height)
     key = 'trees' if kind == 'trees' else 'structures'
     return {'trees': r[key], 'kgs': r['kgs'], 'dropped_qa': r['dropped_qa'], 'truncated': r['truncated'],
+            'min_height': r['min_height'], 'max_height': r['max_height'], 'limit': r['limit'],
             'ready': r['ready'], 'pending_kgs': r['pending_kgs'], 'not_processed': r['not_processed'],
             'realistic': r['realistic'], 'chunks_scanned': r['chunks_scanned'], 'ms': r['ms'], 'kind': kind}
 
