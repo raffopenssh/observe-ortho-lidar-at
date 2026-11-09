@@ -113,6 +113,7 @@ def ne_server_obs_missing(st: dict | None = None) -> dict:
                          headers=h, timeout=180)
         if r.status_code == 304 and cache.get("kgs") is not None:
             cache["checked_at"] = _now(); cache["hits_304"] = int(cache.get("hits_304") or 0) + 1
+            cache["last_status"] = 304
             return dict(cache["kgs"])
         r.raise_for_status()
         out = {}
@@ -120,10 +121,15 @@ def ne_server_obs_missing(st: dict | None = None) -> dict:
             kg = str(x.get("kg") or "").zfill(5)
             b, m = int(x.get("blank_n") or 0), int(x.get("missing_n") or 0)
             if kg and (b or m):
-                out[kg] = {"blank_n": b, "missing_n": m, "view_source": x.get("view_source")}
+                # declared_etag = the ETag GET {kg}/declared answers for the view
+                # the row was computed on (NE server 2026-11-09) → equal to our
+                # stored copy's ETag means no GET at all (ne_h3.declared_view)
+                out[kg] = {"blank_n": b, "missing_n": m, "view_source": x.get("view_source"),
+                           "declared_etag": x.get("declared_etag")}
         if isinstance(st, dict):
-            st["obs_missing"] = {"etag": r.headers.get("ETag"), "fetched_at": _now(), "checked_at": _now(),
-                                 "bytes": len(r.content), "kgs": out, "hits_304": 0}
+            st["obs_missing"] = {"etag": r.headers.get("ETag"), "fetched_at": _now(), "fetched_ts": time.time(),
+                                 "checked_at": _now(), "bytes": len(r.content), "kgs": out, "hits_304": 0,
+                                 "last_status": 200}
         return out
     except Exception as ex:  # noqa: BLE001
         log.warning("ne_viewfill: NE server revisit failed: %s", ex)
@@ -164,7 +170,16 @@ def candidates(all_kgs: bool = False, st: dict | None = None) -> list[tuple[str,
     idx = ne_ingest.load_index_ro()
     st = st if st is not None else load_state()
     est: dict[str, tuple[int, str]] = {}
-    for kg, v in ne_server_obs_missing(st).items():
+    om = ne_server_obs_missing(st)
+    omc = st.get("obs_missing") or {}
+    # revisit answered 304 → the list is the one we already walked: a KG
+    # walked since that list was fetched has nothing new (stop the run for
+    # the NE-server-listed part; local / mixed candidates keep their own gates)
+    unchanged_since = float(omc.get("fetched_ts") or 0) if omc.get("last_status") == 304 else None
+    for kg, v in om.items():
+        k = st["kgs"].get(kg) or {}
+        if unchanged_since and k.get("ts") and float(k["ts"]) >= unchanged_since and not k.get("error"):
+            continue
         est[kg] = (v["blank_n"] + v["missing_n"], "NE server")
     scan = st["stats"].get("local_scan") or {}
     if time.time() - float(scan.get("ts") or 0) > 86400:
@@ -315,21 +330,37 @@ def process(kg: str, entries: dict | None = None, idx: dict | None = None, *, st
     if not ne_ingest._coverage_complete(kg, entries):
         row.update(skip="incomplete"); return row
     prev = (st or {}).get("kgs", {}).get(kg) or {}
-    view = ne_h3.fetch_declared_view(kg)
-    if view is None:
-        row.update(skip="no view"); return row
-    inbound_budget.add(CHANNEL, len(view.raw) + 2048)
-    vids = np.unique(_view_ids(view))
-    row.update(view_n=int(vids.size), view_digest=view.header.get("digest"), view_source=view.header.get("source"),
-               view_etag=view.header.get("_etag"))
     ids, seen, digest = _ids_observed(p)
-    row.update(file_n=int(ids.size), file_observed=int(seen.size), base_digest=digest)
     # Nothing moved since the last walk (same view ETag, same file digest, no
     # error) → the previous result still stands; re-walking only re-staged a
     # duplicate repost every hour for the ~6 800 NE-server-listed parents.
-    if (prev.get("ts") and time.time() - float(prev["ts"]) < RECHECK_S and not prev.get("error")
-            and prev.get("view_etag") and prev.get("view_etag") == row.get("view_etag")
-            and prev.get("base_digest") == digest):
+    may_skip = bool(prev.get("ts") and time.time() - float(prev["ts"]) < RECHECK_S and not prev.get("error")
+                    and prev.get("view_etag") and prev.get("base_digest") == digest)
+    # The view comes from the stored copy (data/ne/declared/) whenever the
+    # revisit row's declared_etag matches it — no request at all; otherwise
+    # one GET with If-None-Match (304 = 0 bytes).  NE server bandwidth, 2026-11-09.
+    omrow = ((st or {}).get("obs_missing") or {}).get("kgs", {}).get(kg) or {}
+    net0 = ne_h3.declared_net_snapshot()
+    view = ne_h3.declared_view(kg, expect_etag=omrow.get("declared_etag"))
+    net = ne_h3.declared_net_delta(net0)
+    row.update(view_from=(view.header.get("_from") if view is not None else None), view_gets=net["gets"],
+               view_bytes=net["bytes"], not_modified=bool(net["n304"]))
+    if view is None:
+        row.update(skip="no view"); return row
+    if row["view_from"] in ("stored", "304") and may_skip and prev.get("view_etag") == view.header.get("_etag"):
+        row.update(skip="unchanged", blank=prev.get("blank"), residual_n=prev.get("residual_n"),
+                   residual_digest=prev.get("residual_digest"), planned_ts=prev.get("planned_ts"),
+                   view_etag=prev.get("view_etag"), view_n=prev.get("view_n"), view_digest=prev.get("view_digest"),
+                   view_source=prev.get("view_source"), base_digest=digest, file_n=int(ids.size),
+                   file_observed=int(seen.size))
+        return row
+    if row["view_from"] == "200":
+        inbound_budget.add(CHANNEL, len(view.raw) + 2048)
+    vids = np.unique(_view_ids(view))
+    row.update(view_n=int(vids.size), view_digest=view.header.get("digest"), view_source=view.header.get("source"),
+               view_etag=view.header.get("_etag"))
+    row.update(file_n=int(ids.size), file_observed=int(seen.size), base_digest=digest)
+    if may_skip and prev.get("view_etag") == row.get("view_etag"):
         row.update(skip="unchanged", blank=prev.get("blank"), residual_n=prev.get("residual_n"),
                    residual_digest=prev.get("residual_digest"), planned_ts=prev.get("planned_ts"))
         return row
@@ -425,7 +456,7 @@ def run(budget_s: float = 3000, max_kgs: int | None = None, kgs: list[str] | Non
     out = {"candidates": len(todo), "walked": 0, "staged": 0, "planned_kgs": 0, "planned_cells": 0,
            "blank": 0, "borrowable": 0, "residual": 0, "skipped": 0, "errors": 0, "budget_stop": False,
            # NE-server GETs this run: view fetches (full / 304) and bytes
-           "view_gets": 0, "view_304": 0, "view_mb": 0.0}
+           "view_gets": 0, "view_304": 0, "view_mb": 0.0, "view_stored": 0, "revisit_status": None}
     try:
         for kg, g, why in todo:
             if time.time() - t0 > budget_s or (max_kgs and out["walked"] >= max_kgs):
@@ -448,9 +479,10 @@ def run(budget_s: float = 3000, max_kgs: int | None = None, kgs: list[str] | Non
             row["why"] = why
             row["est"] = g
             if "view_bytes" in row:
-                out["view_gets"] += 1
+                out["view_gets"] += int(row.get("view_gets") or 0)
                 out["view_304"] += int(bool(row.get("not_modified")))
-                out["view_mb"] = round(out["view_mb"] + int(row.get("view_bytes") or 0) / 1e6, 2)
+                out["view_stored"] += int(row.get("view_from") == "stored")
+                out["view_mb"] = round(out["view_mb"] + int(row.get("view_bytes") or 0) / 1e6, 3)
             if row.get("skip"):
                 out["skipped"] += 1
             else:
@@ -468,6 +500,14 @@ def run(budget_s: float = 3000, max_kgs: int | None = None, kgs: list[str] | Non
             if out["walked"] % 20 == 0:
                 save_state(st)
     finally:
+        om = st.get("obs_missing") or {}
+        out["revisit_status"] = om.get("last_status")
+        out["revisit_bytes"] = int(om.get("bytes") or 0) if om.get("last_status") == 200 else 0
+        # NE server GETs of this run: 1 revisit + the view GETs; 304 ratio and bytes
+        out["gets"] = out["view_gets"] + (1 if om.get("last_status") else 0)
+        out["gets_304"] = out["view_304"] + int(om.get("last_status") == 304)
+        out["ratio_304"] = round(out["gets_304"] / out["gets"], 3) if out["gets"] else None
+        out["mb"] = round(out["view_mb"] + out["revisit_bytes"] / 1e6, 3)
         out["dt"] = round(time.time() - t0, 1)
         out["at"] = _now()
         st["runs"] = (st.get("runs") or [])[-20:] + [out]
@@ -510,7 +550,9 @@ def text_line() -> str:
                 f" staged={st.get('staged', 0)} sweep={st.get('planned_cells', 0)}c/{st.get('planned_kgs', 0)}kg"
                 f" residual={st.get('residual', 0)} errors={st.get('errors', 0)} waiting={s['staged_waiting']}"
                 f" last_run={lr.get('at', '-')} ({lr.get('walked', 0)} walked, {lr.get('candidates', 0)} cand"
-                f"{', budget stop' if lr.get('budget_stop') else ''})"
+                f"{', budget stop' if lr.get('budget_stop') else ''};"
+                f" NE server gets={lr.get('gets', lr.get('view_gets', 0))} 304={lr.get('gets_304', lr.get('view_304', 0))}"
+                f" stored={lr.get('view_stored', 0)} mb={lr.get('mb', lr.get('view_mb', 0))})"
                 f" scan={s['local_scan'].get('kgs')}kg/{s['local_scan'].get('cells')}c@{s['local_scan'].get('at', '-')}")
     except Exception as ex:  # noqa: BLE001
         return f"viewfill: status failed: {ex}"

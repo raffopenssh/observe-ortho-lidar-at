@@ -5,6 +5,12 @@ from pathlib import Path
 os.environ.setdefault("SRTM_APP_IMPORT_ONLY", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ne_ingest
+import pytest
+
+
+@pytest.fixture
+def tmp(tmp_path: Path) -> Path:
+    return tmp_path
 
 
 def _entry(blob, at="2026-11-01T00:00:00+00:00"):

@@ -126,22 +126,45 @@ hour only to compare the ETag (`skip=unchanged`), and `vct_fleet` polled
 `GET {kg}/report` (~1 MB, whole history) every 30 min for rows that never
 POSTed (`skip_rep`) and so were "not listed" forever. Rules now:
 
-* `ne_h3.fetch_declared_view(kg, etag=…)` sends `If-None-Match`; 304 →
-  `ne_h3.VIEW_UNCHANGED` (0 bytes). The walk uses it whenever the file
-  digest equals the last walk's (`may_skip`); the body is only pulled when
-  the view moved or the file changed. Per-run counters in `state.runs[-1]`:
-  `view_gets` / `view_304` / `view_mb`.
-* `revisit?kind=obs_missing&all=1` is ETag-conditional in the builder too
-  (`state.obs_missing{etag,kgs,hits_304}`) — `ne_ingest.refresh_obs_missing`
-  already was.
+* **Stored `/declared` copies** — `data/ne/declared/<kg>.nec1` + `<kg>.json`
+  (`etag, fetched_at, bytes, source, digest, n`), via `ne_h3.declared_view(kg,
+  expect_etag=…, refresh=…)`:
+  - revisit rows carry `declared_etag` (the ETag `GET {kg}/declared` answers
+    for the view the row was computed on). Equal to the stored copy's ETag ⇒
+    the copy is current: **no request** (`header._from="stored"`), the walk /
+    the POST build run on it.
+  - different or no copy ⇒ one `GET` with `If-None-Match: <stored ETag>`:
+    304 ⇒ stored copy (0 bytes, `_from="304"`), 200 ⇒ body + ETag stored
+    (`_from="200"`), 404 ⇒ copy dropped, `None`.
+  - `refresh=True` (the 409 "view moved" retry in `_post_bare_on_view`)
+    skips the first rule but still sends `If-None-Match`.
+  - `ne_h3.fetch_declared_view(kg, etag=)` is the raw GET underneath
+    (304 → `VIEW_UNCHANGED`); new code should call `declared_view`.
+* `revisit?kind=obs_missing&all=1` is ETag-conditional in the builder
+  (`state.obs_missing{etag,kgs,hits_304,last_status,fetched_ts}`) and in
+  `ne_ingest.refresh_obs_missing` (hourly, at most). A 304 means the list is
+  the one already walked: the NE server-listed KGs walked since `fetched_ts` are
+  dropped from the run (local / mixed candidates keep their 7-day gates).
+* No `GET {kg}/report` at all (`vct_fleet._confirm_contrib` takes the POST
+  answer, `http==200`). Should it ever be needed again: at most once per
+  day per KG, with `?observer=<id>&since=<received_at of the last line
+  seen>&limit=N` and `If-None-Match`.
 * The timer runs every 3 h (obs_missing is recomputed every ~3 h on the NE server's
-  side; hourly changed nothing). Each KG is walked at most once per run
-  (`candidates()` is a dict keyed by KG).
-* The `/declared` GET right before a POST (`_post_bare_on_view`) stays
-  unconditional — it is one GET per POST, and the body is needed.
+  side). Each KG is walked at most once per run (`candidates()` is a dict
+  keyed by KG; `process` is the only `/declared` caller in the walk).
 
-Target agreed with NE server: < 100 MB/day. Check with
-`python3 -c 'import json;print(json.load(open("data/ne/viewfill/state.json"))["runs"][-1])'`.
+Counters (what to report to the NE server): per run in `state.runs[-1]` —
+`gets` (1 revisit + view GETs), `gets_304`, `ratio_304`, `mb`, plus
+`view_stored` (views served from the copy without a request) and
+`revisit_status`; the `status` line prints `the NE server gets=… 304=… stored=…
+mb=…`. The post loop keeps the same per tick in
+`idx.stats.the NE server_last.declared {gets,n304,bytes,stored,mb,ratio_304}` and
+cumulatively in `idx.stats.declared_net`. Process-wide source:
+`ne_h3.DECLARED_NET` / `declared_net_delta(snapshot)`.
+
+Target agreed with the NE server: < 100 MB/day. Expected steady state: a run is
+1 revisit GET (304, 0 bytes) and 0 view GETs; a listed KG whose view moved
+costs one 200 (~0.2 MB) per view change, shared by walk and POST.
 
 No repeats: the post loop checkpoints `data/ne/index.json` every 60 s (a
 restart mid-tick used to forget the whole tick's posts), and before every

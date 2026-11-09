@@ -1073,8 +1073,11 @@ def _post_bare_on_view(parent: str, want: str, c: dict, green_fix: bool,
     (``answer["unchanged"] is True``)."""
     import ne_h3
     last = None
+    # the stored copy serves when the revisit row's declared_etag matches it
+    # (no GET); otherwise one If-None-Match GET (NE server bandwidth, 2026-11-09)
+    omrow = ((idx_stats_obs_missing() or {}).get("kgs") or {}).get(parent) or {}
     for attempt in range(2):
-        view = ne_h3.fetch_declared_view(parent)
+        view = ne_h3.declared_view(parent, expect_etag=omrow.get("declared_etag"), refresh=attempt > 0)
         if view is None:
             raise ne_h3.NEError(f"the NE server {parent}/declared: 404 (KG holds nothing)")
         sec, st = ne_h3.neo1_section_on_view(path_for(parent), view, green_fix=green_fix)
@@ -1124,6 +1127,13 @@ def _nodata_settled(omx: dict | None, obs: dict) -> bool:
     return False
 
 
+_OBS_MISSING_LAST: dict = {}     # the last refresh_obs_missing answer (declared_etag lookup at POST time)
+
+
+def idx_stats_obs_missing() -> dict:
+    return _OBS_MISSING_LAST
+
+
 def refresh_obs_missing(idx: dict, force: bool = False) -> dict:
     """``GET /contrib/api/v1/ne/revisit?kind=obs_missing&all=1`` (ETag-conditional,
     at most hourly) → ``idx["stats"]["obs_missing"]`` = ``{fetched_at, etag,
@@ -1135,6 +1145,7 @@ def refresh_obs_missing(idx: dict, force: bool = False) -> dict:
     cur = idx["stats"].get("obs_missing") or {}
     now = time.time()
     legacy = any("blank_n" not in v for v in (cur.get("kgs") or {}).values())   # snapshot from before the nodata fields
+    _OBS_MISSING_LAST.clear(); _OBS_MISSING_LAST.update(cur)
     if not force and not legacy and now - float(cur.get("fetched_ts") or 0) < OBS_MISSING_REFRESH_S:
         return cur
     if legacy:
@@ -1164,6 +1175,7 @@ def refresh_obs_missing(idx: dict, force: bool = False) -> dict:
                 # flagged view_rekey.coverage="swept" (NE server 2026-11-06); older
                 # the NE server answers carry neither → None (not 0: "unknown")
                 kgs[kg] = {"missing_n": int(x.get("missing_n") or 0), "extra_n": int(x.get("extra_n") or 0),
+                           "declared_etag": x.get("declared_etag"),
                            "blank_n": (int(x["blank_n"]) if x.get("blank_n") is not None else None),
                            "nodata_n": (int(x["nodata_n"]) if x.get("nodata_n") is not None else None),
                            "coverage": x.get("coverage"), "view_source": x.get("view_source")}
@@ -1176,6 +1188,7 @@ def refresh_obs_missing(idx: dict, force: bool = False) -> dict:
                "kgs_obs_nodata": oc.get("kgs_obs_nodata"), "cells_obs_nodata": oc.get("cells_obs_nodata"),
                "passes": oc.get("passes")}
         idx["stats"]["obs_missing"] = cur
+        _OBS_MISSING_LAST.clear(); _OBS_MISSING_LAST.update(cur)
         log.info("ne_ingest: the NE server obs_missing: %d KGs / %d cells (pass %s)", len(kgs), cur["cells_n"], cur["pass_at"])
     except Exception as ex:  # noqa: BLE001
         cur["fetched_ts"] = now
@@ -1227,6 +1240,7 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
            "nodata_held": 0, "unswept_held": 0, "coverage_due": 0, "coverage_posted": 0, "viewfill_due": 0}
     now = time.time()
     cov_ctx = ne_h3.coverage_context(force=True)       # sweep + viewfill state, once per tick
+    net0 = ne_h3.declared_net_snapshot()               # /declared GETs of this tick (NE server bandwidth)
     conf = idx.setdefault("ne_server", {})
     max_posts = int(_knob("ne_post_max_per_tick", max_posts))
     day = time.strftime("%Y-%m-%d", time.gmtime())
@@ -1566,6 +1580,10 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
             log.warning("ne_ingest: NEO1 post %s%s failed (attempt %d): %s", parent,
                         " (NEC1+NEO1)" if bev_body else (" (on view)" if on_view else ""), n, str(ex)[:160])
     out["candidates"] = len(cands)
+    out["declared"] = ne_h3.declared_net_delta(net0)   # {gets, n304, bytes, stored, mb, ratio_304}
+    dn = idx["stats"].setdefault("declared_net", {"gets": 0, "n304": 0, "bytes": 0, "stored": 0, "since": _now()})
+    for k in ("gets", "n304", "bytes", "stored"):
+        dn[k] = int(dn.get(k) or 0) + int(out["declared"][k])
     idx["stats"]["ne_server_last"] = dict(out, at=_now())
     return out
 

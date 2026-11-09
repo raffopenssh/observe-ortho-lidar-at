@@ -1889,22 +1889,29 @@ def _als_header_for(hdr: dict, obs: bytes) -> dict | None:
 # === SECTION: declared view (NE server chunk-log view, 2026-10-27) ===
 
 VIEW_UNCHANGED = "view-unchanged"   # fetch_declared_view(..., etag=…) answered 304
+DECLARED_DIR = NE_DIR / "declared"   # stored copies: <kg>.nec1 (the answer body) + <kg>.json (etag, …)
+# process-wide counters of the /declared path (NE server bandwidth, 2026-11-09):
+# gets = requests sent, n304 = answered 304, bytes = body bytes received,
+# stored = served from DECLARED_DIR without a request (row.declared_etag ==
+# stored ETag).  Callers snapshot/diff (``declared_net_delta``).
+DECLARED_NET = {"gets": 0, "n304": 0, "bytes": 0, "stored": 0, "errors": 0}
 
 
-def fetch_declared_view(kg: str, timeout: float = 120.0, etag: str | None = None) -> "Section | str | None":
-    """``GET /contrib/api/v1/ne/{kg}/declared`` → the NEC1 section NE server
-    assembles from its chunk log (``source: chunks@<state>``, header
-    ``view{state,hidden,…}``, register bytes zero).  This is the cell set a
-    bare NEO1 is validated against since 2026-10-27 (ne-change.md §4b).
-    ``None`` when the KG holds nothing (404).  ~0.2 MB per KG, never cached
-    on disk — call it only right before a POST.
+def declared_net_snapshot() -> dict:
+    return dict(DECLARED_NET)
 
-    *etag* (the ``_etag`` of an earlier answer) is sent as ``If-None-Match``;
-    a 304 returns :data:`VIEW_UNCHANGED` (0 bytes — NE server bandwidth,
-    2026-11-09).  Callers that need the body must then reuse their own copy
-    or call again without *etag*."""
+
+def declared_net_delta(before: dict) -> dict:
+    d = {k: int(DECLARED_NET.get(k) or 0) - int(before.get(k) or 0) for k in DECLARED_NET}
+    d["mb"] = round(d["bytes"] / 1e6, 3)
+    d["ratio_304"] = round(d["n304"] / d["gets"], 3) if d["gets"] else None
+    return d
+
+
+def _declared_fetch(kg: str, timeout: float, etag: str | None):
+    """One ``GET {kg}/declared`` with retries → ``(status, body, etag)``;
+    status ∈ {200, 304, 404}.  Raises :class:`NEError` on anything else."""
     import requests
-    kg = str(kg).zfill(5)
     url = f"{_ne_server_contrib_base()}/{kg}/declared"
     last = None
     h = _ne_server_headers()
@@ -1917,24 +1924,129 @@ def fetch_declared_view(kg: str, timeout: float = 120.0, etag: str | None = None
             last = e
             time.sleep(2 + 3 * attempt)
             continue
+        DECLARED_NET["gets"] += 1
         if r.status_code == 404:
-            return None
+            return 404, b"", None
         if r.status_code == 304 and etag:
-            return VIEW_UNCHANGED
+            DECLARED_NET["n304"] += 1
+            return 304, b"", etag
         if r.status_code in (429, 500, 502, 503, 504):
-            last = NEError(f"NE server {kg}/declared: HTTP {r.status_code}")
+            last = NEError(f"the NE server {kg}/declared: HTTP {r.status_code}")
+            DECLARED_NET["errors"] += 1
             time.sleep(5 + 10 * attempt)
             continue
         if r.status_code in (401, 403):
-            raise NEError(f"NE server {kg}/declared: HTTP {r.status_code} — token refused")
+            raise NEError(f"the NE server {kg}/declared: HTTP {r.status_code} — token refused")
         r.raise_for_status()
-        secs = [s for s in unpack_sections(r.content) if s.magic == MAGIC_LU]
-        if not secs:
-            raise NEError(f"NE server {kg}/declared: no NEC1 section in answer")
-        sec = secs[0]
-        sec.header.setdefault("_etag", r.headers.get("ETag"))
-        return sec
-    raise NEError(f"NE server {kg}/declared: {last}")
+        DECLARED_NET["bytes"] += len(r.content)
+        return 200, r.content, r.headers.get("ETag")
+    raise NEError(f"the NE server {kg}/declared: {last}")
+
+
+def _declared_parse(kg: str, body: bytes, etag: str | None) -> "Section":
+    secs = [s for s in unpack_sections(body) if s.magic == MAGIC_LU]
+    if not secs:
+        raise NEError(f"the NE server {kg}/declared: no NEC1 section in answer")
+    sec = secs[0]
+    sec.header["_etag"] = etag
+    return sec
+
+
+def fetch_declared_view(kg: str, timeout: float = 120.0, etag: str | None = None) -> "Section | str | None":
+    """``GET /contrib/api/v1/ne/{kg}/declared`` → the NEC1 section the NE server
+    assembles from its chunk log (``source: chunks@<state>``, header
+    ``view{state,hidden,…}``, register bytes zero).  This is the cell set a
+    bare NEO1 is validated against since 2026-10-27 (ne-change.md §4b).
+    ``None`` when the KG holds nothing (404).  ~0.2 MB per KG.
+
+    *etag* (the ``_etag`` of an earlier answer) is sent as ``If-None-Match``;
+    a 304 returns :data:`VIEW_UNCHANGED` (0 bytes — NE server bandwidth,
+    2026-11-09).  Prefer :func:`declared_view`, which keeps the stored copy
+    and makes every GET conditional."""
+    kg = str(kg).zfill(5)
+    status, body, et = _declared_fetch(kg, timeout, etag)
+    if status == 404:
+        return None
+    if status == 304:
+        return VIEW_UNCHANGED
+    return _declared_parse(kg, body, et)
+
+
+def declared_stored_etag(kg: str) -> str | None:
+    """ETag of the stored ``{kg}/declared`` copy, None without one."""
+    kg = str(kg).zfill(5)
+    try:
+        m = json.loads((DECLARED_DIR / f"{kg}.json").read_text())
+        if (DECLARED_DIR / f"{kg}.nec1").exists() and m.get("etag"):
+            return m["etag"]
+    except Exception:
+        pass
+    return None
+
+
+def _declared_store(kg: str, body: bytes, etag: str | None, sec: "Section") -> None:
+    DECLARED_DIR.mkdir(parents=True, exist_ok=True)
+    tb = DECLARED_DIR / f".{kg}.nec1.tmp"
+    tb.write_bytes(body); os.replace(tb, DECLARED_DIR / f"{kg}.nec1")
+    meta = {"etag": etag, "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "bytes": len(body),
+            "source": sec.header.get("source"), "digest": sec.header.get("digest"), "n": int(sec.header.get("n") or 0)}
+    tj = DECLARED_DIR / f".{kg}.json.tmp"
+    tj.write_text(json.dumps(meta)); os.replace(tj, DECLARED_DIR / f"{kg}.json")
+
+
+def _declared_drop(kg: str) -> None:
+    for suf in (".nec1", ".json"):
+        (DECLARED_DIR / f"{kg}{suf}").unlink(missing_ok=True)
+
+
+def declared_view(kg: str, *, expect_etag: str | None = None, refresh: bool = False,
+                  timeout: float = 120.0) -> "Section | None":
+    """The ``{kg}/declared`` view, from the stored copy when it is current
+    (NE server bandwidth rules, 2026-11-09):
+
+    * *expect_etag* (the revisit row's ``declared_etag``) equal to the stored
+      ETag → the stored copy, **no request**;
+    * otherwise ``GET`` with ``If-None-Match: <stored ETag>``: 304 → the
+      stored copy (0 bytes), 200 → body + ETag stored, 404 → copy dropped,
+      None.
+    * *refresh* skips the first rule (a 409 "view moved" retry).
+
+    ``header["_etag"]`` carries the ETag, ``header["_from"]`` ∈ {stored,
+    304, 200}."""
+    kg = str(kg).zfill(5)
+    stored = declared_stored_etag(kg)
+    bp = DECLARED_DIR / f"{kg}.nec1"
+    if stored and not refresh and expect_etag and expect_etag == stored:
+        try:
+            sec = _declared_parse(kg, bp.read_bytes(), stored)
+            sec.header["_from"] = "stored"
+            DECLARED_NET["stored"] += 1
+            return sec
+        except Exception as ex:  # noqa: BLE001
+            log.warning("ne_h3: stored declared view %s unreadable (%s) — refetching", kg, ex)
+            _declared_drop(kg); stored = None
+    status, body, et = _declared_fetch(kg, timeout, stored)
+    if status == 404:
+        _declared_drop(kg)
+        return None
+    if status == 304:
+        try:
+            sec = _declared_parse(kg, bp.read_bytes(), stored)
+            sec.header["_from"] = "304"
+            return sec
+        except Exception as ex:  # noqa: BLE001
+            log.warning("ne_h3: stored declared view %s unreadable after 304 (%s) — refetching", kg, ex)
+            _declared_drop(kg)
+            status, body, et = _declared_fetch(kg, timeout, None)
+            if status == 404:
+                return None
+    sec = _declared_parse(kg, body, et)
+    sec.header["_from"] = "200"
+    try:
+        _declared_store(kg, body, et, sec)
+    except Exception as ex:  # noqa: BLE001
+        log.warning("ne_h3: could not store declared view %s: %s", kg, ex)
+    return sec
 
 
 def unseen_obs_row(cid: int) -> bytes:
