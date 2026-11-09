@@ -424,7 +424,7 @@ def run(budget_s: float = 3000, max_kgs: int | None = None, kgs: list[str] | Non
         todo = candidates(all_kgs=all_kgs, st=st)
     out = {"candidates": len(todo), "walked": 0, "staged": 0, "planned_kgs": 0, "planned_cells": 0,
            "blank": 0, "borrowable": 0, "residual": 0, "skipped": 0, "errors": 0, "budget_stop": False,
-           # umfeld GETs this run: view fetches (full / 304) and bytes — the budget umfeld asked us to keep
+           # NE-server GETs this run: view fetches (full / 304) and bytes
            "view_gets": 0, "view_304": 0, "view_mb": 0.0}
     try:
         for kg, g, why in todo:

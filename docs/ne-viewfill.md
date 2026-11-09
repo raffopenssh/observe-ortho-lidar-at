@@ -14,8 +14,8 @@ flight_years 0) — NE server lists them under `revisit?kind=obs_missing`
 
 ## Pieces
 
-* `ne_viewfill.py` — the builder. Own process (`ne-viewfill.service`, hourly
-  `ne-viewfill.timer` at :20, nice 15 / idle IO / 2 GB / 40 min budget) so the
+* `ne_viewfill.py` — the builder. Own process (`ne-viewfill.service`,
+  `ne-viewfill.timer` every 3 h at :20 (hourly until 2026-11-09), nice 15 / idle IO / 2 GB / 40 min budget) so the
   view fetches, corpus look-ups and merges never run inside gunicorn or the
   director tick. Candidates = NE server `obs_missing` ∪ local scan of
   coverage-complete parents with unseen rows (cached 24 h) ∪ mixed parents;
@@ -117,6 +117,31 @@ borrowable / staged / sweep=<cells>c/<kg>kg / residual / waiting` (builder
 totals) · `tick: applied swapped rejected sweep repost errors due` (ingest
 side) · `view_pass … viewfill N` = forced re-posts done. Sweep units show up
 in `sweep:` as `-sw<k>` units with `source=viewfill`.
+
+## NE server bandwidth (2026-11-09)
+
+The NE server measured 3 257 GETs / 1.55 GB per day from us, zero conditional:
+~100 listed candidates re-downloaded their 0.2 MB `/declared` view every
+hour only to compare the ETag (`skip=unchanged`), and `vct_fleet` polled
+`GET {kg}/report` (~1 MB, whole history) every 30 min for rows that never
+POSTed (`skip_rep`) and so were "not listed" forever. Rules now:
+
+* `ne_h3.fetch_declared_view(kg, etag=…)` sends `If-None-Match`; 304 →
+  `ne_h3.VIEW_UNCHANGED` (0 bytes). The walk uses it whenever the file
+  digest equals the last walk's (`may_skip`); the body is only pulled when
+  the view moved or the file changed. Per-run counters in `state.runs[-1]`:
+  `view_gets` / `view_304` / `view_mb`.
+* `revisit?kind=obs_missing&all=1` is ETag-conditional in the builder too
+  (`state.obs_missing{etag,kgs,hits_304}`) — `ne_ingest.refresh_obs_missing`
+  already was.
+* The timer runs every 3 h (obs_missing is recomputed every ~3 h on the NE server's
+  side; hourly changed nothing). Each KG is walked at most once per run
+  (`candidates()` is a dict keyed by KG).
+* The `/declared` GET right before a POST (`_post_bare_on_view`) stays
+  unconditional — it is one GET per POST, and the body is needed.
+
+Target agreed with NE server: < 100 MB/day. Check with
+`python3 -c 'import json;print(json.load(open("data/ne/viewfill/state.json"))["runs"][-1])'`.
 
 No repeats: the post loop checkpoints `data/ne/index.json` every 60 s (a
 restart mid-tick used to forget the whole tick's posts), and before every
