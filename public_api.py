@@ -14,6 +14,7 @@ thread set). ``hillshade_tiles`` is reused as-is.
 """
 from __future__ import annotations
 
+import email.utils
 import gzip
 import hashlib
 import json
@@ -118,6 +119,8 @@ def _common_headers(resp):
             resp.headers['Access-Control-Allow-Origin'] = '*'
             resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, If-None-Match'
             resp.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+            resp.headers['Access-Control-Expose-Headers'] = ('ETag, Last-Modified, Cache-Control, Content-Encoding, Retry-After, '
+                                                             'X-Cells-Gen, X-Cells-Epoch, X-Cells-Source, X-KG-Universe-Hash, X-Data-Attribution')
         resp.headers.setdefault('X-Data-Attribution', ATTRIBUTION_HDR)
         resp.headers.setdefault('Link', f'<{LICENSE_URL}>; rel="license"')
         # gzip JSON/text/binary ≥ 1 KiB (not h3b — already deflated)
@@ -339,6 +342,10 @@ def heightfield():
     return _json(payload, st, max_age=3600)
 
 
+TREES_REV = 'trees-c1'          # bump when the /trees/bbox body layout or QA rules change (part of the ETag)
+TREES_MAX_AGE = 86400          # answers change only when a KG is reprocessed; ETag revalidation is index-only
+
+
 def _flag_arg(name: str, default: bool) -> bool:
     v = request.args.get(name)
     if v is None or v == '':
@@ -365,50 +372,96 @@ def trees_bbox():
         types = {t.strip().lower() for t in request.args['types'].split(',') if t.strip()}
     realistic = _flag_arg('realistic', True)
     import ne_trees
+    fmt = (request.args.get('format') or 'json').strip().lower()
+    if fmt not in ('json', 'geojson', 'columns'):
+        return _err('format must be json | geojson | columns', 400)
+    max_limit = ne_trees.MAX_LIMIT_COLUMNS if fmt == 'columns' else ne_trees.MAX_LIMIT
     try:
         min_h = float(request.args.get('min_height') or 0)
         max_h = request.args.get('max_height')
         max_h = float(max_h) if max_h not in (None, '') else None
-        limit = int(request.args.get('limit') or ne_trees.DEFAULT_LIMIT)
+        limit = int(request.args.get('limit') or (max_limit if fmt == 'columns' else ne_trees.DEFAULT_LIMIT))
     except ValueError:
         return _err('min_height / max_height / limit must be numbers', 400)
     if max_h is not None and max_h <= min_h:
         return _err('max_height must be greater than min_height (window is min_height <= h < max_height)', 400)
-    if limit > ne_trees.MAX_LIMIT:
-        return _err(f'limit must be <= {ne_trees.MAX_LIMIT}', 400)
+    if limit > max_limit:
+        return _err(f'limit must be <= {max_limit} for format={fmt}', 400)
+    fields = None
+    if request.args.get('fields'):
+        fields = tuple(f.strip() for f in request.args['fields'].split(',') if f.strip())
+        bad = [f for f in fields if f not in ne_trees.COLUMN_FIELDS[kind]]
+        if bad:
+            return _err(f'unknown fields: {",".join(bad)}', 400, allowed=list(ne_trees.COLUMN_FIELDS[kind]))
+    # Strong ETag from the per-KG NE file state (neo1_digest changes only when
+    # a KG is reprocessed / re-ingested) + the canonical query + code revision.
+    # Computed BEFORE the scan so a matching If-None-Match is index-only.
+    st = ne_trees.bbox_state(*bb)
+    canon = '&'.join(f'{k}={v}' for k, v in sorted(request.args.items(multi=True)) if k != 'pretty')
+    etag = '"t-' + hashlib.sha256(('|'.join(st['digests']) + '\n' + canon + '\n' + TREES_REV).encode()).hexdigest()[:20] + '"'
+    cacheable = st['ready']
+    cc = f'public, max-age={TREES_MAX_AGE}' if cacheable else 'no-store'
+    lm = email.utils.formatdate(st['mtime'], usegmt=True) if st['mtime'] else None
+    hdrs = {'ETag': etag, 'Cache-Control': cc}
+    if lm:
+        hdrs['Last-Modified'] = lm
+    if cacheable:
+        inm = request.headers.get('If-None-Match') or ''
+        if etag in [x.strip() for x in inm.split(',')] or inm.strip() == '*':
+            return Response(status=304, headers=hdrs)
     try:
-        t = lq.trees_bbox(*bb, min_height=min_h, max_height=max_h, limit=limit,
-                          realistic=realistic, kind=kind, types=types)
+        if fmt == 'columns':
+            t = ne_trees.columns_bbox(*bb, kind, fields=fields, min_height=min_h, max_height=max_h, limit=limit,
+                                      realistic=realistic, types=types)
+        else:
+            t = lq.trees_bbox(*bb, min_height=min_h, max_height=max_h, limit=limit,
+                              realistic=realistic, kind=kind, types=types)
+    except ValueError as e:
+        return _err(str(e), 400)
     except Exception as e:  # noqa: BLE001
+        log.exception('trees_bbox %s', bb)
         return _err(str(e), 500)
     key = 'trees' if kind == 'trees' else 'structures'
     ready = bool(t['ready'])
+    n_out = t['n'] if fmt == 'columns' else len(t['trees'])
     extra = {}
-    if not t['trees']:
-        st = ne_trees.status()
-        if not st['ok']:
+    if not n_out:
+        sti = ne_trees.status()
+        if not sti['ok']:
             ready = False
-            extra['error'] = st.get('error') or 'cells index unusable'
+            extra['error'] = sti.get('error') or 'cells index unusable'
             extra['retry_after_s'] = 600
     if t['pending_kgs']:
         extra['pending_kgs'] = t['pending_kgs']; extra['retry_after_s'] = 300
     if t['not_processed']:
         extra['not_processed'] = t['not_processed']
+    if not ready:
+        hdrs['Cache-Control'] = 'no-store'
     meta = dict(docs.TREES_META if kind == 'trees' else docs.STRUCTURES_META, realistic=realistic,
                 min_height=t['min_height'], max_height=t['max_height'], limit=t['limit'],
-                max_limit=ne_trees.MAX_LIMIT, chunks_scanned=t['chunks_scanned'], ms=t['ms'])
-    fmt = request.args.get('format', 'json')
-    if fmt == 'geojson':
-        fc = {'type': 'FeatureCollection',
-              'features': [{'type': 'Feature', 'geometry': {'type': 'Point', 'coordinates': [x['lon'], x['lat']]},
-                            'properties': {k: v for k, v in x.items() if k not in ('lon', 'lat')}}
-                           for x in t['trees']],
-              'meta': _meta(count=len(t['trees']), truncated=t['truncated'], dropped_qa=t['dropped_qa'],
-                            kgs=t['kgs'], ready=ready, **extra, **meta)}
-        return _json(fc)
-    return _json({'bbox': list(bb), 'objects': kind, key: t['trees'], 'count': len(t['trees']),
-                  'truncated': t['truncated'], 'dropped_qa': t['dropped_qa'], 'kgs': t['kgs'],
-                  'ready': ready, **extra, 'meta': _meta(**meta)})
+                max_limit=max_limit, chunks_scanned=t['chunks_scanned'], ms=t['ms'])
+    if fmt == 'columns':
+        meta['columns_note'] = docs.TREES_COLUMNS_NOTE
+        body = {'bbox': list(bb), 'objects': kind, 'format': 'columns', 'fields': t['fields'], 'order': t['order'],
+                'columns': t['columns'], 'count': n_out, 'truncated': t['truncated'], 'dropped_qa': t['dropped_qa'],
+                'kgs': t['kgs'], 'ready': ready, **extra, 'meta': _meta(**meta)}
+    elif fmt == 'geojson':
+        body = {'type': 'FeatureCollection',
+                'features': [{'type': 'Feature', 'geometry': {'type': 'Point', 'coordinates': [x['lon'], x['lat']]},
+                              'properties': {k: v for k, v in x.items() if k not in ('lon', 'lat')}}
+                             for x in t['trees']],
+                'meta': _meta(count=n_out, truncated=t['truncated'], dropped_qa=t['dropped_qa'],
+                              kgs=t['kgs'], ready=ready, **extra, **meta)}
+    else:
+        body = {'bbox': list(bb), 'objects': kind, key: t['trees'], 'count': n_out,
+                'truncated': t['truncated'], 'dropped_qa': t['dropped_qa'], 'kgs': t['kgs'],
+                'ready': ready, **extra, 'meta': _meta(**meta)}
+    resp = Response(json.dumps(body, separators=(',', ':'), ensure_ascii=False,
+                               indent=1 if request.args.get('pretty') else None).encode(),
+                    mimetype='application/json')
+    for k, v in hdrs.items():
+        resp.headers[k] = v
+    return resp
 
 
 @app.route('/api/v1/landmarks/bbox')

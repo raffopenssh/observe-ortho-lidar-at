@@ -1141,12 +1141,14 @@ Grid cell (r,c) → lon = w + c*cell/(111320*cos(lat)), lat = n - r*cell/110540.
 Recipe — everything a 2.5D renderer needs for one KG, all <100 ms each:
   /api/v1/kg/<kg>/heightfield?cell=50                    terrain grid
   /api/v1/kg/<kg>/heightfield?cell=50&landcover=1        + dominant land-cover class per cell (2.1+)
-  /api/v1/trees/bbox?west&south&east&north&min_height=20 sampled tallest trees (index, <10 ms)
+  /api/v1/trees/bbox?bbox=…&min_height=3&format=columns      every apex of the bbox as parallel arrays (NE corpus, ~6 B/apex gz;
+                                                          public tier: see /api/v1/docs/llm.txt § Trees, landmarks, buildings)
 AVOID for interactive use: /kg/<kg>/segments (GPKG fetch) and every POST
 raster endpoint (10–60 s).
 
 #### Index-backed fast routes (also on the public tier :8100)
-  GET /api/v1/trees/bbox      sampled tree apices in a bbox (index, <10 ms)
+  GET /api/v1/trees/bbox      tree apices / structures in a bbox (NE corpus; format=columns&fields=, limit ≤ 100000,
+                              strong per-KG-state ETag + Last-Modified, max-age 86400, 304 on If-None-Match)
   GET /tiles/{hillshade|slope|ndsm}/{z}/{x}/{y}.png   z10-17 WebMercator, from the 25 m grid25 DTM; 204 = no data
   All CORS *, ETag, gzip, index-backed (never a KG JSON / GPKG read).
 
@@ -1398,5 +1400,6 @@ curl 'http://localhost:8000/api/v1/kg/91109?index_only=true'
 curl -X POST 'http://localhost:8000/api/v1/index/rebuild'
 
 # Sampled tallest trees in a bbox (index, <10 ms)
-curl 'http://localhost:8000/api/v1/trees/bbox?west=15.4&south=47.0&east=15.5&north=47.1&min_height=25'
+# All apices ≥ 3 m of one 0.025° tile as columns (lon,lat,h_m,crown_m2; ~190 KB gz, ~15 ms warm)
+curl --compressed 'http://localhost:8100/api/v1/trees/bbox?bbox=10.075,47.125,10.1,47.15&min_height=3&format=columns'
 ```

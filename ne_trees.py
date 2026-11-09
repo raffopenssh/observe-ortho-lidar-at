@@ -270,58 +270,141 @@ def _decode(kind: str, ch) -> tuple[np.ndarray, np.ndarray, dict]:
     return h, cell_idx, d
 
 
-def points_bbox(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int = DEFAULT_LIMIT,
-                realistic: bool = True, types: set | None = None, max_height: float | None = None) -> dict:
-    """All objects of ``kind`` in bbox, tallest first, ≤ limit.
+# ── decoded-chunk cache ────────────────────────────────────────────────
+# One fully decoded, reprojected chunk per (kg, digest, r10, kind): lon/lat,
+# heights, attributes and the *height-independent* part of the realistic
+# rule (saturation / spike / per-type caps / confidence).  A band request
+# (3–8, 8–14 …) over an already-seen tile is then a boolean mask per chunk —
+# no inflate, no decode, no pyproj — so umfeld-at's 4 parallel bands cost
+# roughly one scan.  The bbox / min_h / max_h / flag filters stay per request.
+
+def _dec_bytes(d: dict) -> int:
+    return sum(int(v.nbytes) for v in d.values() if hasattr(v, 'nbytes')) + 256
+
+
+import mem_lru as _mem_lru
+_dec_lru = _mem_lru.ByteLRU('ne_trees_decoded', 96, sizer=_dec_bytes, env='NE_TREES_DECODED_MB')
+_STRUCT_CAP = None
+
+
+def _struct_cap() -> np.ndarray:
+    global _STRUCT_CAP
+    if _STRUCT_CAP is None:
+        _STRUCT_CAP = np.array([STRUCT_H_MAX.get(t, 300.0) for t in ca.STRUCTURE_TYPES]
+                               + [300.0] * (16 - len(ca.STRUCTURE_TYPES)))
+    return _STRUCT_CAP
+
+
+_dec_locks = [threading.Lock() for _ in range(256)]   # striped single-flight: concurrent bands of a cold
+                                                        # tile decode each chunk once, not once per request
+
+
+def _decoded_chunk(kg: str, r: dict, hdr: dict, kind: str) -> dict | None:
+    key = (kg, hdr['neo1_digest'], int(r['r10']), kind)
+    d = _dec_lru.get(key)
+    if d is not None:
+        return d
+    with _dec_locks[hash(key) & 255]:
+        d = _dec_lru.get(key)
+        if d is not None:
+            return d
+        return _decode_chunk_uncached(key, kg, r, hdr, kind)
+
+
+def _decode_chunk_uncached(key, kg: str, r: dict, hdr: dict, kind: str) -> dict:
+    ch = ca._load_chunk(kg, r, hdr)
+    hs, cell_idx, dec = _decode(kind, ch)
+    if hs.size == 0:
+        d = {'n': 0}
+        _dec_lru.put(key, d)
+        return d
+    cen = ch.centres()
+    x = cen[cell_idx, 0] + dec['dx']; y = cen[cell_idx, 1] + dec['dy']
+    lon, lat = ca._tf('EPSG:3035', 'EPSG:4326').transform(x, y)
+    d = {'n': int(hs.size), 'lon': np.asarray(lon, np.float64), 'lat': np.asarray(lat, np.float64),
+         'x': x.astype(np.int32), 'y': y.astype(np.int32), 'h': hs.astype(np.float32),
+         'cell': ch.ids[cell_idx].astype(np.uint64)}
+    if kind == 'trees':
+        ok = hs < TREE_H_SATURATED
+        if hs.size > 1 and hs.max() >= TREE_SPIKE_H:
+            srt = np.sort(hs)
+            p90 = float(np.percentile(hs, 90)); sec = float(srt[-2])
+            spike = (hs >= TREE_SPIKE_H) & ((hs / max(p90, 1.0) > TREE_SPIKE_RATIO) | (hs - sec > TREE_SPIKE_GAP))
+            ok &= ~spike
+        d.update(crown_m2=dec['crown_m2'].astype(np.float32), species=dec['species'].astype(np.uint8),
+                 vitality=dec['vitality'].astype(np.uint8), ndsm_only=dec['ndsm_only'].astype(bool))
+    else:
+        ok = (hs <= _struct_cap()[dec['type']]) & (dec['conf'] >= STRUCT_CONF_MIN)
+        d.update(type=dec['type'].astype(np.uint8), h_robust_m=dec['h_robust_m'].astype(np.float32),
+                 area_m2=dec['area_m2'].astype(np.int32), conf=dec['conf'].astype(np.float32),
+                 dh_m=dec['dh_m'].astype(np.float32))
+    d['ok'] = ok
+    _dec_lru.put(key, d)
+    return d
+
+
+# ── per-request state (ETag / Last-Modified) ───────────────────────────
+
+def bbox_state(w, s, e, n) -> dict:
+    """What the answer for this bbox depends on: the NE files of the
+    intersecting KGs (neo1_digest changes only when a KG is reprocessed /
+    re-ingested) + the newest of their mtimes.  Cheap (index only) — the
+    public route hashes ``digests`` into the ETag *before* scanning so a
+    matching If-None-Match costs no chunk work."""
+    kgs_all = ca._kgs_intersecting(w, s, e, n)
+    files = ca._files()
+    have = [k for k in kgs_all if k in files]
+    pending, not_proc = ca.split_missing([k for k in kgs_all if k not in files])
+    digs = sorted(f'{k}:{files[k].get("neo1_digest")}' for k in have)
+    mt = max([float(files[k].get('mtime') or 0) for k in have] or [0.0])
+    return {'kgs': have, 'pending': pending, 'not_processed': not_proc, 'digests': digs, 'mtime': mt,
+            'ready': bool(have) and not pending}
+
+
+# ── query ──────────────────────────────────────────────────────────────
+
+MAX_LIMIT_COLUMNS = 100000      # format=columns: one call carries a whole 0.025° tile (≈ 31k apices ≥ 3 m)
+_TREE_FIELDS = ('lon', 'lat', 'h_m', 'crown_m2', 'species', 'vitality', 'ndsm_only', 'cell', 'kg_code', 'x', 'y')
+_STRUCT_FIELDS = ('lon', 'lat', 'h_m', 'type', 'h_robust_m', 'area_m2', 'confidence', 'dh_m', 'cell', 'kg_code', 'x', 'y')
+DEFAULT_COLUMNS = {'trees': ('lon', 'lat', 'h_m', 'crown_m2'), 'structures': ('lon', 'lat', 'h_m', 'type')}
+COLUMN_FIELDS = {'trees': _TREE_FIELDS, 'structures': _STRUCT_FIELDS}
+
+
+def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int = DEFAULT_LIMIT,
+            realistic: bool = True, types: set | None = None, max_height: float | None = None,
+            max_limit: int = MAX_LIMIT) -> dict:
+    """Column arrays (numpy) of all objects of ``kind`` in bbox, tallest first,
+    ≤ limit (+1 row when more exist, so the caller can set ``truncated``).
 
     ``max_height`` makes a half-open window ``min_height <= h < max_height``
-    so adjacent bands (20–25, 25–30 …) partition the apices without
-    double-counting.  The chunk accelerator still applies: chunks are walked
-    by their tallest object, chunks whose max is below ``min_height`` end
-    the scan, and once ``limit`` window objects are in hand no chunk whose
-    max cannot beat the limit-th one is opened."""
+    so adjacent bands partition the apices.  Chunk accelerator: chunks are
+    walked by their tallest object (``chunk.hmax/bmax``); chunks whose max is
+    below ``min_height`` end the scan; once ``limit`` window objects are in
+    hand no chunk whose max cannot beat the limit-th one is opened."""
     if kind not in KINDS:
         raise ValueError(f'kind must be one of {KINDS}')
     t0 = time.time()
-    lim = max(1, min(int(limit), MAX_LIMIT))
+    lim = max(1, min(int(limit), max_limit))
     min_h = max(0.0, float(min_height))
     max_h = None if max_height is None else float(max_height)
     if max_h is not None and max_h <= min_h:
         raise ValueError('max_height must be greater than min_height')
-    kgs_all = ca._kgs_intersecting(w, s, e, n)
-    files = ca._files()
-    kgs_have = [k for k in kgs_all if k in files]
-    pending, not_proc = ca.split_missing([k for k in kgs_all if k not in files])
+    st = bbox_state(w, s, e, n)
     cnt_key = _CNT[kind]
     rows = [r for r in _chunk_rows_bbox(w, s, e, n, kind) if int(r.get(cnt_key) or 0) > 0]
     rows.sort(key=lambda r: -(255 if r['max'] is None else int(r['max'])))   # unknown first, then tallest
-    tf = ca._tf('EPSG:3035', 'EPSG:4326')
     type_codes = None
     if kind == 'structures' and types:
-        type_codes = {i for i, t in enumerate(ca.STRUCTURE_TYPES) if t in types}
+        type_codes = np.array(sorted(i for i, t in enumerate(ca.STRUCTURE_TYPES) if t in types), dtype=np.uint8)
     hdrs: dict = {}
-    scanned = 0; exhausted = True; kth = -1.0
-    acc: dict = {}; n_acc = 0            # accepted (inside bbox) column arrays
-    bat: dict = {}; n_bat = 0            # pending batch in EPSG:3035, not yet bbox-filtered
-    dropped = 0
+    scanned = 0; exhausted = True; kth = -1.0; n_at_kth = 0
+    parts: list[tuple[dict, np.ndarray, str]] = []     # (decoded chunk, selected idx, kg)
+    n_acc = 0; dropped = 0
+    legacy: dict = {}
 
-    def flush():
-        nonlocal n_bat, n_acc, kth
-        if not n_bat:
-            return
-        cols = {k: np.concatenate(v) for k, v in bat.items()}
-        lon, lat = tf.transform(cols.pop('x'), cols.pop('y'))
-        lon = np.asarray(lon); lat = np.asarray(lat)
-        inb = (lon >= w) & (lon <= e) & (lat >= s) & (lat <= n)
-        if inb.any():
-            acc.setdefault('lon', []).append(lon[inb]); acc.setdefault('lat', []).append(lat[inb])
-            for k, v in cols.items():
-                acc.setdefault(k, []).append(v[inb])
-            n_acc += int(inb.sum())
-            if n_acc >= lim:
-                h_all = np.concatenate(acc['h'])
-                kth = float(np.partition(h_all, h_all.size - lim)[h_all.size - lim])
-        bat.clear(); n_bat = 0
+    def kth_now() -> float:
+        hs = np.concatenate([p[0]['h'][p[1]] for p in parts])
+        return float(np.partition(hs, hs.size - lim)[hs.size - lim])
 
     for r in rows:
         mq = r['max']
@@ -329,10 +412,13 @@ def points_bbox(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit:
             hm = mq / 4.0
             if hm < min_h:
                 break                       # nothing left ≥ min_height
-            if n_bat and (n_bat >= 4 * lim or hm <= kth):
-                flush()
-            if n_acc >= lim and hm <= kth:
-                break                       # cannot beat the limit-th object
+            if n_acc >= lim:
+                # a stale kth is a lower bound → still a safe cut-off; refresh when the
+                # accepted set grew ≥ 10 % (np.partition over 20k+ rows per chunk is not free)
+                if kth < 0 or n_acc >= n_at_kth * 1.1:
+                    kth = kth_now(); n_at_kth = n_acc
+                if hm <= kth:
+                    break                   # cannot beat the limit-th object
         if scanned >= CHUNK_BUDGET:
             exhausted = False
             break
@@ -344,87 +430,146 @@ def points_bbox(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit:
                 continue
             hdrs[kg] = h
         try:
-            ch = ca._load_chunk(kg, r, h)
+            d = _decoded_chunk(kg, r, h, kind)
         except Exception as ex:  # noqa: BLE001
             log.warning('ne_trees: chunk %s/%x unreadable: %s', kg, int(r['r10']), ex)
             continue
         scanned += 1
-        hs, cell_idx, d = _decode(kind, ch)
-        if hs.size == 0:
+        if not d or not d['n']:
             continue
-        m = hs >= min_h
+        hs = d['h']
+        m = (hs >= min_h) & (d['lon'] >= w) & (d['lon'] <= e) & (d['lat'] >= s) & (d['lat'] <= n)
         if max_h is not None:
             m &= hs < max_h
         if realistic:
-            if kind == 'trees':
-                m &= hs < TREE_H_SATURATED
-                if hs.size > 1 and hs.max() >= TREE_SPIKE_H:
-                    srt = np.sort(hs)
-                    p90 = float(np.percentile(hs, 90)); sec = float(srt[-2])
-                    spike = (hs >= TREE_SPIKE_H) & ((hs / max(p90, 1.0) > TREE_SPIKE_RATIO) | (hs - sec > TREE_SPIKE_GAP))
-                    m &= ~spike
-            else:
-                cap = np.array([STRUCT_H_MAX.get(t, 300.0) for t in ca.STRUCTURE_TYPES] + [300.0] * (16 - len(ca.STRUCTURE_TYPES)))
-                m &= (hs <= cap[d['type']]) & (d['conf'] >= STRUCT_CONF_MIN)
+            m &= d['ok']
             fc = flagged_cells(kg, kind)
             if fc:
-                m &= ~np.isin(ch.ids[cell_idx], np.fromiter(fc, np.uint64))
+                m &= ~np.isin(d['cell'], np.fromiter(fc, np.uint64))
+            fs = legacy.get(kg)
+            if fs is None:
+                fs = legacy[kg] = legacy_flagged_points(kg, kind)
+            if fs and m.any():
+                idx = np.nonzero(m)[0]
+                bad = [i for i in idx.tolist() if (round(float(d['lon'][i]), 5), round(float(d['lat'][i]), 5)) in fs]
+                if bad:
+                    m[bad] = False; dropped += len(bad)
         if type_codes is not None:
-            m &= np.isin(d['type'], list(type_codes))
+            m &= np.isin(d['type'], type_codes)
         if not m.any():
             continue
         sel = np.nonzero(m)[0]
-        ci = cell_idx[sel]
-        cen = ch.centres()
-        bat.setdefault('x', []).append(cen[ci, 0] + d['dx'][sel]); bat.setdefault('y', []).append(cen[ci, 1] + d['dy'][sel])
-        bat.setdefault('h', []).append(hs[sel])
-        bat.setdefault('cell', []).append(ch.ids[ci].astype(np.uint64))
-        for k, v in d.items():
-            if k not in ('dx', 'dy', 'h_m', 'h_max_m'):
-                bat.setdefault(k, []).append(v[sel])
-        bat.setdefault('kg', []).append(np.full(sel.size, kg, dtype=object))
-        n_bat += int(sel.size)
-    flush()
-    out = []
+        parts.append((d, sel, kg))
+        n_acc += int(sel.size)
+    out: dict = {}
     if n_acc:
-        a = {k: np.concatenate(v) for k, v in acc.items()}
-        order = np.argsort(-a['h'], kind='stable')
-        legacy: dict = {}
-        for i in order.tolist():
-            kg = a['kg'][i]; lon = float(a['lon'][i]); lat = float(a['lat'][i])
-            if realistic:
-                fs = legacy.get(kg)
-                if fs is None:
-                    fs = legacy[kg] = legacy_flagged_points(kg, kind)
-                if fs and (round(lon, 5), round(lat, 5)) in fs:
-                    dropped += 1
-                    continue
-            rec = {'lon': round(lon, 7), 'lat': round(lat, 7), 'height_m': round(float(a['h'][i]), 2)}
-            if kind == 'trees':
-                crown_m2 = float(a['crown_m2'][i])
-                rec.update(crown_d_m=round(2.0 * math.sqrt(crown_m2 / math.pi), 1) if crown_m2 > 0 else None,
-                           crown_m2=crown_m2,
-                           species=ca.SPECIES[int(a['species'][i])] if int(a['species'][i]) < len(ca.SPECIES) else None,
-                           vitality=ca.VITALITY[int(a['vitality'][i])] if int(a['vitality'][i]) < len(ca.VITALITY) else None,
-                           ndsm_only=bool(a['ndsm_only'][i]), confidence=None)
-            else:
-                t = int(a['type'][i])
-                rec.update(type=ca.STRUCTURE_TYPES[t] if t < len(ca.STRUCTURE_TYPES) else None,
-                           height_robust_m=round(float(a['h_robust_m'][i]), 2),
-                           area_m2=int(a['area_m2'][i]), confidence=round(float(a['conf'][i]), 2),
-                           dh_m=round(float(a['dh_m'][i]), 2))
-            rec['cell'] = f"{int(a['cell'][i]):x}"
-            rec['kg_code'] = kg
-            out.append(rec)
-            if len(out) > lim:
-                break
-    truncated = len(out) > lim or not exhausted
-    return {'kind': kind, 'trees' if kind == 'trees' else 'structures': out[:lim], 'kgs': kgs_have,
-            'min_height': min_h, 'max_height': max_h, 'limit': lim,
-            'pending_kgs': pending, 'not_processed': not_proc, 'dropped_qa': dropped,
-            'realistic': bool(realistic), 'truncated': truncated, 'chunks_scanned': scanned,
-            'chunks_in_bbox': len(rows), 'ms': round((time.time() - t0) * 1000, 1),
-            'ready': bool(kgs_have) and not pending}
+        cols = [k for k in parts[0][0] if k not in ('n', 'ok')]
+        for k in cols:
+            out[k] = np.concatenate([p[0][k][p[1]] for p in parts])
+        out['kg'] = np.concatenate([np.full(p[1].size, p[2], dtype=object) for p in parts])
+        order = np.argsort(-out['h'], kind='stable')[:lim + 1]
+        for k in list(out):
+            out[k] = out[k][order]
+    n_out = int(out['h'].size) if n_acc else 0
+    truncated = n_out > lim or not exhausted
+    if n_out > lim:
+        for k in list(out):
+            out[k] = out[k][:lim]
+        n_out = lim
+    return {'kind': kind, 'cols': out, 'n': n_out, 'kgs': st['kgs'], 'min_height': min_h, 'max_height': max_h,
+            'limit': lim, 'pending_kgs': st['pending'], 'not_processed': st['not_processed'],
+            'dropped_qa': dropped, 'realistic': bool(realistic), 'truncated': truncated,
+            'chunks_scanned': scanned, 'chunks_in_bbox': len(rows), 'ms': round((time.time() - t0) * 1000, 1),
+            'ready': st['ready'], 'state': st}
+
+
+def _species(a: np.ndarray) -> list:
+    return [ca.SPECIES[int(v)] if int(v) < len(ca.SPECIES) else None for v in a.tolist()]
+
+
+def _vitality(a: np.ndarray) -> list:
+    return [ca.VITALITY[int(v)] if int(v) < len(ca.VITALITY) else None for v in a.tolist()]
+
+
+def _stype(a: np.ndarray) -> list:
+    return [ca.STRUCTURE_TYPES[int(v)] if int(v) < len(ca.STRUCTURE_TYPES) else None for v in a.tolist()]
+
+
+def columns_bbox(w, s, e, n, kind: str = 'trees', fields: tuple | None = None, **kw) -> dict:
+    """``format=columns``: parallel arrays, tallest first.  Default fields
+    lon, lat, h_m, crown_m2 (trees) / lon, lat, h_m, type (structures);
+    ``fields=`` picks from :data:`COLUMN_FIELDS` (species, vitality, ndsm_only,
+    cell, kg_code, x, y = EPSG:3035 integer metres …).  lon/lat are rounded to
+    1e-6° (≈ 0.1 m, finer than the metre-snapped source), h_m to 0.25 m,
+    crown_m2 to 0.1 m² — ~7 B/apex gzipped."""
+    kw.setdefault('limit', MAX_LIMIT_COLUMNS)
+    r = collect(w, s, e, n, kind, max_limit=MAX_LIMIT_COLUMNS, **kw)
+    want = tuple(fields or DEFAULT_COLUMNS[kind])
+    bad = [f for f in want if f not in COLUMN_FIELDS[kind]]
+    if bad:
+        raise ValueError(f'unknown fields for {kind}: {",".join(bad)} (allowed: {",".join(COLUMN_FIELDS[kind])})')
+    c = r['cols']; n_out = r['n']
+    cols: dict = {}
+    for f in want:
+        if not n_out:
+            cols[f] = []; continue
+        if f in ('lon', 'lat'):
+            cols[f] = np.round(c[f], 6).tolist()
+        elif f == 'h_m':
+            cols[f] = np.round(c['h'].astype(np.float64), 2).tolist()
+        elif f in ('crown_m2', 'h_robust_m', 'dh_m'):
+            cols[f] = np.round(c[f].astype(np.float64), 2).tolist()
+        elif f == 'confidence':
+            cols[f] = np.round(c['conf'].astype(np.float64), 2).tolist()
+        elif f == 'species':
+            cols[f] = _species(c['species'])
+        elif f == 'vitality':
+            cols[f] = _vitality(c['vitality'])
+        elif f == 'type':
+            cols[f] = _stype(c['type'])
+        elif f == 'ndsm_only':
+            cols[f] = c['ndsm_only'].astype(int).tolist()
+        elif f == 'cell':
+            cols[f] = [f'{int(v):x}' for v in c['cell'].tolist()]
+        elif f == 'kg_code':
+            cols[f] = c['kg'].tolist()
+        elif f in ('x', 'y', 'area_m2'):
+            cols[f] = c[f].tolist()
+    r = dict(r); r.pop('cols'); r.pop('state')
+    r.update(columns=cols, fields=list(want), order='height_desc')
+    return r
+
+
+def points_bbox(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int = DEFAULT_LIMIT,
+                realistic: bool = True, types: set | None = None, max_height: float | None = None) -> dict:
+    """All objects of ``kind`` in bbox as row dicts, tallest first, ≤ limit
+    (see :func:`collect` for the scan semantics)."""
+    r = collect(w, s, e, n, kind, min_height=min_height, limit=limit, realistic=realistic, types=types,
+                max_height=max_height)
+    c = r['cols']; out = []
+    if r['n']:
+        lon = np.round(c['lon'], 7).tolist(); lat = np.round(c['lat'], 7).tolist()
+        hh = np.round(c['h'].astype(np.float64), 2).tolist(); cell = c['cell'].tolist(); kgs = c['kg'].tolist()
+        if kind == 'trees':
+            cr = c['crown_m2'].astype(np.float64).tolist(); sp = _species(c['species']); vi = _vitality(c['vitality'])
+            nd = c['ndsm_only'].tolist()
+            for i in range(r['n']):
+                crown_m2 = cr[i]
+                out.append({'lon': lon[i], 'lat': lat[i], 'height_m': hh[i],
+                            'crown_d_m': round(2.0 * math.sqrt(crown_m2 / math.pi), 1) if crown_m2 > 0 else None,
+                            'crown_m2': round(crown_m2, 1), 'species': sp[i], 'vitality': vi[i], 'ndsm_only': bool(nd[i]),
+                            'confidence': None, 'cell': f'{int(cell[i]):x}', 'kg_code': kgs[i]})
+        else:
+            ty = _stype(c['type']); hr = np.round(c['h_robust_m'].astype(np.float64), 2).tolist()
+            ar = c['area_m2'].tolist(); cf = np.round(c['conf'].astype(np.float64), 2).tolist()
+            dh = np.round(c['dh_m'].astype(np.float64), 2).tolist()
+            for i in range(r['n']):
+                out.append({'lon': lon[i], 'lat': lat[i], 'height_m': hh[i], 'type': ty[i], 'height_robust_m': hr[i],
+                            'area_m2': int(ar[i]), 'confidence': cf[i], 'dh_m': dh[i],
+                            'cell': f'{int(cell[i]):x}', 'kg_code': kgs[i]})
+    r = dict(r); r.pop('cols'); r.pop('state')
+    r['trees' if kind == 'trees' else 'structures'] = out
+    return r
 
 
 def trees_bbox(w, s, e, n, min_height: float = 0.0, limit: int = DEFAULT_LIMIT, realistic: bool = True,

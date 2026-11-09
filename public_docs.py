@@ -36,6 +36,9 @@ TREES_META = {
             'confidence is null (no RF score per apex in the corpus); crown_d_m from crown_m2.',
     'complete': True,
 }
+TREES_COLUMNS_NOTE = ('parallel arrays, order height_desc; lon/lat 1e-6 deg, h_m 0.25 m steps, crown_m2 0.1 m2, '
+                      'x/y EPSG:3035 integer metres, ndsm_only 0/1, cell H3 r12 hex; fields= picks columns')
+
 STRUCTURES_META = {
     'note': 'Non-tree objects (objects=structures): every segmented structure with LiDAR heights from '
             'the NE cells corpus — roof, greenhouse, solar_panel, mast, wind_turbine, substation, '
@@ -395,18 +398,32 @@ HTTP 202 with retry_after_s — repeat later, don't poll in a loop. Coverage: /a
 
 ## Trees, landmarks, buildings (points in a bbox)
 
-GET /api/v1/trees/bbox?bbox=…[&min_height=3][&max_height=…][&limit=2000][&realistic=1][&objects=trees|structures][&types=…][&format=geojson]
-    Tree apices {{lon, lat, height_m, crown_d_m, crown_m2, species, vitality, ndsm_only, confidence,
-    cell, kg_code}}, tallest first, from the NE cells corpus (EVERY apex h ≥ 3 m — a full
-    inventory, meta.complete=true; ≤ limit, truncated:true when more exist). limit default 2000,
-    max 20000 (400 above that). min_height / max_height form a half-open window
-    min_height <= h < max_height, so adjacent bands (20–25, 25–30 …) partition the apices without
-    overlap — fetch a dense tile band by band instead of one huge call; meta echoes min_height,
-    max_height, limit, max_limit. realistic=1 (default)
-    removes what the height distribution says are not trees: the saturated ≥ 60 m bin, local
-    spikes ≥ 45 m (masts, wind turbines, cranes) and flagged cells — dropped_qa counts them;
-    realistic=0 gives the raw apices. objects=structures returns the non-tree objects instead
-    ({{type, lon, lat, height_m, height_robust_m, area_m2, confidence, dh_m, cell, kg_code}};
+GET /api/v1/trees/bbox?bbox=…[&min_height=3][&max_height=…][&limit=2000][&realistic=1][&objects=trees|structures][&types=…][&format=json|geojson|columns][&fields=…]
+    Tree apices, tallest first, from the NE cells corpus (EVERY apex h ≥ 3 m — a full inventory,
+    meta.complete=true; ≤ limit, truncated:true when more exist). min_height / max_height form a
+    half-open window min_height <= h < max_height, so adjacent bands (3–8, 8–14 …) partition the
+    apices without overlap; meta echoes min_height, max_height, limit, max_limit.
+    format=json (default): rows {{lon, lat, height_m, crown_d_m, crown_m2, species, vitality,
+      ndsm_only, confidence, cell, kg_code}}; limit default 2000, max 20000 (400 above that).
+    format=columns (bulk, ~6 B/apex gzipped): parallel arrays under "columns", same order
+      (height_desc) → {{bbox, objects, format:"columns", fields:[…], order:"height_desc",
+      columns:{{lon:[…], lat:[…], h_m:[…], crown_m2:[…]}}, count, truncated, dropped_qa, kgs, ready, meta}}.
+      Default fields lon,lat,h_m,crown_m2 (structures: lon,lat,h_m,type). fields= picks from
+      lon,lat,h_m,crown_m2,species,vitality,ndsm_only,cell,kg_code,x,y (structures: lon,lat,h_m,type,
+      h_robust_m,area_m2,confidence,dh_m,cell,kg_code,x,y). lon/lat rounded to 1e-6° (≈ 0.1 m —
+      the source is metre-snapped), h_m 0.25 m steps, crown_m2 0.1 m², x/y = EPSG:3035 integer
+      metres, ndsm_only 0/1, cell = H3 r12 hex. limit default = max = 100000 (a whole 0.025° tile
+      ≥ 3 m is ~31k apices → one call; truncated:true still set when limit is hit or the chunk
+      budget ran out).
+    Caching: strong ETag + Last-Modified derived from the NE file state of the KGs in the bbox
+      (changes only when a KG is reprocessed / re-ingested) + the query string; If-None-Match →
+      304 before any scan; Cache-Control public, max-age=86400 when ready (no-store while a KG is
+      pending). ETag / Last-Modified are CORS-exposed. Chunks of a tile are decoded once and
+      shared by all bands / concurrent calls (server ms ≈ 10 for a warm 0.025° tile band).
+    realistic=1 (default) removes what the height distribution says are not trees: the saturated
+    ≥ 60 m bin, local spikes ≥ 45 m (masts, wind turbines, cranes) and flagged cells — dropped_qa
+    counts them; realistic=0 gives the raw apices. objects=structures returns the non-tree objects
+    instead ({{type, lon, lat, height_m, height_robust_m, area_m2, confidence, dh_m, cell, kg_code}};
     types=mast,wind_turbine,roof,… to filter). ready:false (+ pending_kgs / retry_after_s or
     error) when a KG of the bbox is not on disk yet or the index is unusable — never a silent 0.
 GET /api/v1/landmarks/bbox?bbox=…
