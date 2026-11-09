@@ -275,7 +275,7 @@ def _decode(kind: str, ch) -> tuple[np.ndarray, np.ndarray, dict]:
 # heights, attributes and the *height-independent* part of the realistic
 # rule (saturation / spike / per-type caps / confidence).  A band request
 # (3–8, 8–14 …) over an already-seen tile is then a boolean mask per chunk —
-# no inflate, no decode, no pyproj — so umfeld-at's 4 parallel bands cost
+# no inflate, no decode, no pyproj — so a client's 4 parallel bands cost
 # roughly one scan.  The bbox / min_h / max_h / flag filters stay per request.
 
 def _dec_bytes(d: dict) -> int:
