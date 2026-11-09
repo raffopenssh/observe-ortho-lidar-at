@@ -9808,6 +9808,18 @@ class PeerDirector:
                         with self._lock:
                             self.state['active_peer'] = None
                             active_id = None
+                    elif self._frontier_work_exhausted():
+                        # Endgame: nothing left for a frontier. Release
+                        # the slot (+ its cred/strip plan) so the peer is
+                        # a cache-only / sweep candidate next tick, and
+                        # don't pick a replacement below.
+                        log.info('Active frontier %s idle and no KG/block pending '
+                                 '— releasing the frontier slot (endgame)', active_id)
+                        with self._lock:
+                            self.state['active_peer'] = None
+                            (self.state.get('frontier_cred_plan') or {}).pop(active_id, None)
+                            (self.state.get('frontier_strip_plan') or {}).pop(active_id, None)
+                            active_id = None
                     elif not bw_depleted:
                         excl = _excluded_kgs(cfg, exclude_peer_id=active_id)
                         # Re-issue with the current cred/strip plan so
@@ -9938,7 +9950,35 @@ class PeerDirector:
                         )
                         safely_stop_peer(p.get('url'), p['id'])
 
-        # If no active peer, choose one
+        # If no active peer, choose one — unless the run has no pending
+        # KG/block left (endgame: idle peers are cache-only / sweepers).
+        if not active_id and self._frontier_work_exhausted():
+            # Also release parallel-frontier slots whose processor has
+            # stopped: the parallel orchestrator bails out while there
+            # is no active peer, so without this the stale
+            # ``parallel_frontiers_active`` set would keep those peers
+            # out of the cache-only candidate list for good.
+            _par = list(self.state.get('parallel_frontiers_active') or [])
+            _released = []
+            for _pid in _par:
+                _pp = get_peer_by_id(cfg, _pid)
+                try:
+                    _st = get_peer_status(_pp.get('url')).get('state') if _pp else 'unknown'
+                except Exception:  # noqa: BLE001
+                    _st = 'unknown'
+                if _st in ('idle', 'stopped', 'complete'):
+                    _released.append(_pid)
+            if _released:
+                log.info('Endgame: releasing idle parallel frontier slot(s) %s',
+                         ','.join(_released))
+                with self._lock:
+                    self.state['parallel_frontiers_active'] = [
+                        x for x in _par if x not in _released]
+                    for _pid in _released:
+                        (self.state.get('frontier_cred_plan') or {}).pop(_pid, None)
+                        (self.state.get('frontier_strip_plan') or {}).pop(_pid, None)
+                    save_director_state(self.state)
+            return
         if not active_id:
             with self._lock:
                 new_peer = choose_active_peer(self.cfg, self.state)
@@ -10725,6 +10765,35 @@ class PeerDirector:
         decision = max(baseline, min(ceiling, decision))
         self.state['_target_frontier_count'] = float(decision)
         return decision
+
+    def _frontier_work_exhausted(self) -> bool:
+        """True when no KG / block is pending anywhere and the retry queue
+        is empty — i.e. there is nothing a frontier could process.
+
+        Endgame rule (2026-11-09): in that state the director must not
+        (re)start frontier peers at all — every idle peer belongs to the
+        cache-only pool (sliver sweeps, repairs) until the run-complete
+        hold takes over. Before this, ``_max_parallel_frontiers`` floored
+        at 1 and the active-frontier path re-issued dead plans, so idle
+        peers were grabbed as frontiers, hit the "no-work restart loop"
+        quarantine and never reached the sweep assign (8 parents open for
+        7 h with every worker idle).
+        """
+        try:
+            self._frontier_cells()  # refreshes _frontier_pending_total
+            tot = getattr(self, '_frontier_pending_total', None)
+            if tot is None or int(tot) > 0:
+                return False
+            rq = DATA_DIR / 'retry_queue.json'
+            if rq.exists():
+                q = json.loads(rq.read_text() or '[]')
+                if isinstance(q, dict):
+                    q = q.get('kgs') or q.get('queue') or []
+                if q:
+                    return False
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     def _max_parallel_frontiers(self, cfg: dict) -> int:
         """How many frontier peers we may run concurrently.
@@ -12891,6 +12960,14 @@ class PeerDirector:
         slack = max(0, total_enabled - (1 if active_id else 0)
                     - len(running) - min_reserve)
         max_add = min(slack, max_par - 1 - len(running))
+        if max_add > 0 and self._frontier_work_exhausted():
+            if not getattr(self, '_frontier_exhausted_logged', False):
+                log.info('Parallel frontier: no pending KG/block anywhere — '
+                         'not starting frontiers; idle peers go cache-only')
+                self._frontier_exhausted_logged = True
+            max_add = 0
+        elif max_add > 0:
+            self._frontier_exhausted_logged = False
         # Ramp limiter (see RAMP_*_STARTS_PER_TICK). Scale gentleness
         # to capacity factor: never burst more than a few new frontier
         # peers per tick.
