@@ -505,6 +505,8 @@ def _outage_ok() -> None:
 _FAILED_MONTH_COOLDOWNS: Dict[tuple, float] = {}
 _FAILED_MONTH_COOLDOWN_SECS = 1800  # 30 minutes for 500 (Spark timeout)
 _FAILED_MONTH_402_COOLDOWN_SECS = 1800  # 30 minutes — 402 is IP-level, recovery takes ~2h
+_HEAVY_MONTH_COOLDOWN_SECS = 6 * 3600   # HeavyMonthError: deterministic per cell+month,
+                                         # don't re-spend ~45 min on it per tile of the same KG
 
 # --- Adaptive sync-request splitting (Sep 2026) ----------------------------
 # When openEO's synchronous path is slow (Spark backlog), a full 0.1° NDVI
@@ -1359,6 +1361,23 @@ class CreditsExhaustedError(Exception):
 class IPThrottledError(RuntimeError):
     """Raised when Copernicus API is IP-level rate-limited (all credentials 402)."""
     pass
+
+
+class HeavyMonthError(RuntimeError):
+    """A single NDVI month is too heavy for openEO's sync path *even as
+    2×2 quadrants* (quadrant read-timeout after the full cell hit a
+    runaway kill / timeout).  Per-request heaviness of a specific
+    high-alpine cell+month, not an origin outage: the month is skipped
+    (harmonics tolerate a gap, repairable later via product_repair) and
+    it must NOT feed the upstream-stress cascade breaker.
+
+    Why: Brenner/Zillertal blocks 81201-south / 81206-south / 87104-south*
+    looped for >30 h (2026-11-08/09): every attempt → runaway on the full
+    cell → quadrant timeout on 2024-03 → same on 2024-04 → cascade →
+    ``UpstreamStressError`` → KG deferred → *another* peer starts from
+    scratch (month caches are per peer).  ~45 min burned per attempt,
+    zero progress, forever.
+    """
 
 
 class UpstreamStressError(IPThrottledError):
@@ -2380,9 +2399,22 @@ def get_ndvi_timeseries(
 
                 month_cache.parent.mkdir(parents=True, exist_ok=True)
                 tmp_month = month_cache.with_suffix(month_cache.suffix + ".tmp")
+                def _dl_quadrants_or_heavy(dst, why: str):
+                    """Quadrants are the last resort: a read-timeout here
+                    is per-request heaviness (HeavyMonthError → month
+                    skipped, no cascade), not origin stress."""
+                    try:
+                        _dl_quadrants(dst)
+                    except Exception as qe:
+                        if _is_read_timeout(str(qe)) or _is_runaway(str(qe)):
+                            raise HeavyMonthError(
+                                f"month too heavy for openEO even as quadrants "
+                                f"({why[:60]} → {str(qe)[:80]})") from qe
+                        raise
+
                 try:
                     if _sync_split_active():
-                        _dl_quadrants(tmp_month)
+                        _dl_quadrants_or_heavy(tmp_month, "split mode")
                     else:
                         try:
                             _dl_cube(bbox, tmp_month)
@@ -2396,7 +2428,7 @@ def get_ndvi_timeseries(
                             # straight away.
                             _sync_split_arm(str(fe))
                             tmp_month.unlink(missing_ok=True)
-                            _dl_quadrants(tmp_month)
+                            _dl_quadrants_or_heavy(tmp_month, str(fe))
                     tmp_month.rename(month_cache)
                 except Exception:
                     tmp_month.unlink(missing_ok=True)
@@ -2489,6 +2521,11 @@ def get_ndvi_timeseries(
                     except CreditsExhaustedError as ce:
                         return label, ce
                     # Should not reach here (402 always raises above)
+                    return label, exc
+
+                if isinstance(exc, HeavyMonthError):
+                    logger.warning("NDVI %s: %s — skipping month (heavy, no cascade)",
+                                   label, exc)
                     return label, exc
 
                 # --- Handle 429 / 500 / 503 with backoff ---
@@ -2609,13 +2646,15 @@ def get_ndvi_timeseries(
                 # read-timeouts that survived quadrant splitting) separately
                 # from 402: it indicates the openeo origin is overloaded,
                 # not that our credential is exhausted.
-                if _is_runaway(exc_str):
+                if isinstance(exc, HeavyMonthError) or _is_runaway(exc_str):
                     # Per-request heaviness (server killed *our* job at
-                    # 15 min), not an origin outage: skip the month, keep
-                    # going — must not trip the cascade breaker, which
-                    # would defer the KG every ~3 h forever (81201-south
-                    # x3, 2026-11-07/08).
+                    # 15 min, or the quadrants timed out too), not an
+                    # origin outage: skip the month, keep going — must
+                    # not trip the cascade breaker, which would defer
+                    # the KG every ~45 min forever (81201-south x3
+                    # 2026-11-07/08; all four Brenner blocks 11-08/09).
                     consecutive_5xx = 0
+                    cooldown = _HEAVY_MONTH_COOLDOWN_SECS
                 elif any(s in exc_str for s in ('500', '502', '503', '504',
                                               'Bad Gateway', 'Gateway Time',
                                               'Service Unavailable',

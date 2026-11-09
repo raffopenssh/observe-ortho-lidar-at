@@ -198,3 +198,22 @@ timed out — skipping month` lines spaced minutes apart on the same KG and
 `copernicus (…s) completed with warnings`; the per-hour error rate in
 `/api/v1/credentials` is the fastest tell. Nothing to fix locally — the
 sync-timeout cap only bounds how much wall-clock is lost.
+
+## Heavy months vs. origin stress (2026-11-09)
+
+A few high-alpine 0.1° cells (Brenner/Zillertal: 81201-south, 81206-south,
+87104-southeast/-southwest) have NDVI months (2024-03, 2024-04) that openEO's
+sync path cannot finish: full cell → Spark runaway kill at 15 min, 0.05°
+quadrant → our 600 s read timeout. Before 2026-11-09 the quadrant timeout
+counted toward the *upstream-stress cascade* (2 consecutive → `UpstreamStressError`
+→ KG deferred → another peer starts from scratch, month caches are per peer).
+The four blocks looped for >30 h at ~45 min per attempt with zero progress.
+
+Now a quadrant read-timeout/runaway raises `copernicus.HeavyMonthError`:
+the month is **skipped** (`NDVI 2024-03: month too heavy for openEO even as
+quadrants … — skipping month (heavy, no cascade)`), the (cell, month) goes
+into a 6 h in-process cooldown (`_HEAVY_MONTH_COOLDOWN_SECS`, so later
+tiles of the same KG don't re-pay), and `consecutive_5xx` is reset. The
+cascade breaker now only fires on genuine consecutive 5xx (non-runaway).
+Harmonics tolerate a missing month; a product that ends up without
+harmonics is `-partial` and picked up by `product_repair`.
