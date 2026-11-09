@@ -14,6 +14,7 @@ and setup: `README.md`. Security model: `SECURITY.md`.
 | public "this looks wrong" flags | `docs/public-flags.md` | `public_flags.py` |
 | the Austria-wide processor, tiles, checkpoints, splitting | `docs/austria-processor.md` | `austria_processor.py`, `kg_splitter.py`, `tile_checkpoint_registry.py` |
 | director (single machine / `SRTM_PEERS`) | `docs/peer-director.md` | `peer_director.py` |
+| endgame triage (last blocks: stale claims from stopped peers, quarantined work cell) | `docs/peer-director.md → Endgame triage` | `app.processing_peers_status`, `peer_director` barren cells |
 | product layout v2.4, upgrades, ingest | `docs/v2.1-product-spec.md` | `v21_products.py`, `v2_verify.py`, `v2_ingest.py`, `v24_fast.py`, `kg_v2_store.py`, `kg_docs.py` |
 | tree inventory (v2 live, v3 product-backed) | `docs/tree-inventory-v3.md` | `tree_inventory.py`, `trees_v3.py` |
 | classifier v1 (RF) / v2 (LightGBM) | `docs/rf-training.md`, `segv2/README.md` | `learned_classifier.py`, `segv2/`, `safe_load.py` |

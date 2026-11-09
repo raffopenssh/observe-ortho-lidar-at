@@ -113,3 +113,33 @@ curl -s -XPOST -H 'Content-Type: application/json' -d '{"ne_ingest_enabled":fals
   `status=removed`/size-0 `_json` is not a product; a local `json/<code>.json` without a
   committed record counts only for `LOCAL_JSON_ORPHAN_GRACE_S` (24 h) — an older orphan is a
   failed upload that was re-queued and must not be advertised to peers as completed.
+
+## Endgame triage — last blocks of the run (Nov 2026)
+
+When `health:` says ~100 % and only a handful of split blocks are left, the
+whole fleet collapses onto **one planning cell**. Every mechanism that was
+tuned for 7 850 KGs now has a single-point-of-failure flavour. Cheapest
+reading order (≈3 curls):
+
+```bash
+curl -s "http://localhost:8000/process.txt?hidden=1&log=0"           # roster incl. STOPPED/COMPLETE; `cells:` work=/quarantined=
+curl -s "http://localhost:8000/process.txt?q=<block>&hours=12&log=30&roster=0'   # who touched the block, where it died
+python3 - <<'PY'   # which blocks of the parent are actually committed
+import json; m=json.load(open('data/austria_processor/zenodo_manifest.json'))['entries']
+print(sorted(k for k in m if k.startswith('81206')))
+PY
+```
+
+Symptoms and what they really mean:
+
+| Seen | Meaning | Action |
+|---|---|---|
+| Fresh frontiers log `frontier start → … ×6` then `no-work restart loop … quarantined for 6h`, `cells: quarantined=<the only cell with work>` | Everything left in the cell is *claimed*. Either genuinely running on other peers (fine — the newcomers have nothing to do) **or** a stale claim (next row). | Roster check: is every remaining block on a RUN/FRONTIER row? If yes, nothing to do. |
+| A peer is `STOPPED` but its row still shows a `kg`, and nobody else runs that block | **Stale claim.** `progress.json` kept `current_kg` after SIGTERM / a silent death (OOM, hard update mid-tile). Since fc5c10c `/api/v1/processing/peers` only reports `current` / `in_progress` while `state ∈ running/processing/paused*` (`processor_state` is in the reply), so this no longer blocks others. | Director restarts the stopped peer on its own; if the cell is quarantined, release it: `POST /api/v1/director/barren_cells/clear` (owner token). |
+| Peer log ends mid-step with no error, `processor_state=stopped`, `Received SIGTERM — will finish current KG then exit` 10–15 min earlier | Graceful update escalated / process killed before the KG boundary. Tile checkpoints survive (`tile N restored from checkpoint`, chkpt registry) → the retry is cheap. | Nothing — the block is re-picked by the next idle peer in the cell. |
+| `copernicus: NDVI <month>: month too heavy … skipping month`, `copernicus (2700s) completed with warnings`, `ndvi_harmonics: No monthly NDVI data retrieved` | openEO degraded; harmonics come out partial. The product still uploads (`-partial` label) and lands in `repair: pending[harmonics]` → re-upgraded later when cells are cached. | Nothing. Don't touch timeouts (`docs/copernicus-throttle.md`). |
+| Same block `Starting KG` on 2–3 peers within one minute | Dispatch-claim race (150 s window). The dup-KG reconciler keeps the furthest-along peer. | Nothing; `?q=dup-kg` to audit. |
+
+Do **not** hand-start processors or `update_peers` across the fleet to
+"unstick" the endgame — one stale claim + one quarantined cell is the
+whole story 9 times out of 10, and both self-heal or take two POSTs.
