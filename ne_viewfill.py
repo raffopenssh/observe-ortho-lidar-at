@@ -19,7 +19,7 @@ cheapest source that has it:
    (``sliver_sweep.plan_cells``: clustered, padded bboxes; built by the
    cache-only sweepers exactly like the bbox-revision slivers).
 
-Runs as its own process (``ne-viewfill.service`` / hourly timer, nice 15,
+Runs as its own process (``ne-viewfill.service`` / 3-hourly timer, nice 15,
 memory-capped, time budget) so gunicorn / the director tick never carry
 the view fetches or the merges.  It never touches ``data/ne/index.json``
 or a live parent file: results go to ``data/ne/viewfill/staged/<kg>.json``
@@ -95,16 +95,25 @@ def save_state(d: dict) -> None:
 
 # === SECTION: candidates ===
 
-def ne_server_obs_missing() -> dict:
+def ne_server_obs_missing(st: dict | None = None) -> dict:
     """``{kg: {blank_n, missing_n, view_source}}`` from the NE server's revisit list
-    (empty between its 3-hourly passes — never the only source)."""
+    (empty between its 3-hourly passes — never the only source).
+    ETag-conditional: the last answer + its ETag live in
+    ``state.obs_missing``; a 304 (0 bytes) re-serves it."""
+    cache = (st or {}).get("obs_missing") if isinstance(st, dict) else None
+    cache = cache if isinstance(cache, dict) else {}
     try:
         import requests
         import ne_h3
         h = {"User-Agent": "observe-ortho-lidar-at/2.4 ne_viewfill"}
         h.update(ne_h3._ne_server_headers())
+        if cache.get("etag") and cache.get("kgs") is not None:
+            h["If-None-Match"] = cache["etag"]
         r = requests.get(f"{ne_h3._ne_server_contrib_base()}/revisit", params={"kind": "obs_missing", "all": 1},
                          headers=h, timeout=180)
+        if r.status_code == 304 and cache.get("kgs") is not None:
+            cache["checked_at"] = _now(); cache["hits_304"] = int(cache.get("hits_304") or 0) + 1
+            return dict(cache["kgs"])
         r.raise_for_status()
         out = {}
         for x in r.json().get("obs_missing") or []:
@@ -112,10 +121,13 @@ def ne_server_obs_missing() -> dict:
             b, m = int(x.get("blank_n") or 0), int(x.get("missing_n") or 0)
             if kg and (b or m):
                 out[kg] = {"blank_n": b, "missing_n": m, "view_source": x.get("view_source")}
+        if isinstance(st, dict):
+            st["obs_missing"] = {"etag": r.headers.get("ETag"), "fetched_at": _now(), "checked_at": _now(),
+                                 "bytes": len(r.content), "kgs": out, "hits_304": 0}
         return out
     except Exception as ex:  # noqa: BLE001
         log.warning("ne_viewfill: NE server revisit failed: %s", ex)
-        return {}
+        return dict(cache.get("kgs") or {})
 
 
 def local_unseen(kg: str) -> tuple[int, int]:
@@ -152,7 +164,7 @@ def candidates(all_kgs: bool = False, st: dict | None = None) -> list[tuple[str,
     idx = ne_ingest.load_index_ro()
     st = st if st is not None else load_state()
     est: dict[str, tuple[int, str]] = {}
-    for kg, v in ne_server_obs_missing().items():
+    for kg, v in ne_server_obs_missing(st).items():
         est[kg] = (v["blank_n"] + v["missing_n"], "NE server")
     scan = st["stats"].get("local_scan") or {}
     if time.time() - float(scan.get("ts") or 0) > 86400:
@@ -411,7 +423,9 @@ def run(budget_s: float = 3000, max_kgs: int | None = None, kgs: list[str] | Non
     else:
         todo = candidates(all_kgs=all_kgs, st=st)
     out = {"candidates": len(todo), "walked": 0, "staged": 0, "planned_kgs": 0, "planned_cells": 0,
-           "blank": 0, "borrowable": 0, "residual": 0, "skipped": 0, "errors": 0, "budget_stop": False}
+           "blank": 0, "borrowable": 0, "residual": 0, "skipped": 0, "errors": 0, "budget_stop": False,
+           # umfeld GETs this run: view fetches (full / 304) and bytes — the budget umfeld asked us to keep
+           "view_gets": 0, "view_304": 0, "view_mb": 0.0}
     try:
         for kg, g, why in todo:
             if time.time() - t0 > budget_s or (max_kgs and out["walked"] >= max_kgs):
@@ -433,6 +447,10 @@ def run(budget_s: float = 3000, max_kgs: int | None = None, kgs: list[str] | Non
                 continue
             row["why"] = why
             row["est"] = g
+            if "view_bytes" in row:
+                out["view_gets"] += 1
+                out["view_304"] += int(bool(row.get("not_modified")))
+                out["view_mb"] = round(out["view_mb"] + int(row.get("view_bytes") or 0) / 1e6, 2)
             if row.get("skip"):
                 out["skipped"] += 1
             else:
@@ -478,7 +496,7 @@ def text_line() -> str:
     try:
         s = status()
         st, lr = s["stats"], s.get("last_run") or {}
-        # walk ETA: parents with an h3b not yet walked (within RECHECK_S) ÷ KGs per hourly run
+        # walk ETA: parents with an h3b not yet walked (within RECHECK_S) ÷ KGs per run
         total = sum(1 for _ in NE_DIR.glob("?????.h3b"))
         # parents never walked are simply not candidates (no gap known) — the
         # walk is "done" when the last run got through its candidate list

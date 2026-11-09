@@ -1888,26 +1888,39 @@ def _als_header_for(hdr: dict, obs: bytes) -> dict | None:
 
 # === SECTION: declared view (NE server chunk-log view, 2026-10-27) ===
 
-def fetch_declared_view(kg: str, timeout: float = 120.0) -> "Section | None":
+VIEW_UNCHANGED = "view-unchanged"   # fetch_declared_view(..., etag=…) answered 304
+
+
+def fetch_declared_view(kg: str, timeout: float = 120.0, etag: str | None = None) -> "Section | str | None":
     """``GET /contrib/api/v1/ne/{kg}/declared`` → the NEC1 section NE server
     assembles from its chunk log (``source: chunks@<state>``, header
     ``view{state,hidden,…}``, register bytes zero).  This is the cell set a
     bare NEO1 is validated against since 2026-10-27 (ne-change.md §4b).
     ``None`` when the KG holds nothing (404).  ~0.2 MB per KG, never cached
-    on disk — call it only right before a POST."""
+    on disk — call it only right before a POST.
+
+    *etag* (the ``_etag`` of an earlier answer) is sent as ``If-None-Match``;
+    a 304 returns :data:`VIEW_UNCHANGED` (0 bytes — NE server bandwidth,
+    2026-11-09).  Callers that need the body must then reuse their own copy
+    or call again without *etag*."""
     import requests
     kg = str(kg).zfill(5)
     url = f"{_ne_server_contrib_base()}/{kg}/declared"
     last = None
+    h = _ne_server_headers()
+    if etag:
+        h["If-None-Match"] = etag
     for attempt in range(3):
         try:
-            r = requests.get(url, headers=_ne_server_headers(), timeout=timeout)
+            r = requests.get(url, headers=h, timeout=timeout)
         except Exception as e:  # noqa: BLE001
             last = e
             time.sleep(2 + 3 * attempt)
             continue
         if r.status_code == 404:
             return None
+        if r.status_code == 304 and etag:
+            return VIEW_UNCHANGED
         if r.status_code in (429, 500, 502, 503, 504):
             last = NEError(f"NE server {kg}/declared: HTTP {r.status_code}")
             time.sleep(5 + 10 * attempt)
