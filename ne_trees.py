@@ -357,8 +357,10 @@ def bbox_state(w, s, e, n) -> dict:
     pending, not_proc = ca.split_missing([k for k in kgs_all if k not in files])
     digs = sorted(f'{k}:{files[k].get("neo1_digest")}' for k in have)
     mt = max([float(files[k].get('mtime') or 0) for k in have] or [0.0])
+    # ready = nothing of the bbox is still on its way: a bbox that intersects
+    # no KG at all (outside Austria) is a stable, cacheable empty answer.
     return {'kgs': have, 'pending': pending, 'not_processed': not_proc, 'digests': digs, 'mtime': mt,
-            'ready': bool(have) and not pending}
+            'n_kgs': len(kgs_all), 'ready': not pending and (bool(have) or not kgs_all)}
 
 
 # ── query ──────────────────────────────────────────────────────────────

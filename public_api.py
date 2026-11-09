@@ -342,7 +342,7 @@ def heightfield():
     return _json(payload, st, max_age=3600)
 
 
-TREES_REV = 'trees-c1'          # bump when the /trees/bbox body layout or QA rules change (part of the ETag)
+TREES_REV = 'trees-c2'          # bump when the /trees/bbox body layout or QA rules change (part of the ETag)
 TREES_MAX_AGE = 86400          # answers change only when a KG is reprocessed; ETag revalidation is index-only
 
 
@@ -398,17 +398,21 @@ def trees_bbox():
     # Computed BEFORE the scan so a matching If-None-Match is index-only.
     st = ne_trees.bbox_state(*bb)
     canon = '&'.join(f'{k}={v}' for k, v in sorted(request.args.items(multi=True)) if k != 'pretty')
-    etag = '"t-' + hashlib.sha256(('|'.join(st['digests']) + '\n' + canon + '\n' + TREES_REV).encode()).hexdigest()[:20] + '"'
+    state = '|'.join(st['digests']) + '\np=' + ','.join(st['pending']) + '\nn=' + ','.join(st['not_processed'])
+    etag = '"t-' + hashlib.sha256((state + '\n' + canon + '\n' + TREES_REV).encode()).hexdigest()[:20] + '"'
     cacheable = st['ready']
-    cc = f'public, max-age={TREES_MAX_AGE}' if cacheable else 'no-store'
+    # Ready → a day of freshness. Not ready (a KG of the bbox still pending) →
+    # *no-cache*, not no-store: the browser keeps the body and revalidates with
+    # If-None-Match on every use (304 is index-only here, and the ETag covers the
+    # pending/not_processed lists so it flips the moment the KG lands).
+    cc = f'public, max-age={TREES_MAX_AGE}' if cacheable else 'public, no-cache'
     lm = email.utils.formatdate(st['mtime'], usegmt=True) if st['mtime'] else None
     hdrs = {'ETag': etag, 'Cache-Control': cc}
     if lm:
         hdrs['Last-Modified'] = lm
-    if cacheable:
-        inm = request.headers.get('If-None-Match') or ''
-        if etag in [x.strip() for x in inm.split(',')] or inm.strip() == '*':
-            return Response(status=304, headers=hdrs)
+    inm = request.headers.get('If-None-Match') or ''
+    if etag in [x.strip() for x in inm.split(',')] or inm.strip() == '*':
+        return Response(status=304, headers=hdrs)
     try:
         if fmt == 'columns':
             t = ne_trees.columns_bbox(*bb, kind, fields=fields, min_height=min_h, max_height=max_h, limit=limit,
@@ -435,8 +439,12 @@ def trees_bbox():
         extra['pending_kgs'] = t['pending_kgs']; extra['retry_after_s'] = 300
     if t['not_processed']:
         extra['not_processed'] = t['not_processed']
-    if not ready:
-        hdrs['Cache-Control'] = 'no-store'
+    if not t['kgs'] and not t['pending_kgs'] and not t['not_processed']:
+        extra['note'] = 'bbox intersects no Austrian KG'
+    if extra.get('error'):
+        hdrs['Cache-Control'] = 'no-store'     # transient index trouble only
+    elif not ready:
+        hdrs['Cache-Control'] = 'public, no-cache'
     meta = dict(docs.TREES_META if kind == 'trees' else docs.STRUCTURES_META, realistic=realistic,
                 min_height=t['min_height'], max_height=t['max_height'], limit=t['limit'],
                 max_limit=max_limit, chunks_scanned=t['chunks_scanned'], ms=t['ms'])

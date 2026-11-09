@@ -417,8 +417,10 @@ GET /api/v1/trees/bbox?bbox=…[&min_height=3][&max_height=…][&limit=2000][&re
       budget ran out).
     Caching: strong ETag + Last-Modified derived from the NE file state of the KGs in the bbox
       (changes only when a KG is reprocessed / re-ingested) + the query string; If-None-Match →
-      304 before any scan; Cache-Control public, max-age=86400 when ready (no-store while a KG is
-      pending). ETag / Last-Modified are CORS-exposed. Chunks of a tile are decoded once and
+      304 before any scan; Cache-Control public, max-age=86400 when ready, public, no-cache while
+      a KG of the bbox is still pending (keep the body, revalidate with If-None-Match — the ETag
+      covers the pending list, so it flips when the KG lands; no-store only on a transient index
+      error). A bbox outside Austria is ready:true, kgs:[] + note. ETag / Last-Modified are CORS-exposed. Chunks of a tile are decoded once and
       shared by all bands / concurrent calls (server ms ≈ 10 for a warm 0.025° tile band).
     realistic=1 (default) removes what the height distribution says are not trees: the saturated
     ≥ 60 m bin, local spikes ≥ 45 m (masts, wind turbines, cranes) and flagged cells — dropped_qa
