@@ -14024,7 +14024,7 @@ class PeerDirector:
                          'blocks (%d → %d codes) for cross-peer distribution',
                          n_split, len(whitelist), len(expanded))
             whitelist = expanded
-            if not whitelist and not v2_codes:
+            if not whitelist and not v2_codes and not _sweep_pending:
                 log.info('Cache-only orchestrate: whitelist empty after block expansion')
                 return
         except Exception as e:
