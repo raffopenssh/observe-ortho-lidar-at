@@ -3924,6 +3924,12 @@ def processing_throttle():
         return jsonify({'throttle': True, 'message': 'Throttle enabled \u2014 skipping GPKG uploads'})
 
 
+# Processor states under which progress.json's ``current_kg`` /
+# ``in_progress_kg.txt`` count as a cross-peer claim (keep in sync with
+# ``peer_director`` cache-only ``active_states``).
+_CLAIM_ACTIVE_STATES = ('running', 'processing', 'paused', 'paused_zenodo')
+
+
 @app.route('/api/v1/processing/peers', methods=['GET'])
 def processing_peers_status():
     """Return compact state for peer coordination.
@@ -3941,17 +3947,28 @@ def processing_peers_status():
     else:
         result['completed'] = sorted(_get_completed_kgs())
 
-    # Current KG being processed
+    # Current KG being processed. Only a *live* processor holds a claim:
+    # ``current_kg`` lingers in progress.json after SIGTERM / a silent
+    # death with state='stopped' (2026-11-09: at218 died mid-tile during
+    # a graceful update; its stale ``current=81206-south`` made every
+    # fresh frontier see "no work" in the last cell with pending blocks,
+    # loop-restart 6×/30 min and quarantine the cell — the KG sat
+    # unclaimed for hours). Mirrors the director's ``active_states``
+    # gate in the cache-only whitelist builder.
     current = None
+    proc_state = None
     pf = data_dir / 'progress.json'
     if pf.exists():
         try:
             pd = json.loads(pf.read_text())
-            ckg = pd.get('current_kg') or {}
-            current = ckg.get('code')
+            proc_state = pd.get('state')
+            if proc_state in _CLAIM_ACTIVE_STATES:
+                ckg = pd.get('current_kg') or {}
+                current = ckg.get('code')
         except Exception:
             pass
     result['current'] = current
+    result['processor_state'] = proc_state
     # Parent code for split-KG awareness. Older peers (pre-kg_splitter)
     # don't know that ``60336-northwest`` is a sub-block of ``60336``;
     # exposing the parent code lets them de-dupe correctly.
@@ -3962,9 +3979,12 @@ def processing_peers_status():
     except Exception:
         pass
 
-    # In-progress marker (crash recovery file)
+    # In-progress marker (crash recovery file). Same rule: a stopped
+    # processor does not claim it — if it resumes while another peer
+    # has picked the code up, the director's dup-KG reconciler keeps the
+    # furthest-along copy.
     ipf = data_dir / 'in_progress_kg.txt'
-    if ipf.exists():
+    if ipf.exists() and proc_state in _CLAIM_ACTIVE_STATES:
         try:
             ip = ipf.read_text().strip()
             if ip and ip != current:
