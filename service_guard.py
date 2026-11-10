@@ -8,8 +8,8 @@ Three independent mechanisms, all per gunicorn worker, all env-tunable:
   a worker thread.  Without this, a tile flood pins all 24 threads in numpy
   and the cheap endpoints (status, peer heartbeats) starve.
 
-* ``RateLimiter`` — per-client token bucket (first ``X-Forwarded-For`` hop,
-  which the exe.dev proxy sets).  429 + ``Retry-After`` + ``X-RateLimit-*``
+* ``RateLimiter`` — per-client token bucket (LAST ``X-Forwarded-For`` hop —
+  the one the exe.dev proxy appends; earlier hops are client-supplied).  429 + ``Retry-After`` + ``X-RateLimit-*``
   headers so well-behaved clients back off instead of retrying blindly.
 
 * ``MemoryWatchdog`` — the Oct 2026 outage: both workers crossed the cgroup
@@ -163,24 +163,120 @@ class RateLimiter:
 
 
 def client_key(request) -> str:
-    """Rate-limit key: the first ``X-Forwarded-For`` hop when the request
-    reached us through a reverse proxy (loopback / private peer address),
-    else the socket address — a direct client cannot pick its own bucket by
-    sending a forged header."""
+    """Rate-limit key.  The exe.dev proxy reaches us on loopback and
+    APPENDS the client address to whatever ``X-Forwarded-For`` the client
+    sent, so only the **last** hop is trustworthy — keying on the first let
+    anyone mint a fresh bucket per request with a forged header (2026-11-10
+    security check).  Anything not arriving on loopback (a direct LAN
+    connection to the 0.0.0.0 listener) is keyed on its socket address and
+    its headers are ignored."""
     xff = request.headers.get('X-Forwarded-For')
     ra = request.remote_addr or ''
     if xff and _from_proxy(ra):
-        return xff.split(',')[0].strip() or 'unknown'
+        return xff.split(',')[-1].strip() or 'unknown'
     return ra or 'unknown'
 
 
 def _from_proxy(addr: str) -> bool:
     try:
         import ipaddress
-        ip = ipaddress.ip_address(addr)
-        return ip.is_loopback or ip.is_private
+        return ipaddress.ip_address(addr).is_loopback
     except ValueError:
         return False
+
+
+def is_local(request) -> bool:
+    """On-box caller (watchdog probe, CLI): loopback socket, no proxy header."""
+    return _from_proxy(request.remote_addr or '') and not request.headers.get('X-Forwarded-For')
+
+
+class ClientGuard:
+    """Whole-tier fairness: a generous per-client token bucket plus a cap on
+    one client's requests *in flight* per worker, so no single address can
+    hold every gunicorn thread or hammer the uncached endpoints forever.
+
+    ``data/rate_friends`` (one IP or CIDR per line, ``#`` comments; re-read
+    every 30 s) lists sibling services (trusted consumers) that get
+    ``friend_x`` × the rate/burst and a higher in-flight cap.  Per worker —
+    the effective budget is × the number of workers."""
+
+    FRIENDS_PATH = 'data/rate_friends'
+
+    def __init__(self):
+        self.rate = _env_f('PUBLIC_RATE_PER_S', 30.0)
+        self.burst = _env_f('PUBLIC_RATE_PER_S_BURST', 900.0)
+        self.friend_x = _env_f('PUBLIC_FRIEND_X', 5.0)
+        self.inflight_max = int(_env_f('PUBLIC_INFLIGHT_MAX', 14))
+        self.inflight_friend = int(_env_f('PUBLIC_INFLIGHT_FRIEND', 20))
+        self._rl = RateLimiter('public', self.rate, self.burst)
+        self._rl_friend = RateLimiter('public_friend', self.rate * self.friend_x, self.burst * self.friend_x)
+        self._in: dict[str, int] = {}
+        self._lock = threading.Lock()
+        self._friends: list = []
+        self._friends_t = 0.0
+        self.inflight_rejected = 0
+
+    def _is_friend(self, key: str) -> bool:
+        now = time.monotonic()
+        if now - self._friends_t > 30:
+            self._friends_t = now
+            nets = []
+            try:
+                import ipaddress
+                for line in open(self.FRIENDS_PATH):
+                    line = line.split('#')[0].strip()
+                    if line:
+                        try:
+                            nets.append(ipaddress.ip_network(line, strict=False))
+                        except ValueError:
+                            pass
+            except OSError:
+                pass
+            self._friends = nets
+        if not self._friends:
+            return False
+        try:
+            import ipaddress
+            ip = ipaddress.ip_address(key)
+        except ValueError:
+            return False
+        return any(ip.version == n.version and ip in n for n in self._friends)
+
+    def enter(self, key: str, count_inflight: bool = True) -> tuple[bool, float, str]:
+        """→ (allowed, retry_after_s, reason).  On allowed + count_inflight
+        the caller MUST call ``leave(key)`` when the request ends."""
+        friend = self._is_friend(key)
+        ok, _left, retry = (self._rl_friend if friend else self._rl).take(key)
+        if not ok:
+            return False, retry, 'rate_limited'
+        if count_inflight:
+            cap = self.inflight_friend if friend else self.inflight_max
+            with self._lock:
+                n = self._in.get(key, 0)
+                if cap > 0 and n >= cap:
+                    self.inflight_rejected += 1
+                    return False, 1.0, 'too_many_in_flight'
+                self._in[key] = n + 1
+        return True, 0.0, ''
+
+    def leave(self, key: str) -> None:
+        with self._lock:
+            n = self._in.get(key, 0) - 1
+            if n <= 0:
+                self._in.pop(key, None)
+            else:
+                self._in[key] = n
+
+    def stats(self) -> dict:
+        with self._lock:
+            top = sorted(self._in.items(), key=lambda kv: -kv[1])[:5]
+        return {'rate': self._rl.stats(), 'friend_rate': self._rl_friend.stats(),
+                'friends': [str(n) for n in self._friends],
+                'inflight_max': self.inflight_max, 'inflight_friend': self.inflight_friend,
+                'inflight_rejected': self.inflight_rejected, 'inflight_top': top}
+
+
+CLIENTS = ClientGuard()
 
 
 # --------------------------------------------------------------------------

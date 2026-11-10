@@ -455,6 +455,9 @@ GET /tiles/hillshade/{{z}}/{{x}}/{{y}}.png  ·  GET /tiles/slope/{{z}}/{{x}}/{{y
     Retry-After (exponential back-off from it), keep ≤ 8 tile requests in flight,
     and never pre-fetch whole pyramids — fetch what a viewport needs, when it needs it.
     Low zooms (z10–11) span many KGs and are the most expensive renders.
+Fair use (all routes): per client address ≈ 60 r/s sustained (burst ≈ 1800) and
+    ≈ 28 requests in flight → 429 + Retry-After ({{error: rate_limited|too_many_in_flight}}).
+    Far above what a tiling client needs; honour Retry-After and you will never notice.
 GET /api/v1/health
     Liveness probe ({{ok, rss_mb}}; 503 while a worker is recycling). /api/v1/status?guard=1
     adds per-worker cache / gate / rate-limit telemetry.

@@ -149,7 +149,30 @@ def _preflight():
         return Response(status=204)
     g.t0 = time.time()
     sg.WATCHDOG.check()          # ≤ 1 RSS sample / 5 s / worker; sheds caches or recycles (service_guard)
+    # whole-tier fairness (service_guard.ClientGuard): generous per-client rate +
+    # in-flight cap.  /k is token-gated fleet traffic, on-box probes are exempt;
+    # tiles count for rate only (own render gate bounds their thread use).
+    p = request.path or ''
+    if not p.startswith(tiers.PRIVATE_PREFIX) and not sg.is_local(request):
+        key = sg.client_key(request)
+        count = not p.startswith('/tiles/')
+        ok, retry, why = sg.CLIENTS.enter(key, count_inflight=count)
+        if not ok:
+            r = _json({'error': why, 'retry_after_s': round(retry, 1),
+                       'detail': 'per-client fair-use limit; honour Retry-After'}, 429)
+            r.headers['Retry-After'] = str(max(1, int(retry + 0.999)))
+            r.headers['Cache-Control'] = 'no-store'
+            return r
+        if count:
+            g._guard_key = key
     return None
+
+
+@app.teardown_request
+def _guard_leave(_exc):
+    key = g.pop('_guard_key', None)
+    if key is not None:
+        sg.CLIENTS.leave(key)
 
 
 @app.errorhandler(sg.Overloaded)
@@ -163,7 +186,8 @@ def _overloaded(e):
 def _guard_dict() -> dict:
     """Per-worker resource picture (this is one of two gunicorn workers)."""
     d = {'watchdog': sg.WATCHDOG.stats(), 'cgroup': sg.cgroup_memory(),
-         'caches': mem_lru.stats_all(), 'caches_total_mb': mem_lru.total_mb()}
+         'caches': mem_lru.stats_all(), 'caches_total_mb': mem_lru.total_mb(),
+         'clients': sg.CLIENTS.stats()}
     try:
         import hillshade_tiles as _hs
         d['tiles'] = _hs.stats()

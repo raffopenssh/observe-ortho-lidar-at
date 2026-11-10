@@ -466,7 +466,8 @@ _safe_load.install()          # whitelist unpickler for np.load(allow_pickle=Tru
 
 
 def _peer_of_request() -> str:
-    xff = (request.headers.get('X-Forwarded-For') or '').split(',')[0].strip()
+    # last hop = appended by the exe.dev proxy; earlier hops are client-supplied
+    xff = (request.headers.get('X-Forwarded-For') or '').split(',')[-1].strip()
     return xff or request.remote_addr or '?'
 
 
