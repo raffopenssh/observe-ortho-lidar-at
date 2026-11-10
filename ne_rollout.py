@@ -116,7 +116,10 @@ def audit_manifest(entries: dict | None = None) -> dict:
             stripped += 1
         if st == "cf":
             cf += 1
-        if st in CLEAN_STATUS:
+        if st in CLEAN_STATUS or str(e.get("version") or "") == CUR:
+            # a product written at the current version is cadastre-free
+            # by construction (CADASTRE_PRODUCTS=False) even when the
+            # uploader forgot the status flag (56304-sw1_json_v2, 2026-11-10)
             clean[suf] += 1
         else:
             suspect[suf] += 1
@@ -183,7 +186,12 @@ def strip_local_json(entries: dict | None = None, max_files: int = 200) -> dict:
         if code in done_codes:
             continue
         e = entries.get(f"{code}_json")
-        if not isinstance(e, dict) or str(e.get("status") or "") not in ("cf", "stripped"):
+        _st = str(e.get("status") or "") if isinstance(e, dict) else ""
+        # strip once the Zenodo copy is clean — or once there is no live
+        # Zenodo copy at all (record removed / code retired from the
+        # manifest): a local mirror of a retired product is not coverage
+        # and must not keep parcel sections either (8 files, 2026-11-10)
+        if _st not in ("cf", "stripped", "removed") and isinstance(e, dict):
             remaining += 1
             continue
         if checked >= max_files:

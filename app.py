@@ -20185,7 +20185,7 @@ def process_txt():
         n_ooc = sum(1 for r in rows if r[4] == 'ooc')
         out.append(
             f'zen_stall: done={_sv["done"]} partial={n_part} '
-            f'stalled={n_stal} | holes={n_hole} ({n_q} queued, '
+            f'stalled={n_stal - n_drift - n_ooc} | holes={n_hole} ({n_q} queued, '
             f'{n_hole - n_q - n_gap} pending-sweep'
             + (f', {n_gap} GAP' if n_gap else '') + ') '
             f'orphans={len(rows) - n_hole - n_drift - n_ooc - n_requeued}'
@@ -20513,7 +20513,7 @@ def process_txt():
                 _line = ('v2_regen: ' + ' '.join(f'{k}={v}' for k, v in sorted(_cnt.items()))
                          + f' (gate: zenodo circuit clear, {_pd_rg.V2_REGEN_CONFIRMATIONS} gone-checks '
                            f'≥{_pd_rg.V2_REGEN_CONFIRM_GAP_S // 60}m apart; v1 json/light kept until v2.2 lands)')
-                _rows = _rg.get('rows') or []
+                _rows = [r for r in (_rg.get('rows') or []) if r.get('state') != 'dismissed']
                 if _rows:
                     _line += ' · ' + ' '.join(
                         f"{r['code']}@{r['state']}"
@@ -20543,12 +20543,17 @@ def process_txt():
             if _sbs.get('error'):
                 out.append(f"stale_blocks: unavailable ({_sbs['error']})")
             else:
-                out.append(f"stale_blocks: parents={_sbs['stale_parents']} codes={_sbs['stale_codes']} "
-                           f"(old layout residue overlapping the live layout; `python3 stale_blocks.py apply`) "
-                           f"· drift={_sbs['drift_parents']} (layout changed, old product is the coverage — kept"
-                           + (": " + " ".join(f"{k}={v}" for k, v in sorted((_sbs.get('drift_kinds') or {}).items()))
-                              if _sbs.get('drift_kinds') else '') + ")"
-                           + (f" · {' '.join(_sbs['sample'])}" if _sbs['sample'] else ''))
+                _dk = " ".join(f"{k}={v}" for k, v in sorted((_sbs.get('drift_kinds') or {}).items()))
+                if _sbs['stale_parents']:
+                    out.append(f"stale_blocks: parents={_sbs['stale_parents']} codes={_sbs['stale_codes']} "
+                               f"(old layout residue overlapping the live layout; `python3 stale_blocks.py apply`) "
+                               f"· benign drift={_sbs['drift_parents']}" + (f" [{_dk}]" if _dk else '')
+                               + (f" · {' '.join(_sbs['sample'])}" if _sbs['sample'] else ''))
+                else:
+                    # nothing actionable: drift = valid coverage the current
+                    # layout alone would not give (stale_blocks.DRIFT_KINDS)
+                    out.append(f"stale_blocks: clean (0 stale · benign drift={_sbs['drift_parents']}"
+                               + (f" [{_dk}]" if _dk else '') + ")")
         except Exception as _e:
             out.append(f'stale_blocks: unavailable ({_e})')
         # json_heal: missing v1 _json completion markers rebuilt from
