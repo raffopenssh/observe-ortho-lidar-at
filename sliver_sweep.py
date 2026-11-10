@@ -70,6 +70,9 @@ DISPATCH_STALE_S = 8 * 3600     # no result from the peer → back to pending
 RESWEEP_COOLDOWN_S = 6 * 3600   # a done parent with struck-out (failed) units gets its units re-opened after this
 HOLD_RECHECK_S = 15 * 60        # a unit on hold (openEO cell not cached) is re-checked against the Zenodo index this often
 HOLD_MAX_CELLS = 40             # cap on held cells handed to the director's prewarm.repair_cells plan per tick
+HOLD_PARTIAL_AFTER_S = 6 * 3600  # a unit held this long (frontier could not fill the openEO cell) is re-dispatched
+                                 # *tolerating* the missing Copernicus products → partial sweep (knob sweep_hold_partial_h)
+PARTIAL_PRODUCTS = ("ndvi", "worldcover", "sar", "harmonics")  # what a partial sweep may run without (never LiDAR/ortho)
 _CACHE_CHECK_TTL_S = 10 * 60    # CopernicusTileCache / HansenTileCache instance reuse (ZIP index parse is costly)
 SCAN_PER_TICK = 400
 INTEGRATE_PER_TICK = 40         # cap per ingest tick; INTEGRATE_BUDGET_S stops earlier (2026-11-04: 6/tick left 677 parents received-not-integrated)
@@ -660,7 +663,8 @@ def spec_for(code: str, k: dict) -> dict:
     return {"parent": code, "bbox_new": k.get("bbox_new"), "bbox_old": k.get("bbox_old"),
             "attempt": int(k.get("attempts") or 0) + 10 * int(k.get("rerun") or 0),
             "units": [{"id": u["id"], "bbox": u["bbox"], "cells": u.get("cells"), "side": u.get("side"),
-                       "declared": u.get("declared") or "lu"}
+                       "declared": u.get("declared") or "lu",
+                       **({"tolerate": sorted(u["tolerate"])} if u.get("tolerate") else {})}
                       for u in k.get("units") or [] if _unit_open(u) or u.get("state") == "dispatched"]}
 
 
@@ -840,6 +844,15 @@ def accept_result(unit: str, parent: str, peer: str, attempt: int, status: str,
             # h3b accepted (file kept); products missing → one more try
             status, error = "failed", products
         u.update(state=status, peer=peer, at=_now(), cells_observed=cells_observed, seconds=seconds)
+        if status in ("ok", "nodata"):
+            if u.get("tolerate"):
+                # partial sweep landed: remember what it ran without
+                u["partial"] = sorted(u["tolerate"])
+                st["stats"]["partial"] = int(st["stats"].get("partial") or 0) + 1
+                log.info("sliver_sweep: %s partial sweep ok (without %s), cells=%s",
+                         unit, ",".join(u["partial"]), cells_observed)
+            for key in ("hold_cells", "hold_at", "hold_since", "tolerate"):
+                u.pop(key, None)
         if products:
             u["products"] = products[:200]
         else:
@@ -859,6 +872,7 @@ def accept_result(unit: str, parent: str, peer: str, attempt: int, status: str,
                 miss = [{"error": str(ex)[:80]}]
             status = "hold"
             u.update(hold_cells=miss, hold_at=time.time(), misses=int(u.get("misses") or 0) + 1)
+            u.setdefault("hold_since", time.time())
             u["state"] = "hold"
             st["stats"]["cache_miss"] = int(st["stats"].get("cache_miss") or 0) + 1
             log.info("sliver_sweep: %s on hold (cache miss, %d cell(s) uncached on Zenodo): %s",
@@ -1171,6 +1185,23 @@ def evict_integrated_units(idx: dict, entries: dict, max_n: int = EVICT_PER_TICK
     return out
 
 
+def _partial_tolerance(u: dict, now: float | None = None) -> list[str] | None:
+    """Products a long-held unit may sweep without, or None while the hold
+    is young / the miss is not a Copernicus product (hansen is fetched
+    best-effort anyway; a LiDAR gap is never tolerated)."""
+    now = now or time.time()
+    since = float(u.get("hold_since") or u.get("hold_at") or now)
+    limit = float(_knob("sweep_hold_partial_h", HOLD_PARTIAL_AFTER_S / 3600)) * 3600
+    if limit <= 0 or now - since < limit:
+        return None
+    prods: set = set(u.get("tolerate") or [])
+    for c in u.get("hold_cells") or []:
+        if "w" not in c:
+            return None  # index check errored → not a real miss list
+        prods |= {p for p in (c.get("products") or []) if p in PARTIAL_PRODUCTS}
+    return sorted(prods) or None
+
+
 def _reopen_unswept() -> list[str]:
     """A ``done`` parent whose units struck out (3× cache-miss / crash) kept
     its strip unswept.  After ``RESWEEP_COOLDOWN_S`` (the frontier has had
@@ -1196,6 +1227,21 @@ def _reopen_unswept() -> list[str]:
                         continue
                     if miss:
                         u.update(hold_cells=miss, hold_at=now)
+                        tol = _partial_tolerance(u, now)
+                        if tol is None:
+                            continue
+                        # Partial sweep (docs/sliver-sweep.md → Partial
+                        # sweeps): the frontier had HOLD_PARTIAL_AFTER_S to
+                        # fill the cell and could not (openEO returns no
+                        # NDVI months for glacier cells, …).  Re-dispatch
+                        # tolerating exactly the uncached Copernicus
+                        # products; LiDAR/ortho still observe the cells.
+                        u["tolerate"] = tol
+                        u["state"] = "pending"; u.pop("error", None)
+                        hit = True
+                        log.info("sliver_sweep: %s held %.1fh for uncached %s — re-dispatched as partial sweep",
+                                 u.get("id"), (now - float(u.get("hold_since") or u.get("hold_at") or now)) / 3600,
+                                 ",".join(tol))
                         continue
                     if int(u.get("misses") or 0) >= 2 * MAX_ATTEMPTS:
                         # cells cached but the peer keeps missing them → count it as a real attempt
@@ -1229,6 +1275,9 @@ def status() -> dict:
     nodata = sum(int(k.get("nodata") or 0) for k in done)
     unswept = sum(int(k.get("unswept") or 0) for k in done)
     hold_units = sum(1 for k in kgs.values() for u in k.get("units") or [] if u.get("state") == "hold")
+    partial_units = sum(1 for k in kgs.values() for u in k.get("units") or [] if u.get("partial"))
+    tolerant_open = sum(1 for k in kgs.values() for u in k.get("units") or []
+                        if u.get("tolerate") and u.get("state") in ("pending", "dispatched", "failed"))
     hold_cells = len(held_cells(10 ** 6))
     now = time.time()
     day = [k for k in done if k.get("done_at") and now - _ts(k["done_at"]) < 86400]
@@ -1274,7 +1323,8 @@ def status() -> dict:
             "kgs": len(kgs), "by_state": by, "seen_elsewhere": seen_elsewhere, "lu_fetched": lu_fetched, "units_open": units_open, "cells_open": cells_open,
             "cells_filled": cells_done, "nodata_cells": nodata, "unswept_cells": unswept,
             "unswept_parents": sum(1 for k in done if k.get("unswept")),
-            "hold_units": hold_units, "hold_cells": hold_cells, "cache_miss_total": int((st.get("stats") or {}).get("cache_miss") or 0),
+            "hold_units": hold_units, "hold_cells": hold_cells, "partial_units": partial_units,
+            "tolerant_open": tolerant_open, "cache_miss_total": int((st.get("stats") or {}).get("cache_miss") or 0),
             "done_24h": len(day), "rate_per_h": round(rate, 2),
             "scan_backlog": scan_backlog, "scan_rate_per_h": round(scan_rate, 2),
             "eta_h": round(eta_h, 1) if eta_h is not None else None, "peers": st.get("peers") or {},
@@ -1311,6 +1361,8 @@ def text_lines(v: dict | None = None) -> list[str]:
             f"· filled={v['cells_filled']:,} nodata={v['nodata_cells']:,}"
             + (f" unswept={v['unswept_cells']:,}({v['unswept_parents']}p)" if v.get("unswept_cells") else "")
             + (f" hold={v['hold_units']}u/{v['hold_cells']}cells→repair_cells" if v.get("hold_units") else "")
+            + (f" partial={v['partial_units']}u" + (f"(+{v['tolerant_open']} open)" if v.get("tolerant_open") else "")
+               if v.get("partial_units") or v.get("tolerant_open") else "")
             + f" · @{v['rate_per_h']}/h eta={eta}"
             + (f" · evicted={(v.get('stats') or {}).get('evicted_units')}u/{int((v.get('stats') or {}).get('evicted_bytes') or 0) // 1_000_000}MB"
                if (v.get('stats') or {}).get('evicted_units') else "")
@@ -1389,6 +1441,11 @@ def detail_lines(limit: int = 30) -> list[str]:
         if n_hold:
             cells = sorted({(c["w"], c["s"]) for u in us if u.get("state") == "hold" for c in (u.get("hold_cells") or []) if "w" in c})
             hold_s = f" hold={n_hold}(" + ("transient, retry" if not cells else "waiting cells " + " ".join(f"{w:g}/{s_:g}" for w, s_ in cells[:4])) + ")"
+        n_part = sum(1 for u in us if u.get("partial"))
+        n_tol = sum(1 for u in us if u.get("tolerate") and not u.get("partial"))
+        if n_part or n_tol:
+            miss = sorted({p for u in us for p in (u.get("partial") or u.get("tolerate") or [])})
+            hold_s += f" partial={n_part}" + (f"(+{n_tol} open)" if n_tol else "") + f" without {','.join(miss)}"
         prod_ok = sum(1 for u in us if u.get("state") == "ok" and str(u.get("products") or "") == "ok")
         prod_n = sum(1 for u in us if u.get("state") == "ok")
         if k["state"] == "done":
@@ -1502,6 +1559,7 @@ def peer_units(codes: list[str], kg_index: dict) -> list[dict]:
                      lat=(s + n) / 2, lon=(w + e) / 2, _sweep=True, _sweep_attempt=int(sp.get("attempt") or 0),
                      _sweep_cells=u.get("cells"), _sweep_side=u.get("side"),
                      _sweep_declared=str(u.get("declared") or "lu"),
+                     _sweep_tolerate=sorted(str(x) for x in (u.get("tolerate") or [])),
                      _parent_bbox=(tuple(float(x) for x in bn) if bn else None))
             out.append(d)
     return out

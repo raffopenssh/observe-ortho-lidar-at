@@ -6138,8 +6138,17 @@ def _fetch_copernicus_for_tile(
     cop_cache,
     report_fn=None,
     tile_label: str = "",
+    tolerate_miss: frozenset | set | None = None,
 ) -> dict | None:
     """Fetch all Copernicus data for a tile bbox, with sub-tile fallback.
+
+    ``tolerate_miss`` (``{"ndvi","worldcover","sar","harmonics"}`` subset):
+    products whose cache-only ``CacheMissError`` is swallowed instead of
+    aborting the KG — a *partial sliver sweep* (``sliver_sweep.py`` →
+    ``tolerate``, ``docs/sliver-sweep.md → Partial sweeps``) for a cell the
+    frontier could not fill (openEO has no NDVI months for a glacier cell,
+    …).  The layer is simply absent for the tile (→ ``-partial`` label on
+    the add-on products, nodata in the NE cells).
 
     If the initial fetch for the full bbox times out, the bbox is
     subdivided into smaller sub-tiles.  Each sub-tile is fetched
@@ -6153,6 +6162,25 @@ def _fetch_copernicus_for_tile(
         if report_fn:
             report_fn("copernicus", f"{tile_label} — {detail}")
 
+    tolerate_miss = frozenset(tolerate_miss or ())
+    _tolerated: set = set()
+
+    def _tolerant(product, fn):
+        """Run *fn*; a cache-only miss on a tolerated product → None."""
+        if product not in tolerate_miss:
+            return fn()
+        from tile_cache import CacheMissError as _CME
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            if isinstance(e, _CME) or isinstance(e.__cause__, _CME):
+                if product not in _tolerated:
+                    _tolerated.add(product)
+                    log.warning("Copernicus %s: %s uncached — tolerated (partial sweep): %s",
+                                tile_label, product, str(e)[:120])
+                return None
+            raise
+
     def _try_fetch_single(bbox, label=""):
         """Attempt to fetch all Copernicus layers for one bbox."""
         # Bail immediately if IP-throttled
@@ -6164,7 +6192,7 @@ def _fetch_copernicus_for_tile(
 
         # NDVI composite (grid-snapped, usually fast)
         _report(f"{label}NDVI" if label else "NDVI")
-        nd = cop_cache.get_ndvi(bbox, year=obs_year)
+        nd = _tolerant("ndvi", lambda: cop_cache.get_ndvi(bbox, year=obs_year))
         if nd and nd.get("ndvi") is not None:
             cop["ndvi"] = nd["ndvi"]
             cop["transform"] = nd.get("transform")
@@ -6172,13 +6200,13 @@ def _fetch_copernicus_for_tile(
 
         # WorldCover
         _report(f"{label}WorldCover" if label else "WorldCover")
-        lc = cop_cache.get_landcover(bbox)
+        lc = _tolerant("worldcover", lambda: cop_cache.get_landcover(bbox))
         if lc:
             cop["landcover"] = lc
 
         # SAR
         _report(f"{label}SAR" if label else "SAR")
-        sar = cop_cache.get_sar(bbox, year=obs_year)
+        sar = _tolerant("sar", lambda: cop_cache.get_sar(bbox, year=obs_year))
         if sar:
             cop.update({k: sar[k] for k in ["vv", "vh"] if k in sar})
             if "transform" in sar:
@@ -6190,8 +6218,8 @@ def _fetch_copernicus_for_tile(
             def _harm_progress(done, total):
                 _report(f"{label}harmonics ({done}/{total} months)" if label
                         else f"harmonics ({done}/{total} months)")
-            harm = cop_cache.get_harmonics(bbox, year=obs_year,
-                                           progress_fn=_harm_progress)
+            harm = _tolerant("harmonics", lambda: cop_cache.get_harmonics(
+                bbox, year=obs_year, progress_fn=_harm_progress))
             if harm is not None:
                 cop["harmonics"] = harm
 
@@ -7637,14 +7665,25 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     try:
                         bbox_dict = {"west": tw, "south": ts, "east": te, "north": tn}
                         cop_cache = _get_cop_cache()
+                        _sweep_tolerate = frozenset(kg.get("_sweep_tolerate") or ()) \
+                            if kg.get("_sweep") else frozenset()
                         copernicus_data = _fetch_copernicus_for_tile(
                             bbox_dict, obs_year, cop_cache,
                             report_fn=_report_step,
                             tile_label=tile_label,
+                            tolerate_miss=_sweep_tolerate,
                         )
                         # Update circuit breaker
                         if copernicus_data:
                             c_breaker["consecutive_failures"] = 0
+                        elif _sweep_tolerate:
+                            # Partial sliver sweep: the director told us the
+                            # cell's Copernicus products are unfillable —
+                            # the tile proceeds without them (LiDAR/ortho
+                            # still make the NE cells; '-partial' label).
+                            log.warning("KG %s %s: no Copernicus layers (tolerated: %s) — "
+                                        "partial sweep tile proceeds without",
+                                        kg_code, tile_label, ",".join(sorted(_sweep_tolerate)))
                         elif _v2_upgrade:
                             # Upgrade mode: the v1 GPKG carried no Copernicus
                             # layers for this tile and the tile cache has none
