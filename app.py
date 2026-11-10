@@ -5418,6 +5418,18 @@ def _get_completed_kgs() -> set:
                 except OSError:
                     continue
             completed.add(jf.stem)
+    # Split parents covered by blocks of ANY historical layout count as
+    # completed too (layout drift, 2026-11-10: 91123 Wolfurt was finished
+    # as 7 directional blocks, its strike count later moved the plan to 8
+    # doubled blocks; a peer whose pending list only knew block *codes*
+    # re-ran the whole parent under the new layout — 8 × ~1.5 h + 5 GB of
+    # uploads for nothing). Advertising the parent in ``completed`` makes
+    # every consumer (peers' ``peer_claimed`` → skip split, director
+    # ``_frontier_cells``, queue pruning) agree with the coverage oracle.
+    try:
+        completed |= _coverage_complete_parents(json_dir=json_dir)
+    except Exception:
+        pass
     # Drop tombstoned KGs (force-requeued by operator).
     try:
         if _tombstone_path.exists():
@@ -5431,6 +5443,86 @@ def _get_completed_kgs() -> set:
     except Exception:
         pass
     return completed
+
+
+# Geometrically complete split parents (no own live ``_json``, blocks of
+# some layout cover the bbox). The oracle costs ~14 s over the whole
+# manifest (1 354 parents, 2026-11-10), so it is computed in a background
+# thread, keyed on the manifest file signature, and persisted so both
+# gunicorn workers + a restart reuse it. Until the first pass lands the
+# persisted set (or nothing) is returned — a stale answer only means a
+# drift parent is advertised a few minutes late, never wrongly.
+_COV_PARENTS_FILE = Path('data/austria_processor/coverage_complete_parents.json')
+_COV_PARENTS_TTL_S = 600
+_cov_parents_lock = threading.Lock()
+_cov_parents_state: dict = {'sig': None, 'at': 0.0, 'codes': None, 'busy': False}
+
+
+def _coverage_complete_parents(json_dir=None) -> set:
+    mf = Path('data/austria_processor/zenodo_manifest.json')
+    try:
+        st = mf.stat()
+        sig = (int(st.st_mtime), st.st_size)
+    except OSError:
+        return set()
+    now = time.time()
+    with _cov_parents_lock:
+        s = _cov_parents_state
+        if s['codes'] is None and _COV_PARENTS_FILE.exists():
+            try:
+                d = json.loads(_COV_PARENTS_FILE.read_text())
+                s['codes'] = set(d.get('codes') or [])
+                s['sig'] = tuple(d.get('sig') or ()) or None
+                s['at'] = float(d.get('at') or 0)
+            except Exception:
+                s['codes'] = set()
+        fresh = (s['sig'] == sig) or (now - s['at'] < _COV_PARENTS_TTL_S)
+        if not fresh and not s['busy']:
+            s['busy'] = True
+            threading.Thread(target=_refresh_coverage_complete_parents,
+                             args=(sig, json_dir), daemon=True,
+                             name='cov-parents').start()
+        return set(s['codes'] or ())
+
+
+def _refresh_coverage_complete_parents(sig, json_dir=None):
+    try:
+        from kg_splitter import is_block_code, parent_kg_code
+        import json_cache
+        m = json_cache.load(Path('data/austria_processor/zenodo_manifest.json')) or {}
+        entries = m.get('entries', m)
+        live = set()
+        for k, e in entries.items():
+            if not k.endswith('_json') or not isinstance(e, dict):
+                continue
+            stt = str(e.get('status') or '')
+            if 'error' in stt or stt == 'removed' or not int(e.get('size') or 0):
+                continue
+            live.add(k[:-5])
+        parents = {parent_kg_code(c) for c in live if is_block_code(c)}
+        out = set()
+        for p in sorted(parents - live):
+            try:
+                if _kg_coverage_complete(p, entries, json_dir=json_dir)[0]:
+                    out.add(p)
+            except Exception:
+                continue
+        with _cov_parents_lock:
+            _cov_parents_state.update(sig=sig, at=time.time(), codes=out)
+        try:
+            tmp = _COV_PARENTS_FILE.with_suffix('.tmp')
+            tmp.write_text(json.dumps({'sig': list(sig), 'at': time.time(),
+                                       'codes': sorted(out)}))
+            os.replace(tmp, _COV_PARENTS_FILE)
+        except Exception:
+            pass
+        log.info('coverage-complete parents: %d split parents covered by '
+                 'blocks of a historical layout (advertised as completed)', len(out))
+    except Exception as e:
+        log.warning('coverage-complete parents refresh failed: %s', e)
+    finally:
+        with _cov_parents_lock:
+            _cov_parents_state['busy'] = False
 
 
 # === SECTION: KG geographic-coverage completion oracle ===
@@ -5578,11 +5670,18 @@ def _kg_coverage_complete(code, mentries, after_ts=None, json_dir=None):
                 continue
             bb = _read_bbox_cheap(c, json_dir)
             if bb is None:
+                # Unreadable geometry (block JSON not ingested yet / gone):
+                # leave it out. Coverage is monotone in the rect set, so
+                # the readable blocks can still prove completeness on
+                # their own (a fresh drift-layout block landing must not
+                # flip a parent already covered by the old layout back to
+                # 'pending', 2026-11-10 91123); only when they don't do
+                # we fall back to the conservative parent-json rule.
                 ok_geom = False
-                break
+                continue
             rects.append(bb)
-        complete = (_rects_cover_parent(pbbox, rects) if ok_geom
-                    else parent_ua is not None)
+        complete = _rects_cover_parent(pbbox, rects) or (
+            (parent_ua is not None) if not ok_geom else False)
     if not complete:
         return (False, newest)
     if after_ts is not None:

@@ -68,6 +68,36 @@ Long loops inside a task must call `_check_aborted()`.
 | Quality flags + feedback | operator-tier `/api/v1/flags*`, `/feedback*` (`quality_flags.py`, `feedback_db.py`) |
 | parse-geometry | `/api/v1/parse-geometry` (`geo_parse.py`: GeoJSON, WKT, KML, GPX, GPKG, zipped SHP, coordinates) |
 
+## Completed set vs. split-layout drift (`_get_completed_kgs`)
+
+`_get_completed_kgs()` is what `/api/v1/processing/peers` advertises as
+`completed` and what every peer folds into its `peer_claimed` set before
+expanding parents into blocks. It is **block-code based** (one entry per
+live `_json`), so a split parent finished under an *older* layout was never
+in it: the peer re-split the parent with today's strike count, saw none of
+the new block codes committed and happily re-ran the whole parent (91123
+Wolfurt, 2026-11-09: 7 directional blocks done since July, plan moved to 8
+doubled blocks → 8 × ~1.5 h + ~5 GB re-uploaded; the director's own
+`_frontier_cells` had been oracle-aware since 7e742bc, the peers were not).
+
+Since 2026-11-10 the set also contains every parent the coverage oracle
+calls complete (`_coverage_complete_parents()`: parents without an own live
+`_json` whose blocks of *any* historical layout cover the bbox). The oracle
+pass costs ~14 s over the manifest (1 350 parents), so it runs in a
+background thread keyed on the manifest file signature (10 min TTL) and is
+persisted in `data/austria_processor/coverage_complete_parents.json` for
+the other gunicorn worker / restarts; until the first pass lands the
+persisted (or empty) set is returned. Tombstoned codes are still removed
+afterwards, so a deliberate force-requeue of a drift parent keeps working.
+
+The oracle itself now ignores blocks whose bbox it cannot read (a fresh
+block JSON not yet ingested) instead of bailing to the parent-json rule —
+coverage is monotone in the rect set, so the readable blocks may still
+prove completeness; the conservative fallback only applies when they don't.
+
+Old-layout residue left behind by such a double run (`stale_blocks:` line)
+is retired with `python3 stale_blocks.py apply` as before.
+
 ## Re-queueing a KG (and the tombstone trap)
 
 ```bash
