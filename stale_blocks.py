@@ -30,7 +30,7 @@ Parents whose current layout does NOT cover the bbox without the extra
 codes (``drift`` — typically an unsplit parent product whose layout has
 since split) are left alone: the old product is the valid coverage.
 
-    python3 stale_blocks.py scan              # report only
+    python3 stale_blocks.py scan [-v]         # report only (-v: per-parent drift kinds)
     python3 stale_blocks.py apply [--limit N] [code ...]
     python3 stale_blocks.py retire [--dry-run] code ...   # orphan residue (no _json)
 """
@@ -65,19 +65,43 @@ def _entries() -> dict:
     return raw.get("entries", raw) or {}
 
 
-def scan(entries: dict | None = None) -> dict:
-    """→ ``{"stale": [{parent, codes, layout}], "drift": [...]}``."""
-    import austria_processor as ap
-    import kg_splitter
-    import app as _app
+DRIFT_KINDS = {
+    "unsplit": "parent's own unsplit product is the complete coverage; layout split later (strikes), no block done — nothing to do",
+    "mixed": "parent's own unsplit product covers; some current-layout blocks also committed (ne_ingest merges own product + blocks) — nothing to do",
+    "old-blocks": "old-layout block products are load-bearing: a current-layout label was committed under an older geometry (label collision), the extras close the gap — nothing to do",
+}
+
+
+def _drift_kind(parent: str, kept: list, layout_done: list) -> str:
+    if kept == [parent]:
+        return "mixed" if layout_done else "unsplit"
+    return "old-blocks"
+
+
+def scan(entries: dict | None = None, *, kgs: dict | None = None,
+         layout_fn=None, cover_fn=None, sweep_fn=None) -> dict:
+    """→ ``{"stale": [{parent, codes, layout}], "drift": [{parent, codes,
+    layout, kind, layout_done}]}``.  ``kind`` ∈ :data:`DRIFT_KINDS` — every
+    drift row is *valid* coverage that the current layout alone would not
+    reproduce (2026-11-10 audit of 67 drift parents: 60 unsplit, 5 mixed,
+    2 old-blocks, zero actionable).  The keyword args inject the layout /
+    coverage oracle for tests."""
     entries = entries if entries is not None else _entries()
+    if layout_fn is None or cover_fn is None or sweep_fn is None or kgs is None:
+        import austria_processor as ap
+        import kg_splitter
+        import app as _app
+        layout_fn = layout_fn or kg_splitter.maybe_split_kg
+        cover_fn = cover_fn or _app._kg_coverage_complete
+        sweep_fn = sweep_fn or kg_splitter.is_sweep_code
+        if kgs is None:
+            kgs = {k["kg_code"]: k for k in ap.get_all_kgs(state_filter=None)}
     codes: dict[str, set] = {}
     for k, e in entries.items():
         m = _KEY_RE.match(k)
-        if not m or not _live(e) or kg_splitter.is_sweep_code(m.group(1)):
+        if not m or not _live(e) or sweep_fn(m.group(1)):
             continue
         codes.setdefault(m.group(1), set()).add(m.group(2))
-    kgs = {k["kg_code"]: k for k in ap.get_all_kgs(state_filter=None)}
     by_parent: dict[str, list] = {}
     for c in codes:
         by_parent.setdefault(c.split("-")[0], []).append(c)
@@ -86,7 +110,7 @@ def scan(entries: dict | None = None) -> dict:
         if p not in kgs:
             continue
         try:
-            layout = sorted(b["kg_code"] for b in kg_splitter.maybe_split_kg(kgs[p]))
+            layout = sorted(b["kg_code"] for b in layout_fn(kgs[p]))
         except Exception as ex:  # noqa: BLE001
             log.debug("layout %s: %s", p, ex)
             continue
@@ -98,7 +122,7 @@ def scan(entries: dict | None = None) -> dict:
             sans = {k: v for k, v in entries.items()
                     if not any(k.startswith(c + "_") for c in drop)}
             try:
-                return bool(_app._kg_coverage_complete(p, sans)[0])
+                return bool(cover_fn(p, sans)[0])
             except Exception:  # noqa: BLE001
                 return False
 
@@ -120,7 +144,10 @@ def scan(entries: dict | None = None) -> dict:
             stale.append({"parent": p, "codes": sorted(dropped), "layout": layout,
                           "products": {c: sorted(codes[c]) for c in sorted(dropped)}})
         if kept:
+            layout_done = [b for b in layout if b in codes and "json" in codes[b]]
             drift.append({"parent": p, "codes": kept, "layout": layout,
+                          "layout_done": layout_done,
+                          "kind": _drift_kind(p, kept, layout_done),
                           "products": {c: sorted(codes[c]) for c in kept}})
     return {"stale": stale, "drift": drift}
 
@@ -425,6 +452,7 @@ def status(ttl: float = 900.0) -> dict:
     background thread and the caller gets the last result (or
     ``computing`` on the first call)."""
     import threading
+    from collections import Counter
     now = time.time()
     if _STATUS["v"] is None or now - _STATUS["t"] >= ttl:
         if not _STATUS["busy"]:
@@ -436,6 +464,7 @@ def status(ttl: float = 900.0) -> dict:
                     v = {"stale_parents": len(rep["stale"]),
                          "stale_codes": sum(len(r["codes"]) for r in rep["stale"]),
                          "drift_parents": len(rep["drift"]),
+                         "drift_kinds": dict(Counter(r["kind"] for r in rep["drift"])),
                          "sample": [f"{r['parent']}:" + ",".join(x.split('-', 1)[1] if '-' in x else x
                                                                   for x in r['codes'])
                                     for r in rep["stale"][:6]]}
@@ -458,7 +487,15 @@ if __name__ == "__main__":
         print(f"STALE parents={len(rep['stale'])} codes={sum(len(r['codes']) for r in rep['stale'])}")
         for r in rep["stale"]:
             print(f"  {r['parent']}: {' '.join(r['codes'])}   layout={'unsplit' if r['layout'] == [r['parent']] else len(r['layout'])}")
-        print(f"DRIFT parents={len(rep['drift'])} (left alone)")
+        from collections import Counter
+        kinds = Counter(r["kind"] for r in rep["drift"])
+        print(f"DRIFT parents={len(rep['drift'])} (left alone — valid coverage the current layout alone would not give): "
+              + " ".join(f"{k}={n}" for k, n in sorted(kinds.items())))
+        if "-v" in args:
+            for r in rep["drift"]:
+                print(f"  {r['parent']}: {r['kind']:10} extras={' '.join(r['codes'])}  layout={len(r['layout'])} done={len(r['layout_done'])}/{len(r['layout'])}")
+            for k, n in sorted(kinds.items()):
+                print(f"  {k}: {DRIFT_KINDS[k]}")
     elif cmd == "reconcile":
         # re-push removed records for codes whose Zenodo files are gone
         # but whose manifest entry reverted (peer-sync RMW race)

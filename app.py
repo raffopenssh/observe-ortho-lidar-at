@@ -20545,7 +20545,9 @@ def process_txt():
             else:
                 out.append(f"stale_blocks: parents={_sbs['stale_parents']} codes={_sbs['stale_codes']} "
                            f"(old layout residue overlapping the live layout; `python3 stale_blocks.py apply`) "
-                           f"· drift={_sbs['drift_parents']} (layout changed, old product is the coverage — kept)"
+                           f"· drift={_sbs['drift_parents']} (layout changed, old product is the coverage — kept"
+                           + (": " + " ".join(f"{k}={v}" for k, v in sorted((_sbs.get('drift_kinds') or {}).items()))
+                              if _sbs.get('drift_kinds') else '') + ")"
                            + (f" · {' '.join(_sbs['sample'])}" if _sbs['sample'] else ''))
         except Exception as _e:
             out.append(f'stale_blocks: unavailable ({_e})')
