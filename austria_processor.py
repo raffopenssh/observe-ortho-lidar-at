@@ -420,6 +420,51 @@ def _repair_cells_fill(flag: dict, obs_year: int, *, max_cells: int | None = Non
         return 0
     cap = PREWARM_REPAIR_CELLS_PER_KG if max_cells is None else int(max_cells)
     budget = PREWARM_MAX_SECONDS if max_seconds is None else float(max_seconds)
+    cop = _get_cop_cache()
+    hc = _get_hansen_cache()
+    deadline = time.time() + budget
+    # Randomised start so concurrent frontiers don't all take cell #1.
+    import random as _rnd
+    order = list(cells)
+    _rnd.shuffle(order)
+    try:
+        return _repair_cells_fill_loop(order, cap, deadline, obs_year, rep, cop, hc)
+    finally:
+        _clear_fetch_deadline()
+        if rep["filled"]:
+            try:
+                flush_tile_cache_to_zenodo(force=True)
+            except Exception as e:
+                log.warning("repair: flush failed: %s", e)
+
+
+def _arm_fetch_deadline(deadline: float) -> None:
+    """Cooperative budget inside a single cell fetch (``copernicus``
+    month loop) — the per-cell loops only check *between* cells."""
+    try:
+        import copernicus as _cop
+        _cop.set_fetch_deadline(deadline)
+    except Exception:
+        pass
+
+
+def _clear_fetch_deadline() -> None:
+    try:
+        import copernicus as _cop
+        _cop.set_fetch_deadline(None)
+    except Exception:
+        pass
+
+
+def _is_fetch_deadline(e: BaseException) -> bool:
+    try:
+        from copernicus import FetchDeadlineError
+    except Exception:
+        return False
+    return isinstance(e, FetchDeadlineError) or isinstance(e.__cause__, FetchDeadlineError)
+
+
+def _repair_cells_fill_loop(order, cap, deadline, obs_year, rep, cop, hc) -> int:
     from tile_cache import CacheMissError
     try:
         from copernicus import CreditsExhaustedError, IPThrottledError
@@ -428,14 +473,8 @@ def _repair_cells_fill(flag: dict, obs_year: int, *, max_cells: int | None = Non
             pass
         class IPThrottledError(Exception):
             pass
-    cop = _get_cop_cache()
-    hc = _get_hansen_cache()
+    _arm_fetch_deadline(deadline)
     done = 0
-    deadline = time.time() + budget
-    # Randomised start so concurrent frontiers don't all take cell #1.
-    import random as _rnd
-    order = list(cells)
-    _rnd.shuffle(order)
     for c in order:
         if done >= cap or time.time() >= deadline:
             rep["stop"] = "cap" if done >= cap else "deadline"
@@ -495,14 +534,15 @@ def _repair_cells_fill(flag: dict, obs_year: int, *, max_cells: int | None = Non
             rep["stop"] = f"cache-miss: {str(e)[:80]}"
             break
         except Exception as e:
+            if _is_fetch_deadline(e):
+                rep["stop"] = "deadline"
+                log.info("repair: cell %.2f,%.2f %s hit the fetch budget mid-cell "
+                         "(months downloaded so far stay cached locally) — stopping",
+                         csub["west"], csub["south"], ",".join(sorted(products)))
+                break
             rep["failed"].append(f"{_cid} {str(e)[:60]}")
             log.warning("repair: cell %.2f,%.2f %s failed: %s", csub["west"], csub["south"],
                         ",".join(sorted(products)), e)
-    if done:
-        try:
-            flush_tile_cache_to_zenodo(force=True)
-        except Exception as e:
-            log.warning("repair: flush failed: %s", e)
     return done
 
 
@@ -621,6 +661,7 @@ def prewarm_cell_tiles(kg: dict, obs_year: int) -> int:
     # Hard wall-clock deadline: pre-warm must NEVER block the subprocess
     # result (and therefore the json upload) for more than this budget.
     _deadline = time.time() + PREWARM_MAX_SECONDS
+    _arm_fetch_deadline(_deadline)
 
     # Iterate the cell's 0.1° grid in deterministic (row-major) order so
     # repeated calls march through the grid, skipping cells already filled
@@ -667,8 +708,12 @@ def prewarm_cell_tiles(kg: dict, obs_year: int) -> int:
             except Exception as e:
                 log.debug("prewarm: cell %.2f,%.2f fetch failed: %s",
                           csub["west"], csub["south"], e)
+                if _is_fetch_deadline(e):
+                    lat = cn
+                    break
             lon = round(lon + step, 4)
         lat = round(lat + step, 4)
+    _clear_fetch_deadline()
 
     if time.time() >= _deadline:
         log.info("prewarm: hit %ds wall-clock budget after %d cell(s) — "

@@ -1394,6 +1394,38 @@ class UpstreamStressError(IPThrottledError):
     pass
 
 
+class FetchDeadlineError(RuntimeError):
+    """Cooperative wall-clock budget for *opportunistic* fetches (post-KG
+    prewarm, repair probe).  ``set_fetch_deadline(ts)`` arms it; the NDVI
+    month loop checks it before every month download and raises so the
+    caller moves on — ``ndvi_harmonics`` turns it into ``None`` (nothing
+    cached, the months already downloaded stay in the local month cache).
+
+    Why: on 2026-11-10 at300 sat 2 h+ in ``prewarm`` after
+    91123-southeast-2 — the 8-min prewarm budget was only checked
+    *between* cells, while one harmonics cell in openEO quadrant mode
+    costs ~10 min per month × 8 months.  The dashboard showed the peer
+    "stuck in prewarm" and the stuck-KG watchdog (12 h) would never fire.
+    """
+    pass
+
+
+_FETCH_DEADLINE: float | None = None
+
+
+def set_fetch_deadline(ts: float | None) -> None:
+    """Arm (or clear with ``None``) the cooperative fetch deadline for
+    this process — see ``FetchDeadlineError``."""
+    global _FETCH_DEADLINE
+    _FETCH_DEADLINE = float(ts) if ts else None
+
+
+def _check_fetch_deadline(what: str = "") -> None:
+    if _FETCH_DEADLINE is not None and time.time() >= _FETCH_DEADLINE:
+        raise FetchDeadlineError(
+            f"fetch budget exhausted{(' before ' + what) if what else ''}")
+
+
 class CredentialRotatedError(Exception):
     """Raised when a 402 was handled by rotating to a fresh credential.
     Callers should rebuild their connection/datacube and retry."""
@@ -2612,6 +2644,7 @@ def get_ndvi_timeseries(
         consecutive_402 = 0  # track 402 cascade
         consecutive_5xx = 0  # track upstream-stress cascade (503/502/500)
         for label, m_start, m_end, month_cache in actually_download:
+            _check_fetch_deadline(f"NDVI {label}")
             lbl, exc = _download_month_sequential(label, m_start, m_end, month_cache)
             if exc is None:
                 n_done += 1

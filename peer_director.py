@@ -12368,10 +12368,16 @@ class PeerDirector:
                 if ps.get('_stale'):
                     continue
                 # must run the current code (``--repair-cells`` is new) and
-                # not be a peer the cache-only / sweep orchestrator holds.
+                # not be a peer with sweep units pushed to it.  Peers in
+                # ``cache_only_active`` are *not* excluded: during the
+                # run-complete hold the sweep orchestrator parks every
+                # idle peer in that list (at11/at12/at203/at218/at301 on
+                # 2026-11-10 → "no idle online peer" forever).  The
+                # orchestrator already skips ``_repair_probe_peer()`` on
+                # its own ticks, and a same-tick collision answers 409
+                # (``already_running`` → finalised as failure, retry in
+                # 10 min) — no double-run possible.
                 if _LOCAL_GIT_COMMIT != 'unknown' and str(ps.get('git_commit') or '')[:7] != _LOCAL_GIT_COMMIT[:7]:
-                    continue
-                if pid in set(self.state.get('cache_only_active') or []):
                     continue
                 if pid in (self.state.get('sweep_pushed') or {}):
                     continue
