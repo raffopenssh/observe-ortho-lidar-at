@@ -189,11 +189,18 @@ def _to3035():
 
 
 def _grids(kg_code):
-    g = _grid_cache.get(kg_code)
-    if g is not None:
-        return g
     import kg_v2_store as kvs
     import v21_products as v21
+    # key on the parent's ingest stamp too: a sweep unit / block re-ingested
+    # after the first render must not keep serving the old grid list from RAM
+    # (the PNG key already carries the stamp; the grid LRU did not)
+    try:
+        ckey = f'{kg_code}|{kvs.parents_stamp([kg_code])[0][1]}'
+    except Exception:  # noqa: BLE001
+        ckey = kg_code
+    g = _grid_cache.get(ckey)
+    if g is not None:
+        return g
     out = []
     for code in kvs.codes_for_parent(kg_code) or []:
         try:
@@ -202,7 +209,7 @@ def _grids(kg_code):
                 out.append(v21.decode_terrain_grid25(sec['terrain']))
         except Exception as e:  # noqa: BLE001
             log.debug('grid25 %s: %s', code, e)
-    _grid_cache.put(kg_code, out)
+    _grid_cache.put(ckey, out)
     return out
 
 

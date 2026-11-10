@@ -757,11 +757,23 @@ def _kg_bboxes() -> dict:
     c = ca._search_conn()
     v = {}
     if c is not None:
+        # The r-tree envelope is the polygon-complete bbox revision 2 (∪ the
+        # pinned r1 processing bbox) — the ``kg`` row keeps the r1 bbox for
+        # the coverage oracle (search_index.RTREE_BBOX_REV).  Bins must use
+        # the r-tree one, else the sliver strip a sweep unit observed (e.g.
+        # 87104's southern 2 km) belongs to no bin: no rows, no grid25.
         try:
-            rows = c.execute('SELECT kg_code, min_lon, min_lat, max_lon, max_lat FROM kg WHERE min_lon IS NOT NULL').fetchall()
+            rows = c.execute('SELECT k.kg_code, r.min_lon, r.min_lat, r.max_lon, r.max_lat FROM kg k '
+                             'JOIN kg_rtree r ON r.id = k.rowid WHERE k.min_lon IS NOT NULL').fetchall()
             v = {r[0]: tuple(float(x) for x in r[1:]) for r in rows}
         except sqlite3.Error:
             v = {}
+        if not v:
+            try:
+                rows = c.execute('SELECT kg_code, min_lon, min_lat, max_lon, max_lat FROM kg WHERE min_lon IS NOT NULL').fetchall()
+                v = {r[0]: tuple(float(x) for x in r[1:]) for r in rows}
+            except sqlite3.Error:
+                v = {}
     _bbox_cache.update(t=now, v=v)
     return v
 

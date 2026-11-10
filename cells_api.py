@@ -469,7 +469,13 @@ def _kg_bbox(code: str):
     c = _search_conn()
     if c is None:
         return None
-    r = c.execute('SELECT min_lon, min_lat, max_lon, max_lat FROM kg WHERE kg_code=?', (code,)).fetchone()
+    try:    # r-tree = bbox revision 2 envelope (sweep strips included), see cells_bins._kg_bboxes
+        r = c.execute('SELECT r.min_lon, r.min_lat, r.max_lon, r.max_lat FROM kg k JOIN kg_rtree r ON r.id = k.rowid '
+                      'WHERE k.kg_code=?', (code,)).fetchone()
+    except sqlite3.Error:
+        r = None
+    if not r or r[0] is None:
+        r = c.execute('SELECT min_lon, min_lat, max_lon, max_lat FROM kg WHERE kg_code=?', (code,)).fetchone()
     return tuple(r) if r and r[0] is not None else None
 
 
