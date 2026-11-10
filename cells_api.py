@@ -255,7 +255,7 @@ def index_file(path: str | Path, *, conn: sqlite3.Connection | None = None) -> d
         c.execute('BEGIN IMMEDIATE')
         try:
             c.execute('DELETE FROM chunk WHERE kg=?', (kg,))
-            c.executemany('INSERT INTO chunk VALUES (?,?,?,?,?,?,?,?)', rows)
+            c.executemany('INSERT INTO chunk (r10, kg, off, len, raw_len, cells, trees, bld) VALUES (?,?,?,?,?,?,?,?)', rows)
             c.execute('INSERT OR REPLACE INTO file VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
                       (kg, int(hdr['body_offset']), int(hdr['cells_n']), (hdr.get('neo1') or {}).get('epoch'),
                        hdr.get('product_version'), (hdr.get('neo1') or {}).get('digest'),
