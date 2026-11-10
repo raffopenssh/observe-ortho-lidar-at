@@ -280,6 +280,9 @@ DIRECTOR_KNOBS = {
     # peer floor = max(abs_kbps, frac × fleet median PUT rate). Published
     # to peers in the peer_status ack (``fleet_put_rate()``).
     'zenodo_put_floor_abs_kbps': float, 'zenodo_put_floor_frac': float,
+    # Repair probe (docs/product-repair.md → Repair probe): on/off, hours
+    # between probes, cells per probe.
+    'repair_probe': bool, 'repair_probe_h': float, 'repair_probe_cells': int,
 }
 _knob_cache: dict = {'at': 0.0, 'd': {}}
 
@@ -401,6 +404,16 @@ FRONTIER_MAX_PARALLEL = int(os.environ.get('FRONTIER_MAX_PARALLEL', '20'))
 FRONTIER_ENDGAME_PER_CELL = int(os.environ.get('FRONTIER_ENDGAME_PER_CELL', '8'))
 PRODUCT_REPAIR_MAX_CELLS = 40
 PRODUCT_REPAIR_MAX_CODES = 300
+# Repair probe (docs/product-repair.md → Repair probe): every
+# ``repair_probe_h`` hours (knob, default 6) one idle peer + two
+# least-recently-used healthy credentials fetch the open repair / sweep-
+# hold cells directly (no frontier KG needed — after run-complete there
+# is none).  Bounded to one peer, ``REPAIR_PROBE_MAX_CELLS`` cells and
+# ``REPAIR_PROBE_MAX_S`` wall-clock; nothing else moves.
+REPAIR_PROBE_INTERVAL_H = float(os.environ.get('REPAIR_PROBE_INTERVAL_H', '6'))
+REPAIR_PROBE_MAX_S = int(os.environ.get('REPAIR_PROBE_MAX_S', str(40 * 60)))
+REPAIR_PROBE_MAX_CELLS = int(os.environ.get('REPAIR_PROBE_MAX_CELLS', '24'))
+REPAIR_PROBE_HISTORY = 24
 # Repair cells stay published while hourly openEO read-timeouts are
 # at most this many OR fewer than successful months (see _product_repair_plan).
 PRODUCT_REPAIR_OPENEO_MAX_TIMEOUTS = 3
@@ -3027,8 +3040,13 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
                          queue_whitelist: list | None = None,
                          cred_indices: list | None = None,
                          lat_strips: list | None = None,
-                         v2_upgrade: bool = False) -> dict:
+                         v2_upgrade: bool = False,
+                         repair_cells: dict | None = None) -> dict:
     """Start the processor on a peer.
+
+    *repair_cells* (``{cells, year, max_seconds}``) starts the processor
+    in **repair-probe** mode instead of a KG run (``--repair-cells``;
+    docs/product-repair.md → Repair probe).
 
     For remote peers, syncs the local priority queue first so the peer
     processes the same KGs in priority order. `exclude_kgs` lets callers
@@ -3069,6 +3087,9 @@ def start_peer_processor(peer_url: str | None, exclude_kgs: set | None = None,
         payload['cred_indices'] = list(cred_indices)
     if lat_strips is not None:
         payload['lat_strips'] = list(lat_strips)
+    if repair_cells:
+        payload['repair_cells'] = dict(repair_cells)
+        queue_whitelist = []  # nothing to process — keep the peer's queue empty
     if peer_url is None:
         # Local start — use the local API so _processor_process is tracked
         try:
@@ -6128,9 +6149,12 @@ class PeerDirector:
         processor with an empty queue exits by itself, this only shortens
         the tail.  Never touches a peer inside a KG (the hold requires none)."""
         n = 0
+        _probe_pid = self._repair_probe_peer()
         for p in self.cfg.get('peers', []):
             ps = (statuses or {}).get(p['id']) or {}
             if not p.get('url') or not isinstance(ps, dict):
+                continue
+            if p['id'] == _probe_pid or ps.get('repair_probe'):
                 continue
             if str(ps.get('state') or '') not in ('running', 'processing'):
                 continue
@@ -12146,6 +12170,237 @@ class PeerDirector:
         except Exception as e:
             log.debug('prewarm flag write failed: %s', e)
 
+    # === SECTION: repair probe ===
+
+    def _repair_probe_peer(self) -> str | None:
+        """Peer id currently running the repair probe (excluded from both
+        orchestrators + the hold's idle-stop), else None."""
+        try:
+            return ((self.state.get('repair_probe') or {}).get('active') or {}).get('peer') or None
+        except Exception:
+            return None
+
+    def _repair_probe_cells(self) -> list[dict]:
+        """Every cell the fleet still needs for a `-partial` repair or a
+        sweep unit on hold — the union ``_product_repair_plan`` would
+        publish *if* the Copernicus gate were open.  Refreshes the
+        product_repair sweep (≤ every 15 min) as a side effect."""
+        try:
+            cop_ema = float(self._sub_factor_ema.get('copernicus', THROTTLE_MAX_FACTOR))
+        except Exception:
+            cop_ema = THROTTLE_MAX_FACTOR
+        cop_ok = cop_ema >= PREWARM_COP_EMA_MIN and not (DATA_DIR / 'copernicus_paused').exists()
+        try:
+            self._product_repair_plan(cop_ok)
+        except Exception as e:  # noqa: BLE001
+            log.debug('repair probe: plan refresh: %s', e)
+        cells: list[dict] = []
+        have: set = set()
+        for c in list((self.state.get('_product_repair') or {}).get('cells') or []):
+            k = (c.get('w'), c.get('s'))
+            if 'w' in c and k not in have:
+                cells.append(dict(c)); have.add(k)
+        try:
+            import sliver_sweep as _sls
+            for c in _sls.held_cells():
+                k = (c.get('w'), c.get('s'))
+                if 'w' in c and k not in have:
+                    cells.append(dict(c)); have.add(k)
+        except Exception as e:  # noqa: BLE001
+            log.debug('repair probe: held cells: %s', e)
+        return cells
+
+    def _repair_probe_tick(self, statuses: dict | None) -> None:
+        """Periodic **repair probe** (docs/product-repair.md → Repair probe).
+
+        The frontier-piggyback repair fill (``prewarm.repair_cells``)
+        needs (a) a frontier KG to ride on and (b) the Copernicus EMA
+        gate open — after run-complete there is no frontier, and the EMA
+        never recovers because nobody fetches.  So every
+        ``repair_probe_h`` hours (knob, default 6) the director starts
+        ONE idle peer in ``--repair-cells`` mode with the open repair /
+        sweep-hold cells and TWO least-recently-used healthy credentials
+        not held by any frontier.  The probe fetches, pushes its tile
+        delta to the primary and exits; the next product_repair sweep
+        then promotes codes to ``fixable`` (→ v2 re-upgrade) and sweep
+        units leave hold (→ sweepers) — both wake the run-complete hold
+        on their own.  If nothing was filled, nothing else moves until
+        the next interval.  Per-cell strikes park cells that fail
+        repeatedly (glacier harmonics with no NDVI months) for 7 days.
+        Runs in the hold branch too; the probe peer never counts as
+        ``peers_in_kg`` (``current_kg`` stays None).
+        """
+        cfg = self.cfg
+        if not knob(cfg, 'repair_probe', True):
+            return
+        now = time.time()
+        with self._lock:
+            rp = self.state.setdefault('repair_probe', {})
+        active = rp.get('active') or {}
+        # --- finalize a running probe ---------------------------------
+        if active:
+            pid = active.get('peer')
+            peer = next((p for p in cfg.get('peers', []) if p['id'] == pid), None)
+            ps = (statuses or {}).get(pid) or {}
+            if not isinstance(ps, dict) or not ps:
+                ps = get_peer_status(peer.get('url')) if peer else {}
+            st = str(ps.get('state') or 'unknown')
+            age = now - float(active.get('started_at') or now)
+            timeout = age > int(active.get('max_seconds') or REPAIR_PROBE_MAX_S) + 300
+            running = st in ('running', 'processing', 'pausing', 'paused')
+            if running and not timeout:
+                return
+            if st == 'unreachable' and age < 15 * 60 and not timeout:
+                return
+            if running and timeout and peer:
+                try:
+                    stop_peer_processor(peer.get('url'))
+                except Exception:
+                    pass
+            rep = ps.get('repair_probe') if isinstance(ps.get('repair_probe'), dict) else {}
+            filled = list(rep.get('filled') or [])
+            failed = list(rep.get('failed') or [])
+            entry = {'peer': pid, 'creds': active.get('creds'), 'n_cells': active.get('n_cells'),
+                     'started_at': active.get('started_at'), 'finished_at': now,
+                     'filled': len(filled), 'failed': len(failed),
+                     'skipped': int(rep.get('skipped') or 0),
+                     'stop': rep.get('stop') or ('timeout' if timeout else rep.get('error') or 'exhausted'),
+                     'pushed': int(rep.get('pushed') or 0)}
+            with self._lock:
+                strikes = rp.setdefault('cell_strikes', {})
+                for f in failed:
+                    cid = str(f).split(' ', 1)[0]
+                    s = strikes.setdefault(cid, {'n': 0})
+                    s['n'] = int(s.get('n') or 0) + 1
+                    s['at'] = now
+                    s['why'] = str(f)[:80]
+                for cid in filled:
+                    strikes.pop(cid, None)
+                hist = rp.setdefault('history', [])
+                hist.append(entry)
+                del hist[:-REPAIR_PROBE_HISTORY]
+                rp['active'] = None
+                rp['last_at'] = now
+                rp['last'] = entry
+                if filled:
+                    # make the next tick re-sweep the registry right away
+                    self.state.setdefault('_product_repair', {})['at'] = 0
+            try:
+                _emit_director_event(
+                    f"repair probe {pid}: filled {len(filled)} / failed {len(failed)} / "
+                    f"skipped {entry['skipped']} of {entry['n_cells']} cell(s) in {age/60:.0f} min "
+                    f"(creds {entry['creds']}, stop={entry['stop']})"
+                    + (" — registry re-sweep queued" if filled else ""),
+                    peer=pid, level='info' if filled or not failed else 'warning')
+            except Exception:
+                pass
+            return
+        # --- start a new probe when due -------------------------------
+        interval_s = float(knob(cfg, 'repair_probe_h', REPAIR_PROBE_INTERVAL_H)) * 3600.0
+        if now - float(rp.get('last_at') or 0) < interval_s:
+            return
+        if read_director_mode() == 'paused':
+            return
+        why = ''
+        if (DATA_DIR / 'copernicus_paused').exists():
+            why = 'copernicus_paused'
+        cells = [] if why else self._repair_probe_cells()
+        if not why and not cells:
+            why = 'no open cells'
+        strikes = rp.get('cell_strikes') or {}
+        if cells:
+            keep = []
+            for c in cells:
+                cid = f"{float(c['w']):.2f},{float(c['s']):.2f}"
+                s = strikes.get(cid) or {}
+                if int(s.get('n') or 0) >= 3 and now - float(s.get('at') or 0) < 7 * 86400:
+                    continue
+                keep.append(c)
+            if not keep:
+                why = f'all {len(cells)} open cell(s) struck out (3 failed probes, 7 d park)'
+            cells = keep[:int(knob(cfg, 'repair_probe_cells', REPAIR_PROBE_MAX_CELLS))]
+        creds: list[int] = []
+        if not why:
+            held = set()
+            for v in (self.state.get('frontier_cred_plan') or {}).values():
+                held.update(int(i) for i in (v or []))
+            # scored pool: healthy first, then least recently probed
+            pool = {int(c.get('index')): c for c in (self.state.get('credentials') or [])
+                    if c.get('index') is not None}
+            last_used = rp.get('cred_last_used') or {}
+            cand = [i for i in self._valid_credentials() if i not in held]
+            def _rank(i):
+                lab = ((pool.get(i) or {}).get('health') or {}).get('label') or ''
+                return (0 if lab in ('healthy', 'warm', '') else 1,
+                        float(last_used.get(str(i)) or 0))
+            cand.sort(key=_rank)
+            creds = cand[:2]
+            if not creds:
+                why = 'no free healthy credential'
+        peer = None
+        if not why:
+            active_frontier = self.state.get('active_peer')
+            par = set(self.state.get('parallel_frontiers_active') or [])
+            peer_last = rp.get('peer_last_used') or {}
+            cands = []
+            for p in cfg.get('peers', []):
+                pid = p['id']
+                if pid == 'primary' or not p.get('url') or not p.get('enabled', True):
+                    continue
+                if _peer_is_scheduled(p) or pid == active_frontier or pid in par or p.get('reserved_kg'):
+                    continue
+                if self._peer_role(p) == 'idle':
+                    continue
+                bw = (self.state.get('peer_bandwidth') or {}).get(pid, {})
+                if _peer_bw_depleted(p, bw, cfg):
+                    continue
+                ps = (statuses or {}).get(pid) or {}
+                if not isinstance(ps, dict) or not ps:
+                    continue
+                if str(ps.get('state') or 'unknown') not in ('idle', 'stopped', 'complete'):
+                    continue
+                if ps.get('_stale'):
+                    continue
+                cands.append((float(peer_last.get(pid) or 0), pid, p))
+            cands.sort()
+            if cands:
+                peer = cands[0][2]
+            else:
+                why = 'no idle online peer'
+        if why:
+            with self._lock:
+                rp['skip'] = {'why': why, 'at': now, 'cells': len(cells)}
+            if rp.get('skip_logged_at', 0) < now - 3600:
+                log.info('repair probe: not started — %s', why)
+                rp['skip_logged_at'] = now
+            return
+        year = 2024
+        spec = {'cells': cells, 'year': year, 'max_seconds': REPAIR_PROBE_MAX_S,
+                'max_cells': len(cells)}
+        res = start_peer_processor(peer.get('url'), cred_indices=creds, repair_cells=spec)
+        if res.get('error'):
+            log.warning('repair probe: start on %s failed: %s', peer['id'], res.get('error'))
+            with self._lock:
+                rp['skip'] = {'why': f"start failed on {peer['id']}: {res.get('error')}"[:160], 'at': now}
+                rp.setdefault('peer_last_used', {})[peer['id']] = now  # rotate away next time
+            return
+        with self._lock:
+            rp['active'] = {'peer': peer['id'], 'creds': creds, 'n_cells': len(cells),
+                            'started_at': now, 'max_seconds': REPAIR_PROBE_MAX_S,
+                            'cells': [f"{float(c['w']):.2f},{float(c['s']):.2f}" for c in cells]}
+            rp.setdefault('peer_last_used', {})[peer['id']] = now
+            for i in creds:
+                rp.setdefault('cred_last_used', {})[str(i)] = now
+            rp.pop('skip', None)
+            rp['last_at'] = now
+        try:
+            _emit_director_event(
+                f"repair probe {peer['id']}: fetching {len(cells)} open cell(s) with creds {creds} "
+                f"(budget {REPAIR_PROBE_MAX_S // 60} min)",
+                peer=peer['id'], kg='repair-probe')
+        except Exception:
+            pass
+
     def _compute_v2_upgrade_candidates(self, max_n: int = 400) -> list[str]:
         """Product codes (parents AND split blocks, straight from the
         manifest) that are v1-complete (committed ``_json`` + ``_full_gpkg``)
@@ -12813,10 +13068,13 @@ class PeerDirector:
         # running peer's entry was pruned on a previous tick (the
         # "have creds=[] strips=[]" empty-held restart loop, Jul 2026).
         reported_env: dict[str, tuple] = {}
+        _probe_pid = self._repair_probe_peer()
         for p in peers:
             pid = p['id']
             if pid == active_id:
                 continue
+            if pid == _probe_pid:
+                continue  # repair probe owns this peer for ≤45 min
             if not p.get('enabled', True):
                 continue
             if _peer_is_scheduled(p):
@@ -13645,6 +13903,7 @@ class PeerDirector:
         # active frontier, has bandwidth, online).
         candidates: list[dict] = []
         unreachable = 0
+        _probe_pid = self._repair_probe_peer()
         for p in peers:
             pid = p['id']
             if not p.get('enabled', True):
@@ -13653,6 +13912,8 @@ class PeerDirector:
                 continue
             if pid == active_frontier:
                 continue
+            if pid == _probe_pid:
+                continue  # repair probe owns this peer for ≤45 min
             if pid in parallel_authorised:
                 # Owned by the parallel-frontier orchestrator — leave
                 # alone, otherwise we ping-pong frontier↔cache-only.
@@ -14961,6 +15222,12 @@ class PeerDirector:
                         self._enforce_primary_park()
                     except Exception:
                         log.exception('primary park enforce failed')
+                    # The repair probe is the only thing that moves during
+                    # the hold (docs/product-repair.md → Repair probe).
+                    try:
+                        self._repair_probe_tick(locals().get('_statuses') or {})
+                    except Exception:
+                        log.exception('repair probe tick failed')
                     with self._lock:
                         save_director_state(self.state)
                     time.sleep(DIRECTOR_POLL_INTERVAL)
@@ -15118,6 +15385,10 @@ class PeerDirector:
                     self._update_prewarm_flag(len(_cr.get('codes') or []))
                 except Exception:
                     log.exception('Pre-warm flag update error')
+                try:
+                    self._repair_probe_tick(locals().get('_statuses') or {})
+                except Exception:
+                    log.exception('repair probe tick failed')
                 # Record fleet-shape sample for the Progress card
                 # sparkline. Counts as observed *after* orchestration
                 # this tick — gives the truest 30s-resolution view of

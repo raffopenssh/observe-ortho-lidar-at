@@ -402,14 +402,24 @@ def _owning_cell_for_kg(kg: dict) -> tuple | None:
 PREWARM_REPAIR_CELLS_PER_KG = int(os.environ.get("PREWARM_REPAIR_CELLS_PER_KG", "4"))
 
 
-def _repair_cells_fill(flag: dict, obs_year: int) -> int:
+def _repair_cells_fill(flag: dict, obs_year: int, *, max_cells: int | None = None,
+                       max_seconds: float | None = None, report: dict | None = None) -> int:
     """Fetch up to ``PREWARM_REPAIR_CELLS_PER_KG`` director-requested
     ``prewarm.repair_cells`` (``[{w,s,e,n,products:[…]}]``), only the
     listed products, skipping cells another frontier already filled
-    (Zenodo index check). Flushes when anything was fetched."""
+    (Zenodo index check). Flushes when anything was fetched.
+
+    ``max_cells`` / ``max_seconds`` override the per-KG defaults (the
+    ``--repair-cells`` probe passes the whole plan + a 40-min budget);
+    ``report`` (optional dict) collects ``filled`` / ``skipped`` /
+    ``failed`` / ``stop`` for the probe's final status push."""
     cells = flag.get("repair_cells") or []
+    rep = report if report is not None else {}
+    rep.setdefault("filled", []); rep.setdefault("failed", []); rep.setdefault("skipped", 0)
     if not cells:
         return 0
+    cap = PREWARM_REPAIR_CELLS_PER_KG if max_cells is None else int(max_cells)
+    budget = PREWARM_MAX_SECONDS if max_seconds is None else float(max_seconds)
     from tile_cache import CacheMissError
     try:
         from copernicus import CreditsExhaustedError, IPThrottledError
@@ -421,13 +431,17 @@ def _repair_cells_fill(flag: dict, obs_year: int) -> int:
     cop = _get_cop_cache()
     hc = _get_hansen_cache()
     done = 0
-    deadline = time.time() + PREWARM_MAX_SECONDS
+    deadline = time.time() + budget
     # Randomised start so concurrent frontiers don't all take cell #1.
     import random as _rnd
     order = list(cells)
     _rnd.shuffle(order)
     for c in order:
-        if done >= PREWARM_REPAIR_CELLS_PER_KG or time.time() >= deadline:
+        if done >= cap or time.time() >= deadline:
+            rep["stop"] = "cap" if done >= cap else "deadline"
+            break
+        if _shutdown_requested:
+            rep["stop"] = "shutdown"
             break
         try:
             csub = {"west": float(c["w"]), "south": float(c["s"]),
@@ -446,7 +460,9 @@ def _repair_cells_fill(flag: dict, obs_year: int) -> int:
         except Exception:
             already = False
         if already:
+            rep["skipped"] += 1
             continue
+        _cid = f"{csub['west']:.2f},{csub['south']:.2f}"
         try:
             if kw["ndvi"]:
                 cop.get_ndvi(csub, year=obs_year)
@@ -468,14 +484,18 @@ def _repair_cells_fill(flag: dict, obs_year: int) -> int:
                     if not any(kw.values()):
                         continue  # nothing else fetched for this cell
             done += 1
+            rep["filled"].append(_cid)
             log.info("repair: filled cell %.2f,%.2f %s", csub["west"], csub["south"],
                      ",".join(sorted(products)))
         except (CreditsExhaustedError, IPThrottledError) as e:
             log.info("repair: stopping early (Copernicus throttled/exhausted): %s", e)
+            rep["stop"] = f"throttled: {str(e)[:80]}"
             break
-        except CacheMissError:
+        except CacheMissError as e:
+            rep["stop"] = f"cache-miss: {str(e)[:80]}"
             break
         except Exception as e:
+            rep["failed"].append(f"{_cid} {str(e)[:60]}")
             log.warning("repair: cell %.2f,%.2f %s failed: %s", csub["west"], csub["south"],
                         ",".join(sorted(products)), e)
     if done:
@@ -484,6 +504,67 @@ def _repair_cells_fill(flag: dict, obs_year: int) -> int:
         except Exception as e:
             log.warning("repair: flush failed: %s", e)
     return done
+
+
+REPAIR_PROBE_MAX_SECONDS = int(os.environ.get("REPAIR_PROBE_MAX_SECONDS", str(40 * 60)))
+
+
+def _run_repair_probe(spec_path: str, progress) -> None:
+    """``--repair-cells FILE`` — the director's periodic repair probe
+    (``docs/product-repair.md → Repair probe``). One idle peer, a fresh
+    pair of Copernicus credentials, no KG: fetch the listed cells into the
+    tile store, push the tile delta straight to the director (the 5-min
+    sync is off during the run-complete hold), leave a ``repair_probe``
+    report in progress.json and exit with ``state=complete``."""
+    import random as _rnd
+    try:
+        spec = json.loads(Path(spec_path).read_text())
+    except Exception as e:
+        log.error("repair probe: cannot read %s: %s", spec_path, e)
+        progress.update(state="complete", current_kg=None,
+                        repair_probe={"error": f"spec: {e}"})
+        progress.save()
+        return
+    cells = list(spec.get("cells") or [])
+    year = int(spec.get("year") or 2024)
+    budget = float(spec.get("max_seconds") or REPAIR_PROBE_MAX_SECONDS)
+    cap = int(spec.get("max_cells") or len(cells) or 0)
+    started = datetime.now(timezone.utc).isoformat()
+    rep = {"started_at": started, "n_cells": len(cells), "year": year,
+           "creds": os.environ.get("COPERNICUS_CRED_INDICES", "")}
+    progress.update(state="running", current_kg="repair-probe",
+                    started_at=started, total_kgs=0, repair_probe=dict(rep))
+    progress.save()
+    log.info("repair probe: %d cell(s), year %d, budget %.0f s, creds=%s",
+             len(cells), year, budget, rep["creds"] or "default")
+    if os.environ.get("COPERNICUS_FORBIDDEN", "").strip() in ("1", "true", "yes"):
+        log.error("repair probe: COPERNICUS_FORBIDDEN set — nothing to do")
+        rep["error"] = "copernicus forbidden"
+        cells = []
+    t0 = time.time()
+    filled = 0
+    try:
+        if cells:
+            filled = _repair_cells_fill({"repair_cells": cells}, year, max_cells=cap,
+                                        max_seconds=budget, report=rep)
+    except Exception as e:  # noqa: BLE001
+        log.warning("repair probe: fill failed: %s", e)
+        rep["error"] = str(e)[:200]
+    pushed = 0
+    if filled:
+        try:
+            from zenodo_cache import ZenodoCache
+            pushed = ZenodoCache().tiles.push_delta_to_director(started)
+        except Exception as e:  # noqa: BLE001
+            log.warning("repair probe: director push failed (5-min sync will catch up): %s", e)
+            rep["push_error"] = str(e)[:120]
+    rep.update(filled_n=filled, pushed=pushed, seconds=round(time.time() - t0),
+               finished_at=datetime.now(timezone.utc).isoformat())
+    log.info("repair probe: done — filled %d, skipped %d, failed %d, pushed %d, stop=%s (%.0f s)",
+             filled, rep.get("skipped", 0), len(rep.get("failed") or []), pushed,
+             rep.get("stop", "exhausted"), time.time() - t0)
+    progress.update(state="complete", current_kg=None, repair_probe=rep)
+    progress.save()
 
 
 def prewarm_cell_tiles(kg: dict, obs_year: int) -> int:
@@ -11423,6 +11504,11 @@ def main():
                              "products on Zenodo to v2, from their own full GPKG "
                              "(no BEV/openEO). With --kg: upgrade that single code. "
                              "Env V2_UPGRADE=1 is equivalent.")
+    parser.add_argument("--repair-cells", default=None, metavar="FILE",
+                        help="Repair probe: fetch the Copernicus/Hansen cells listed in "
+                             "FILE ({cells:[{w,s,e,n,products}], year, max_seconds}) "
+                             "into the Zenodo tile store, push the tile delta to the "
+                             "director and exit. No KG processing.")
     parser.add_argument("--peers", nargs='*', default=[],
                         help="Peer instance URLs for coordination (default: config.peers())")
     parser.add_argument("--instance-id", default=None,
@@ -11561,6 +11647,10 @@ def main():
         current_kg=None,
     )
     progress.save()
+
+    if args.repair_cells:
+        _run_repair_probe(args.repair_cells, progress)
+        return
 
     # --- Get KG list ---
     if args.kg:

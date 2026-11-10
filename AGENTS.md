@@ -21,7 +21,7 @@ and setup: `README.md`. Security model: `SECURITY.md`.
 | search index | `docs/search-index.md` | `search_index.py` |
 | Zenodo tile cache / products / lock | `docs/zenodo-cache.md` | `zenodo_cache.py`, `zenodo_tiles.py`, `zenodo_client.py`, `zenodo_lock.py`, `tile_cache.py` |
 | Copernicus throttle + credentials | `docs/copernicus-throttle.md` | `copernicus.py` |
-| partial products (missing cache layers) | `docs/product-repair.md` | `product_repair.py` |
+| partial products (missing cache layers), repair probe (one idle peer + 2 creds every 6 h) | `docs/product-repair.md` | `product_repair.py`, `peer_director._repair_probe_tick` |
 | label-id collision guard | `docs/label-mix.md` | `label_mix.py` |
 | sliver sweep (bbox-edge cells) | `docs/sliver-sweep.md` | `sliver_sweep.py` |
 | host patch audit / auto-patch / graceful peer reboot | `docs/host-maintenance.md` | `app.py` (`/api/v1/admin/pkgstat`, `_host_patch_*`, `_host_reboot_*`), `tools/fleet_pkgstat.py`, `tools/host_patch.sh` |

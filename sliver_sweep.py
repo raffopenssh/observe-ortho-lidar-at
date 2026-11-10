@@ -669,15 +669,27 @@ def spec_for(code: str, k: dict) -> dict:
 
 
 def pending_count() -> int:
-    """Parents in ``pending`` with ≥1 open unit (what ``assign`` would hand
-    out) — the director's cache-only orchestrator treats this as work so
-    sweeps still dispatch when no cache-ready KG / v2 unit is left."""
+    """Parents with sweep work the director's cache-only orchestrator must
+    keep workers alive for: ``pending`` with ≥1 open unit (what ``assign``
+    hands out) **or** ``dispatched`` with a unit still out (a peer holds the
+    spec).  Counting only ``pending`` (2026-11-09) meant that one tick after
+    ``assign`` moved every parent to ``dispatched`` the orchestrator saw
+    "nothing to do", gracefully stopped the sweepers 30 s into their first
+    unit and never restarted them — the dispatches then sat for the 8 h
+    stale window (at11/at12, 2026-11-10)."""
     if not enabled():
         return 0
     try:
         st = load_state()
-        return sum(1 for k in (st.get("kgs") or {}).values()
-                   if k.get("state") == "pending" and any(_unit_open(u) for u in k.get("units") or []))
+        n = 0
+        for k in (st.get("kgs") or {}).values():
+            units = k.get("units") or []
+            if k.get("state") == "pending" and any(_unit_open(u) for u in units):
+                n += 1
+            elif k.get("state") == "dispatched" and any(
+                    u.get("state") == "dispatched" or _unit_open(u) for u in units):
+                n += 1
+        return n
     except Exception:  # noqa: BLE001
         return 0
 

@@ -146,6 +146,17 @@ the sweep side:
 * Nothing left anywhere → director run-complete hold
   (`docs/peer-director.md → Run-complete hold`).
 
+* **Dispatched ≠ done** (2026-11-10): `pending_count()` counted only
+  `pending` parents, so one tick after `assign()` moved every parent to
+  `dispatched` the orchestrator saw "nothing to do", gracefully stopped the
+  sweepers 30 s into their first unit and never restarted them (at11/at12
+  held 5 parents for 8 h). Dispatched parents with a unit still out now
+  count as work.
+* **Hold cells after run-complete**: units parked on an uncached openEO
+  cell are filled by the director's **repair probe**
+  (`docs/product-repair.md → Repair probe`) — one idle peer every 6 h —
+  since no frontier exists any more to piggyback on.
+
 ## Invariants
 
 * Sweep units never touch the retry queue, strikes, completed sets or

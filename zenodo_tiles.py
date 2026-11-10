@@ -226,6 +226,40 @@ class TileStore:
                      data=json.dumps({"shards": {key: sh}, "files": {}}),
                      headers=headers, timeout=8)
 
+    def push_delta_to_director(self, since_iso: str) -> int:
+        """PUT every tile entry (and every shard) updated since *since_iso*
+        to the director's ``/api/v1/processing/cache_manifest`` so the
+        primary's ``has_cached`` view is current *now* instead of after
+        the 5-min peer sync (which is suspended during run-complete /
+        fleet-dormant holds — the repair probe runs exactly then).
+        Returns the number of file entries pushed (0 when no director)."""
+        try:
+            self_p = Path("data/austria_processor/self.json")
+            url = (json.loads(self_p.read_text()).get("director_url") or "").rstrip("/")
+        except Exception:
+            url = ""
+        if not url:
+            return 0
+        files = {n: e for n, e in (self.manifest.all_files() or {}).items()
+                 if is_tile_entry(n, e) and (e.get("updated_at") or "") >= since_iso}
+        shards = {k: v for k, v in (self.manifest.all_shards() or {}).items()
+                  if isinstance(v, dict) and v.get("depo_id")}
+        if not files and not shards:
+            return 0
+        headers = {"Content-Type": "application/json"}
+        try:
+            tok = Path("data/admin_token").read_text().strip()
+            if tok:
+                headers["X-Admin-Token"] = tok
+        except Exception:
+            pass
+        r = requests.put(url + "/api/v1/processing/cache_manifest",
+                         data=json.dumps({"shards": shards, "files": files}),
+                         headers=headers, timeout=30)
+        r.raise_for_status()
+        log.info("tile store: pushed %d tile entries / %d shards to director", len(files), len(shards))
+        return len(files)
+
     # --- read -----------------------------------------------------------
 
     def entry(self, name: str) -> Optional[dict]:

@@ -2622,6 +2622,9 @@ def _peer_status_push_loop():
                     # denominator for as long as they stay idle (at202
                     # made the fleet read 49, not 50, Oct 2026).
                     'ne_tooling': status.get('ne_tooling'),
+                    # repair probe report (director finalises the probe
+                    # from it; ~200 B, only present after a probe run)
+                    'repair_probe': status.get('repair_probe'),
                     # ~40 B stub (ne_source marker) so idle peers stay eligible
                     'vct_pilot': ({k: (status.get('vct_pilot') or {}).get(k)
                                    for k in ('enabled', 'ne_source', 'tooling')}
@@ -4514,6 +4517,21 @@ def processing_start():
     #                 dedicated to (cache-only orchestration)
     cred_indices = body.get('cred_indices')
     lat_strips = body.get('lat_strips')
+    # Director repair probe (docs/product-repair.md → Repair probe):
+    # {cells:[{w,s,e,n,products}], year, max_seconds}. The processor
+    # fetches those cells into the tile store and exits — no KG run.
+    repair_cells = body.get('repair_cells')
+    _probe_spec = Path('data/austria_processor/repair_probe_cells.json')
+    if isinstance(repair_cells, dict) and repair_cells.get('cells'):
+        try:
+            _probe_spec.write_text(json.dumps(repair_cells))
+        except Exception as _pe:
+            return jsonify({'error': f'repair_cells spec write failed: {_pe}'}), 500
+        args.extend(['--repair-cells', str(_probe_spec)])
+        kg = state = None
+        cache_only = False
+    else:
+        _probe_spec.unlink(missing_ok=True)
 
     if kg:
         args.extend(['--kg', kg])
@@ -4658,6 +4676,8 @@ def processing_start():
         if proc_env.get('KG_LAT_STRIP_FILTER'):
             _payload['lat_strip_filter'] = json.loads(
                 proc_env['KG_LAT_STRIP_FILTER'])
+        if '--repair-cells' in args:
+            _payload['repair_probe'] = True
         if _payload:
             _payload['ts'] = time.time()
             _asn.write_text(json.dumps(_payload))
@@ -20585,6 +20605,34 @@ def process_txt():
                 _rl += (f" · plan: cells={len(_pw.get('repair_cells') or [])} "
                         f"codes={len(_pw.get('repair_codes') or [])}{_gate} · debug: ?q=repair")
                 out.append(_rl)
+                # Repair probe (docs/product-repair.md → Repair probe)
+                try:
+                    _rp = (pd.load_director_state_ro() or {}).get('repair_probe') or {}
+                    _ra = _rp.get('active') or {}
+                    _rlast = _rp.get('last') or {}
+                    _rsk = _rp.get('skip') or {}
+                    _ivl = pd.knob(None, 'repair_probe_h', pd.REPAIR_PROBE_INTERVAL_H)
+                    _on = pd.knob(None, 'repair_probe', True)
+                    _nxt = ''
+                    if _rp.get('last_at'):
+                        _nxt = f" next≈{max(0, (float(_rp['last_at']) + float(_ivl) * 3600 - time.time()) / 60):.0f}m"
+                    _s = f"  probe:   {'on' if _on else 'OFF'} every {_ivl:g}h{_nxt}"
+                    if _ra:
+                        _s += (f" · ACTIVE {_ra.get('peer')} cells={_ra.get('n_cells')} creds={_ra.get('creds')} "
+                               f"{(time.time() - float(_ra.get('started_at') or 0)) / 60:.0f}m")
+                    if _rlast:
+                        _s += (f" · last {_rlast.get('peer')} filled={_rlast.get('filled')} failed={_rlast.get('failed')} "
+                               f"skipped={_rlast.get('skipped')} stop={_rlast.get('stop')} "
+                               f"{(time.time() - float(_rlast.get('finished_at') or 0)) / 3600:.1f}h ago")
+                    if _rsk and not _ra:
+                        _s += f" · skip: {_rsk.get('why')}"
+                    _st = {k: v for k, v in (_rp.get('cell_strikes') or {}).items() if int(v.get('n') or 0) >= 3}
+                    if _st:
+                        _s += f" · struck-out cells={len(_st)} ({', '.join(sorted(_st)[:4])})"
+                    _s += f" · runs={len(_rp.get('history') or [])}"
+                    out.append(_s)
+                except Exception as _e:
+                    out.append(f'  probe:   unavailable ({_e})')
         except Exception as _e:
             out.append(f'repair:   unavailable ({_e})')
     except Exception as _e:

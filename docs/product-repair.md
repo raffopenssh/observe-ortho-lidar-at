@@ -72,6 +72,59 @@ Run `scan --apply` again only when a new defect class is added to
 restart the web service afterwards so every gunicorn worker reloads the
 relabelled manifest.
 
+## Repair probe (2026-11-10)
+
+The frontier-piggyback fill above needs a frontier KG to ride on **and**
+the Copernicus EMA gate open (`sub_factor_ema.copernicus ≥ 0.8`). After
+run-complete neither holds: no frontier runs, and the EMA cannot recover
+because nobody fetches — so `-partial` codes and sweep units on hold sat
+forever (`gate=cop`, 5 harmonics codes, 2026-11-10). The **repair probe**
+closes that loop without re-opening the fleet:
+
+* `PeerDirector._repair_probe_tick` runs every tick, in the run-complete
+  hold branch too. Every `repair_probe_h` hours (knob, default 6;
+  `repair_probe: false` disables, `repair_probe_cells` caps cells, default
+  24) it collects the open cells (`_product_repair` sweep cells + the
+  sweep's `held_cells()`, same union the frontier plan would publish — the
+  cop/openEO gate is *not* applied), picks the **least-recently-probed
+  idle online peer** (enabled, not scheduled/reserved/frontier/bw-depleted,
+  role ≠ idle) and the **two least-recently-used healthy credentials** not
+  in `frontier_cred_plan`, and starts that peer with
+  `start_peer_processor(cred_indices=…, repair_cells={cells, year,
+  max_seconds})` → `app.processing_start` writes
+  `data/austria_processor/repair_probe_cells.json` and launches
+  `austria_processor.py --repair-cells FILE`.
+* The processor runs `_repair_cells_fill` over the whole list (40-min
+  budget, `REPAIR_PROBE_MAX_SECONDS`), flushes to the tile store, **pushes
+  its tile delta straight to the director**
+  (`zenodo_tiles.TileStore.push_delta_to_director` → `PUT
+  /processing/cache_manifest`; the 5-min peer sync is suspended during the
+  hold), writes a `repair_probe` report `{filled, failed, skipped, stop,
+  pushed}` into progress.json (`current_kg` stays `None` so the hold's
+  `peers_in_kg` never sees it) and exits `state=complete`.
+* The director finalises on peer stopped/complete (or budget + 5 min
+  timeout → hard stop): per-cell **strikes** for failed cells (3 strikes =
+  parked 7 days — glacier harmonics with no NDVI months), history ring,
+  `state['repair_probe'] = {active, last, last_at, history, cell_strikes,
+  peer_last_used, cred_last_used, skip}`. If anything was filled the
+  registry re-sweeps on the next tick: promoted codes become `fixable`
+  (→ `repair_fixable` opens the hold → v2 re-upgrade) and sweep units leave
+  hold on their 15-min recheck. If nothing was filled, nothing else moves.
+* The probe peer is excluded from both orchestrators and from the hold's
+  idle-processor stop; it never counts as a frontier (no `cred_plan` row),
+  so no plan-drift restart.
+* Cost: one peer, two creds, ≤24 cells, ≤40 min, once per 6 h; all other
+  fanout stays off. `/process.txt`: `probe:` sub-line under `repair:`
+  (`on every 6h next≈…m · ACTIVE <peer> … · last <peer> filled=… · skip: …
+  · struck-out cells=…`); events `?q=repair probe`.
+
+```bash
+curl -s 'localhost:8000/process.txt?q=repair%20probe&hours=48&log=50'
+curl -s -XPOST -H "X-Admin-Token: $(cat data/admin_token)" localhost:8000/api/v1/director/config \
+     -H 'Content-Type: application/json' -d '{"repair_probe_h": 1}'   # probe hourly
+python3 -c "import peer_director as pd; print(pd.load_director_state_ro().get('repair_probe'))"
+```
+
 ## Adding a repairable layer
 
 1. The layer must be a tile-cache product with a `has_cached` predicate
