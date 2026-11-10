@@ -12281,6 +12281,12 @@ class PeerDirector:
                 del hist[:-REPAIR_PROBE_HISTORY]
                 rp['active'] = None
                 rp['last_at'] = now
+                if not rep and not timeout:
+                    # never reported (start raced / old code / crashed at
+                    # argparse): retry on another peer in ~10 min, not 6 h
+                    _ivl = float(knob(cfg, 'repair_probe_h', REPAIR_PROBE_INTERVAL_H)) * 3600.0
+                    rp['last_at'] = now - _ivl + 600
+                    entry['stop'] = 'no report (retry in 10 min)'
                 rp['last'] = entry
                 if filled:
                     # make the next tick re-sweep the registry right away
@@ -12361,6 +12367,14 @@ class PeerDirector:
                     continue
                 if ps.get('_stale'):
                     continue
+                # must run the current code (``--repair-cells`` is new) and
+                # not be a peer the cache-only / sweep orchestrator holds.
+                if _LOCAL_GIT_COMMIT != 'unknown' and str(ps.get('git_commit') or '')[:7] != _LOCAL_GIT_COMMIT[:7]:
+                    continue
+                if pid in set(self.state.get('cache_only_active') or []):
+                    continue
+                if pid in (self.state.get('sweep_pushed') or {}):
+                    continue
                 cands.append((float(peer_last.get(pid) or 0), pid, p))
             cands.sort()
             if cands:
@@ -12378,6 +12392,9 @@ class PeerDirector:
         spec = {'cells': cells, 'year': year, 'max_seconds': REPAIR_PROBE_MAX_S,
                 'max_cells': len(cells)}
         res = start_peer_processor(peer.get('url'), cred_indices=creds, repair_cells=spec)
+        if res.get('already_running'):
+            # somebody else started a KG run on it this tick — not ours
+            res = {'error': 'already running (raced another orchestrator)'}
         if res.get('error'):
             log.warning('repair probe: start on %s failed: %s', peer['id'], res.get('error'))
             with self._lock:
