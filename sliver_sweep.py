@@ -365,7 +365,24 @@ def plan_cells(parent: str, ids: np.ndarray, source: str = "viewfill", bbox_fall
                                      "state": "wait", "attempts": 0, "units": []}
         if k.get("state") in ("pending", "dispatched", "received"):
             return {"planned": 0, "skipped": "in flight", "state": k["state"]}
-        units = [u for u in (k.get("units") or []) if u.get("state") == "ok"]
+        # ``hold`` units survive a re-plan: they already cover their cells and
+        # carry the ``hold_since`` clock that promotes them to a partial sweep
+        # (``_reopen_unswept``).  Dropping them here (as before 2026-11-10)
+        # re-planned the same strip as a fresh unit every viewfill pass, the
+        # peer re-hit the same uncached openEO cell and the 6 h clock never
+        # ran (87104 Finkenberg: sw4 → sw7 → …).  Cells inside a held unit's
+        # bbox are therefore excluded from this pass.
+        units = [u for u in (k.get("units") or []) if u.get("state") in ("ok", "hold")]
+        held = [u["bbox"] for u in units if u.get("state") == "hold" and u.get("bbox")]
+        if held:
+            keep = np.ones(len(ll), dtype=bool)
+            for w, s_, e, n in held:
+                keep &= ~((ll[:, 1] >= w) & (ll[:, 1] <= e) & (ll[:, 0] >= s_) & (ll[:, 0] <= n))
+            if not keep.all():
+                ll = ll[keep]
+                if not len(ll):
+                    return {"planned": 0, "held": len(held)}
+                groups = _cluster_cells(ll, lat0)
         nxt = 1 + max([int(u["id"].rsplit("-sw", 1)[1]) for u in (k.get("units") or []) if "-sw" in str(u.get("id"))] or [0])
         # the cap bounds one planning pass (peer work per dispatch), not the
         # parent's lifetime: integrated ``ok`` units are kept for the merge but
@@ -1238,6 +1255,7 @@ def _reopen_unswept() -> list[str]:
                         u["hold_at"] = now
                         continue
                     if miss:
+                        u.setdefault("hold_since", float(u.get("hold_at") or now))  # pre-394887e holds only had hold_at
                         u.update(hold_cells=miss, hold_at=now)
                         tol = _partial_tolerance(u, now)
                         if tol is None:
