@@ -51,6 +51,13 @@ MAX_IDS = 512
 MAX_ROWS_OUT = 2000
 MAX_K = 3
 DAILY_CAP = 500                      # reports per client key per UTC day
+DAILY_CAP_KEYED = 20_000             # … per reporter key issued by us (organisations)
+DAILY_CAP_SELF = 2_000               # … per self-issued reporter key (POST /api/v1/flags/token)
+TOKENS_PER_CLIENT_DAY = 20           # self-issued keys per client per UTC day
+MAX_SELF_KEYS = 200_000
+SELF_MARK = '~'                      # holder "name~1a2b" = self-issued, unverified
+KEYS_PATH = DATA_DIR / 'reporter_keys.json'        # {"<key>": "<holder>"} — gitignored, 0600
+KEY_REQUIRED_PATH = DATA_DIR / 'tree_key_required'  # flag file: tree reports without a key → 401
 MAX_ROWS_DB = 2_000_000              # hard cap; oldest non-open rows pruned past it
 CLOSED_RETENTION_S = 180 * 86400     # rejected / fixed / stale rows older than this are pruned
 _PRUNE_EVERY = 500
@@ -125,6 +132,8 @@ _SCHEMA = [
     'CREATE INDEX IF NOT EXISTS r_ts ON report(ts_last)',
     'CREATE INDEX IF NOT EXISTS r_status ON report(status)',
     "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)",
+    # self-issued reporter keys (POST /api/v1/flags/token): only the sha256 of a key is kept
+    "CREATE TABLE IF NOT EXISTS rkey (h BLOB PRIMARY KEY, holder TEXT NOT NULL, ts INTEGER NOT NULL, client TEXT)",
 ]
 
 _LOCK = threading.Lock()
@@ -206,8 +215,9 @@ def _dict_val(i) -> str | None:
     return v
 
 
-def _reporter_hash(reporter: str | None, client: str) -> bytes:
-    v = ('r:' + reporter) if reporter else ('c:' + client)
+def _reporter_hash(reporter: str | None, client: str, org: str | None = None) -> bytes:
+    # a keyed caller's reporters live in their own namespace and do not depend on where the caller connects from
+    v = (f'k:{org}:{reporter or ""}') if org else (('r:' + reporter) if reporter else ('c:' + client))
     return hmac.new(_salt(), v.encode(), hashlib.blake2s).digest()[:8]
 
 
@@ -371,14 +381,20 @@ def _clean_note(s) -> str | None:
 
 
 _KNOWN = {'cell', 'lon', 'lat', 'kg', 'kg_code', 'layer', 'claim', 'observed', 'expected', 'note', 'source',
-          'reporter', 'epoch', 'species', 'taxon', 'h_m', 'dbh_cm'}
+          'reporter', 'epoch', 'species', 'taxon', 'h_m', 'dbh_cm', 'tree_id', 'tree_id_v2', 'client_id', 'force',
+          'retract', 'measured_at', 'dbh_method', 'h_method', 'vitality', 'status', 'reporter_key'}
 TREE_LAYERS = ('trees', 'cells.trees')
 
 
-def record(body: dict, client: str) -> dict:
+def record(body: dict, client: str, org: str | None = None) -> dict:
     if not isinstance(body, dict):
         raise FlagError(400, 'report must be a JSON object')
-    names_tree = any(body.get(k) not in (None, '') for k in ('species', 'taxon', 'dbh_cm'))
+    # anything only a tree report carries makes it one (also "species": null = withdraw)
+    names_tree = (any(body.get(k) not in (None, '') for k in ('species', 'taxon', 'dbh_cm', 'tree_id', 'client_id'))
+                  or any(k in body for k in ('species', 'taxon')))
+    if names_tree or str(body.get('layer') or '').strip().lower() in TREE_LAYERS:
+        import tree_user as tu
+        tu.prefill(body)                # tree_id / client_id → lon, lat
     layer = str(body.get('layer') or ('trees' if names_tree else 'other')).strip().lower()
     if layer not in LAYERS:
         raise FlagError(400, f'layer must be one of {", ".join(LAYERS)}', layers=LAYERS)
@@ -398,9 +414,10 @@ def record(body: dict, client: str) -> dict:
         src = _clean_note(body.get('source'))
         rp = body.get('reporter')
         epoch = str(body['epoch'])[:40] if body.get('epoch') else _epoch_now(subj['kg'])
-        tree = tu.record(body, subj, claim, _reporter_hash(str(rp)[:120] if rp not in (None, '') else None, client),
-                         _dict_id(c, 'source', src[:MAX_SOURCE]) if src else None, epoch)
-        out = {'rev': tree.get('rev'), 'folded': tree.pop('folded'), 'status': 'open', 'layer': layer, 'claim': claim,
+        tree = tu.record(body, subj, claim, _reporter_hash(str(rp)[:120] if rp not in (None, '') else None, client, org),
+                         _dict_id(c, 'source', src[:MAX_SOURCE]) if src else None, epoch,
+                         _dict_id(c, 'org', org) if org else None)
+        out = {'rev': tree.get('rev'), 'folded': tree['folded'], 'status': 'open', 'layer': layer, 'claim': claim,
                'subject': _subject_public(subj), 'epoch': epoch, 'tree': tree}
         warn = [k for k in body if k not in _KNOWN]
         if warn:
@@ -429,7 +446,22 @@ def record(body: dict, client: str) -> dict:
     now = int(time.time())
     lid, cid_ = _dict_id(c, 'layer', layer), _dict_id(c, 'claim', claim)
     sid = _dict_id(c, 'source', source) if source else None
-    rep = _reporter_hash(reporter, client)
+    rep = _reporter_hash(reporter, client, org)
+    tree = None
+    if claim == 'missing' and layer in TREE_LAYERS and has_point:
+        # a tree we do not have: kept as a versioned user-added tree (tree_user.py).  Done BEFORE the flag
+        # row so a refused add (409: a tree exists there) or a withdrawal leaves no stray row behind.
+        import tree_user as tu
+        try:
+            tree = tu.record(body, subj, claim, rep, _dict_id(c, 'source', source) if source else None, epoch,
+                             _dict_id(c, 'org', org) if org else None)
+        except FlagError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning('tree add failed: %s', e)
+        if tree is not None and tree.get('op') == 'retract':
+            return {'rev': tree.get('rev'), 'folded': tree['folded'], 'status': 'open', 'layer': layer,
+                    'claim': claim, 'subject': _subject_public(subj), 'epoch': epoch, 'tree': tree}
     lon_e6 = int(round(subj['lon'] * 1e6)) if subj['lon'] is not None else None
     lat_e6 = int(round(subj['lat'] * 1e6)) if subj['lat'] is not None else None
     global _WRITES
@@ -463,15 +495,8 @@ def record(body: dict, client: str) -> dict:
         if snap and body.get('observed') in (None, '', {}):
             out['snapshot'] = snap
     out['tally'] = tally(subj['skey'])
-    if claim == 'missing' and layer in TREE_LAYERS and has_point:
-        # a tree we do not have: also keep it as a versioned user-added tree (tree_user.py)
-        try:
-            import tree_user as tu
-            out['tree'] = tu.record(body, subj, claim, rep, sid, epoch)
-        except FlagError as e:
-            out['tree'] = {'error': e.msg, **e.extra}
-        except Exception as e:  # noqa: BLE001
-            log.warning('tree add failed: %s', e)
+    if tree is not None:
+        out['tree'] = tree
     warn = [k for k in body if k not in _KNOWN]
     if warn:
         out['warnings'] = [f'ignored unknown field(s): {", ".join(sorted(warn))}']
@@ -748,6 +773,8 @@ def _limits() -> dict:
     return {'batch': MAX_BATCH, 'note_chars': MAX_NOTE, 'observed_bytes': MAX_OBSERVED_B,
             'expected_bytes': MAX_EXPECTED_B, 'bbox_span_deg': MAX_BBOX_SPAN_DEG, 'ids': MAX_IDS,
             'rows_out': MAX_ROWS_OUT, 'k': MAX_K, 'daily_per_client': DAILY_CAP,
+            'daily_per_reporter_key': DAILY_CAP_KEYED, 'daily_per_self_issued_key': DAILY_CAP_SELF,
+            'keys_per_client_per_day': TOKENS_PER_CLIENT_DAY,
             'rate_hint': 'POST ≤ 1 r/s sustained (burst 10); GET ≤ 5 r/s (burst 20)'}
 
 
@@ -807,7 +834,101 @@ def _limited(lim: sg.RateLimiter, cost: float = 1.0):
     return r
 
 
-def _daily_ok(client: str, n: int) -> bool:
+_keys_cache: list = [None, {}]
+
+
+def reporter_keys() -> dict:
+    """{key: holder}.  Re-read when the file changes."""
+    try:
+        mt = KEYS_PATH.stat().st_mtime_ns
+    except OSError:
+        return {}
+    if _keys_cache[0] != mt:
+        try:
+            d = json.loads(KEYS_PATH.read_text())
+            _keys_cache[1] = {str(k): str(v)[:MAX_SOURCE] for k, v in d.items()} if isinstance(d, dict) else {}
+        except Exception as e:  # noqa: BLE001
+            log.warning('reporter_keys unreadable: %s', e)
+            _keys_cache[1] = {}
+        _keys_cache[0] = mt
+    return _keys_cache[1]
+
+
+def _org_for(key) -> str | None:
+    """Holder of a reporter key; None without a key; 401 for a wrong one."""
+    if key in (None, ''):
+        return None
+    key = str(key).strip()
+    for k, v in reporter_keys().items():
+        if hmac.compare_digest(k.encode(), key.encode()):
+            return v
+    if key.startswith('trk_') and len(key) <= 80:
+        r = _conn().execute('SELECT holder FROM rkey WHERE h=?', (hashlib.sha256(key.encode()).digest(),)).fetchone()
+        if r is not None:
+            return r[0]
+    raise FlagError(401, 'unknown reporter_key (get one: POST /api/v1/flags/token {"name": "…"})')
+
+
+def _key_cap(org) -> int:
+    return DAILY_CAP if not org else DAILY_CAP_SELF if SELF_MARK in org else DAILY_CAP_KEYED
+
+
+def issue_key(name, client: str) -> dict:
+    """A self-issued reporter key: anyone may ask.  The holder is the chosen
+    name + a 4-hex suffix (``waldapp~3f9c``) — unique, and visibly not one of
+    the names we assign ourselves.  The key is returned once; we keep its hash."""
+    import re
+    import secrets
+    name = re.sub(r'\s+', ' ', str(name or '')).strip()
+    if not (2 <= len(name) <= 40) or not re.fullmatch(r'[\w .@/+-]+', name):
+        raise FlagError(400, 'name: 2–40 characters (letters, digits, space, . @ / + -) — your app, organisation or handle')
+    if not _daily_ok('t:' + client, 1, TOKENS_PER_CLIENT_DAY):
+        raise FlagError(429, f'{TOKENS_PER_CLIENT_DAY} keys per client per day')
+    c = _conn()
+    key = 'trk_' + secrets.token_urlsafe(24)
+    h = hashlib.sha256(key.encode()).digest()
+    holder = f'{name}{SELF_MARK}{h.hex()[:4]}'
+    with _LOCK:
+        if c.execute('SELECT COUNT(*) FROM rkey').fetchone()[0] >= MAX_SELF_KEYS:
+            raise FlagError(507, 'key store full')
+        c.execute('INSERT INTO rkey(h, holder, ts, client) VALUES (?,?,?,?)',
+                  (h, holder, int(time.time()), hashlib.sha256((client or '').encode()).hexdigest()[:16]))
+        c.commit()
+    return {'reporter_key': key, 'holder': holder, 'self_issued': True, 'daily_cap': DAILY_CAP_SELF,
+            'send_as': 'header X-Reporter-Key (or Authorization: Bearer …, or body "reporter_key")',
+            'note': 'shown once — store it; we keep only its hash. One key per app, or one per user / device.'}
+
+
+@flags_bp.route('/api/v1/flags/token', methods=['POST'])
+def flags_token():
+    lim = _limited(_post_limit, cost=3.0)
+    if lim is not None:
+        return lim
+    body = request.get_json(silent=True) or {}
+    out = issue_key(body.get('name') if isinstance(body, dict) else None, sg.client_key(request))
+    out['meta'] = _meta()
+    r = _resp(out, 201)
+    r.headers['Cache-Control'] = 'no-store'
+    return r
+
+
+def _request_key(body):
+    k = body.get('reporter_key') if isinstance(body, dict) else None
+    if k in (None, ''):
+        k = request.headers.get('X-Reporter-Key')
+    if k in (None, ''):
+        a = request.headers.get('Authorization') or ''
+        if a.lower().startswith('bearer trk_'):
+            k = a[7:]
+    return k
+
+
+def _is_tree_report(it) -> bool:
+    return isinstance(it, dict) and (str(it.get('layer') or '').lower() in TREE_LAYERS or any(
+        k in it for k in ('species', 'taxon', 'dbh_cm', 'tree_id', 'client_id')))
+
+
+def _daily_ok(client: str, n: int, cap: int = DAILY_CAP) -> bool:
     day = int(time.time() // 86400)
     with _LOCK:
         e = _daily.get(client)
@@ -815,7 +936,7 @@ def _daily_ok(client: str, n: int) -> bool:
             if len(_daily) > 20_000:
                 _daily.clear()
             e = _daily[client] = [day, 0]
-        if e[1] + n > DAILY_CAP:
+        if e[1] + n > cap:
             return False
         e[1] += n
     return True
@@ -838,22 +959,33 @@ def flags_post():
     if lim is not None:
         return lim
     client = sg.client_key(request)
-    if not _daily_ok(client, len(items)):
-        r = _resp({'error': 'daily_cap', 'detail': f'{DAILY_CAP} reports per client per day'}, 429)
+    org = _org_for(_request_key(body))            # one key per call (body, X-Reporter-Key or Bearer)
+    cap = _key_cap(org)
+    if not _daily_ok(('k:' + org) if org else client, len(items), cap):
+        r = _resp({'error': 'daily_cap', 'detail': f'{cap} reports per {"key" if org else "client"} per day'}, 429)
         r.headers['Retry-After'] = str(int(86400 - time.time() % 86400))
         return r
+    need_key = not org and KEY_REQUIRED_PATH.exists()
     results = []
     for it in items:
         try:
-            results.append(record(it, client))
+            if isinstance(it, dict) and it.get('reporter_key') not in (None, '') and batch is not None:
+                it_org = _org_for(it['reporter_key'])
+            else:
+                it_org = org
+            if need_key and not it_org and _is_tree_report(it):
+                raise FlagError(401, 'tree reports need a reporter_key: POST /api/v1/flags/token {"name": "…"}')
+            r = record(it, client, it_org)
+            r['http'] = 201 if r.get('tree', {}).get('written', True) else 200
+            results.append(r)
         except FlagError as e:
             if batch is None:
                 raise
-            results.append({'error': e.msg, **e.extra})
+            results.append({'error': e.msg, 'http': e.status, **e.extra})
     if batch is None:
         out = results[0]
         out['meta'] = _meta()
-        return _resp(out, 201)
+        return _resp(out, out.pop('http'))
     return _resp({'results': results, 'count': len(results),
                   'errors': sum(1 for r in results if 'error' in r), 'meta': _meta()}, 201)
 

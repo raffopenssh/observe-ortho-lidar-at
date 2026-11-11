@@ -38,10 +38,15 @@ log = logging.getLogger('tree_user')
 
 OP_SPECIES, OP_ADD, OP_RETRACT, OP_MODERATE = 0, 1, 2, 3
 OP_NAMES = ('species', 'add', 'retract', 'moderated')
-MATCH_MIN_M = 4.0            # a point this close to an apex always means that tree
-MATCH_MAX_M = 10.0           # … or inside its crown radius, capped here
-ADDED_MATCH_M = 3.0          # reports this close to a user-added tree fold onto it
-EXISTS_M = 2.0               # "missing" this close to a measured apex is refused (it exists)
+MATCH_MIN_M = 1.5            # a point this close to an apex means that tree …
+MATCH_CROWN_FRAC = 0.5       # … or within this share of its crown radius (whichever is larger)
+MATCH_SURE_M = 0.75          # the apex coordinate itself (metre-snapped corpus) — never ambiguous
+MATCH_AMBIG_RATIO = 2.0      # a second tree within reach must be this many times farther, else 409
+ADDED_NAME_M = 1.5           # a name / measure call reaches a user-added tree within this
+ADDED_FOLD_M = 0.5           # an add this close to the reporter's own added tree is the same tree
+EXISTS_M = 2.0               # "missing" this close to a measured apex needs force / a measured apex
+ID_SNAP_M = 0.5              # corpus apex = product apex rounded to the metre (per axis)
+ID_SHIFT_M = 1.5             # … or one pixel aside, when it is the only apex there
 SEARCH_M = 12.0
 ORPHAN_M = 1.5               # read side: apex moved after a rebuild → re-attach within this …
 ORPHAN_DH_M = 3.0            # … if the height still agrees
@@ -71,7 +76,37 @@ _SCHEMA = [
     'CREATE INDEX IF NOT EXISTS tv_kg ON tree_ver(kg, x, y)',
 ]
 _ADD_COLS = (('uh_dm', 'INTEGER'),      # reporter's own height measurement / estimate (dm)
-             ('dbh_mm', 'INTEGER'))     # reporter's diameter at breast height (mm)
+             ('dbh_mm', 'INTEGER'),     # reporter's diameter at breast height (mm)
+             ('e_dm', 'INTEGER'),       # exact EPSG:3035 position in 0.1 m: the inventory tree id (op 0/2 rows)
+             ('n_dm', 'INTEGER'),       #   or the reporter's point of an added tree (op 1 rows)
+             ('cid', 'TEXT'),           # client_id of an added tree (idempotency key + identity)
+             ('mts', 'INTEGER'),        # measured_at (epoch s); ts stays the receive time
+             ('meta', 'INTEGER'),       # packed training metadata, 4 bits each (META_FIELDS order; 0 = not given)
+             ('org', 'INTEGER'))        # dict id (kind 'org'): holder of the reporter key the version came with
+# training metadata vocabulary (standard English terms; value index + 1 is stored).  German field terms
+# and common synonyms are accepted and normalised.
+META_FIELDS = (
+    ('dbh_method', ('caliper', 'tape', 'estimate')),
+    ('h_method', ('hypsometer', 'laser', 'estimate')),
+    ('vitality', ('alive', 'dead')),
+    ('status', ('standing', 'felled')),
+)
+_META_ALIAS = {
+    'dbh_method': {'kluppe': 'caliper', 'calliper': 'caliper', 'calipers': 'caliper', 'umfang': 'tape',
+                   'girth': 'tape', 'girth_tape': 'tape', 'circumference': 'tape', 'massband': 'tape',
+                   'diameter_tape': 'tape', 'schaetzung': 'estimate', 'geschaetzt': 'estimate',
+                   'estimated': 'estimate', 'visual': 'estimate', 'ocular': 'estimate'},
+    'h_method': {'vertex': 'hypsometer', 'clinometer': 'hypsometer', 'hoehenmesser': 'hypsometer',
+                 'rangefinder': 'laser', 'laser_rangefinder': 'laser', 'lidar': 'laser',
+                 'schaetzung': 'estimate', 'geschaetzt': 'estimate', 'estimated': 'estimate',
+                 'visual': 'estimate', 'ocular': 'estimate'},
+    'vitality': {'lebend': 'alive', 'living': 'alive', 'live': 'alive', 'vital': 'alive', 'tot': 'dead',
+                 'abgestorben': 'dead', 'snag': 'dead'},
+    'status': {'stehend': 'standing', 'gefaellt': 'felled', 'geschlaegert': 'felled', 'cut': 'felled',
+               'harvested': 'felled', 'removed': 'felled'},
+}
+_TREE_ID = re.compile(r'^t_(\d{7,9})_(\d{7,9})$')
+_CLIENT_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{7,63}$')
 DBH_CM = (1.0, 600.0)
 H_M = (1.0, 70.0)
 
@@ -239,6 +274,7 @@ def _conn():
                     c.execute(f'ALTER TABLE tree_ver ADD COLUMN {col} {typ}')
                 except Exception:  # noqa: BLE001 — another worker won the race
                     pass
+        c.execute('CREATE INDEX IF NOT EXISTS tv_cid ON tree_ver(cid) WHERE cid IS NOT NULL')
         pf._TLS.tu_c = c
     return c
 
@@ -277,7 +313,15 @@ def _derive(rows) -> dict:
     uh: dict = {}            # reporter -> own height (dm)
     dbh: dict = {}           # reporter -> dbh (mm)
     apex_h = None
+    tid = pos = cid = None
     for r in rows:
+        if r['e_dm'] is not None:                 # identity survives retraction / moderation
+            if r['op'] == OP_ADD:
+                pos = pos or (r['e_dm'], r['n_dm'])
+            elif r['op'] in (OP_SPECIES, OP_RETRACT):
+                tid = (r['e_dm'], r['n_dm'])
+        if r['cid'] and cid is None:
+            cid = r['cid']
         if r['op'] == OP_MODERATE or r['rev'] in hidden:
             continue
         rep = bytes(r['reporter'])
@@ -302,12 +346,13 @@ def _derive(rows) -> dict:
         sp, (n, _) = max(cnt.items(), key=lambda kv: (kv[1][0], kv[1][1]))
     hs = sorted(uh.values()); ds = sorted(dbh.values())          # several reporters → median
     return {'sp': sp, 'n': n, 'added': bool(adds), 'h_dm': hs[len(hs) // 2] if hs else None,
-            'dbh_mm': ds[len(ds) // 2] if ds else None, 'apex_h': apex_h,
+            'dbh_mm': ds[len(ds) // 2] if ds else None, 'apex_h': apex_h, 'tid': tid, 'pos': pos, 'cid': cid,
             'v': len(rows), 'rev': rows[-1]['rev'], 'reporters': len(set(votes) | adds | set(uh) | set(dbh))}
 
 
 def _load(c, kg: int) -> dict:
-    rows = c.execute('SELECT rev, x, y, op, sp, h_dm, uh_dm, dbh_mm, reporter, ref FROM tree_ver WHERE kg=? ORDER BY rev', (kg,)).fetchall()
+    rows = c.execute('SELECT rev, x, y, op, sp, h_dm, uh_dm, dbh_mm, reporter, ref, e_dm, n_dm, cid FROM tree_ver '
+                     'WHERE kg=? ORDER BY rev', (kg,)).fetchall()
     if not rows:
         return dict(_EMPTY, path=str(pf.DB_PATH))
     by: dict = {}
@@ -315,8 +360,13 @@ def _load(c, kg: int) -> dict:
         by.setdefault((r['x'], r['y']), []).append(r)
     xy = np.array(list(by), dtype=np.int64).reshape(-1, 2)
     cur = [_derive(v) for v in by.values()]
-    lon, lat = _tf('EPSG:3035', 'EPSG:4326').transform(xy[:, 0].astype(float), xy[:, 1].astype(float))
-    st = {'n': len(cur), 'rev': rows[-1]['rev'], 'path': str(pf.DB_PATH), 'x': xy[:, 0], 'y': xy[:, 1],
+    # exact position where we know it: the inventory id of an apex, the reporter's point of an added tree
+    ex = [(d['tid'] if not d['added'] else None) or d['pos'] or d['tid'] for d in cur]
+    e = np.array([p[0] / 10.0 if p else float(k[0]) for p, k in zip(ex, by)], np.float64)
+    n = np.array([p[1] / 10.0 if p else float(k[1]) for p, k in zip(ex, by)], np.float64)
+    lon, lat = _tf('EPSG:3035', 'EPSG:4326').transform(e, n)
+    st = {'n': len(cur), 'rev': rows[-1]['rev'], 'path': str(pf.DB_PATH), 'x': xy[:, 0], 'y': xy[:, 1], 'e': e, 'n_': n,
+          'tid': [tree_id_str(d['tid']) for d in cur], 'cid': [d['cid'] for d in cur],
           'key': (xy[:, 0] << 32) | xy[:, 1], 'lon': np.asarray(lon), 'lat': np.asarray(lat),
           'sp': np.array([d['sp'] or 0 for d in cur], np.int64), 'cnt': np.array([d['n'] for d in cur], np.int32),
           'added': np.array([d['added'] for d in cur], bool), 'v': np.array([d['v'] for d in cur], np.int32),
@@ -325,7 +375,70 @@ def _load(c, kg: int) -> dict:
           'dbh': np.array([np.nan if d['dbh_mm'] is None else d['dbh_mm'] / 10.0 for d in cur]),
           'apex_h': np.array([np.nan if d['apex_h'] is None else d['apex_h'] / 10.0 for d in cur])}
     st['live'] = (st['sp'] > 0) | st['added'] | np.isfinite(st['h']) | np.isfinite(st['dbh'])
+    st['has_id'] = np.array([t is not None for t in st['tid']], bool)
+    # inventory trees reported by id that the corpus had no apex for (apex-bound versions store the apex height)
+    st['idonly'] = st['has_id'] & ~st['added'] & ~np.isfinite(st['apex_h'])
     return st
+
+
+def tree_id_str(t) -> str | None:
+    return f't_{t[0]}_{t[1]}' if t else None
+
+
+def parse_tree_id(v):
+    """'t_<E>_<N>' (EPSG:3035 in 0.1 m — the id of the product apex inventory) → (e_dm, n_dm) | None."""
+    if v in (None, ''):
+        return None
+    m = _TREE_ID.match(str(v).strip())
+    if not m:
+        raise pf.FlagError(400, 'tree_id must look like "t_47092875_26831275" (EPSG:3035 easting_northing in 0.1 m); '
+                                'ids of the pre-2.4 live inventory (tree_id_v2) depend on the query area and cannot be '
+                                'resolved here')
+    e, n = int(m.group(1)), int(m.group(2))
+    if not (40_000_000 <= e <= 50_000_000 and 25_000_000 <= n <= 30_000_000):
+        raise pf.FlagError(400, 'tree_id lies outside Austria')
+    return e, n
+
+
+def prefill(body: dict) -> None:
+    """A report that names its tree by ``tree_id`` / ``client_id`` needs no point:
+    fill lon / lat from the id (tree_id always wins over a sent point)."""
+    if not isinstance(body, dict):
+        return
+    tid = parse_tree_id(body.get('tree_id'))
+    if tid is not None:
+        lon, lat = _tf('EPSG:3035', 'EPSG:4326').transform(tid[0] / 10.0, tid[1] / 10.0)
+        body['lon'], body['lat'] = float(lon), float(lat)
+    elif body.get('client_id') not in (None, '') and (body.get('lon') is None or body.get('lat') is None):
+        t = _tree_by_cid(_conn(), parse_client_id(body['client_id']))
+        if t is None:
+            raise pf.FlagError(404, 'unknown client_id — send lon, lat with the first report of an added tree')
+        st = state(t[0]); j = _state_idx(st, t[1], t[2])
+        if j is not None:
+            body['lon'], body['lat'] = float(st['lon'][j]), float(st['lat'][j])
+
+
+def parse_client_id(v) -> str | None:
+    if v in (None, ''):
+        return None
+    v = str(v).strip().lower()
+    if not _CLIENT_ID.match(v):
+        raise pf.FlagError(400, 'client_id must be a UUID (8–64 chars of A-Z a-z 0-9 . _ : -)')
+    return v
+
+
+def _tree_by_cid(c, cid):
+    if not cid:
+        return None
+    r = c.execute('SELECT kg, x, y FROM tree_ver WHERE cid=? ORDER BY rev LIMIT 1', (cid,)).fetchone()
+    return (int(r['kg']), int(r['x']), int(r['y'])) if r else None
+
+
+def _state_idx(st, x, y):
+    if not st['n']:
+        return None
+    j = np.nonzero(st['key'] == ((int(x) << 32) | int(y)))[0]
+    return int(j[0]) if j.size else None
 
 
 def state(kg, grev: int | None = None) -> dict:
@@ -388,16 +501,18 @@ def annotate(x: np.ndarray, y: np.ndarray, h: np.ndarray, kgs) -> dict | None:
         return None
     key = (x.astype(np.int64) << 32) | y.astype(np.int64)
     out_i: list = []; out_sp: list = []; out_n: list = []; out_v: list = []; out_h: list = []; out_d: list = []
+    out_t: list = []
 
     def take(k, j):
         out_i.append(k); out_sp.append(int(ssp[j])); out_n.append(int(scn[j])); out_v.append(int(sv[j]))
-        out_h.append(_num(suh[j])); out_d.append(_num(sdb[j]))
+        out_h.append(_num(suh[j])); out_d.append(_num(sdb[j])); out_t.append(stid[j])
 
     for s in sts:
         m = s['live'] & ~s['added']
         if not m.any():
             continue
         sk = s['key'][m]; ssp = s['sp'][m]; scn = s['cnt'][m]; sv = s['v'][m]; suh = s['h'][m]; sdb = s['dbh'][m]
+        stid = [t for t, k_ in zip(s['tid'], m.tolist()) if k_]
         order = np.argsort(key, kind='stable')
         pos = np.searchsorted(key[order], sk)
         pos[pos >= key.size] = 0
@@ -420,7 +535,7 @@ def annotate(x: np.ndarray, y: np.ndarray, h: np.ndarray, kgs) -> dict | None:
     seen = set(); keep = [j for j in o if not (out_i[j] in seen or seen.add(out_i[j]))]
     u = {'i': [out_i[j] for j in keep], 'taxon': [_taxon(out_sp[j]) for j in keep],
          'n': [out_n[j] for j in keep], 'v': [out_v[j] for j in keep]}
-    for name, col in (('h_user_m', out_h), ('dbh_cm', out_d)):       # only when someone measured one
+    for name, col in (('h_user_m', out_h), ('dbh_cm', out_d), ('tree_id', out_t)):   # only when any is known
         if any(col[j] is not None for j in keep):
             u[name] = [col[j] for j in keep]
     return u
@@ -430,7 +545,15 @@ def _num(v) -> float | None:
     return round(float(v), 1) if np.isfinite(v) else None
 
 
-def added(w, s, e, n, kgs, min_h: float = 0.0, max_h: float | None = None) -> dict | None:
+def reported(w, s, e, n, kgs, min_h: float = 0.0, max_h: float | None = None) -> dict | None:
+    """Inventory trees somebody reported by ``tree_id`` that the corpus has no
+    apex for (trees only the live fused inventory of ``/api/v3/trees`` finds):
+    ``{tree_id, lon, lat, h_m, taxon, n, v[, dbh_cm]}``, same height window rule
+    as :func:`added`."""
+    return added(w, s, e, n, kgs, min_h, max_h, which='idonly')
+
+
+def added(w, s, e, n, kgs, min_h: float = 0.0, max_h: float | None = None, which: str = 'added') -> dict | None:
     """User-added trees (ones the corpus has no apex for) in a bbox as columns
     ``{lon, lat, h_m, taxon, n, v}``.  Height window: the reported height, or
     3 m (the inventory floor) when none was given — so exactly one band of a
@@ -438,14 +561,14 @@ def added(w, s, e, n, kgs, min_h: float = 0.0, max_h: float | None = None) -> di
     g = global_rev()
     if not g:
         return None
-    out = {'lon': [], 'lat': [], 'h_m': [], 'taxon': [], 'n': [], 'v': [], 'dbh_cm': []}
+    out = {'lon': [], 'lat': [], 'h_m': [], 'taxon': [], 'n': [], 'v': [], 'dbh_cm': [], 'client_id': [], 'tree_id': []}
     seen = set()
     for k in kgs:
         st = state(k, g)
         if not st['n']:
             continue
         hw = np.where(np.isfinite(st['h']), st['h'], ADDED_DEFAULT_H)
-        m = st['added'] & (st['lon'] >= w) & (st['lon'] <= e) & (st['lat'] >= s) & (st['lat'] <= n) & (hw >= min_h)
+        m = st[which] & st['live'] & (st['lon'] >= w) & (st['lon'] <= e) & (st['lat'] >= s) & (st['lat'] <= n) & (hw >= min_h)
         if max_h is not None:
             m &= hw < max_h
         for j in np.nonzero(m)[0].tolist():
@@ -456,10 +579,12 @@ def added(w, s, e, n, kgs, min_h: float = 0.0, max_h: float | None = None) -> di
             out['lon'].append(round(float(st['lon'][j]), 6)); out['lat'].append(round(float(st['lat'][j]), 6))
             out['h_m'].append(_num(st['h'][j])); out['dbh_cm'].append(_num(st['dbh'][j]))
             out['taxon'].append(_taxon(st['sp'][j])); out['n'].append(int(st['cnt'][j])); out['v'].append(int(st['v'][j]))
+            out['client_id'].append(st['cid'][j]); out['tree_id'].append(st['tid'][j] if which == 'idonly' else None)
     if not out['lon']:
         return None
-    if all(v is None for v in out['dbh_cm']):
-        del out['dbh_cm']
+    for k in ('dbh_cm', 'client_id', 'tree_id'):
+        if all(v is None for v in out[k]):
+            del out[k]
     return out
 
 
@@ -485,28 +610,130 @@ def _apices_near(lon, lat, r_m=SEARCH_M) -> dict | None:
         return None
 
 
-def _match(lon, lat, px, py, want_measured=True):
-    """Nearest tree to the point → (kind, x, y, kg, dist_m, apex_h_m) with kind
-    'apex' | 'added', or None."""
-    best = None
-    c = _apices_near(lon, lat) if want_measured else None
-    if c is not None:
-        d = np.hypot(c['x'] - px, c['y'] - py)
-        rad = np.clip(np.sqrt(np.maximum(c['crown_m2'], 0) / math.pi), MATCH_MIN_M, MATCH_MAX_M)
-        ok = d <= rad
-        if ok.any():
-            j = int(np.argmin(np.where(ok, d, 1e9)))
-            best = ('apex', int(c['x'][j]), int(c['y'][j]), int(c['kg'][j]), float(d[j]), float(c['h'][j]))
+def _reach(crown_m2) -> np.ndarray:
+    return np.maximum(MATCH_MIN_M, MATCH_CROWN_FRAC * np.sqrt(np.maximum(crown_m2, 0) / math.pi))
+
+
+def _candidates(lon, lat, px, py) -> list:
+    """Every tree within SEARCH_M of the point, nearest first:
+    ``{kind: apex | id | added, x, y, kg, d, h, reach, tid, live}``.
+    apex = measured apex of the corpus; id = an inventory tree somebody
+    reported by tree_id that the corpus has no apex for; added = user-added."""
+    out = []
+    seen = set()
     g = global_rev()
+    sts = {}
     for k in (_near_kgs(lon, lat) if g else ()):
         st = state(k, g)
-        if not st['n'] or not st['added'].any():
+        if st['n']:
+            sts[int(k)] = st
+    c = _apices_near(lon, lat)
+    if c is not None:
+        d = np.hypot(c['x'] - px, c['y'] - py)
+        rad = _reach(c['crown_m2'])
+        for j in np.argsort(d).tolist():
+            kg = int(c['kg'][j]); x = int(c['x'][j]); y = int(c['y'][j])
+            st = sts.get(kg); i = _state_idx(st, x, y) if st else None
+            tid = st['tid'][i] if i is not None else None
+            dj = float(d[j])
+            if tid is not None:                       # exact position known → measure against it
+                dj = float(math.hypot(st['e'][i] - px, st['n_'][i] - py))
+            seen.add((x, y))
+            out.append({'kind': 'apex', 'x': x, 'y': y, 'kg': kg, 'd': dj, 'h': float(c['h'][j]),
+                        'reach': float(rad[j]), 'tid': tid, 'live': bool(i is not None and st['live'][i]),
+                        'lon': float(c['lon'][j]) if tid is None else float(st['lon'][i]),
+                        'lat': float(c['lat'][j]) if tid is None else float(st['lat'][i])})
+    for kg, st in sts.items():
+        d = np.hypot(st['e'] - px, st['n_'] - py)
+        for i in np.nonzero(d <= SEARCH_M)[0].tolist():
+            x, y = int(st['x'][i]), int(st['y'][i])
+            if st['added'][i]:
+                kind, reach = 'added', ADDED_NAME_M
+            elif st['idonly'][i] and (x, y) not in seen:
+                kind, reach = 'id', MATCH_MIN_M
+            else:
+                continue
+            out.append({'kind': kind, 'x': x, 'y': y, 'kg': kg, 'd': float(d[i]), 'h': None, 'reach': reach,
+                        'tid': st['tid'][i] if kind == 'id' else None, 'cid': st['cid'][i],
+                        'live': bool(st['live'][i]), 'lon': float(st['lon'][i]), 'lat': float(st['lat'][i])})
+    out.sort(key=lambda t: t['d'])
+    return out
+
+
+def _cand_public(cs, n=5) -> list:
+    out = []
+    for t in cs[:n]:
+        d = {'tree_id': t.get('tid'), 'lon': round(t['lon'], 6), 'lat': round(t['lat'], 6),
+             'height_m': None if t['h'] is None else round(t['h'], 2), 'dist_m': round(t['d'], 1),
+             'kind': t['kind']}
+        if t.get('cid'):
+            d['client_id'] = t['cid']
+        out.append(d)
+    return out
+
+
+def _pick(cs: list):
+    """The tree a point means: a measured tree within reach wins over an added
+    one; the nearest must be clearly nearer than the next (409 otherwise)."""
+    for kinds in (('apex', 'id'), ('added',)):
+        hit = [t for t in cs if t['kind'] in kinds and t['d'] <= t['reach']]
+        if not hit:
             continue
-        d = np.where(st['added'], np.hypot(st['x'] - px, st['y'] - py), 1e9)
-        j = int(np.argmin(d))
-        if d[j] <= ADDED_MATCH_M and (best is None or d[j] < best[4]):
-            best = ('added', int(st['x'][j]), int(st['y'][j]), int(k), float(d[j]), None)
-    return best
+        a = hit[0]
+        if len(hit) > 1 and a['d'] > MATCH_SURE_M and hit[1]['d'] < MATCH_AMBIG_RATIO * a['d']:
+            raise pf.FlagError(409, 'several trees are within reach of this point — send tree_id (or the exact '
+                                    'coordinate of one candidate)', candidates=_cand_public(hit))
+        return a
+    return None
+
+
+def _bind_id(c, tid, lon, lat, subj_kg):
+    """tree_id → the tree it names, never an added one.  Order: a tree already
+    carrying this id; the corpus apex this inventory apex was snapped to
+    (≤ 0.5 m per axis, not owned by another id); else a tree of its own
+    (the corpus has no apex for it) — keyed in the transaction."""
+    e, n = tid[0] / 10.0, tid[1] / 10.0
+    fx, fy = int(math.floor(e)), int(math.floor(n))
+    kgs = [int(k) for k in _near_kgs(lon, lat, 3.0)]
+    for k in kgs:
+        r = c.execute('SELECT x, y, h_dm FROM tree_ver WHERE kg=? AND x BETWEEN ? AND ? AND y BETWEEN ? AND ? '
+                      'AND e_dm=? AND n_dm=? AND op IN (0, 2) ORDER BY rev DESC LIMIT 1',
+                      (k, fx - 3, fx + 4, fy - 3, fy + 4, tid[0], tid[1])).fetchone()
+        if r is not None:
+            return {'kind': 'apex' if r['h_dm'] is not None else 'id', 'x': int(r['x']), 'y': int(r['y']), 'kg': k,
+                    'd': 0.0, 'h': None if r['h_dm'] is None else r['h_dm'] / 10.0}
+    ap = _apices_near(lon, lat, 3.0)
+    if ap is not None:
+        want = tree_id_str(tid)
+        # 1) the metre snap of this very pixel; 2) one pixel off (a product stitched a tile a pixel
+        #    aside — 63350-north, 2026-11) when exactly one apex qualifies
+        for tol, single in ((ID_SNAP_M, False), (ID_SHIFT_M, True)):
+            ok = (np.abs(ap['x'] - e) <= tol + 1e-6) & (np.abs(ap['y'] - n) <= tol + 1e-6)
+            free = []
+            for j in sorted(np.nonzero(ok)[0].tolist(), key=lambda j: (int(ap['x'][j]), int(ap['y'][j]))):
+                kg = int(ap['kg'][j]); x = int(ap['x'][j]); y = int(ap['y'][j])
+                st = state(kg); i = _state_idx(st, x, y)
+                if i is not None and (st['added'][i] or st['tid'][i] not in (None, want)):
+                    continue                              # that apex already is another inventory tree
+                free.append({'kind': 'apex', 'x': x, 'y': y, 'kg': kg, 'd': 0.0, 'h': float(ap['h'][j])})
+            if free and (len(free) == 1 or not single):
+                return free[0]
+    if not subj_kg:
+        raise pf.FlagError(400, 'tree_id lies in no KG we know')
+    return {'kind': 'id', 'x': fx, 'y': fy, 'kg': int(subj_kg), 'd': 0.0, 'h': None, 'new': True}
+
+
+def _free_key(c, kg, x, y):
+    """Nearest unused integer-metre key (two trees closer than a metre must
+    not share one; the exact position lives in e_dm / n_dm)."""
+    for r in range(0, 4):
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                if max(abs(dx), abs(dy)) != r:
+                    continue
+                if not c.execute('SELECT 1 FROM tree_ver WHERE kg=? AND x=? AND y=? LIMIT 1', (kg, x + dx, y + dy)).fetchone():
+                    return x + dx, y + dy
+    raise pf.FlagError(409, 'too many trees reported on this spot')
 
 
 def _free_taxa_ok(c, latin: str) -> bool:
@@ -516,58 +743,158 @@ def _free_taxa_ok(c, latin: str) -> bool:
     return n < MAX_FREE_TAXA + len(TAXA)
 
 
-def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str | None) -> dict:
-    """One species / add report → appended version (or a no-op when the
-    reporter repeats themself).  Returns the tree's current public answer."""
+def _truthy(v) -> bool:
+    return v is True or str(v).strip().lower() in ('1', 'true', 'yes')
+
+
+def _metadata(body, exp, warnings: list):
+    """→ (packed meta | None, measured_at epoch | None).  Unknown values are a
+    warning, never an error (the measure itself must not be lost)."""
+    meta = 0
+    for i, (name, vals) in enumerate(META_FIELDS):
+        v = next((d[name] for d in (body, exp) if d.get(name) not in (None, '')), None)
+        if v is None:
+            continue
+        s = _fold(str(v)).replace(' ', '_').replace('-', '_')
+        s = _META_ALIAS[name].get(s, s)
+        if s in vals:
+            meta |= (vals.index(s) + 1) << (4 * i)
+        else:
+            warnings.append(f'{name} {str(v)[:30]!r} not understood (use {" | ".join(vals)}) — not stored')
+    mts = None
+    v = next((d['measured_at'] for d in (body, exp) if d.get('measured_at') not in (None, '')), None)
+    if v is not None:
+        try:
+            import datetime as dt
+            if isinstance(v, (int, float)):
+                t = float(v)
+            else:
+                d = dt.datetime.fromisoformat(str(v).strip().replace('Z', '+00:00'))
+                if d.tzinfo is None:
+                    d = d.replace(tzinfo=dt.timezone.utc)
+                t = d.timestamp()
+            if not (946684800 <= t <= time.time() + 86400):
+                raise ValueError
+            mts = int(t)
+        except (ValueError, OverflowError):
+            warnings.append('measured_at not understood (ISO 8601, e.g. "2026-11-11T09:30:00Z", 2000 … now) — not stored')
+    return (meta or None), mts
+
+
+def _meta_public(meta, mts, v: dict) -> None:
+    if mts is not None:
+        v['measured_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(mts))
+    if meta:
+        for i, (name, vals) in enumerate(META_FIELDS):
+            k = (meta >> (4 * i)) & 15
+            if 0 < k <= len(vals):
+                v[name] = vals[k - 1]
+
+
+def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str | None, org_id=None) -> dict:
+    """One tree report → appended version (or a no-op when the reporter repeats
+    themself).  Returns the tree's current public answer.  Raises FlagError
+    (404 no tree, 409 ambiguous / exists) BEFORE anything is written."""
     exp = body.get('expected') if isinstance(body.get('expected'), dict) else {}
     has_sp = any(k in d for d in (body, exp) for k in ('species', 'taxon'))
     raw = next((d[k] for d in (body, exp) for k in ('species', 'taxon') if d.get(k) not in (None, '')), None)
     uh_dm = _measure(body, exp, ('h_m', 'height_m'), H_M, 10, 'h_m', 'm')
     dbh_mm = _measure(body, exp, ('dbh_cm', 'dbh'), DBH_CM, 10, 'dbh_cm', 'cm')
+    warnings: list = []
+    meta, mts = _metadata(body, exp, warnings)
+    tid = parse_tree_id(body.get('tree_id'))
+    cid = parse_client_id(body.get('client_id'))
+    if body.get('tree_id_v2') not in (None, '') and tid is None:
+        warnings.append('tree_id_v2 ignored: pre-2.4 ids depend on the query area — matched by position instead; '
+                        'send tree_id (POST /api/v3/trees, legacy_ids=1 maps old → new)')
     lon, lat = subj['lon'], subj['lat']
     px, py = _to_3035(lon, lat)
     latin = known = None
     if raw is not None:
         latin, known = normalise(raw)
+    empty = latin is None and uh_dm is None and dbh_mm is None
+    retract = _truthy(body.get('retract')) or (empty and has_sp)
     c = _conn()
+    e_dm = n_dm = None
+    new_tree = False
     if claim == 'species':
-        m = _match(lon, lat, px, py)
-        if m is None:
-            raise pf.FlagError(404, f'no tree within reach of this point (crown radius, {MATCH_MIN_M:g}–{MATCH_MAX_M:g} m). '
-                                    'To add a tree we do not have: claim "missing" with the same point.',
-                               hint={'layer': 'trees', 'claim': 'missing'})
-        kind, x, y, kg, dist, apex_h = m
-        if latin is None and uh_dm is None and dbh_mm is None:
-            if not has_sp:
-                raise pf.FlagError(400, 'say something about the tree: species, dbh_cm and / or h_m '
-                                        '("species": null withdraws your report)', dict='/api/v1/trees/taxa/dict')
-            op, sp, h_dm = OP_RETRACT, None, None
+        if tid is not None:
+            m = _bind_id(c, tid, lon, lat, subj.get('kg'))
+            e_dm, n_dm = tid
+            new_tree = bool(m.get('new'))
+        elif cid is not None:
+            t = _tree_by_cid(c, cid)
+            if t is None:
+                raise pf.FlagError(404, 'unknown client_id — add the tree first (claim "missing")',
+                                   hint={'layer': 'trees', 'claim': 'missing'})
+            m = {'kind': 'added', 'kg': t[0], 'x': t[1], 'y': t[2], 'd': 0.0, 'h': None}
         else:
-            op, h_dm = OP_SPECIES, (None if apex_h is None else int(round(apex_h * 10)))
-    else:                                           # missing → add
-        m = _match(lon, lat, px, py)
-        if m is not None and m[0] == 'apex' and m[4] <= EXISTS_M:
-            raise pf.FlagError(409, 'we already have a tree here — name it with claim "species"',
-                               tree={'height_m': m[5], 'dist_m': round(m[4], 1)}, hint={'layer': 'trees', 'claim': 'species'})
-        m = m if (m is not None and m[0] == 'added') else None
-        if m is not None:
-            kind, x, y, kg, dist, apex_h = m
+            cs = _candidates(lon, lat, px, py)
+            m = None
+            if retract:                             # several added trees on one spot: withdraw my own
+                top = next((t for t in cs if t['kind'] in ('apex', 'id') and t['d'] <= t['reach']), None)
+                if top is None:
+                    m = next((t for t in cs if t['kind'] == 'added' and t['d'] <= ADDED_NAME_M
+                              and _mine_ok(c, t, rep, None)), None)
+            m = m or _pick(cs)
+            if m is None:
+                raise pf.FlagError(404, f'no tree within reach of this point (max({MATCH_MIN_M:g} m, '
+                                        f'{MATCH_CROWN_FRAC:g} × crown radius) of an apex, {ADDED_NAME_M:g} m of an added '
+                                        'tree). Send tree_id, or add the tree: claim "missing" with the same point.',
+                                   hint={'layer': 'trees', 'claim': 'missing'}, candidates=_cand_public(cs))
+        if empty and not retract and meta is None and mts is None:
+            raise pf.FlagError(400, 'say something about the tree: species, dbh_cm and / or h_m '
+                                    '("species": null or "retract": true withdraws your report)', dict='/api/v1/trees/taxa/dict')
+        if retract:
+            op, h_dm = OP_RETRACT, None
         else:
-            if not subj.get('kg'):
-                raise pf.FlagError(400, 'point lies in no KG we know')
-            kind, x, y, kg, dist, apex_h = 'added', int(round(px)), int(round(py)), int(subj['kg']), 0.0, None
-        op, h_dm = OP_ADD, None
+            op, h_dm = OP_SPECIES, (None if m['h'] is None else int(round(m['h'] * 10)))
+    else:                                           # missing → add (or withdraw my add)
+        cs = _candidates(lon, lat, px, py)
+        m = None
+        t = _tree_by_cid(c, cid)
+        if t is not None:
+            m = {'kind': 'added', 'kg': t[0], 'x': t[1], 'y': t[2], 'd': 0.0, 'h': None}
+        elif retract or cid is None:
+            # my own added tree at this spot (never somebody else's, never one with other measures)
+            lim = ADDED_NAME_M if retract else ADDED_FOLD_M
+            m = next((t for t in cs if t['kind'] == 'added' and t['d'] <= lim
+                      and _mine_ok(c, t, rep, None if retract else (uh_dm, dbh_mm))), None)
+        if retract:
+            if m is None:
+                raise pf.FlagError(404, 'no tree added by you at this point (send client_id, or the point you added it at)')
+            op, h_dm = OP_RETRACT, None
+        else:
+            if m is None:
+                near = next((t for t in cs if t['kind'] in ('apex', 'id') and t['d'] <= EXISTS_M), None)
+                if near is not None and not (_truthy(body.get('force')) or near['live']):
+                    raise pf.FlagError(409, f'we already have a tree {near["d"]:.1f} m from here — describe it with claim '
+                                            '"tree" (tree_id / its coordinate), or send "force": true for a second '
+                                            'stem / understorey tree',
+                                       tree=_cand_public([near])[0], hint={'layer': 'trees', 'claim': 'tree', 'force': True})
+                if not subj.get('kg'):
+                    raise pf.FlagError(400, 'point lies in no KG we know')
+                m = {'kind': 'added', 'x': int(round(px)), 'y': int(round(py)), 'kg': int(subj['kg']), 'd': 0.0, 'h': None}
+                new_tree = True
+                e_dm, n_dm = int(round(px * 10)), int(round(py * 10))
+            op, h_dm = OP_ADD, None
+    kind, x, y, kg, dist, apex_h = m['kind'], m['x'], m['y'], m['kg'], m['d'], m['h']
     if latin is not None and not known and not _free_taxa_ok(c, latin):
         raise pf.FlagError(400, 'too many free-form species names; use one from the dictionary', dict='/api/v1/trees/taxa/dict')
     sp = pf._dict_id(c, 'taxon', latin) if latin else None
     ep = pf._dict_id(c, 'epoch', epoch) if epoch else None
     now = int(time.time())
-    folded = False
+    written = False
     with pf._LOCK:
         c.execute('BEGIN IMMEDIATE')
         try:
-            rows = c.execute('SELECT rev, op, sp, uh_dm, dbh_mm, reporter, ref FROM tree_ver WHERE kg=? AND x=? AND y=? ORDER BY rev',
-                             (kg, x, y)).fetchall()
+            if new_tree:
+                if cid is not None and _tree_by_cid(c, cid) is not None:      # lost a race on the same client_id
+                    kg, x, y = _tree_by_cid(c, cid); new_tree = False
+                else:
+                    x, y = _free_key(c, kg, x, y)
+            rows = c.execute('SELECT rev, op, sp, uh_dm, dbh_mm, mts, meta, reporter, ref FROM tree_ver '
+                             'WHERE kg=? AND x=? AND y=? ORDER BY rev', (kg, x, y)).fetchall()
             hidden = {r['ref'] for r in rows if r['op'] == OP_MODERATE}
             mine = [r for r in rows if bytes(r['reporter']) == rep and r['op'] != OP_MODERATE and r['rev'] not in hidden]
             since = 0                               # my versions after my last retraction
@@ -579,31 +906,83 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
             def latest(col):
                 return next((r[col] for r in reversed(cur) if r[col] is not None), None)
 
+            def meta_same():
+                if meta is None:
+                    return True
+                for i in range(len(META_FIELDS)):
+                    k = (meta >> (4 * i)) & 15
+                    if k and k != next(((r['meta'] >> (4 * i)) & 15 for r in reversed(cur)
+                                        if r['meta'] and (r['meta'] >> (4 * i)) & 15), 0):
+                        return False
+                return True
+
             if op == OP_RETRACT:
-                folded = not cur
+                same = not cur
             else:
-                folded = bool(cur) and all(v is None or v == latest(col)
-                                           for col, v in (('sp', sp), ('uh_dm', uh_dm), ('dbh_mm', dbh_mm)))
+                same = bool(cur) and meta_same() and all(
+                    v is None or v == latest(col)
+                    for col, v in (('sp', sp), ('uh_dm', uh_dm), ('dbh_mm', dbh_mm), ('mts', mts)))
                 if op == OP_ADD and not any(r['op'] == OP_ADD for r in cur):
-                    folded = False
-            if not folded:
+                    same = False
+            if not same:
                 if len(rows) >= MAX_VERSIONS_PER_TREE:
                     raise pf.FlagError(429, f'this tree already has {MAX_VERSIONS_PER_TREE} versions')
                 if c.execute('SELECT COUNT(*) FROM tree_ver').fetchone()[0] >= MAX_ROWS:
                     raise pf.FlagError(507, 'tree store full')
-                c.execute('INSERT INTO tree_ver(ts, x, y, kg, op, sp, h_dm, reporter, source, epoch, uh_dm, dbh_mm) '
-                          'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', (now, x, y, kg, op, sp, h_dm, rep, source_id, ep, uh_dm, dbh_mm))
+                c.execute('INSERT INTO tree_ver(ts, x, y, kg, op, sp, h_dm, reporter, source, epoch, uh_dm, dbh_mm, '
+                          'e_dm, n_dm, cid, mts, meta, org) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                          (now, x, y, kg, op, sp, h_dm, rep, source_id, ep, uh_dm, dbh_mm, e_dm, n_dm,
+                           cid if op == OP_ADD else None, mts, meta, org_id))
+                written = True
             c.execute('COMMIT')
         except Exception:
             c.execute('ROLLBACK')
             raise
     out = tree_at(kg, x, y) or {}
-    out.update(folded=folded, matched=kind, dist_m=round(dist, 1))
+    # folded: nothing new was created — a repeat (no version written) or, for an add, the report landed on
+    # a tree that already existed.  written: a version was appended.
+    out.update(folded=(not written) or (op == OP_ADD and not new_tree), written=written,
+               op=OP_NAMES[op], matched=kind, dist_m=round(dist, 1))
+    if tid is not None:
+        out['matched_by'] = 'tree_id'
+        if kind == 'id':
+            warnings.append('this tree_id has no apex on /api/v1/trees/bbox (cell outside the published set); the report '
+                            'is kept under the id and served by /api/v1/trees/taxa')
+    elif cid is not None and kind == 'added':
+        out['matched_by'] = 'client_id'
     if apex_h is not None:
         out['height_m'] = round(apex_h, 2)
     if latin is not None and not known:
-        out['warning'] = 'species not in our dictionary — stored as written; check /api/v1/trees/taxa/dict'
+        warnings.append('species not in our dictionary — stored as written; check /api/v1/trees/taxa/dict')
+    if warnings:
+        out['warning'] = '; '.join(warnings)
     return out
+
+
+def _mine_ok(c, t, rep: bytes, measures) -> bool:
+    """Did this reporter add tree ``t`` (and, for a fold, without measures that
+    contradict the new ones)?"""
+    rows = c.execute('SELECT rev, op, uh_dm, dbh_mm, reporter, ref FROM tree_ver WHERE kg=? AND x=? AND y=? ORDER BY rev',
+                     (t['kg'], t['x'], t['y'])).fetchall()
+    hidden = {r['ref'] for r in rows if r['op'] == OP_MODERATE}
+    live = [r for r in rows if r['op'] != OP_MODERATE and r['rev'] not in hidden]
+    mine = False
+    for r in live:
+        if bytes(r['reporter']) == rep:
+            if r['op'] == OP_ADD:
+                mine = True
+            elif r['op'] == OP_RETRACT:
+                mine = False
+    if not mine:
+        return False
+    if measures is None:
+        return True
+    for col, v in zip(('uh_dm', 'dbh_mm'), measures):
+        if v is not None:
+            have = {r[col] for r in live if r[col] is not None}
+            if have and have != {v}:
+                return False
+    return True
 
 
 def _measure(body, exp, keys, rng, scale, name, unit) -> int | None:
@@ -636,6 +1015,10 @@ def _public(st: dict, j: int) -> dict:
         d['h_m'] = round(float(st['h'][j]), 1)          # reporters' own height (median), not the LiDAR one
     if np.isfinite(st['dbh'][j]):
         d['dbh_cm'] = round(float(st['dbh'][j]), 1)
+    if st['tid'][j] and not st['added'][j]:
+        d['tree_id'] = st['tid'][j]
+    if st['cid'][j]:
+        d['client_id'] = st['cid'][j]
     return d
 
 
@@ -655,7 +1038,7 @@ def moderate(rev: int) -> dict | None:
 
 # === SECTION: listing / history / stats ===
 
-LIST_FIELDS = ('lon', 'lat', 'taxon', 'n', 'v', 'rev', 'added', 'h_m', 'dbh_cm')
+LIST_FIELDS = ('lon', 'lat', 'taxon', 'n', 'v', 'rev', 'added', 'h_m', 'dbh_cm', 'tree_id', 'client_id')
 
 
 def listing(bbox=None, kg=None, since: int = 0, limit: int = LIST_LIMIT) -> dict:
@@ -696,28 +1079,49 @@ def listing(bbox=None, kg=None, since: int = 0, limit: int = LIST_LIMIT) -> dict
         cols['taxon'].append(_taxon(st['sp'][j])); cols['n'].append(int(st['cnt'][j])); cols['v'].append(int(st['v'][j]))
         cols['rev'].append(int(st['trev'][j])); cols['added'].append(int(st['added'][j]))
         cols['h_m'].append(_num(st['h'][j])); cols['dbh_cm'].append(_num(st['dbh'][j]))
+        cols['tree_id'].append(None if st['added'][j] else st['tid'][j]); cols['client_id'].append(st['cid'][j])
     out['count'] = len(rows)
     return out
 
 
-def history(lon: float, lat: float) -> dict | None:
-    """Every version of the reported tree nearest to the point (≤ 5 m)."""
-    px, py = _to_3035(lon, lat)
+def history(lon: float | None = None, lat: float | None = None, tree_id=None, client_id=None) -> dict | None:
+    """Every version of one reported tree: by tree_id, by client_id, or the
+    nearest to a point (≤ 5 m)."""
     g = global_rev()
+    if not g:
+        return None
     best = None
-    for k in (_near_kgs(lon, lat) if g else ()):
-        st = state(k, g)
-        if not st['n']:
-            continue
-        d = np.hypot(st['x'] - px, st['y'] - py)
-        j = int(np.argmin(d))
-        if d[j] <= 5.0 and (best is None or d[j] < best[0]):
-            best = (float(d[j]), st, j, int(k))
+    tid = parse_tree_id(tree_id)
+    if tid is not None:
+        lon, lat = _tf('EPSG:3035', 'EPSG:4326').transform(tid[0] / 10.0, tid[1] / 10.0)
+        want = tree_id_str(tid)
+        for k in _near_kgs(lon, lat, 3.0):
+            st = state(k, g)
+            if st['n'] and want in st['tid']:
+                j = st['tid'].index(want)
+                best = (0.0, st, j, int(k))
+                break
+    elif client_id not in (None, ''):
+        t = _tree_by_cid(_conn(), parse_client_id(client_id))
+        if t is not None:
+            st = state(t[0], g); j = _state_idx(st, t[1], t[2])
+            if j is not None:
+                best = (0.0, st, j, t[0])
+    else:
+        px, py = _to_3035(lon, lat)
+        for k in _near_kgs(lon, lat):
+            st = state(k, g)
+            if not st['n']:
+                continue
+            d = np.hypot(st['e'] - px, st['n_'] - py)
+            j = int(np.argmin(d))
+            if d[j] <= 5.0 and (best is None or d[j] < best[0]):
+                best = (float(d[j]), st, j, int(k))
     if best is None:
         return None
     d, st, j, kg = best
-    rows = _conn().execute('SELECT rev, ts, op, sp, uh_dm, dbh_mm, source, epoch, ref FROM tree_ver WHERE kg=? AND x=? AND y=? '
-                           'ORDER BY rev', (kg, int(st['x'][j]), int(st['y'][j]))).fetchall()
+    rows = _conn().execute('SELECT rev, ts, op, sp, uh_dm, dbh_mm, source, epoch, ref, e_dm, n_dm, mts, meta, org FROM tree_ver '
+                           'WHERE kg=? AND x=? AND y=? ORDER BY rev', (kg, int(st['x'][j]), int(st['y'][j]))).fetchall()
     hidden = {r['ref'] for r in rows if r['op'] == OP_MODERATE}
     vs = []
     for i, r in enumerate(rows, 1):
@@ -728,8 +1132,13 @@ def history(lon: float, lat: float) -> dict | None:
             v['h_m'] = r['uh_dm'] / 10.0
         if r['dbh_mm'] is not None:
             v['dbh_cm'] = r['dbh_mm'] / 10.0
+        _meta_public(r['meta'], r['mts'], v)
+        if r['e_dm'] is not None and r['op'] in (OP_SPECIES, OP_RETRACT):
+            v['tree_id'] = tree_id_str((r['e_dm'], r['n_dm']))
         if r['source'] is not None:
             v['source'] = pf._dict_val(r['source'])
+        if r['org'] is not None:
+            v['by'] = pf._dict_val(r['org'])
         if r['epoch'] is not None:
             v['epoch'] = pf._dict_val(r['epoch'])
         if r['op'] == OP_MODERATE:
@@ -749,7 +1158,14 @@ def taxa_dict() -> dict:
                          'note': 'optional on any tree report; several reporters → median; h_m is the reporter\'s '
                                  'height and never replaces the LiDAR height_m'},
             'limits': {'taxon_chars': MAX_TAXON_CHARS, 'versions_per_tree': MAX_VERSIONS_PER_TREE,
-                       'match_m': [MATCH_MIN_M, MATCH_MAX_M], 'added_fold_m': ADDED_MATCH_M, 'exists_m': EXISTS_M}}
+                       'match_m': MATCH_MIN_M, 'match_crown_frac': MATCH_CROWN_FRAC, 'match_sure_m': MATCH_SURE_M,
+                       'match_ambiguous_ratio': MATCH_AMBIG_RATIO, 'added_name_m': ADDED_NAME_M,
+                       'added_fold_m': ADDED_FOLD_M, 'exists_m': EXISTS_M},
+            'match': 'tree_id (t_<E>_<N>, EPSG:3035 in 0.1 m) binds exactly; client_id binds an added tree; a bare '
+                     'point means the nearest apex within max(match_m, match_crown_frac × crown radius) when the next '
+                     'tree in reach is ≥ match_ambiguous_ratio × farther (or the point is ≤ match_sure_m from the '
+                     'apex) — else 409 + candidates; measured trees win over added ones',
+            'metadata': {name: list(vals) for name, vals in META_FIELDS} | {'measured_at': 'ISO 8601'}}
 
 
 def stats() -> dict:
@@ -803,13 +1219,17 @@ def taxa_history():
     lim = pf._limited(pf._get_limit)
     if lim is not None:
         return lim
-    try:
-        lon, lat = float(request.args['lon']), float(request.args['lat'])
-    except (KeyError, ValueError):
-        raise pf.FlagError(400, 'lon, lat required')
-    d = history(lon, lat)
+    a = request.args
+    if a.get('tree_id') or a.get('client_id'):
+        d = history(tree_id=a.get('tree_id'), client_id=a.get('client_id'))
+    else:
+        try:
+            lon, lat = float(a['lon']), float(a['lat'])
+        except (KeyError, ValueError):
+            raise pf.FlagError(400, 'tree_id=, client_id= or lon=&lat= required')
+        d = history(lon, lat)
     if d is None:
-        raise pf.FlagError(404, 'no reported tree within 5 m')
+        raise pf.FlagError(404, 'no reported tree with this id / within 5 m')
     d['meta'] = _meta()
     return pf._resp(d, max_age=TAXA_MAX_AGE)
 

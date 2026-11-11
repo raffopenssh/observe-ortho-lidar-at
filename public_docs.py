@@ -321,48 +321,87 @@ what you expect, and send `looks_right` too: a confirmation is as useful as a co
   from /cells/<h3>?flags=1. Giant trees / heights (game-client pattern): POST {{lon, lat, layer:"trees",
   claim:"too_tall", observed:{{h_m}}}} straight from the tree symbol.
 
-### Tree species + trees we miss — per tree, versioned                              #tree-species
+### Tree reports — species, measures, trees we miss; per tree, versioned              #tree-species
 
-People can name a single tree and add trees we have no apex for. A tree is its position (no ids): the
-measured apex nearest to your point, or your point for an added tree. Every report is an appended version —
-nothing is overwritten; `v` = number of versions of that tree, `rev` = global revision to sync against.
-Current answer = plurality of each reporter's latest version (tie → newest); `n` = reporters agreeing.
+People name a single tree, measure it (DBH, height) and add trees we have no apex for. Every report is an
+appended version — nothing is overwritten; `v` = versions of that tree, `rev` = global revision to sync
+against. Current answer = plurality of each reporter's latest version (tie → newest); `n` = reporters agreeing;
+measures of several reporters → median.
 
-  POST /api/v1/flags {{"lon":…, "lat":…, "species":"Quercus robur"[, "reporter", "source"]}}
-       (short for layer:"trees", claim:"species"; expected:{{species}} works too). The point must lie within
-       the crown radius (4–10 m) of an apex or ≤ 3 m of an added tree, else 404 + hint. species = scientific
-       name, or a German / English name of /api/v1/trees/taxa/dict ("Stieleiche", "beech"); unknown → 400 +
-       did_you_mean[]. "species": null withdraws your own report. Repeating yourself adds no version.
-       Measures ride on the same call, with or without species: "dbh_cm": 62 (diameter at breast height,
-       1–600) and "h_m": 31.5 (your own height, 1–70); alone they need claim:"tree" (= species) or just
-       {{lon, lat, dbh_cm}}. Send them again to update — each change is a version; several reporters →
-       median. h_m never replaces our LiDAR height: it is served next to it as h_user_m / height_user_m.
-       → 201 {{rev, folded, claim, subject, epoch, tree{{lon, lat, taxon, class, n, v, rev, added, matched:
-              "apex"|"added", dist_m, height_m? (LiDAR), h_m? (reported), dbh_cm?}}}}   class = our model class
-  POST /api/v1/flags {{"lon":…, "lat":…, "layer":"trees", "claim":"missing"[, "species":…, "h_m": 6, "dbh_cm": 12]}}
-       adds a tree (h_m, dbh_cm optional; update them later with the call above). ≤ 2 m from a measured apex → tree.error (name it instead); ≤ 3 m
-       from an added tree → folds onto it. The usual flag row is written too (id, tally as before) + tree{{…}}.
-  Batches ({{"reports":[…]}} ≤ 50), limits and reporter hashing are those of /flags.
+IDENTITY — say which tree you mean, in this order of preference:
+  "tree_id": "t_<E>_<N>"   the inventory id of /api/v3/trees (apex pixel centre, EPSG:3035 in 0.1 m). Binds exactly,
+                 never to an added tree; lon/lat not needed. Binds to our apex of that pixel (matched:"apex"); an
+                 id we serve no apex for (trees only detection_mode=fused finds) keeps a record of its own
+                 (matched:"id" + warning) and is served as "reported" below. Ids are stable across calls and modes;
+                 where two products overlap /api/v3/trees returns each tree once (the other product's id, if it
+                 differs by a pixel, is on the row as tree_id_twin — both ids bind to the same tree).
+                 The AOI-relative tree_id_v2 cannot be resolved — send tree_id.
+  "client_id": "<uuid>"    your own id for a tree YOU add (claim "missing"): idempotency key + identity. Later
+                 reports / retracts with the same client_id reach that tree wherever the point is.
+  lon, lat only  the nearest apex if dist ≤ max(1.5 m, 0.5 × crown radius) AND unambiguous (the next tree in reach is
+                 ≥ 2 × farther, or you are ≤ 0.75 m from the apex); a measured apex wins over an added tree (≤ 1.5 m).
+                 Several in reach → 409 {{error, candidates:[{{tree_id?, client_id?, kind, lon, lat, height_m, dist_m}}]}}
+                 → re-send with a candidate's tree_id (null until that tree was reported by id — then re-send the
+                 candidate's own lon/lat: an exact hit always binds). None in reach → 404 + candidates within 12 m.
 
-  Read back — three ways, cheapest first:
+  POST /api/v1/flags {{"tree_id":"t_47092875_26831275", "dbh_cm":41.5, "h_m":27, "species":"Picea abies",
+                      "measured_at":"2026-11-11T09:30:00Z", "dbh_method":"caliper", "h_method":"hypsometer",
+                      "vitality":"alive", "status":"standing"[, "reporter", "source"]}}
+       (short for layer:"trees", claim:"tree"; any subset of species / dbh_cm / h_m / metadata.) species = scientific
+       name or a German / English name of /api/v1/trees/taxa/dict; unknown → 400 + did_you_mean[]. dbh_cm 1–600,
+       h_m 1–70 (your height; never replaces our LiDAR height — served next to it as h_user_m / height_user_m).
+       Metadata is stored per version (English vocabulary; common synonyms and German terms are normalised):
+         measured_at  ISO 8601, when it was measured (`ts` of a version stays our receive time)
+         dbh_method   caliper | tape | estimate          h_method  hypsometer | laser | estimate
+         vitality     alive | dead                       status    standing | felled
+       An unknown value is dropped with tree.warning — never a 400.
+       → 201 (version written) | 200 (identical repeat, folded:true)
+         {{rev, folded, claim, subject, epoch, tree{{tree_id?, client_id?, lon, lat, taxon, class, n, v, rev, added,
+           matched:"apex"|"id"|"added", matched_by?:"tree_id"|"client_id", dist_m, folded, written, op, height_m?
+           (LiDAR), h_m? (reported), dbh_cm?, warning?}}}}                                class = our model class
+  POST /api/v1/flags {{"lon":…, "lat":…, "layer":"trees", "claim":"missing"[, "client_id":"<uuid>", "species",
+                      "h_m", "dbh_cm", metadata…, "force":true]}}
+       adds a tree at your point. Same client_id again → same tree (new measures = a new version, folded:true).
+       Without client_id it folds only onto a tree YOU added ≤ 0.5 m away whose dbh_cm / h_m do not contradict;
+       anything else is a new tree (two stems 0.8 m apart stay two). ≤ 2 m from one of our apexes → 409 + tree{{…}}
+       and NOTHING is written, unless "force": true (second stem, understorey) or that apex already carries a report.
+       → 201 {{id, tally, tree{{…added:true, client_id?}}}}
+  Withdraw: {{…identity…, "species": null}} or {{…, "retract": true}} (with claim "missing": withdraws your added
+       tree) → op:"retract"; never writes a flag row. Only your own reports are withdrawn.
+  Batches {{"reports":[…]}} ≤ 50 → 200 {{results:[{{…, "http": 201|200|4xx}}…], errors}} — one result per item, in
+       order, each with its own status; one bad item does not fail the others.
+  Reporter keys (optional, recommended): POST /api/v1/flags/token {{"name":"<app, organisation or handle>"}}
+       → 201 {{reporter_key:"trk_…", holder:"<name>~<4 hex>", daily_cap}} — anyone may ask (≤ 20 keys per client per
+       day); shown once, we keep only its hash. One key per app (tell users apart with "reporter"), or one per user /
+       device. Send it as header `X-Reporter-Key: trk_…` (or `Authorization: Bearer trk_…`, or body
+       "reporter_key"; a batch item may carry its own). Keyed reports are attributed (`by` in /history = holder),
+       `reporter` ids are namespaced to the key and no longer depend on the network you post from, daily cap
+       2 000 per key instead of 500 per client. Holders without "~" are organisations we verified (cap 20 000 —
+       ask us). Wrong key → 401. The key works for every POST /api/v1/flags, not only trees.
+
+  Read back — cheapest first:
   1. /api/v1/trees/bbox grows ONLY where something was reported (untouched KGs: byte-identical, 1-day cache;
      touched KGs: ETag carries the newest revision, max-age 300):
-       format=columns → "user": {{i:[row index…], taxon:[… | null], n:[…], v:[…][, h_user_m:[…], dbh_cm:[…]]}}
-                        (sparse, aligned with columns; h_user_m / dbh_cm only when any was reported)
-                        "added": {{lon:[…], lat:[…], h_m:[… | null], taxon:[… | null], n:[…], v:[…][, dbh_cm:[…]]}}
-                        fields=…,taxon,h_user_m,dbh_cm give dense columns (null where unreported)
-       format=json | geojson → reported rows carry taxon, taxon_n, taxon_v[, height_user_m, dbh_cm]; top-level
-                        "added": [{{lon, lat, height_m | null, taxon, taxon_n, taxon_v, added:true[, dbh_cm]}}]
+       format=columns → "user": {{i:[row index…], taxon:[… | null], n:[…], v:[…][, h_user_m:[…], dbh_cm:[…], tree_id:[…]]}}
+                        "added": {{lon, lat, h_m, taxon, n, v[, dbh_cm, client_id]}}       (trees people added)
+                        "reported": {{tree_id, lon, lat, h_m, taxon, n, v[, dbh_cm]}}     (inventory trees reported by
+                        id that this endpoint has no apex for)
+                        fields=…,taxon,h_user_m,dbh_cm,tree_id give dense columns (null where unreported)
+       format=json | geojson → reported rows carry taxon, taxon_n, taxon_v[, height_user_m, dbh_cm, tree_id]; top-level
+                        "added": [{{lon, lat, height_m | null, taxon, taxon_n, taxon_v, added:true[, dbh_cm, client_id]}}],
+                        "reported": [{{tree_id, lon, lat, height_user_m, taxon, taxon_n, taxon_v[, dbh_cm]}}]
                         (never mixed into trees[]).
-     Existing fields are unchanged (`species` stays our model class). Added trees fall into the height
-     window by h_m (3 m when none was given), so exactly one band of a partition carries each.
+     tree_id appears on a row once the tree was reported by id. Existing fields are unchanged (`species` stays our
+     model class). Added / reported trees fall into the height window by h_m (3 m when none was given).
   2. GET /api/v1/trees/taxa?bbox=w,s,e,n | kg=63349 | (nothing = national) [&since=<rev>][&limit≤5000]
-       → {{rev, since, fields, order:"rev_asc", columns:{{lon, lat, taxon, n, v, rev, added, h_m, dbh_cm}},
-          count, truncated, next_since?}} — poll with since=<last rev>: only trees changed after it (~25 B
-       each gzipped; h_m = reported height; a row with taxon, h_m, dbh_cm all null and added 0 = drop it). ETag → 304, max-age 30.
-  3. GET /api/v1/trees/taxa/history?lon=&lat= → {{tree, kg, dist_m, versions:[{{v, rev, ts, op: species | add |
-       retract | moderated, taxon?, h_m?, dbh_cm?, source?, epoch?, hidden?}}]}} — the full version list of one tree.
-  GET /api/v1/trees/taxa/dict → {{fields:[taxon, de, en, class], taxa:[[…]…]}} (~90 Austrian trees; max-age 1 d).
+       → {{rev, since, fields, order:"rev_asc", columns:{{lon, lat, taxon, n, v, rev, added, h_m, dbh_cm, tree_id,
+          client_id}}, count, truncated, next_since?}} — poll with since=<last rev>: only trees changed after it
+       (a row with taxon, h_m, dbh_cm all null and added 0 = drop it). ETag → 304, max-age 30.
+  3. GET /api/v1/trees/taxa/history?tree_id= | client_id= | lon=&lat= → {{tree, kg, dist_m, versions:[{{v, rev, ts,
+       op: species | add | retract | moderated, taxon?, h_m?, dbh_cm?, measured_at?, dbh_method?, h_method?,
+       vitality?, status?, tree_id?, by?, source?, epoch?, hidden?}}]}} — every version of one tree, with its metadata.
+  GET /api/v1/trees/taxa/dict → {{fields:[taxon, de, en, class], taxa:[[…]…], limits, match, metadata}}
+       (~90 Austrian trees + the matching rule and metadata vocabulary in machine form; max-age 1 d).
 
 """
 

@@ -117,7 +117,7 @@ def _common_headers(resp):
         # /segmentation POSTs are same-origin (served from this host).
         if request.method in ('GET', 'HEAD', 'OPTIONS'):
             resp.headers['Access-Control-Allow-Origin'] = '*'
-            resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, If-None-Match'
+            resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, If-None-Match, Authorization, X-Reporter-Key'
             resp.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
             resp.headers['Access-Control-Expose-Headers'] = ('ETag, Last-Modified, Cache-Control, Content-Encoding, Retry-After, '
                                                              'X-Cells-Gen, X-Cells-Epoch, X-Cells-Source, X-KG-Universe-Hash, X-Data-Attribution')
@@ -489,19 +489,19 @@ def trees_bbox():
         meta['columns_note'] = docs.TREES_COLUMNS_NOTE
         body = {'bbox': list(bb), 'objects': kind, 'format': 'columns', 'fields': t['fields'], 'order': t['order'],
                 'columns': t['columns'], 'count': n_out, 'truncated': t['truncated'], 'dropped_qa': t['dropped_qa'],
-                **{k: t[k] for k in ('user', 'added') if t.get(k)},
+                **{k: t[k] for k in ('user', 'added', 'reported') if t.get(k)},
                 'kgs': t['kgs'], 'ready': ready, **extra, 'meta': _meta(**meta)}
     elif fmt == 'geojson':
         body = {'type': 'FeatureCollection',
                 'features': [{'type': 'Feature', 'geometry': {'type': 'Point', 'coordinates': [x['lon'], x['lat']]},
                               'properties': {k: v for k, v in x.items() if k not in ('lon', 'lat')}}
                              for x in t['trees']],
-                **({'added': t['added']} if t.get('added') else {}),
+                **{k: t[k] for k in ('added', 'reported') if t.get(k)},
                 'meta': _meta(count=n_out, truncated=t['truncated'], dropped_qa=t['dropped_qa'],
                               kgs=t['kgs'], ready=ready, **extra, **meta)}
     else:
         body = {'bbox': list(bb), 'objects': kind, key: t['trees'], 'count': n_out,
-                **({'added': t['added']} if t.get('added') else {}),
+                **{k: t[k] for k in ('added', 'reported') if t.get(k)},
                 'truncated': t['truncated'], 'dropped_qa': t['dropped_qa'], 'kgs': t['kgs'],
                 'ready': ready, **extra, 'meta': _meta(**meta)}
     resp = Response(json.dumps(body, separators=(',', ':'), ensure_ascii=False,

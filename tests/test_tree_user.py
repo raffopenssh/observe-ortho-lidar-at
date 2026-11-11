@@ -87,8 +87,78 @@ def main() -> int:
         h = c.get(f'/api/v1/trees/taxa/history?lon={lon}&lat={lat}').get_json()
         assert h['versions'][-1]['dbh_cm'] == 70.0 and h['versions'][-1]['h_m'] == 31.5
         # add: refused on top of an apex, accepted in a gap
-        j = c.post('/api/v1/flags', json={'lon': lon, 'lat': lat, 'layer': 'trees', 'claim': 'missing', 'reporter': 'u1'}).get_json()
-        assert j['id'] and 'already' in j['tree']['error'], j
+        # add next to an apex: refused (409, no flag row) on an untouched apex; allowed with force or when the
+        # apex already carries a report (second stem / understorey)
+        lon5, lat5 = base['columns']['lon'][5], base['columns']['lat'][5]
+        n_flags = pf._conn().execute('SELECT COUNT(*) FROM report').fetchone()[0]
+        r = c.post('/api/v1/flags', json={'lon': lon5, 'lat': lat5, 'layer': 'trees', 'claim': 'missing', 'reporter': 'u1'})
+        assert r.status_code == 409 and r.get_json()['tree']['dist_m'] <= 2 and 'already' in r.get_json()['error'], r.data
+        assert pf._conn().execute('SELECT COUNT(*) FROM report').fetchone()[0] == n_flags
+        r = c.post('/api/v1/flags', json={'lon': lon5, 'lat': lat5, 'layer': 'trees', 'claim': 'missing', 'reporter': 'u1',
+                                          'force': True, 'dbh_cm': 9, 'client_id': '0b9d0e86-1111-4222-8333-444455556666'})
+        j = r.get_json()
+        assert r.status_code == 201 and j['tree']['added'] and j['tree']['client_id'].startswith('0b9d0e86') and not j['tree']['folded'], j
+        r = c.post('/api/v1/flags', json={'lon': lon, 'lat': lat, 'layer': 'trees', 'claim': 'missing', 'reporter': 'u1'})
+        assert r.status_code == 201 and r.get_json()['tree']['added'], r.data      # apex carries measures → allowed
+        # a name call next to both still means the measured apex, never the added tree
+        j = c.post('/api/v1/flags', json={'lon': lon, 'lat': lat, 'dbh_cm': 63, 'reporter': 'u1'}).get_json()
+        assert j['tree']['matched'] == 'apex' and not j['tree']['added'] and j['tree']['dbh_cm'], j
+        # retract my added tree by client_id alone (no point): row drops out of the delta feed, no flag row
+        rev0 = tu.global_rev(); n_flags = pf._conn().execute('SELECT COUNT(*) FROM report').fetchone()[0]
+        r = c.post('/api/v1/flags', json={'client_id': '0b9d0e86-1111-4222-8333-444455556666', 'layer': 'trees',
+                                          'claim': 'missing', 'retract': True, 'reporter': 'u1'})
+        j = r.get_json()
+        assert r.status_code == 201 and j['tree']['op'] == 'retract' and not j['tree']['added'], j
+        assert pf._conn().execute('SELECT COUNT(*) FROM report').fetchone()[0] == n_flags
+        L = c.get(f'/api/v1/trees/taxa?since={rev0}').get_json()
+        assert L['count'] == 1 and L['columns']['added'] == [0] and L['columns']['dbh_cm'] == [None], L
+        # --- identity: tree_id binds exactly; a bare point must be unambiguous
+        x6, y6 = base['columns']['x'][6], base['columns']['y'][6]
+        tid = f't_{x6 * 10 + 5}_{y6 * 10 + 5}'                    # product apex whose metre snap is corpus row 6 (or a neighbour)
+        r = c.post('/api/v1/flags', json={'tree_id': tid, 'dbh_cm': 41.5, 'reporter': 'w1', 'measured_at': '2026-11-11T08:00:00Z',
+                                          'dbh_method': 'Kluppe', 'h_method': 'geschätzt', 'vitality': 'lebend',
+                                          'status': 'standing', 'source': 'waldmanager/kluppe'})
+        j = r.get_json()
+        assert r.status_code == 201 and j['tree']['tree_id'] == tid and j['tree']['matched'] == 'apex', j
+        assert j['tree']['dist_m'] == 0 and j['tree']['matched_by'] == 'tree_id' and j['tree']['dbh_cm'] == 41.5
+        r = c.post('/api/v1/flags', json={'tree_id': tid, 'dbh_cm': 41.5, 'reporter': 'w1', 'measured_at': '2026-11-11T08:00:00Z',
+                                          'dbh_method': 'caliper'})
+        assert r.status_code == 200 and r.get_json()['folded'] and r.get_json()['tree']['v'] == 1          # idempotent
+        h = c.get(f'/api/v1/trees/taxa/history?tree_id={tid}').get_json()
+        v = h['versions'][0]
+        assert (v['measured_at'], v['dbh_method'], v['h_method'], v['vitality'], v['status'], v['tree_id']) == \
+            ('2026-11-11T08:00:00Z', 'caliper', 'estimate', 'alive', 'standing', tid), v
+        j = c.post('/api/v1/flags', json={'tree_id': tid, 'dbh_cm': 42, 'dbh_method': 'schieblehre'}).get_json()
+        assert 'dbh_method' in j['tree']['warning'] and j['tree']['dbh_cm'] in (41.5, 42.0), j     # unknown value → warning
+        col = ne_trees.columns_bbox(*BB, 'trees', min_height=20, limit=50, fields=('lon', 'tree_id'))
+        assert tid in col['user']['tree_id'] and tid in col['columns']['tree_id']
+        assert c.post('/api/v1/flags', json={'tree_id': 't_1_2', 'dbh_cm': 4}).status_code == 400
+        # an inventory tree the corpus has no apex for (a spot in the lake of trees: 30 m off) keeps its own record
+        ghost = f't_{(x6 + 3) * 10 + 5}_{(y6 + 2) * 10 + 5}'
+        near = tu._apices_near(*tu._tf('EPSG:3035', 'EPSG:4326').transform(x6 + 3.5, y6 + 2.5), 3.0)
+        if near is None or not (((abs(near['x'] - (x6 + 3.5)) <= 0.5) & (abs(near['y'] - (y6 + 2.5)) <= 0.5)).any()):
+            j = c.post('/api/v1/flags', json={'tree_id': ghost, 'dbh_cm': 30, 'reporter': 'w1'}).get_json()
+            assert j['tree']['tree_id'] == ghost and j['tree']['matched'] == 'id' and j['tree']['v'] == 1 and 'warning' in j['tree'], j
+            j = c.post('/api/v1/flags', json={'tree_id': ghost, 'dbh_cm': 31, 'reporter': 'w1'}).get_json()
+            assert j['tree']['tree_id'] == ghost and j['tree']['v'] == 2 and j['tree']['dbh_cm'] == 31.0, j
+            L = c.get(f'/api/v1/trees/taxa?kg={j["subject"]["kg"]}').get_json()
+            assert ghost in L['columns']['tree_id'], L
+            rp = ne_trees.points_bbox(*BB, 'trees', limit=5).get('reported') or []
+            assert any(t['tree_id'] == ghost and t['dbh_cm'] == 31.0 for t in rp), rp
+        # ambiguous point: midway between two apexes that are both in reach → 409 + candidates; far away → 404
+        import numpy as np
+        allc = ne_trees.collect(*BB, 'trees', realistic=False, limit=20000)['cols']
+        pair = None
+        for i in range(min(len(allc['x']), 3000)):
+            d = np.hypot(allc['x'] - allc['x'][i], allc['y'] - allc['y'][i]); d[i] = 1e9
+            k = int(np.argmin(d))
+            if 1.5 < d[k] <= 2.9:
+                pair = (i, k); break
+        if pair:
+            mx = (allc['x'][pair[0]] + allc['x'][pair[1]]) / 2.0 + 0.1; my = (allc['y'][pair[0]] + allc['y'][pair[1]]) / 2.0
+            mlon, mlat = tu._tf('EPSG:3035', 'EPSG:4326').transform(mx, my)
+            r = c.post('/api/v1/flags', json={'lon': mlon, 'lat': mlat, 'dbh_cm': 20})
+            assert r.status_code == 409 and len(r.get_json()['candidates']) >= 2 and 'dist_m' in r.get_json()['candidates'][0], r.data
         assert c.post('/api/v1/flags', json={'lon': 10.0, 'lat': 46.5, 'species': 'Fichte'}).status_code == 404
     # add a tree where we have none (works without the corpus as long as the KG resolves)
     alon, alat = 10.0871234, 47.1371234
@@ -97,7 +167,7 @@ def main() -> int:
         near = tu._apices_near(alon, alat)
         if near is not None:     # walk off any measured apex
             px, py = tu._to_3035(alon, alat)
-            while near is not None and np.hypot(near['x'] - px, near['y'] - py).min() <= tu.MATCH_MAX_M:
+            while near is not None and np.hypot(near['x'] - px, near['y'] - py).min() <= 12.0:
                 alon += 0.0002; px, py = tu._to_3035(alon, alat); near = tu._apices_near(alon, alat)
         j = c.post('/api/v1/flags', json={'lon': alon, 'lat': alat, 'layer': 'trees', 'claim': 'missing',
                                           'expected': {'species': 'Walnuss', 'h_m': 6}, 'reporter': 'u1'}).get_json()
@@ -105,6 +175,49 @@ def main() -> int:
         v0 = j['tree']['v']
         j2 = c.post('/api/v1/flags', json={'lon': alon, 'lat': alat, 'layer': 'trees', 'claim': 'missing', 'reporter': 'u1'}).get_json()
         assert j2['tree']['folded'] and j2['tree']['v'] == v0
+        # two stems 0.8 m apart with different dbh stay two trees; an identical repeat folds; client_id is the identity
+        blon = alon + 0.0004; dl = 0.8 / 76000.0
+        ja = c.post('/api/v1/flags', json={'lon': blon, 'lat': alat, 'layer': 'trees', 'claim': 'missing', 'dbh_cm': 20, 'reporter': 'u1'}).get_json()
+        jb = c.post('/api/v1/flags', json={'lon': blon + dl, 'lat': alat, 'layer': 'trees', 'claim': 'missing', 'dbh_cm': 25, 'reporter': 'u1'}).get_json()
+        assert not ja['tree']['folded'] and not jb['tree']['folded'] and jb['tree']['dbh_cm'] == 25.0 and jb['tree']['v'] == 1, (ja, jb)
+        assert abs(ja['tree']['lon'] - jb['tree']['lon']) > 5e-6
+        jr = c.post('/api/v1/flags', json={'lon': blon + dl, 'lat': alat, 'layer': 'trees', 'claim': 'missing', 'dbh_cm': 25, 'reporter': 'u1'}).get_json()
+        assert jr['tree']['folded'] and not jr['tree']['written'] and jr['tree']['v'] == 1, jr
+        jc = c.post('/api/v1/flags', json={'lon': blon + dl, 'lat': alat, 'layer': 'trees', 'claim': 'missing', 'dbh_cm': 25, 'reporter': 'u2'}).get_json()
+        assert not jc['tree']['folded'] and jc['tree']['v'] == 1, jc                          # another reporter → own tree
+        cid = 'a3f1c2d4-0000-4000-8000-00000000abcd'
+        j1 = c.post('/api/v1/flags', json={'lon': blon + 3 * dl, 'lat': alat, 'layer': 'trees', 'claim': 'missing', 'dbh_cm': 11,
+                                           'client_id': cid, 'reporter': 'u1'}).get_json()
+        j2_ = c.post('/api/v1/flags', json={'lon': blon + 9 * dl, 'lat': alat, 'layer': 'trees', 'claim': 'missing', 'dbh_cm': 12,
+                                            'client_id': cid, 'reporter': 'u1'}).get_json()          # same id, moved point, new dbh
+        assert j1['tree']['client_id'] == cid and j2_['tree']['client_id'] == cid and j2_['tree']['v'] == 2 and j2_['tree']['folded']
+        assert j2_['tree']['dbh_cm'] == 12.0 and j2_['tree']['lon'] == j1['tree']['lon']
+        j3_ = c.post('/api/v1/flags', json={'client_id': cid, 'dbh_cm': 13, 'reporter': 'u1'}).get_json()   # measure by client_id
+        assert j3_['claim'] == 'species' and j3_['tree']['matched_by'] == 'client_id' and j3_['tree']['dbh_cm'] == 13.0, j3_
+        # species:null on a bare added tree withdraws it (no stray flag row of layer "other")
+        nfl = pf._conn().execute('SELECT COUNT(*) FROM report').fetchone()[0]
+        r = c.post('/api/v1/flags', json={'lon': blon + dl, 'lat': alat, 'species': None, 'reporter': 'u2'})
+        assert r.get_json()['tree']['op'] == 'retract' and not r.get_json()['tree']['added'], r.data
+        assert pf._conn().execute('SELECT COUNT(*) FROM report').fetchone()[0] == nfl
+        # reporter keys: identified caller, shown as `by` in the history; a wrong key is 401
+        pf.KEYS_PATH = tmp / 'keys.json'; pf.KEYS_PATH.write_text('{"trk_test_1": "forestry"}')
+        assert c.post('/api/v1/flags', json={'client_id': cid, 'dbh_cm': 14, 'reporter_key': 'nope'}).status_code == 401
+        r = c.post('/api/v1/flags', json={'reports': [{'client_id': cid, 'dbh_cm': 14, 'reporter': 'u1'},
+                                                       {'client_id': 'ffffffff-0000-4000-8000-000000000000', 'dbh_cm': 1}]},
+                   headers={'X-Reporter-Key': 'trk_test_1'})
+        res = r.get_json()['results']
+        assert [x['http'] for x in res] == [201, 404] and r.get_json()['errors'] == 1, res
+        hv = c.get(f'/api/v1/trees/taxa/history?client_id={cid}').get_json()['versions']
+        assert hv[-1]['by'] == 'forestry' and 'by' not in hv[0], hv
+        # anyone can get a key; self-issued holders are marked
+        r = c.post('/api/v1/flags/token', json={'name': 'Wald App'})
+        tk = r.get_json()
+        assert r.status_code == 201 and tk['reporter_key'].startswith('trk_') and tk['holder'].startswith('Wald App~'), tk
+        assert c.post('/api/v1/flags/token', json={'name': '<x>'}).status_code == 400
+        r = c.post('/api/v1/flags', json={'client_id': cid, 'dbh_cm': 15, 'reporter': 'u1'}, headers={'Authorization': 'Bearer ' + tk['reporter_key']})
+        assert r.status_code == 201, r.data
+        assert c.get(f'/api/v1/trees/taxa/history?client_id={cid}').get_json()['versions'][-1]['by'] == tk['holder']
+        assert pf._key_cap(tk['holder']) == pf.DAILY_CAP_SELF and pf._key_cap('forestry') == pf.DAILY_CAP_KEYED
         # someone else names the added tree 1 m away
         j3 = c.post('/api/v1/flags', json={'lon': alon + 0.00001, 'lat': alat, 'species': 'Juglans regia', 'reporter': 'u9'}).get_json()
         assert j3['tree']['matched'] == 'added' and j3['tree']['n'] == 2 and j3['tree']['v'] == v0 + 1, j3
@@ -112,9 +225,9 @@ def main() -> int:
                                            'reporter': 'u1'}).get_json()          # update my height + dbh on the added tree
         assert j4['tree']['h_m'] == 7.0 and j4['tree']['dbh_cm'] == 18.5 and j4['tree']['v'] == v0 + 2, j4
         kgs = [pf._kg_for_point(alon, alat)]
-        a = tu.added(alon - 0.001, alat - 0.001, alon + 0.001, alat + 0.001, kgs, 3, 8)
+        a = tu.added(alon - 0.0001, alat - 0.0001, alon + 0.0001, alat + 0.0001, kgs, 3, 8)
         assert a and a['taxon'] == ['Juglans regia'] and a['h_m'] == [7.0] and a['dbh_cm'] == [18.5]
-        assert tu.added(alon - 0.001, alat - 0.001, alon + 0.001, alat + 0.001, kgs, 8, 14) is None
+        assert tu.added(alon - 0.0001, alat - 0.0001, alon + 0.0001, alat + 0.0001, kgs, 8, 14) is None
         lst = c.get(f'/api/v1/trees/taxa?kg={kgs[0]}')
         L = lst.get_json()
         assert L['count'] >= 1 and 1 in L['columns']['added'] and L['rev'] == tu.global_rev()
@@ -122,7 +235,7 @@ def main() -> int:
         assert c.get(f'/api/v1/trees/taxa?since={L["rev"]}').get_json()['count'] == 0
         assert c.get(f'/api/v1/trees/taxa?since={L["rev"] - 1}').get_json()['count'] == 1
         st = c.get('/api/v1/flags/stats').get_json()
-        assert st['trees']['versions'] == tu.global_rev() and st['trees']['add_versions'] == 1
+        assert st['trees']['versions'] == tu.global_rev() and st['trees']['add_versions'] >= 1
     # vocabulary
     import public_docs
     src = (ROOT / 'tree_user.py').read_text()

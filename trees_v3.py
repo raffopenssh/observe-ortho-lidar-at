@@ -466,7 +466,72 @@ def collect_product_trees(cov: dict, geom_3035, progress=None, *, failed_reasons
         product_versions.update(versions)
     if gpkg_paths is not None:
         gpkg_paths.update(paths)
-    return list(rows.values()), used, failed
+    out = list(rows.values())
+    if len(used) > 1:
+        out, _n = dedupe_twins(out)
+    return out, used, failed
+
+
+#: the same apex reported by two overlapping products whose grids disagree by a pixel
+TWIN_MAX_M = 1.5
+TWIN_DH_M = 0.02
+
+
+def dedupe_twins(rows: list[dict]) -> tuple[list[dict], int]:
+    """Drop the second copy of a tree that two overlapping products report a
+    pixel apart (same height, ≤ 1.5 m, different ``product_code``).
+
+    Product bboxes overlap by hundreds of metres; ``tree_id`` collapses the
+    copies only when both products sit on the same grid.  Products upgraded
+    from a full GPKG stitched before 2026-09-20 carry per-tile ±1 px
+    placement errors (63350-north vs 63330, 2026-11: 46 % of the shared
+    apices), so every tree of the overlap came back twice with two ids.
+    The copy kept is the one the public cells corpus serves on
+    ``/api/v1/trees/bbox`` (so both endpoints name the same trees); the
+    other id is kept on the row as ``tree_id_twin``."""
+    if len(rows) < 2:
+        return rows, 0
+    from scipy.spatial import cKDTree
+    xy = np.array([[r["e"], r["n"]] for r in rows])
+    hh = np.array([float(r.get("h_m") or 0.0) for r in rows])
+    pairs = [(i, j) for i, j in cKDTree(xy).query_pairs(TWIN_MAX_M)
+             if rows[i].get("product_code") != rows[j].get("product_code") and abs(hh[i] - hh[j]) <= TWIN_DH_M]
+    if not pairs:
+        return rows, 0
+    corpus = _corpus_keys(xy[sorted({k for p in pairs for k in p})])
+
+    def served(k) -> bool:
+        e, n = xy[k]
+        return any((int(e + dx), int(n + dy)) in corpus for dx in (-0.5, 0.5) for dy in (-0.5, 0.5))
+
+    drop: dict[int, int] = {}
+    for i, j in sorted(pairs):
+        if i in drop or j in drop:
+            continue
+        keep, lose = (j, i) if (corpus and served(j) and not served(i)) else (i, j)
+        drop[lose] = keep
+    for lose, keep in drop.items():
+        rows[keep].setdefault("tree_id_twin", rows[lose].get("tree_id"))
+    return [r for k, r in enumerate(rows) if k not in drop], len(drop)
+
+
+def _corpus_keys(xy: np.ndarray) -> set:
+    """Integer-metre apex positions of the public cells corpus around *xy*
+    (EPSG:3035) — empty when the corpus is unavailable here."""
+    try:
+        import cells_api as ca
+        import ne_trees
+        lon, lat = ca._tf("EPSG:3035", "EPSG:4326").transform(xy[:, 0], xy[:, 1])
+        pad = 0.0001
+        r = ne_trees.collect(float(np.min(lon)) - pad, float(np.min(lat)) - pad, float(np.max(lon)) + pad,
+                             float(np.max(lat)) + pad, "trees", realistic=False, limit=ne_trees.MAX_LIMIT_COLUMNS,
+                             max_limit=ne_trees.MAX_LIMIT_COLUMNS)
+        if not r["n"]:
+            return set()
+        return set(zip(r["cols"]["x"].tolist(), r["cols"]["y"].tolist()))
+    except Exception as e:  # noqa: BLE001
+        log.debug("trees_v3: corpus keys unavailable: %s", e)
+        return set()
 
 
 # --------------------------------------------------------------------------
@@ -622,6 +687,8 @@ def product_row_to_feature(r: dict, crown=None) -> dict:
     }
     if r.get("tree_id_product"):
         props["tree_id_product"] = r["tree_id_product"]
+    if r.get("tree_id_twin"):
+        props["tree_id_twin"] = r["tree_id_twin"]
     if r.get("tree_id_v2"):
         props["tree_id_v2"] = r["tree_id_v2"]
     geom = {"type": "Point", "coordinates": [props["apex_lon"], props["apex_lat"]]}

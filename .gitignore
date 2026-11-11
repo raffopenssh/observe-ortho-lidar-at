@@ -25,6 +25,8 @@ data/ne_tooling_last.json
 data/golden/
 data/public_flags.sqlite*
 data/public_flags.salt
+data/reporter_keys.json
+data/tree_key_required
 data/secrets.json
 data/secret_leases.json
 data/secrets_deny
