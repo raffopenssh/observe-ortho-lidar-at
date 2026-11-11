@@ -87,6 +87,7 @@ CLAIMS = (
     'stale',         # changed since our observation date
     'artifact',      # processing artefact (stripe, seam, tile edge, NaN hole)
     'looks_right',   # positive confirmation — counts as QA evidence
+    'species',       # layer trees + a point: name the tree there (versioned per tree, tree_user.py)
     'other',
 )
 STATUS = ('open', 'confirmed', 'rejected', 'fixed', 'stale')
@@ -369,19 +370,39 @@ def _clean_note(s) -> str | None:
 
 
 _KNOWN = {'cell', 'lon', 'lat', 'kg', 'kg_code', 'layer', 'claim', 'observed', 'expected', 'note', 'source',
-          'reporter', 'epoch'}
+          'reporter', 'epoch', 'species', 'taxon', 'h_m'}
+TREE_LAYERS = ('trees', 'cells.trees')
 
 
 def record(body: dict, client: str) -> dict:
     if not isinstance(body, dict):
         raise FlagError(400, 'report must be a JSON object')
-    layer = str(body.get('layer') or 'other').strip().lower()
+    names_tree = any(body.get(k) not in (None, '') for k in ('species', 'taxon'))
+    layer = str(body.get('layer') or ('trees' if names_tree else 'other')).strip().lower()
     if layer not in LAYERS:
         raise FlagError(400, f'layer must be one of {", ".join(LAYERS)}', layers=LAYERS)
-    claim = str(body.get('claim') or 'other').strip().lower()
+    claim = str(body.get('claim') or ('species' if names_tree and layer in TREE_LAYERS else 'other')).strip().lower()
     if claim not in CLAIMS:
         raise FlagError(400, f'claim must be one of {", ".join(CLAIMS)}', claims=CLAIMS)
     subj = _subject(body)
+    has_point = body.get('lon') is not None and body.get('lat') is not None
+    if claim == 'species':
+        # per-tree, versioned: lives in tree_ver only (no folded report row)
+        if layer not in TREE_LAYERS or not has_point:
+            raise FlagError(400, 'claim "species" needs layer "trees" and a point: {lon, lat, species}')
+        import tree_user as tu
+        c = _conn()
+        src = _clean_note(body.get('source'))
+        rp = body.get('reporter')
+        epoch = str(body['epoch'])[:40] if body.get('epoch') else _epoch_now(subj['kg'])
+        tree = tu.record(body, subj, claim, _reporter_hash(str(rp)[:120] if rp not in (None, '') else None, client),
+                         _dict_id(c, 'source', src[:MAX_SOURCE]) if src else None, epoch)
+        out = {'rev': tree.get('rev'), 'folded': tree.pop('folded'), 'status': 'open', 'layer': layer, 'claim': claim,
+               'subject': _subject_public(subj), 'epoch': epoch, 'tree': tree}
+        warn = [k for k in body if k not in _KNOWN]
+        if warn:
+            out['warnings'] = [f'ignored unknown field(s): {", ".join(sorted(warn))}']
+        return out
     observed = _compact_json(body.get('observed'), MAX_OBSERVED_B, 'observed')
     expected = _compact_json(body.get('expected'), MAX_EXPECTED_B, 'expected')
     note = _clean_note(body.get('note') or body.get('notes'))
@@ -439,6 +460,15 @@ def record(body: dict, client: str) -> dict:
         if snap and body.get('observed') in (None, '', {}):
             out['snapshot'] = snap
     out['tally'] = tally(subj['skey'])
+    if claim == 'missing' and layer in TREE_LAYERS and has_point:
+        # a tree we do not have: also keep it as a versioned user-added tree (tree_user.py)
+        try:
+            import tree_user as tu
+            out['tree'] = tu.record(body, subj, claim, rep, sid, epoch)
+        except FlagError as e:
+            out['tree'] = {'error': e.msg, **e.extra}
+        except Exception as e:  # noqa: BLE001
+            log.warning('tree add failed: %s', e)
     warn = [k for k in body if k not in _KNOWN]
     if warn:
         out['warnings'] = [f'ignored unknown field(s): {", ".join(sorted(warn))}']
@@ -707,7 +737,7 @@ def stats() -> dict:
         db_b = 0
     return {'reports': tot['rows_'], 'n': tot['n'], 'subjects': tot['subjects'], 'kgs': tot['kgs'],
             'first': tot['first'], 'last': tot['last'], 'by': by, 'recent': recent, 'top_kgs': top,
-            'db_bytes': db_b, 'limits': _limits(),
+            'trees': __import__('tree_user').stats(), 'db_bytes': db_b, 'limits': _limits(),
             'rate_limits': {'post': _post_limit.stats(), 'get': _get_limit.stats()}}
 
 
@@ -725,7 +755,9 @@ def dict_block() -> dict:
                         '{group, share, h_max, trees_n, structures_n, consistency[, nearest{…}]} + epoch',
             'fold': 'same subject + layer + claim + reporter → one row, n += 1 (reporter = your opaque id, '
                     'else a salted hash of the client IP; neither is stored or returned)',
-            'superseded': 'read-side flag: the KG product was rebuilt since the report (epoch differs)'}
+            'superseded': 'read-side flag: the KG product was rebuilt since the report (epoch differs)',
+            'trees': 'layer trees + lon,lat: claim species {species} names the tree at the point, claim missing '
+                     '[{species, h_m}] adds one we do not have — versioned per tree; /api/v1/trees/taxa[/dict|/history]'}
 
 
 # === SECTION: HTTP ===
@@ -918,3 +950,6 @@ def tally_for_cell(cid: int) -> dict | None:
         return t if t['n'] else None
     except Exception:  # noqa: BLE001
         return None
+
+
+import tree_user  # noqa: E402,F401  — mounts /api/v1/trees/taxa* on flags_bp

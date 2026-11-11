@@ -366,7 +366,7 @@ def bbox_state(w, s, e, n) -> dict:
 # ── query ──────────────────────────────────────────────────────────────
 
 MAX_LIMIT_COLUMNS = 100000      # format=columns: one call carries a whole 0.025° tile (≈ 31k apices ≥ 3 m)
-_TREE_FIELDS = ('lon', 'lat', 'h_m', 'crown_m2', 'species', 'vitality', 'ndsm_only', 'cell', 'kg_code', 'x', 'y')
+_TREE_FIELDS = ('lon', 'lat', 'h_m', 'crown_m2', 'species', 'vitality', 'ndsm_only', 'cell', 'kg_code', 'x', 'y', 'taxon')
 _STRUCT_FIELDS = ('lon', 'lat', 'h_m', 'type', 'h_robust_m', 'area_m2', 'confidence', 'dh_m', 'cell', 'kg_code', 'x', 'y')
 DEFAULT_COLUMNS = {'trees': ('lon', 'lat', 'h_m', 'crown_m2'), 'structures': ('lon', 'lat', 'h_m', 'type')}
 COLUMN_FIELDS = {'trees': _TREE_FIELDS, 'structures': _STRUCT_FIELDS}
@@ -482,7 +482,28 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
             'limit': lim, 'pending_kgs': st['pending'], 'not_processed': st['not_processed'],
             'dropped_qa': dropped, 'realistic': bool(realistic), 'truncated': truncated,
             'chunks_scanned': scanned, 'chunks_in_bbox': len(rows), 'ms': round((time.time() - t0) * 1000, 1),
-            'ready': st['ready'], 'state': st}
+            'ready': st['ready'], 'state': st, **_user_blocks(kind, out if n_out else None, st['kgs'], w, s, e, n, min_h, max_h)}
+
+
+def _user_blocks(kind, cols, kgs, w, s, e, n, min_h, max_h) -> dict:
+    """What people told us about trees of this result (tree_user.py): ``user``
+    = sparse {i, taxon, n, v} over the result rows, ``added`` = trees we have
+    no apex for.  Empty dict (zero bytes on the wire) when the KGs carry none."""
+    if kind != 'trees':
+        return {}
+    try:
+        import tree_user as tu
+        d = {}
+        u = tu.annotate(cols['x'], cols['y'], cols['h'], kgs) if cols else None
+        if u:
+            d['user'] = u
+        a = tu.added(w, s, e, n, kgs, min_h, max_h)
+        if a:
+            d['added'] = a
+        return d
+    except Exception as ex:  # noqa: BLE001
+        log.warning('ne_trees: user blocks: %s', ex)
+        return {}
 
 
 def _species(a: np.ndarray) -> list:
@@ -537,6 +558,12 @@ def columns_bbox(w, s, e, n, kind: str = 'trees', fields: tuple | None = None, *
             cols[f] = c['kg'].tolist()
         elif f in ('x', 'y', 'area_m2'):
             cols[f] = c[f].tolist()
+        elif f == 'taxon':
+            col = [None] * n_out
+            u = r.get('user') or {'i': [], 'taxon': []}
+            for i, t in zip(u['i'], u['taxon']):
+                col[i] = t
+            cols[f] = col
     r = dict(r); r.pop('cols'); r.pop('state')
     r.update(columns=cols, fields=list(want), order='height_desc')
     return r
@@ -569,7 +596,15 @@ def points_bbox(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit:
                 out.append({'lon': lon[i], 'lat': lat[i], 'height_m': hh[i], 'type': ty[i], 'height_robust_m': hr[i],
                             'area_m2': int(ar[i]), 'confidence': cf[i], 'dh_m': dh[i],
                             'cell': f'{int(cell[i]):x}', 'kg_code': kgs[i]})
-    r = dict(r); r.pop('cols'); r.pop('state')
+    u = r.get('user')
+    if u:
+        for i, t, cnt, v in zip(u['i'], u['taxon'], u['n'], u['v']):
+            out[i].update(taxon=t, taxon_n=cnt, taxon_v=v)
+    a = r.get('added')
+    if a:
+        r['added'] = [{'lon': a['lon'][i], 'lat': a['lat'][i], 'height_m': a['h_m'][i], 'taxon': a['taxon'][i],
+                       'taxon_n': a['n'][i], 'taxon_v': a['v'][i], 'added': True} for i in range(len(a['lon']))]
+    r = dict(r); r.pop('cols'); r.pop('state'); r.pop('user', None)
     r['trees' if kind == 'trees' else 'structures'] = out
     return r
 

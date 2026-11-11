@@ -56,6 +56,11 @@ cost = √n), 500 reports / client / day, body ≤ 32 KB; GET 5 r/s / burst
 20; bbox span ≤ 0.05° (use `/heat` for overviews). Env overrides
 `FLAGS_POST_RATE_PER_S[_BURST]`, `FLAGS_GET_RATE_PER_S[_BURST]`.
 
+## Per-tree species / added trees
+
+`claim: species` and `claim: missing` (layer `trees`, with a point) are routed to `tree_user.py` —
+versioned per tree, served back on `/trees/bbox`. See `docs/tree-user.md`.
+
 ## Operating it
 
 ```bash

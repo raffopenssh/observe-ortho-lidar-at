@@ -367,6 +367,7 @@ def heightfield():
 
 
 TREES_REV = 'trees-c2'          # bump when the /trees/bbox body layout or QA rules change (part of the ETag)
+TREES_USER_MAX_AGE = 300       # KGs with user-reported taxa: revalidate (304, index-only) every 5 min
 TREES_MAX_AGE = 86400          # answers change only when a KG is reprocessed; ETag revalidation is index-only
 
 
@@ -423,13 +424,25 @@ def trees_bbox():
     st = ne_trees.bbox_state(*bb)
     canon = '&'.join(f'{k}={v}' for k, v in sorted(request.args.items(multi=True)) if k != 'pretty')
     state = '|'.join(st['digests']) + '\np=' + ','.join(st['pending']) + '\nn=' + ','.join(st['not_processed'])
+    # user-reported taxa / added trees (tree_user.py): their newest revision in
+    # these KGs joins the ETag — only when there is one, so untouched KGs keep
+    # their day-long cache entries.
+    urev = 0
+    if kind == 'trees':
+        try:
+            import tree_user
+            urev = tree_user.kgs_rev(st['kgs'])
+        except Exception:  # noqa: BLE001
+            urev = 0
+    if urev:
+        state += f'\nu={urev}'
     etag = '"t-' + hashlib.sha256((state + '\n' + canon + '\n' + TREES_REV).encode()).hexdigest()[:20] + '"'
     cacheable = st['ready']
     # Ready → a day of freshness. Not ready (a KG of the bbox still pending) →
     # *no-cache*, not no-store: the browser keeps the body and revalidates with
     # If-None-Match on every use (304 is index-only here, and the ETag covers the
     # pending/not_processed lists so it flips the moment the KG lands).
-    cc = f'public, max-age={TREES_MAX_AGE}' if cacheable else 'public, no-cache'
+    cc = f'public, max-age={TREES_USER_MAX_AGE if urev else TREES_MAX_AGE}' if cacheable else 'public, no-cache'
     lm = email.utils.formatdate(st['mtime'], usegmt=True) if st['mtime'] else None
     hdrs = {'ETag': etag, 'Cache-Control': cc}
     if lm:
@@ -476,16 +489,19 @@ def trees_bbox():
         meta['columns_note'] = docs.TREES_COLUMNS_NOTE
         body = {'bbox': list(bb), 'objects': kind, 'format': 'columns', 'fields': t['fields'], 'order': t['order'],
                 'columns': t['columns'], 'count': n_out, 'truncated': t['truncated'], 'dropped_qa': t['dropped_qa'],
+                **{k: t[k] for k in ('user', 'added') if t.get(k)},
                 'kgs': t['kgs'], 'ready': ready, **extra, 'meta': _meta(**meta)}
     elif fmt == 'geojson':
         body = {'type': 'FeatureCollection',
                 'features': [{'type': 'Feature', 'geometry': {'type': 'Point', 'coordinates': [x['lon'], x['lat']]},
                               'properties': {k: v for k, v in x.items() if k not in ('lon', 'lat')}}
                              for x in t['trees']],
+                **({'added': t['added']} if t.get('added') else {}),
                 'meta': _meta(count=n_out, truncated=t['truncated'], dropped_qa=t['dropped_qa'],
                               kgs=t['kgs'], ready=ready, **extra, **meta)}
     else:
         body = {'bbox': list(bb), 'objects': kind, key: t['trees'], 'count': n_out,
+                **({'added': t['added']} if t.get('added') else {}),
                 'truncated': t['truncated'], 'dropped_qa': t['dropped_qa'], 'kgs': t['kgs'],
                 'ready': ready, **extra, 'meta': _meta(**meta)}
     resp = Response(json.dumps(body, separators=(',', ':'), ensure_ascii=False,

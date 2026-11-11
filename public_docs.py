@@ -282,7 +282,8 @@ what you expect, and send `looks_right` too: a confirmation is as useful as a co
                                                     trees | landmarks | buildings | landscape | heightfield | tiles |
                                                     kg | docs | other
      "claim": "wrong_type",                         wrong_type | wrong_height | too_tall | too_short | missing |
-                                                    spurious | misplaced | stale | artifact | looks_right | other
+                                                    spurious | misplaced | stale | artifact | looks_right | other |
+                                                    species (per tree, see "Tree species" below)
      "observed": {{"group": "wald", "share": 0.61}},  what you saw from us (≤ 512 B). OMIT IT and we snapshot the
                                                     cell as served right now: {{group, share, h_max, trees_n,
                                                     structures_n, consistency[, nearest{{h_m|h_max_m, type, dist_m}}]}}
@@ -319,6 +320,43 @@ what you expect, and send `looks_right` too: a confirmation is as useful as a co
   tint; per viewport tile GET /flags?bbox=&format=columns to mark disputed cells; show tally.claims on the card
   from /cells/<h3>?flags=1. Giant trees / heights (game-client pattern): POST {{lon, lat, layer:"trees",
   claim:"too_tall", observed:{{h_m}}}} straight from the tree symbol.
+
+### Tree species + trees we miss — per tree, versioned                              #tree-species
+
+People can name a single tree and add trees we have no apex for. A tree is its position (no ids): the
+measured apex nearest to your point, or your point for an added tree. Every report is an appended version —
+nothing is overwritten; `v` = number of versions of that tree, `rev` = global revision to sync against.
+Current answer = plurality of each reporter's latest version (tie → newest); `n` = reporters agreeing.
+
+  POST /api/v1/flags {{"lon":…, "lat":…, "species":"Quercus robur"[, "reporter", "source"]}}
+       (short for layer:"trees", claim:"species"; expected:{{species}} works too). The point must lie within
+       the crown radius (4–10 m) of an apex or ≤ 3 m of an added tree, else 404 + hint. species = scientific
+       name, or a German / English name of /api/v1/trees/taxa/dict ("Stieleiche", "beech"); unknown → 400 +
+       did_you_mean[]. "species": null withdraws your own report. Repeating yourself adds no version.
+       → 201 {{rev, folded, claim, subject, epoch, tree{{lon, lat, taxon, class, n, v, rev, added, matched:
+              "apex"|"added", dist_m, height_m?, h_m?}}}}     class = our model class (spruce … broadleaf)
+  POST /api/v1/flags {{"lon":…, "lat":…, "layer":"trees", "claim":"missing"[, "species":…, "h_m": 6]}}
+       adds a tree (h_m 1–70 optional). ≤ 2 m from a measured apex → tree.error (name it instead); ≤ 3 m
+       from an added tree → folds onto it. The usual flag row is written too (id, tally as before) + tree{{…}}.
+  Batches ({{"reports":[…]}} ≤ 50), limits and reporter hashing are those of /flags.
+
+  Read back — three ways, cheapest first:
+  1. /api/v1/trees/bbox grows ONLY where something was reported (untouched KGs: byte-identical, 1-day cache;
+     touched KGs: ETag carries the newest revision, max-age 300):
+       format=columns → "user": {{i:[row index…], taxon:[…], n:[…], v:[…]}} (sparse, aligned with columns)
+                        "added": {{lon:[…], lat:[…], h_m:[… | null], taxon:[… | null], n:[…], v:[…]}}
+                        fields=…,taxon gives a dense column (null where unnamed) instead of using "user".i
+       format=json | geojson → named rows carry taxon, taxon_n, taxon_v; top-level "added": [{{lon, lat,
+                        height_m | null, taxon, taxon_n, taxon_v, added:true}}] (never mixed into trees[]).
+     Existing fields are unchanged (`species` stays our model class). Added trees fall into the height
+     window by h_m (3 m when none was given), so exactly one band of a partition carries each.
+  2. GET /api/v1/trees/taxa?bbox=w,s,e,n | kg=63349 | (nothing = national) [&since=<rev>][&limit≤5000]
+       → {{rev, since, fields, order:"rev_asc", columns:{{lon, lat, taxon, n, v, rev, added, h_m}}, count,
+          truncated, next_since?}} — poll with since=<last rev>: only trees changed after it (~25 B each
+       gzipped; a row with taxon null and added 0 = drop it). ETag → 304, max-age 30.
+  3. GET /api/v1/trees/taxa/history?lon=&lat= → {{tree, kg, dist_m, versions:[{{v, rev, ts, op: species | add |
+       retract | moderated, taxon?, h_m?, source?, epoch?, hidden?}}]}} — the full version list of one tree.
+  GET /api/v1/trees/taxa/dict → {{fields:[taxon, de, en, class], taxa:[[…]…]}} (~90 Austrian trees; max-age 1 d).
 
 """
 
@@ -409,7 +447,7 @@ GET /api/v1/trees/bbox?bbox=…[&min_height=3][&max_height=…][&limit=2000][&re
       (height_desc) → {{bbox, objects, format:"columns", fields:[…], order:"height_desc",
       columns:{{lon:[…], lat:[…], h_m:[…], crown_m2:[…]}}, count, truncated, dropped_qa, kgs, ready, meta}}.
       Default fields lon,lat,h_m,crown_m2 (structures: lon,lat,h_m,type). fields= picks from
-      lon,lat,h_m,crown_m2,species,vitality,ndsm_only,cell,kg_code,x,y (structures: lon,lat,h_m,type,
+      lon,lat,h_m,crown_m2,species,vitality,ndsm_only,cell,kg_code,x,y,taxon (structures: lon,lat,h_m,type,
       h_robust_m,area_m2,confidence,dh_m,cell,kg_code,x,y). lon/lat rounded to 1e-6° (≈ 0.1 m —
       the source is metre-snapped), h_m 0.25 m steps, crown_m2 0.1 m², x/y = EPSG:3035 integer
       metres, ndsm_only 0/1, cell = H3 r12 hex. limit default = max = 100000 (a whole 0.025° tile
@@ -422,6 +460,8 @@ GET /api/v1/trees/bbox?bbox=…[&min_height=3][&max_height=…][&limit=2000][&re
       covers the pending list, so it flips when the KG lands; no-store only on a transient index
       error). A bbox outside Austria is ready:true, kgs:[] + note. ETag / Last-Modified are CORS-exposed. Chunks of a tile are decoded once and
       shared by all bands / concurrent calls (server ms ≈ 10 for a warm 0.025° tile band).
+    User-reported species + user-added trees ride along sparsely ("user" / "added" blocks, row keys
+    taxon / taxon_n / taxon_v) only where someone reported one — see #tree-species.
     realistic=1 (default) removes what the height distribution says are not trees: the saturated
     ≥ 60 m bin, local spikes ≥ 45 m (masts, wind turbines, cranes) and flagged cells — dropped_qa
     counts them; realistic=0 gives the raw apices. objects=structures returns the non-tree objects

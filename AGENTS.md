@@ -12,6 +12,7 @@ and setup: `README.md`. Security model: `SECURITY.md`.
 | NE cells (H3) — records, container, endpoints | `docs/ne-v24-design.md`, `docs/ne-public-api.md` | `ne_h3.py`, `cells_api.py`, `ne_ingest.py`, `cells_national.py` |
 | NE view-fill (every cell of the NE server's `/declared` view observed: corpus borrow → own-product union → sweep units on the view) | `docs/ne-viewfill.md` | `ne_viewfill.py`, `ne_ingest.consume_viewfill`, `sliver_sweep.plan_cells` |
 | public "this looks wrong" flags | `docs/public-flags.md` | `public_flags.py` |
+| per-tree user species + user-added trees (versioned, via `/flags`; sparse read-back on `/trees/bbox`, `/trees/taxa`) | `docs/tree-user.md` | `tree_user.py`, `ne_trees._user_blocks` |
 | the Austria-wide processor, tiles, checkpoints, splitting | `docs/austria-processor.md` | `austria_processor.py`, `kg_splitter.py`, `tile_checkpoint_registry.py` |
 | director (single machine / `SRTM_PEERS`) | `docs/peer-director.md` | `peer_director.py` |
 | endgame triage (last blocks: stale claims from stopped peers, quarantined work cell) | `docs/peer-director.md → Endgame triage` | `app.processing_peers_status`, `peer_director` barren cells |
