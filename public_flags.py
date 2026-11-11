@@ -639,6 +639,70 @@ def set_status(rid: int, status: str, note: str | None) -> dict | None:
     return get_one(rid) if r else None
 
 
+# === SECTION: machine reports (bulk, no snapshot, no rate limit — callers are our own jobs) ===
+
+def auto_sync(kg: str, source: str, layer: str, claim: str, items: list, gone: list | None = None) -> dict:
+    """Upsert one report per item ({cell, lon, lat, expected, observed}) under the fixed machine
+    reporter of ``source`` in ONE transaction; ``gone`` = cells whose open machine report goes ``stale``.
+    A re-run never reopens a human verdict (confirmed / rejected); stale / fixed rows reopen."""
+    c = _conn()
+    now = int(time.time())
+    lid, cid_, sid = _dict_id(c, 'layer', layer), _dict_id(c, 'claim', claim), _dict_id(c, 'source', source)
+    rep = _reporter_hash(source, 'auto')
+    epoch = _epoch_now(kg) if items else None
+    rows = [(now, now, int(i['cell']), int(i['cell']), kg, int(round(i['lon'] * 1e6)), int(round(i['lat'] * 1e6)),
+             lid, cid_, sid, rep, epoch, i.get('observed'), i.get('expected')) for i in items]
+    with _LOCK:
+        c.execute('BEGIN IMMEDIATE')
+        try:
+            c.executemany(
+                'INSERT INTO report(ts, ts_last, n, skey, cell, kg, lon_e6, lat_e6, layer, claim, source, reporter, '
+                'epoch, observed, expected, status) VALUES (?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,0) '
+                'ON CONFLICT(skey, layer, claim, reporter) DO UPDATE SET ts_last = excluded.ts_last, '
+                'expected = excluded.expected, observed = excluded.observed, epoch = excluded.epoch, '
+                'lon_e6 = excluded.lon_e6, lat_e6 = excluded.lat_e6, '
+                'status = CASE WHEN status IN (3, 4) THEN 0 ELSE status END', rows)
+            st = 0
+            for cell in gone or ():
+                st += c.execute('UPDATE report SET status=4, status_ts=? WHERE skey=? AND layer=? AND claim=? '
+                                'AND reporter=? AND status=0', (now, int(cell), lid, cid_, rep)).rowcount
+            c.execute('COMMIT')
+        except Exception:
+            c.execute('ROLLBACK')
+            raise
+    _heat_cache.clear()
+    return {'upserted': len(rows), 'stale': st}
+
+
+def auto_cells(kg: str, source: str, status: str = 'rejected') -> set:
+    """Subject cells of the machine reports of ``source`` in ``kg`` with this status."""
+    c = _conn()
+    _load_dict(c)
+    sid = _DICT.get(('source', source))
+    if sid is None:
+        return set()
+    return {int(r[0]) for r in c.execute('SELECT skey FROM report WHERE kg=? AND reporter=? AND status=?',
+                                         (kg, _reporter_hash(source, 'auto'), _STATUS_ID[status]))}
+
+
+def source_id(source: str):
+    c = _conn()
+    _load_dict(c)
+    return _DICT.get(('source', source))
+
+
+def hinted_reports(hint: str, exclude_source: str | None = None, limit: int = 200) -> list:
+    """Reports whose ``expected.hint`` is ``hint`` (newest first), minus one source."""
+    c = _conn()
+    ex = source_id(exclude_source) if exclude_source else None
+    q = ("SELECT id, kg, lon_e6, lat_e6, ts_last, status, note FROM report WHERE expected LIKE ? "
+         "AND lon_e6 IS NOT NULL" + (" AND (source IS NULL OR source != ?)" if ex is not None else "") +
+         " ORDER BY ts_last DESC LIMIT ?")
+    args = [f'%"hint":"{hint}"%'] + ([ex] if ex is not None else []) + [int(limit)]
+    return [{'id': r[0], 'kg': r[1], 'lon': r[2] / 1e6, 'lat': r[3] / 1e6, 'ts': r[4], 'status': STATUS[r[5]],
+             'note': r[6]} for r in c.execute(q, args)]
+
+
 # === SECTION: read ===
 
 def _row_public(r, notes: bool = True, epoch_now: dict | None = None) -> dict:

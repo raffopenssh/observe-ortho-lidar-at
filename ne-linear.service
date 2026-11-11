@@ -1,0 +1,13 @@
+[Unit]
+Description=srtm-lidar-at: linear-noise runs in the tree apices (ne_linear.py --backfill; only KG files that changed)
+After=network.target
+
+[Service]
+Type=oneshot
+User=exedev
+WorkingDirectory=/home/exedev/srtm-lidar
+ExecStart=/usr/bin/python3 ne_linear.py --backfill --budget-s 3000 --quiet
+Nice=15
+IOSchedulingClass=idle
+MemoryMax=1500M
+TimeoutStartSec=70min

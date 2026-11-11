@@ -24,6 +24,7 @@ data/austria_processor/vct_fleet.json
 data/ne_tooling_last.json
 data/golden/
 data/public_flags.sqlite*
+data/linear_noise.sqlite*
 data/public_flags.salt
 data/reporter_keys.json
 data/tree_key_required

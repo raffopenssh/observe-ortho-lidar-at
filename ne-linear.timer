@@ -1,0 +1,10 @@
+[Unit]
+Description=hourly ne_linear backfill (no-op while no KG file changed)
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

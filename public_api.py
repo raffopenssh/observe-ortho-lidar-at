@@ -366,7 +366,7 @@ def heightfield():
     return _json(payload, st, max_age=3600)
 
 
-TREES_REV = 'trees-c2'          # bump when the /trees/bbox body layout or QA rules change (part of the ETag)
+TREES_REV = 'trees-c3'          # bump when the /trees/bbox body layout or QA rules change (part of the ETag)
 TREES_USER_MAX_AGE = 300       # KGs with user-reported taxa: revalidate (304, index-only) every 5 min
 TREES_MAX_AGE = 86400          # answers change only when a KG is reprocessed; ETag revalidation is index-only
 
@@ -436,6 +436,8 @@ def trees_bbox():
             urev = 0
     if urev:
         state += f'\nu={urev}'
+    if kind == 'trees' and st.get('linear'):
+        state += '\nl=' + st['linear']       # linear-noise runs (ne_linear.py) of these KGs changed
     etag = '"t-' + hashlib.sha256((state + '\n' + canon + '\n' + TREES_REV).encode()).hexdigest()[:20] + '"'
     cacheable = st['ready']
     # Ready → a day of freshness. Not ready (a KG of the bbox still pending) →

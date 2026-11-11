@@ -289,6 +289,8 @@ what you expect, and send `looks_right` too: a confirmation is as useful as a co
                                                     structures_n, consistency[, nearest{{h_m|h_max_m, type, dist_m}}]}}
                                                     (nearest apex / structure for the *trees* / *structures* layers)
      "expected": {{"group": "gruen"}},                what it should be (≤ 256 B): {{group}}, {{type}}, {{h_m}}, {{absent:true}} …
+                                                    trees that are really a line of noise (a chain of small
+                                                    "trees" in a dead straight row): {{absent:true, hint:"linear"}}
      "note": "mown meadow, no trees",               ≤ 280 chars, shown publicly (no personal data please)
      "source": "my-client/glyph",                   your client label ≤ 40 (stats are grouped by it)
      "reporter": "opaque-id",                       optional; hashed with a server salt, never stored or returned
@@ -567,8 +569,9 @@ GET /api/v1/trees/bbox?bbox=…[&min_height=3][&max_height=…][&limit=2000][&re
     User-reported species + user-added trees ride along sparsely ("user" / "added" blocks, row keys
     taxon / taxon_n / taxon_v / height_user_m / dbh_cm) only where someone reported one — see #tree-species.
     realistic=1 (default) removes what the height distribution says are not trees: the saturated
-    ≥ 60 m bin, local spikes ≥ 45 m (masts, wind turbines, cranes) and flagged cells — dropped_qa
-    counts them; realistic=0 gives the raw apices. objects=structures returns the non-tree objects
+    ≥ 60 m bin, local spikes ≥ 45 m (masts, wind turbines, cranes), flagged cells (dropped_qa) and
+    the apices of machine-detected linear noise (straight chains of small "trees"; each run carries a
+    flag: layer trees, claim spurious, source auto-linear, expected.hint "linear"); realistic=0 gives the raw apices. objects=structures returns the non-tree objects
     instead ({{type, lon, lat, height_m, height_robust_m, area_m2, confidence, dh_m, cell, kg_code}};
     types=mast,wind_turbine,roof,… to filter). ready:false (+ pending_kgs / retry_after_s or
     error) when a KG of the bbox is not on disk yet or the index is unusable — never a silent 0.

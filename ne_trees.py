@@ -17,7 +17,8 @@ limit-th object found.  Chunks whose max is unknown (NULL) are scanned first.
 
 ``realistic`` (default on) removes what the QA rules / flag stores call
 unrealistic: data-derived height rules (see ``TREE_*`` constants), apices / structures with a high-or-
-critical row in ``feedback.sqlite`` (``flags``), and anything in a res-12
+critical row in ``feedback.sqlite`` (``flags``), the apices of linear-noise
+runs (``ne_linear.py`` — per apex, machine-flagged), and anything in a res-12
 cell that carries an open / confirmed public flag with a negative claim
 (``public_flags``: too_tall, spurious, artifact, misplaced, wrong_height).
 """
@@ -213,9 +214,12 @@ def flagged_cells(kg: str, kind: str) -> set[int]:
         clm = [pf._DICT.get(('claim', x)) for x in NEGATIVE_CLAIMS]
         lay = [x for x in lay if x is not None]; clm = [x for x in clm if x is not None]
         if lay and clm:
+            # machine reports of ne_linear hide single apices (ne_linear.hidden_keys), never the whole cell
+            auto = pf._DICT.get(('source', 'auto-linear'))
             q = ('SELECT cell FROM report WHERE kg=? AND cell IS NOT NULL AND status IN (0,1) '
-                 'AND layer IN (%s) AND claim IN (%s)' % (','.join('?' * len(lay)), ','.join('?' * len(clm))))
-            cells = {int(r[0]) for r in c.execute(q, (kg, *lay, *clm))}
+                 'AND layer IN (%s) AND claim IN (%s) AND (source IS NULL OR source != ?)'
+                 % (','.join('?' * len(lay)), ','.join('?' * len(clm))))
+            cells = {int(r[0]) for r in c.execute(q, (kg, *lay, *clm, -1 if auto is None else auto))}
     except Exception as ex:  # noqa: BLE001
         log.debug('ne_trees flagged_cells %s: %s', kg, ex)
     with _pf_lock:
@@ -359,7 +363,12 @@ def bbox_state(w, s, e, n) -> dict:
     mt = max([float(files[k].get('mtime') or 0) for k in have] or [0.0])
     # ready = nothing of the bbox is still on its way: a bbox that intersects
     # no KG at all (outside Austria) is a stable, cacheable empty answer.
-    return {'kgs': have, 'pending': pending, 'not_processed': not_proc, 'digests': digs, 'mtime': mt,
+    try:
+        import ne_linear
+        lin_tok = ne_linear.state_token(have)
+    except Exception:  # noqa: BLE001
+        lin_tok = ''
+    return {'kgs': have, 'pending': pending, 'not_processed': not_proc, 'digests': digs, 'mtime': mt, 'linear': lin_tok,
             'n_kgs': len(kgs_all), 'ready': not pending and (bool(have) or not kgs_all)}
 
 
@@ -401,8 +410,15 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
     hdrs: dict = {}
     scanned = 0; exhausted = True; kth = -1.0; n_at_kth = 0
     parts: list[tuple[dict, np.ndarray, str]] = []     # (decoded chunk, selected idx, kg)
-    n_acc = 0; dropped = 0
+    n_acc = 0; dropped = 0; dropped_lin = 0
     legacy: dict = {}
+    lin = np.zeros(0, np.uint64)
+    if realistic and kind == 'trees':
+        try:                                # apices of detected linear-noise runs (ne_linear.py)
+            import ne_linear
+            lin = ne_linear.hidden_keys(st['kgs'])
+        except Exception as ex:  # noqa: BLE001
+            log.debug('ne_trees linear keys: %s', ex)
 
     def kth_now() -> float:
         hs = np.concatenate([p[0]['h'][p[1]] for p in parts])
@@ -445,6 +461,10 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
             m &= hs < max_h
         if realistic:
             m &= d['ok']
+            if lin.size and m.any():
+                hit = m & ne_linear.is_hidden(d['x'], d['y'], lin)
+                if hit.any():
+                    m &= ~hit; dropped_lin += int(hit.sum())
             fc = flagged_cells(kg, kind)
             if fc:
                 m &= ~np.isin(d['cell'], np.fromiter(fc, np.uint64))
@@ -480,7 +500,7 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
         n_out = lim
     return {'kind': kind, 'cols': out, 'n': n_out, 'kgs': st['kgs'], 'min_height': min_h, 'max_height': max_h,
             'limit': lim, 'pending_kgs': st['pending'], 'not_processed': st['not_processed'],
-            'dropped_qa': dropped, 'realistic': bool(realistic), 'truncated': truncated,
+            'dropped_qa': dropped, 'dropped_linear': dropped_lin, 'realistic': bool(realistic), 'truncated': truncated,
             'chunks_scanned': scanned, 'chunks_in_bbox': len(rows), 'ms': round((time.time() - t0) * 1000, 1),
             'ready': st['ready'], 'state': st, **_user_blocks(kind, out if n_out else None, st['kgs'], w, s, e, n, min_h, max_h)}
 
