@@ -56,3 +56,4 @@ data/host_reboot.lock
 data/austria_processor/host_reboot_slots.json*
 data/ne/
 data/rate_friends
+data/tree_class_tally.json

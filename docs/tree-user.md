@@ -31,11 +31,34 @@ Public contract: `public_docs.FLAGS_TXT → #tree-species`. Test: `python3 tests
   rows get `taxon/taxon_n/taxon_v[/height_user_m/dbh_cm]`; `fields=taxon,h_user_m,dbh_cm` dense columns. Nothing is emitted for KGs without reports, so
   bodies / ETags / the 1-day cache of untouched KGs are unchanged; touched KGs get `u=<rev>` in the
   ETag, a top-level `rev` (start of a `/trees/taxa?since=` poll) and max-age 300 (`public_api.TREES_USER_MAX_AGE`). Delta feed `/api/v1/trees/taxa?since=`,
-  history `/api/v1/trees/taxa/history`, dictionary `/api/v1/trees/taxa/dict` (`TAXA`, ~90 rows with
-  de/en names and our model class).
+  history `/api/v1/trees/taxa/history`, dictionary `/api/v1/trees/taxa/dict` and `/api/v1/trees/taxa/top`
+  (next section).
 * After a KG rebuild an apex may move: exact (x, y) join first, then ≤ 1.5 m **and** height within 3 m
   of the height stored with the version (`ORPHAN_*`); otherwise the name is simply not shown (still in
   `/trees/taxa` and history).
+
+## Dictionary + resolver (`tree_taxa.py`, rev 2 since 2026-11-11)
+
+Test: `python3 tests/test_tree_taxa.py` (no DB / corpus). Contract: `#tree-species` → dict columns, RESOLVER, `/taxa/top`.
+
+* **Table**: `_S` = species lines **in rank order** (`taxon|de|en|class|codes|alt`), `_G` = one row per genus
+  (auto-ranked right after its first species, de shown as `… (Gattung)`), two group rows last. 278 rows.
+  `REV` + `DIGEST` are pinned by the test: any edit of the table fails it until `REV` is bumped.
+* **Rank** is an ordering for suggestion lists, not a census: forest species by the published ÖWI 2016/21 shares
+  (written from the published order, no table was downloaded), street / park trees interleaved by the Vienna
+  Baumkataster (`ogdwien:BAUMKATOGD`, 233 k trees, tallied 2026-11 — only Vienna; Graz / Linz / Salzburg /
+  Innsbruck were not tallied), orchard trees by the usual Streuobst order.
+* **Codes**: forestry abbreviations by hand; EPPO from Wikidata P3031 by taxon name (`tools/taxa_eppo.py --write`
+  rewrites the `_EPPO` block; 5 via a listed synonym, 11 rows have none). No numeric ÖWI / BFW codes (no citable source).
+* **Collision rule**: `build_index()` → `CLASHES` must be empty. Decisions are listed in the module docstring
+  (Ki = Kiefer / Kir = Kirsche, GEr vs GrEr, SPa vs WPa, no SWei, genus vs species meaning of the plain German
+  names, Kastanie = Rosskastanie). 8 two-plus-two codes are shared by two species (AcCa, AcSa, CrLa, PlOr, PoCa,
+  PrCe, PrSe, TiEu) → 400 `reason: ambiguous`.
+* **Keys** (`keys()`): lower-case, ß→ss, diacritics dropped, ä/ö/ü *also* as ae/oe/ue, `×`/` x ` dropped, hyphens /
+  dots / spaces removed. Canonical hybrids keep the ` x ` form (`Populus x canadensis`) — stored reports use it.
+* **`/taxa/top`** (`tree_user.top`): `named` from the per-KG state cache; `classes` = `ne_trees.collect` over the
+  bbox (≤ 0.01 deg², tallest 20 000) or the national estimate (600 random chunks × ratio, cached a week in
+  `data/tree_class_tally.json`; first call after expiry takes ~5 s).
 
 ## Ops
 

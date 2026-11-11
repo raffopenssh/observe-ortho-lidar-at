@@ -22,7 +22,6 @@ Design (docs/tree-user.md):
 """
 from __future__ import annotations
 
-import difflib
 import logging
 import math
 import re
@@ -33,6 +32,7 @@ import numpy as np
 from flask import request
 
 import public_flags as pf
+import tree_taxa as tt
 
 log = logging.getLogger('tree_user')
 
@@ -110,104 +110,27 @@ _CLIENT_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{7,63}$')
 DBH_CM = (1.0, 600.0)
 H_M = (1.0, 70.0)
 
-# (scientific name, German, English, model class of /trees/bbox `species`)
-_T = """Picea abies|Fichte|Norway spruce|spruce
-Picea|Fichte (Gattung)|spruce|spruce
-Picea pungens|Stechfichte|blue spruce|spruce
-Picea omorika|Serbische Fichte|Serbian spruce|spruce
-Abies alba|Weißtanne|silver fir|fir
-Abies|Tanne (Gattung)|fir|fir
-Abies nordmanniana|Nordmanntanne|Nordmann fir|fir
-Pinus sylvestris|Rotföhre|Scots pine|pine
-Pinus nigra|Schwarzföhre|black pine|pine
-Pinus cembra|Zirbe|Swiss stone pine|pine
-Pinus mugo|Latsche|mountain pine|pine
-Pinus strobus|Weymouthskiefer|white pine|pine
-Pinus|Föhre (Gattung)|pine|pine
-Larix decidua|Lärche|European larch|larch
-Larix|Lärche (Gattung)|larch|larch
-Pseudotsuga menziesii|Douglasie|Douglas fir|conifer
-Taxus baccata|Eibe|yew|conifer
-Thuja|Thuje|arborvitae|conifer
-Juniperus communis|Wacholder|juniper|conifer
-Sequoiadendron giganteum|Mammutbaum|giant sequoia|conifer
-Metasequoia glyptostroboides|Urweltmammutbaum|dawn redwood|conifer
-Ginkgo biloba|Ginkgo|ginkgo|broadleaf
-Fagus sylvatica|Rotbuche|beech|beech
-Quercus robur|Stieleiche|pedunculate oak|oak
-Quercus petraea|Traubeneiche|sessile oak|oak
-Quercus cerris|Zerreiche|Turkey oak|oak
-Quercus pubescens|Flaumeiche|downy oak|oak
-Quercus rubra|Roteiche|red oak|oak
-Quercus|Eiche (Gattung)|oak|oak
-Acer pseudoplatanus|Bergahorn|sycamore maple|maple
-Acer platanoides|Spitzahorn|Norway maple|maple
-Acer campestre|Feldahorn|field maple|maple
-Acer|Ahorn (Gattung)|maple|maple
-Fraxinus excelsior|Esche|ash|ash
-Fraxinus ornus|Blumenesche|manna ash|ash
-Betula pendula|Hängebirke|silver birch|birch
-Betula pubescens|Moorbirke|downy birch|birch
-Betula|Birke (Gattung)|birch|birch
-Alnus glutinosa|Schwarzerle|black alder|alder
-Alnus incana|Grauerle|grey alder|alder
-Alnus alnobetula|Grünerle|green alder|alder
-Alnus|Erle (Gattung)|alder|alder
-Populus nigra|Schwarzpappel|black poplar|poplar
-Populus alba|Silberpappel|white poplar|poplar
-Populus tremula|Zitterpappel|aspen|poplar
-Populus x canadensis|Hybridpappel|hybrid poplar|poplar
-Populus|Pappel (Gattung)|poplar|poplar
-Salix alba|Silberweide|white willow|willow
-Salix caprea|Salweide|goat willow|willow
-Salix babylonica|Trauerweide|weeping willow|willow
-Salix|Weide (Gattung)|willow|willow
-Malus domestica|Apfel|apple|fruit
-Pyrus communis|Birne|pear|fruit
-Prunus avium|Vogelkirsche|cherry|fruit
-Prunus domestica|Zwetschke|plum|fruit
-Prunus armeniaca|Marille|apricot|fruit
-Prunus persica|Pfirsich|peach|fruit
-Prunus padus|Traubenkirsche|bird cherry|broadleaf
-Prunus|Steinobst (Gattung)|stone fruit|fruit
-Juglans regia|Walnuss|walnut|fruit
-Cydonia oblonga|Quitte|quince|fruit
-Morus|Maulbeere|mulberry|fruit
-Castanea sativa|Edelkastanie|sweet chestnut|broadleaf
-Aesculus hippocastanum|Rosskastanie|horse chestnut|broadleaf
-Tilia cordata|Winterlinde|small-leaved lime|broadleaf
-Tilia platyphyllos|Sommerlinde|large-leaved lime|broadleaf
-Tilia|Linde (Gattung)|lime|broadleaf
-Carpinus betulus|Hainbuche|hornbeam|broadleaf
-Ostrya carpinifolia|Hopfenbuche|hop hornbeam|broadleaf
-Ulmus glabra|Bergulme|wych elm|broadleaf
-Ulmus minor|Feldulme|field elm|broadleaf
-Ulmus laevis|Flatterulme|white elm|broadleaf
-Ulmus|Ulme (Gattung)|elm|broadleaf
-Robinia pseudoacacia|Robinie|black locust|broadleaf
-Ailanthus altissima|Götterbaum|tree of heaven|broadleaf
-Platanus x hispanica|Platane|plane|broadleaf
-Sorbus aucuparia|Eberesche|rowan|broadleaf
-Sorbus aria|Mehlbeere|whitebeam|broadleaf
-Sorbus torminalis|Elsbeere|wild service tree|broadleaf
-Sorbus domestica|Speierling|service tree|broadleaf
-Corylus colurna|Baumhasel|Turkish hazel|broadleaf
-Corylus avellana|Hasel|hazel|broadleaf
-Sambucus nigra|Holunder|elder|broadleaf
-Crataegus|Weißdorn|hawthorn|broadleaf
-Liriodendron tulipifera|Tulpenbaum|tulip tree|broadleaf
-Catalpa bignonioides|Trompetenbaum|catalpa|broadleaf
-Paulownia tomentosa|Blauglockenbaum|paulownia|broadleaf
-Gleditsia triacanthos|Gleditschie|honey locust|broadleaf
-Celtis australis|Zürgelbaum|hackberry|broadleaf
-Magnolia|Magnolie|magnolia|broadleaf
-Coniferae|Nadelbaum|conifer|conifer
-Magnoliopsida|Laubbaum|broadleaf|broadleaf"""
-TAXA = tuple(tuple(l.split('|')) for l in _T.splitlines())
-_CLASS = {t[0]: t[3] for t in TAXA}
-_GENUS_CLASS: dict = {}
-for _t in TAXA:
-    _GENUS_CLASS.setdefault(_t[0].split()[0], _t[3])
+# the dictionary + resolver live in tree_taxa.py (rank, codes, synonyms, abbreviations)
+TAXA = tt.TAXA
+_CLASS = tt.CLASS
+
+
+def normalise(raw) -> tuple[str, bool]:
+    """→ (scientific name, known).  Accepts every name, code and synonym of
+    the dictionary, rule-based Latin abbreviations ("P. abies", "PiAb"), or
+    any well-formed binomial (known False)."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise pf.FlagError(400, 'species must be a non-empty string', dict='/api/v1/trees/taxa/dict')
+    try:
+        return tt.resolve(raw, MAX_TAXON_CHARS)
+    except tt.Unknown as e:
+        x = {'did_you_mean': e.did_you_mean, 'dict': '/api/v1/trees/taxa/dict'}
+        if e.ambiguous:
+            x['reason'] = 'ambiguous'
+        raise pf.FlagError(400, str(e), **x)
+
+
+taxon_class = tt.taxon_class
 
 
 def _fold(s: str) -> str:
@@ -216,51 +139,6 @@ def _fold(s: str) -> str:
         s = s.replace(a, b)
     return re.sub(r'[\s_]+', ' ', s)
 
-
-_ALIAS: dict = {}
-for _t in TAXA:
-    for _n in (_t[0], _t[1].replace(' (Gattung)', ''), _t[2]):
-        _ALIAS.setdefault(_fold(_n), _t[0])       # first entry wins (species before genus for shared names)
-for _a, _l in (('buche', 'Fagus sylvatica'), ('eiche', 'Quercus'), ('ahorn', 'Acer'), ('birke', 'Betula'),
-               ('erle', 'Alnus'), ('pappel', 'Populus'), ('weide', 'Salix'), ('linde', 'Tilia'), ('ulme', 'Ulmus'),
-               ('tanne', 'Abies alba'), ('kiefer', 'Pinus sylvestris'), ('foehre', 'Pinus sylvestris'),
-               ('waldkiefer', 'Pinus sylvestris'), ('schwarzkiefer', 'Pinus nigra'), ('zirbelkiefer', 'Pinus cembra'),
-               ('arve', 'Pinus cembra'), ('kirsche', 'Prunus avium'), ('apfelbaum', 'Malus domestica'),
-               ('birnbaum', 'Pyrus communis'), ('nussbaum', 'Juglans regia'), ('kastanie', 'Aesculus hippocastanum'),
-               ('akazie', 'Robinia pseudoacacia'), ('vogelbeere', 'Sorbus aucuparia'), ('zwetschge', 'Prunus domestica'),
-               ('pflaume', 'Prunus domestica'), ('aprikose', 'Prunus armeniaca'), ('obstbaum', 'Prunus'),
-               ('fruit', 'Prunus'), ('laerche', 'Larix decidua'), ('fir', 'Abies'), ('spruce', 'Picea'),
-               ('pine', 'Pinus'), ('larch', 'Larix'), ('oak', 'Quercus'), ('maple', 'Acer'), ('birch', 'Betula'),
-               ('alder', 'Alnus'), ('willow', 'Salix'), ('elm', 'Ulmus'), ('lime', 'Tilia'), ('linden', 'Tilia')):
-    _ALIAS[_a] = _l
-_LATIN = re.compile(r'^[a-z]{3,24}( (x )?[a-z][a-z-]{2,30})?$')
-
-
-def normalise(raw) -> tuple[str, bool]:
-    """→ (scientific name, known).  Accepts the built-in list by scientific,
-    German or English name, or any well-formed binomial / genus."""
-    if not isinstance(raw, str) or not raw.strip():
-        raise pf.FlagError(400, 'species must be a non-empty string', dict='/api/v1/trees/taxa/dict')
-    s = _fold(raw)[:MAX_TAXON_CHARS]
-    s = re.sub(r' (sp|spp|spec)\.?$', '', s)
-    hit = _ALIAS.get(s)
-    if hit:
-        return hit, True
-    if _LATIN.match(s) and ' ' in s:              # free binomial; a lone unknown word is more likely a typo
-        return s[0].upper() + s[1:], False
-    near = difflib.get_close_matches(s, list(_ALIAS), n=4, cutoff=0.72)
-    raise pf.FlagError(400, f'unknown species {raw!r}: send a scientific name ("Quercus robur", genus alone is fine '
-                            'for listed genera) or a German / English name from the dictionary',
-                       did_you_mean=sorted({_ALIAS[n] for n in near}), dict='/api/v1/trees/taxa/dict')
-
-
-def taxon_class(latin: str | None) -> str | None:
-    if not latin:
-        return None
-    return _CLASS.get(latin) or _GENUS_CLASS.get(latin.split()[0])
-
-
-# === SECTION: storage ===
 
 def _conn():
     c = pf._conn()
@@ -1158,10 +1036,13 @@ def history(lon: float | None = None, lat: float | None = None, tree_id=None, cl
 
 
 def taxa_dict() -> dict:
-    return {'fields': ['taxon', 'de', 'en', 'class'], 'taxa': [list(t) for t in TAXA],
-            'classes': sorted(set(_CLASS.values())),
-            'accepts': 'any taxon / de / en value above (case- and umlaut-insensitive), or a well-formed scientific '
-                       'binomial not listed (stored as written, flagged with a warning)',
+    return {**tt.as_dict(),
+            'accepts': 'in this order: any taxon / de / en / codes / alt value (case, diacritics, ß/ss, ä/ae, ×/x, '
+                       'hyphens, dots and spaces do not matter); a Latin abbreviation matching exactly one species '
+                       '("P. abies", "Pic. abi.", "PiAb", "PicAbi", "PiceAbie"); a well-formed scientific binomial '
+                       'not listed (stored as written, flagged with a warning); else 400 + did_you_mean (≤ 5 taxa)',
+            'rank': '1 = most frequent tree in Austria (forest: ÖWI shares; street / park: Vienna Baumkataster '
+                    'counts; orchards: Streuobst order); a genus follows its most frequent species, groups last',
             'measures': {'dbh_cm': list(DBH_CM), 'h_m': list(H_M),
                          'note': 'optional on any tree report; several reporters → median; h_m is the reporter\'s '
                                  'height and never replaces the LiDAR height_m'},
@@ -1174,6 +1055,127 @@ def taxa_dict() -> dict:
                      'tree in reach is ≥ match_ambiguous_ratio × farther (or the point is ≤ match_sure_m from the '
                      'apex) — else 409 + candidates; measured trees win over added ones',
             'metadata': {name: list(vals) for name, vals in META_FIELDS} | {'measured_at': 'ISO 8601'}}
+
+
+# === SECTION: what is used where (/api/v1/trees/taxa/top) ===
+
+TOP_MAX_AGE = 60
+TOP_MAX_AREA_DEG2 = 0.01      # ~85 km²: larger views get the national class tally (scope "national")
+TOP_APEX_CAP = 20000          # tallest apexes counted per bbox (approximate beyond that)
+TOP_SAMPLE_CHUNKS = 600       # national class tally = a random sample of corpus chunks, scaled
+TOP_NATIONAL_TTL = 7 * 86400
+_top_nat: dict = {}
+_top_lock = threading.Lock()
+
+
+def top_named(bbox=None, limit: int = 12) -> list:
+    """[[taxon, n trees]] of the current reported answers, most named first (ties by dictionary rank)."""
+    g = global_rev()
+    if not g:
+        return []
+    if bbox is not None:
+        import cells_api as ca
+        kgs = [int(k) for k in ca._kgs_intersecting(*bbox)]
+    else:
+        kgs = [r[0] for r in _conn().execute('SELECT DISTINCT kg FROM tree_ver')]
+    tally: dict = {}
+    for k in kgs:
+        st = state(k, g)
+        if not st['n']:
+            continue
+        m = st['live'] & (st['sp'] > 0)
+        if bbox is not None:
+            w, s, e, n = bbox
+            m &= (st['lon'] >= w) & (st['lon'] <= e) & (st['lat'] >= s) & (st['lat'] <= n)
+        ids, cnt = np.unique(st['sp'][m], return_counts=True)
+        for i, c in zip(ids.tolist(), cnt.tolist()):
+            tally[i] = tally.get(i, 0) + c
+    rows = [(t, c) for t, c in ((_taxon(i), c) for i, c in tally.items()) if t]
+    rows.sort(key=lambda r: (-r[1], tt.RANK.get(r[0], 10 ** 6), r[0]))
+    return [[t, c] for t, c in rows[:limit]]
+
+
+def _class_rows(counts) -> list:
+    import cells_api as ca
+    rows = [(ca.SPECIES[i], int(c)) for i, c in enumerate(counts) if c and i < len(ca.SPECIES) and ca.SPECIES[i] != 'unknown']
+    rows.sort(key=lambda r: -r[1])
+    return [[k, c] for k, c in rows]
+
+
+def _national_classes() -> dict:
+    """Model-class tally of the whole corpus, estimated from a random sample of
+    chunks (ratio estimator).  Kept in process and on disk for a week."""
+    import json
+    import cells_api as ca
+    import ne_trees
+    now = time.time()
+    if _top_nat.get('ts', 0) > now - TOP_NATIONAL_TTL:
+        return _top_nat
+    path = pf.DB_PATH.parent / 'tree_class_tally.json'
+    with _top_lock:
+        try:
+            d = json.loads(path.read_text())
+            if d.get('ts', 0) > now - TOP_NATIONAL_TTL:
+                _top_nat.update(d)
+                return _top_nat
+        except Exception:  # noqa: BLE001
+            pass
+        c = ca._idx_conn()
+        if c is None:
+            return {'classes': [], 'apexes': 0}
+        total = c.execute('SELECT COALESCE(SUM(trees), 0) FROM chunk').fetchone()[0]
+        rows = c.execute('SELECT r10, kg, off, len, raw_len, cells, trees, bld FROM chunk WHERE trees > 0 '
+                         'ORDER BY RANDOM() LIMIT ?', (TOP_SAMPLE_CHUNKS,)).fetchall()
+        counts = np.zeros(len(ca.SPECIES), dtype=np.int64); seen = 0; hdrs: dict = {}
+        for row in rows:
+            r = dict(zip(('r10', 'kg', 'off', 'len', 'raw_len', 'cells', 'trees', 'bld'), row))
+            try:
+                h = hdrs.get(r['kg']) or hdrs.setdefault(r['kg'], ca.header(r['kg']))
+                d = ne_trees._decoded_chunk(r['kg'], r, h, 'trees') if h else None
+            except Exception:  # noqa: BLE001
+                continue
+            if not d or not d['n']:
+                continue
+            sp = d['species'][d['ok']]
+            counts[:] += np.bincount(sp, minlength=len(ca.SPECIES))[:len(ca.SPECIES)]
+            seen += int(d['n'])
+        scale = (total / seen) if seen else 0.0
+        d = {'ts': now, 'apexes': int(total), 'sampled': seen,
+             'classes': _class_rows(np.round(counts * scale).astype(np.int64))}
+        if seen:
+            try:
+                tmp = path.with_suffix('.tmp'); tmp.write_text(json.dumps(d)); tmp.replace(path)
+            except OSError as e:
+                log.warning('tree class tally not saved: %s', e)
+            _top_nat.clear(); _top_nat.update(d)
+        return d
+
+
+def top(bbox=None, limit: int = 12) -> dict:
+    """What is used here: reader-named taxa and our model classes inside the
+    bbox (national without one, or when the bbox is too large to scan)."""
+    out = {'rev': tt.REV, 'tree_rev': global_rev(), 'named': top_named(bbox, limit)}
+    scope = 'national'
+    if bbox is not None and (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) <= TOP_MAX_AREA_DEG2:
+        import cells_api as ca
+        import ne_trees
+        try:
+            r = ne_trees.collect(*bbox, kind='trees', min_height=3.0, limit=TOP_APEX_CAP, max_limit=TOP_APEX_CAP)
+            sp = r['cols'].get('species') if r['n'] else None
+            counts = np.bincount(sp, minlength=len(ca.SPECIES)) if sp is not None else []
+            out.update(classes=_class_rows(counts), apexes=int(r['n']), approximate=bool(r['truncated']))
+            scope = 'bbox'
+        except Exception as e:  # noqa: BLE001
+            log.warning('taxa/top classes %s: %s', bbox, e)
+    if scope == 'national':
+        try:
+            d = _national_classes()
+        except Exception as e:  # noqa: BLE001
+            log.warning('taxa/top national classes: %s', e)
+            d = {'classes': [], 'apexes': 0}
+        out.update(classes=d['classes'], apexes=d['apexes'], approximate=True)
+    out['scope'] = {'named': 'bbox' if bbox is not None else 'national', 'classes': scope}
+    return out
 
 
 def stats() -> dict:
@@ -1240,6 +1242,27 @@ def taxa_history():
         raise pf.FlagError(404, 'no reported tree with this id / within 5 m')
     d['meta'] = _meta()
     return pf._resp(d, max_age=TAXA_MAX_AGE)
+
+
+@pf.flags_bp.route('/api/v1/trees/taxa/top')
+def taxa_top_get():
+    lim = pf._limited(pf._get_limit)
+    if lim is not None:
+        return lim
+    a = request.args
+    bbox = None
+    if a.get('bbox'):
+        try:
+            bbox = tuple(float(v) for v in a['bbox'].split(','))
+            assert len(bbox) == 4 and bbox[0] < bbox[2] and bbox[1] < bbox[3]
+        except (ValueError, AssertionError):
+            raise pf.FlagError(400, 'bbox must be w,s,e,n')
+    try:
+        limit = max(1, min(int(a.get('limit') or 12), 50))
+    except ValueError:
+        raise pf.FlagError(400, 'limit must be an integer')
+    d = top(bbox, limit); d['meta'] = _meta()
+    return pf._resp(d, max_age=TOP_MAX_AGE)
 
 
 @pf.flags_bp.route('/api/v1/trees/taxa/dict')

@@ -26,13 +26,17 @@ def main() -> int:
     c = app.test_client()
     # normalisation
     assert tu.normalise('stieleiche') == ('Quercus robur', True) and tu.normalise('Lärche')[0] == 'Larix decidua'
-    assert tu.normalise('quercus  ROBUR')[0] == 'Quercus robur' and tu.normalise('Zelkova serrata') == ('Zelkova serrata', False)
+    assert tu.normalise('quercus  ROBUR')[0] == 'Quercus robur' and tu.normalise('Zelkova abelicea') == ('Zelkova abelicea', False)
     try:
         tu.normalise('Fichtte'); raise SystemExit('expected FlagError')
     except pf.FlagError as e:
         assert 'Picea abies' in e.extra['did_you_mean'], e.extra
     d = c.get('/api/v1/trees/taxa/dict').get_json()
-    assert d['fields'] == ['taxon', 'de', 'en', 'class'] and len(d['taxa']) > 80
+    assert d['fields'][:4] == ['taxon', 'de', 'en', 'class'] and len(d['taxa']) > 250 and d['rev'] >= 2
+    assert tu.normalise('PiAb') == ('Picea abies', True) and tu.normalise('Fi')[0] == 'Picea abies'
+    r = c.get('/api/v1/trees/taxa/top'); t = r.get_json()
+    assert r.status_code == 200 and t['named'] == [] and t['rev'] == d['rev'] and 'max-age=60' in r.headers['Cache-Control']
+    assert c.get('/api/v1/trees/taxa/top?bbox=1,2').status_code == 400
     assert c.get('/api/v1/trees/taxa').get_json()['count'] == 0
     assert c.post('/api/v1/flags', json={'cell': '8c1e108cc922dff', 'species': 'Fichte'}).status_code == 400   # needs a point
     live = ne_trees.status()['ok'] and ne_trees.bbox_state(*BB)['ready']
@@ -254,13 +258,18 @@ def main() -> int:
         assert c.get(f'/api/v1/trees/taxa?kg={kgs[0]}', headers={'If-None-Match': lst.headers['ETag']}).status_code == 304
         assert c.get(f'/api/v1/trees/taxa?since={L["rev"]}').get_json()['count'] == 0
         assert c.get(f'/api/v1/trees/taxa?since={L["rev"] - 1}').get_json()['count'] == 1
+        t = c.get(f'/api/v1/trees/taxa/top?bbox={alon - 0.001},{alat - 0.001},{alon + 0.001},{alat + 0.001}&limit=3').get_json()
+        assert ['Juglans regia', 1] in t['named'] and t['scope'] == {'named': 'bbox', 'classes': 'bbox'}, t
+        assert all(k in tu.tt.CLASSES for k, _ in t['classes']) and t['apexes'] >= 0
+        assert any(tx == 'Juglans regia' for tx, _ in tu.top_named(None, 50))
         st = c.get('/api/v1/flags/stats').get_json()
         assert st['trees']['versions'] == tu.global_rev() and st['trees']['add_versions'] >= 1
     # vocabulary
     import public_docs
     src = (ROOT / 'tree_user.py').read_text()
     for w in cells_api.FORBIDDEN_WORDS:
-        for text, nm in ((src, 'tree_user.py'), (public_docs.FLAGS_TXT, 'FLAGS_TXT')):
+        for text, nm in ((src, 'tree_user.py'), ((ROOT / 'tree_taxa.py').read_text(), 'tree_taxa.py'),
+                         (public_docs.FLAGS_TXT, 'FLAGS_TXT')):
             assert not re.search(r'(?<![\w])' + re.escape(w) + r'(?![\w])', text, re.I), (w, nm)
     print(f'ok (corpus {"live" if live else "absent"})')
     return 0

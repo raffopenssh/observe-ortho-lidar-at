@@ -348,7 +348,8 @@ IDENTITY — say which tree you mean, in this order of preference:
                       "measured_at":"2026-11-11T09:30:00Z", "dbh_method":"caliper", "h_method":"hypsometer",
                       "vitality":"alive", "status":"standing"[, "reporter", "source"]}}
        (short for layer:"trees", claim:"tree"; any subset of species / dbh_cm / h_m / metadata.) species = scientific
-       name or a German / English name of /api/v1/trees/taxa/dict; unknown → 400 + did_you_mean[]. dbh_cm 1–600,
+       name, a German / English name, a forestry / EPPO code or a Latin abbreviation (RESOLVER below, dictionary
+       /api/v1/trees/taxa/dict); unknown → 400 + did_you_mean[]. dbh_cm 1–600,
        h_m 1–70 (your height; never replaces our LiDAR height — served next to it as h_user_m / height_user_m).
        Metadata is stored per version (English vocabulary; common synonyms and German terms are normalised):
          measured_at  ISO 8601, when it was measured (`ts` of a version stays our receive time)
@@ -409,8 +410,44 @@ IDENTITY — say which tree you mean, in this order of preference:
   3. GET /api/v1/trees/taxa/history?tree_id= | client_id= | lon=&lat= → {{tree, kg, dist_m, versions:[{{v, rev, ts,
        op: species | add | retract | moderated, taxon?, h_m?, dbh_cm?, measured_at?, dbh_method?, h_method?,
        vitality?, status?, tree_id?, by?, source?, epoch?, hidden?}}]}} — every version of one tree, with its metadata.
-  GET /api/v1/trees/taxa/dict → {{fields:[taxon, de, en, class], taxa:[[…]…], limits, match, metadata}}
-       (~90 Austrian trees + the matching rule and metadata vocabulary in machine form; max-age 1 d).
+  GET /api/v1/trees/taxa/dict → {{rev, fields:[taxon, de, en, class, rank, codes, alt], taxa:[[…]…], classes, accepts,
+       limits, match, metadata}}   (~280 trees of Austria: forest, street / park, orchard; max-age 1 d, ETag, ~11 kB gzip)
+       Columns are only ever appended — read by index 0–3 or by `fields`. `rev` changes with any dictionary change.
+         taxon  accepted scientific name = the key every report is stored and served under (hybrids: "Tilia x europaea")
+         de     the one name most used in Austria (Weißkiefer, Zirbe, Latsche, Zwetschke, Marille); genus rows read
+                "Eiche (Gattung)"            en  the one common English name
+         class  our model class (15: alder ash beech birch broadleaf conifer fir fruit larch maple oak pine poplar
+                spruce willow)
+         rank   1 = most frequent tree in Austria, dense, no ties (forest species by ÖWI share, street / park trees by
+                Baumkataster counts, orchard trees between); a genus row follows its most frequent species; the two
+                group rows Coniferae / Magnoliopsida come last. Rows are served in rank order.
+         codes  short codes, most used first: forestry abbreviations (Fi, Ta, Lä, WKi, SKi, Zi, Dgl, Bu, HBu, SEi, TEi,
+                Es, BAh, SAh, FAh, SEr, GEr, WLi, SLi, As, Rob, EKa, RKa, Kir, Nu, Elsb …; genus: Ei, Ah, Bi, Er, Pa,
+                Wei, Li, Ul), then the EPPO code (PIEAB, FAUSY; genus 1QUEG). May be empty.
+         alt    further names in any language: regional German (Föhre, Arve, Legföhre, Vogelbeere, Akazie, Espe,
+                Holler, Maroni), other English names, scientific synonyms (Alnus viridis, Platanus x acerifolia,
+                Torminalis glaberrima, Picea excelsa). May be empty.
+       No value of taxon / de / en / codes / alt belongs to two rows (plain Kastanie = Rosskastanie, Ki = Kiefer,
+       Kir = Kirsche, Eiche / Ei = the genus Quercus, Fichte / Tanne / Buche / Lärche / Esche = the one species).
+  RESOLVER — how `species` of a report is read. Case, diacritics, ß/ss, ä/ae (and plain a), ×/x, hyphens, dots and
+       spaces do not matter. First hit wins; the answer always carries the canonical `taxon`:
+         1. exact taxon / de / en / codes / alt value          "Fi", "PIEAB", "Rottanne", "norway spruce", "Weisskiefer"
+         2. Latin abbreviation matching exactly ONE listed species (not listed in the dictionary — compute them the
+            same way client-side): genus prefix + epithet prefix ("P. abies", "Pic. abi.", "Quercus ro"), or n+n
+            letters for n = 2, 3, 4 ("PiAb", "PicAbi", "PiceAbie"); a bare genus → its genus row. Several species
+            match ("PrSe") → 400 {{reason:"ambiguous", did_you_mean:[… by rank]}}
+         3. a well-formed scientific binomial we do not list → stored as written + tree.warning (one letter off a
+            listed name is treated as a typo → 400 + did_you_mean)
+         4. anything else → 400 {{error, did_you_mean:[≤ 5 taxa, best match first, ties by rank]}} — near-misses by edit
+            distance ≤ 1 (≤ 2 from 7 characters), then names starting with / containing the input
+  GET /api/v1/trees/taxa/top[?bbox=w,s,e,n][&limit=12 (≤ 50)]   what is used here — for "first proposed" (max-age 60)
+       → {{rev (dictionary), tree_rev, named:[[taxon, n]…], classes:[[class, n]…], apexes, approximate,
+          scope:{{named:"bbox"|"national", classes:"bbox"|"national"}}}}
+       named = trees people named inside the bbox, by count (ties by rank); classes = our model class of the apexes
+       ≥ 3 m in the bbox (tallest 20 000 counted — `approximate` when there are more; a bbox over 0.01 deg² gets the
+       national tally, see scope). No bbox → national: every named tree, and a sampled class tally of the corpus.
+       The model class is a coarse hint (mostly spruce / pine / larch) — rank a class's taxa up, do not show it as fact.
+       Suggested order for a species box: named in view → the reader's own recent picks → rank.
 
 """
 
