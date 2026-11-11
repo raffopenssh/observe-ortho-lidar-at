@@ -376,7 +376,8 @@ IDENTITY — say which tree you mean, in this order of preference:
        and NOTHING is written, unless "force": true (second stem, understorey) or that apex already carries a report.
        → 201 {{id, tally, tree{{…added:true, client_id?}}}}
   Withdraw: {{…identity…, "species": null}} or {{…identity…, "retract": true}} → op:"retract"; never writes a flag
-       row. identity = tree_id | client_id | lon+lat; layer / claim are optional (a body with retract:true and no
+       row, and withdrawing a tree you added also removes the trees / missing flag row its add wrote (answer then
+       carries flag_removed:<id> + tally). identity = tree_id | client_id | lon+lat; layer / claim are optional (a body with retract:true and no
        layer is a tree withdraw, never a generic flag). It withdraws everything YOU said about that tree — for a
        tree you added, the tree itself. Only your own reports (same "reporter" + reporter key) are withdrawn:
          201 withdrawn | 200 folded:true + tree.warning "already withdrawn …" (yours, withdrawn before)

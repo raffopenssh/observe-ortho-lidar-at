@@ -113,7 +113,8 @@ def main() -> int:
                                           'claim': 'missing', 'retract': True, 'reporter': 'u1'})
         j = r.get_json()
         assert r.status_code == 201 and j['tree']['op'] == 'retract' and not j['tree']['added'], j
-        assert pf._conn().execute('SELECT COUNT(*) FROM report').fetchone()[0] == n_flags
+        # … and the trees / missing flag row the add wrote goes with it
+        assert pf._conn().execute('SELECT COUNT(*) FROM report').fetchone()[0] == n_flags - 1 and j['flag_removed'], j
         L = c.get(f'/api/v1/trees/taxa?since={rev0}').get_json()
         assert L['count'] == 1 and L['columns']['added'] == [0] and L['columns']['dbh_cm'] == [None], L
         # --- "retract": "last" = undo only my latest version (previous one is current again)
@@ -127,7 +128,8 @@ def main() -> int:
         assert r.status_code == 201 and j['tree']['op'] == 'undo' and j['tree']['undone_op'] == 'species', j
         assert j['tree']['dbh_cm'] == 10 and j['tree']['taxon'] is None and j['tree']['added'], j
         # a full retract can be undone too
-        assert not c.post('/api/v1/flags', json={**CID, 'retract': True}).get_json()['tree']['added']
+        j = c.post('/api/v1/flags', json={**CID, 'retract': True}).get_json()
+        assert not j['tree']['added'] and j['flag_removed'] and 'missing' not in j['tally']['claims'], j
         j = c.post('/api/v1/flags', json={**CID, 'retract': 'last'}).get_json()
         assert j['tree']['undone_op'] == 'retract' and j['tree']['added'] and j['tree']['dbh_cm'] == 10, j
         # the add itself is the latest → the tree goes; then nothing is left (200)
@@ -226,7 +228,7 @@ def main() -> int:
         nfl = pf._conn().execute('SELECT COUNT(*) FROM report').fetchone()[0]
         r = c.post('/api/v1/flags', json={'lon': blon + dl, 'lat': alat, 'species': None, 'reporter': 'u2'})
         assert r.get_json()['tree']['op'] == 'retract' and not r.get_json()['tree']['added'], r.data
-        assert pf._conn().execute('SELECT COUNT(*) FROM report').fetchone()[0] == nfl
+        assert pf._conn().execute('SELECT COUNT(*) FROM report').fetchone()[0] == nfl - 1 and r.get_json()["flag_removed"]
         # reporter keys: identified caller, shown as `by` in the history; a wrong key is 401
         pf.KEYS_PATH = tmp / 'keys.json'; pf.KEYS_PATH.write_text('{"trk_test_1": "forestry"}')
         assert c.post('/api/v1/flags', json={'client_id': cid, 'dbh_cm': 14, 'reporter_key': 'nope'}).status_code == 401
@@ -255,7 +257,7 @@ def main() -> int:
         assert res[0]['tree']['op'] == 'retract' and res[0]['layer'] == 'trees' and 'id' not in res[0], res[0]
         assert res[1]['claim'] == 'too_tall' and res[1]['tally']['claims'].get('too_tall') == 1 and 'other' not in res[1]['tally']['claims'], res[1]
         assert res[2]['folded'] and 'already withdrawn' in res[2]['tree']['warning'], res[2]
-        assert pf._conn().execute('SELECT COUNT(*) FROM report').fetchone()[0] == nfl + 1
+        assert pf._conn().execute("SELECT COUNT(*) FROM report").fetchone()[0] == nfl and res[0]["flag_removed"]
         assert not pf._names_tree({'lon': 1, 'lat': 2, 'layer': 'cells.cover', 'retract': True}) and not pf._names_tree({'retract': True})
         # anyone can get a key; self-issued holders are marked
         r = c.post('/api/v1/flags/token', json={'name': 'Wald App'})

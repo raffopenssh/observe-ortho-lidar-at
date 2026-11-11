@@ -452,6 +452,31 @@ def _retract(c, subj: dict, layer: str, claim: str, rep: bytes) -> dict:
     return out
 
 
+def _drop_added_flag(c, subj: dict, tree: dict, rep: bytes) -> dict:
+    """A reporter withdrew (or undid the add of) a tree they added: the trees / missing flag row that add
+    wrote goes with it.  Looked up in the cell of the request point and of the tree itself."""
+    if tree.get('matched') != 'added' or not (tree.get('op') == 'retract' or tree.get('undone_op') == 'add'):
+        return {}
+    cid_ = _DICT.get(('claim', 'missing'))
+    lays = [i for i in (_DICT.get(('layer', l)) for l in TREE_LAYERS) if i is not None]
+    keys = {subj['skey']}
+    try:
+        h3 = _h3()
+        keys.add(h3.str_to_int(h3.latlng_to_cell(tree['lat'], tree['lon'], RES)))
+    except Exception:  # noqa: BLE001
+        pass
+    if cid_ is None or not lays:
+        return {}
+    with _LOCK:
+        ids = [r[0] for r in c.execute(
+            'DELETE FROM report WHERE skey IN (%s) AND layer IN (%s) AND claim=? AND reporter=? RETURNING id'
+            % (','.join('?' * len(keys)), ','.join('?' * len(lays))), (*keys, *lays, cid_, rep)).fetchall()]
+    if not ids:
+        return {}
+    _heat_cache.clear()
+    return {'flag_removed': ids[0], 'tally': tally(subj['skey'])}
+
+
 def record(body: dict, client: str, org: str | None = None) -> dict:
     if not isinstance(body, dict):
         raise FlagError(400, 'report must be a JSON object')
@@ -479,11 +504,12 @@ def record(body: dict, client: str, org: str | None = None) -> dict:
         src = _clean_note(body.get('source'))
         rp = body.get('reporter')
         epoch = str(body['epoch'])[:40] if body.get('epoch') else _epoch_now(subj['kg'])
-        tree = tu.record(body, subj, claim, _reporter_hash(str(rp)[:120] if rp not in (None, '') else None, client, org),
-                         _dict_id(c, 'source', src[:MAX_SOURCE]) if src else None, epoch,
+        rep = _reporter_hash(str(rp)[:120] if rp not in (None, '') else None, client, org)
+        tree = tu.record(body, subj, claim, rep, _dict_id(c, 'source', src[:MAX_SOURCE]) if src else None, epoch,
                          _dict_id(c, 'org', org) if org else None)
         out = {'rev': tree.get('rev'), 'folded': tree['folded'], 'status': 'open', 'layer': layer, 'claim': claim,
                'subject': _subject_public(subj), 'epoch': epoch, 'tree': tree}
+        out.update(_drop_added_flag(c, subj, tree, rep))
         warn = [k for k in body if k not in _KNOWN]
         if warn:
             out['warnings'] = [f'ignored unknown field(s): {", ".join(sorted(warn))}']
@@ -534,7 +560,8 @@ def record(body: dict, client: str, org: str | None = None) -> dict:
             log.warning('tree add failed: %s', e)
         if tree is not None and tree.get('op') in ('retract', 'undo'):
             return {'rev': tree.get('rev'), 'folded': tree['folded'], 'status': 'open', 'layer': layer,
-                    'claim': claim, 'subject': _subject_public(subj), 'epoch': epoch, 'tree': tree}
+                    'claim': claim, 'subject': _subject_public(subj), 'epoch': epoch, 'tree': tree,
+                    **_drop_added_flag(c, subj, tree, rep)}
     lon_e6 = int(round(subj['lon'] * 1e6)) if subj['lon'] is not None else None
     lat_e6 = int(round(subj['lat'] * 1e6)) if subj['lat'] is not None else None
     global _WRITES

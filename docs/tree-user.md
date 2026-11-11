@@ -79,3 +79,8 @@ row has `b''`), so every `hidden` reader (`_derive`, `record`, `_mine_ok`,
 `history`) follows unchanged. `/history` labels it `op: "undo"`. Undoing a
 retract restores what was there; undoing the add removes the tree. Answers
 201 `tree{op:"undo", undone_rev, undone_op}` / 200 folded / 403 `not_yours`.
+
+Withdrawing an added tree (`retract: true`, or `"last"` when the add was the
+latest) also deletes the reporter's `trees` / `missing` flag row that the add
+wrote (`public_flags._drop_added_flag`; answer carries `flag_removed` + `tally`).
+Undoing such a withdraw restores the tree but not that flag row.
