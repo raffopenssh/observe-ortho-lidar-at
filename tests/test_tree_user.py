@@ -71,6 +71,21 @@ def main() -> int:
         # retract
         j = c.post('/api/v1/flags', json={'lon': lon, 'lat': lat, 'claim': 'species', 'layer': 'trees', 'species': None, 'reporter': 'u2'}).get_json()
         assert j['tree']['taxon'] == 'Abies alba' and j['tree']['v'] == 6, j
+        # measures: dbh + own height on the same tree (no species needed), median over reporters, versioned
+        j = c.post('/api/v1/flags', json={'lon': lon, 'lat': lat, 'dbh_cm': 62, 'reporter': 'u1'}).get_json()
+        assert j['claim'] == 'species' and j['tree']['dbh_cm'] == 62.0 and j['tree']['v'] == 7 and j['tree']['taxon'] == 'Abies alba', j
+        assert c.post('/api/v1/flags', json={'lon': lon, 'lat': lat, 'dbh_cm': 62, 'reporter': 'u1'}).get_json()['folded']
+        j = c.post('/api/v1/flags', json={'lon': lon, 'lat': lat, 'layer': 'trees', 'claim': 'tree', 'h_m': 31.5, 'dbh_cm': 70,
+                                          'reporter': 'u7'}).get_json()
+        assert j['tree']['h_m'] == 31.5 and j['tree']['dbh_cm'] == 70.0 and j['tree']['v'] == 8 and j['tree']['height_m'], j
+        assert c.post('/api/v1/flags', json={'lon': lon, 'lat': lat, 'dbh_cm': 9000}).status_code == 400
+        col = ne_trees.columns_bbox(*BB, 'trees', min_height=20, limit=50, fields=('lon', 'h_m', 'dbh_cm', 'h_user_m'))
+        assert col['user']['dbh_cm'] == [70.0] and col['user']['h_user_m'] == [31.5] and col['columns']['dbh_cm'][3] == 70.0
+        assert col['columns']['h_m'][3] == base['columns']['h_m'][3]          # LiDAR height untouched
+        row = ne_trees.points_bbox(*BB, 'trees', min_height=20, limit=50)['trees'][3]
+        assert row['dbh_cm'] == 70.0 and row['height_user_m'] == 31.5 and row['height_m'] == base['columns']['h_m'][3]
+        h = c.get(f'/api/v1/trees/taxa/history?lon={lon}&lat={lat}').get_json()
+        assert h['versions'][-1]['dbh_cm'] == 70.0 and h['versions'][-1]['h_m'] == 31.5
         # add: refused on top of an apex, accepted in a gap
         j = c.post('/api/v1/flags', json={'lon': lon, 'lat': lat, 'layer': 'trees', 'claim': 'missing', 'reporter': 'u1'}).get_json()
         assert j['id'] and 'already' in j['tree']['error'], j
@@ -93,9 +108,12 @@ def main() -> int:
         # someone else names the added tree 1 m away
         j3 = c.post('/api/v1/flags', json={'lon': alon + 0.00001, 'lat': alat, 'species': 'Juglans regia', 'reporter': 'u9'}).get_json()
         assert j3['tree']['matched'] == 'added' and j3['tree']['n'] == 2 and j3['tree']['v'] == v0 + 1, j3
+        j4 = c.post('/api/v1/flags', json={'lon': alon, 'lat': alat, 'h_m': 7, 'dbh_cm': 18.5, 'layer': 'trees', 'claim': 'tree',
+                                           'reporter': 'u1'}).get_json()          # update my height + dbh on the added tree
+        assert j4['tree']['h_m'] == 7.0 and j4['tree']['dbh_cm'] == 18.5 and j4['tree']['v'] == v0 + 2, j4
         kgs = [pf._kg_for_point(alon, alat)]
         a = tu.added(alon - 0.001, alat - 0.001, alon + 0.001, alat + 0.001, kgs, 3, 8)
-        assert a and a['taxon'] == ['Juglans regia'] and a['h_m'] == [6.0]
+        assert a and a['taxon'] == ['Juglans regia'] and a['h_m'] == [7.0] and a['dbh_cm'] == [18.5]
         assert tu.added(alon - 0.001, alat - 0.001, alon + 0.001, alat + 0.001, kgs, 8, 14) is None
         lst = c.get(f'/api/v1/trees/taxa?kg={kgs[0]}')
         L = lst.get_json()

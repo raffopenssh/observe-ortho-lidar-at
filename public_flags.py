@@ -87,7 +87,8 @@ CLAIMS = (
     'stale',         # changed since our observation date
     'artifact',      # processing artefact (stripe, seam, tile edge, NaN hole)
     'looks_right',   # positive confirmation — counts as QA evidence
-    'species',       # layer trees + a point: name the tree there (versioned per tree, tree_user.py)
+    'species',       # layer trees + a point: describe the tree there — species, dbh_cm, h_m (versioned, tree_user.py)
+    'tree',          # same as species (clearer name when only dbh_cm / h_m are sent)
     'other',
 )
 STATUS = ('open', 'confirmed', 'rejected', 'fixed', 'stale')
@@ -370,14 +371,14 @@ def _clean_note(s) -> str | None:
 
 
 _KNOWN = {'cell', 'lon', 'lat', 'kg', 'kg_code', 'layer', 'claim', 'observed', 'expected', 'note', 'source',
-          'reporter', 'epoch', 'species', 'taxon', 'h_m'}
+          'reporter', 'epoch', 'species', 'taxon', 'h_m', 'dbh_cm'}
 TREE_LAYERS = ('trees', 'cells.trees')
 
 
 def record(body: dict, client: str) -> dict:
     if not isinstance(body, dict):
         raise FlagError(400, 'report must be a JSON object')
-    names_tree = any(body.get(k) not in (None, '') for k in ('species', 'taxon'))
+    names_tree = any(body.get(k) not in (None, '') for k in ('species', 'taxon', 'dbh_cm'))
     layer = str(body.get('layer') or ('trees' if names_tree else 'other')).strip().lower()
     if layer not in LAYERS:
         raise FlagError(400, f'layer must be one of {", ".join(LAYERS)}', layers=LAYERS)
@@ -386,10 +387,12 @@ def record(body: dict, client: str) -> dict:
         raise FlagError(400, f'claim must be one of {", ".join(CLAIMS)}', claims=CLAIMS)
     subj = _subject(body)
     has_point = body.get('lon') is not None and body.get('lat') is not None
+    if claim == 'tree':
+        claim = 'species'
     if claim == 'species':
         # per-tree, versioned: lives in tree_ver only (no folded report row)
         if layer not in TREE_LAYERS or not has_point:
-            raise FlagError(400, 'claim "species" needs layer "trees" and a point: {lon, lat, species}')
+            raise FlagError(400, 'claim "species" / "tree" needs layer "trees" and a point: {lon, lat, species | dbh_cm | h_m}')
         import tree_user as tu
         c = _conn()
         src = _clean_note(body.get('source'))
@@ -756,8 +759,8 @@ def dict_block() -> dict:
             'fold': 'same subject + layer + claim + reporter → one row, n += 1 (reporter = your opaque id, '
                     'else a salted hash of the client IP; neither is stored or returned)',
             'superseded': 'read-side flag: the KG product was rebuilt since the report (epoch differs)',
-            'trees': 'layer trees + lon,lat: claim species {species} names the tree at the point, claim missing '
-                     '[{species, h_m}] adds one we do not have — versioned per tree; /api/v1/trees/taxa[/dict|/history]'}
+            'trees': 'layer trees + lon,lat: claim species (= tree) {species, dbh_cm, h_m} describes the tree at the point, '
+                     'claim missing [{species, dbh_cm, h_m}] adds one we do not have — versioned per tree; /api/v1/trees/taxa[/dict|/history]'}
 
 
 # === SECTION: HTTP ===

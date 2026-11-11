@@ -17,10 +17,15 @@ Public contract: `public_docs.FLAGS_TXT → #tree-species`. Test: `python3 tests
   `POST /api/v1/trees/taxa/<rev>/moderate`, admin token). Each version stores the product epoch it was
   made against. A reporter repeating the same value writes nothing. Caps: 200 versions/tree, 5 M rows,
   3000 free-form taxa.
+* **Measures**: any tree report may carry `dbh_cm` (1–600, stored mm in `dbh_mm`) and `h_m` (the
+  reporter's own height, 1–70, `uh_dm`); alone they use `claim: tree` (alias of `species`). Re-sending a
+  different value is a new version; current value = median of each reporter's latest. The LiDAR
+  `height_m` / `h_m` is never replaced — the reported height is served as `h_user_m` / `height_user_m`
+  (`h_dm` in the table is only the apex height at match time, used for the orphan re-attach).
 * **Current answer** (`_derive`): each reporter's latest live version votes; plurality, tie → newest.
   Cached per KG (`_state`), revalidated across workers with one `MAX(rev)` query per request.
-* **Out**: `ne_trees.collect` → `_user_blocks`: sparse `user {i, taxon, n, v}` + `added {…}`; rows get
-  `taxon/taxon_n/taxon_v`; `fields=taxon` dense column. Nothing is emitted for KGs without reports, so
+* **Out**: `ne_trees.collect` → `_user_blocks`: sparse `user {i, taxon, n, v[, h_user_m, dbh_cm]}` + `added {…}`;
+  rows get `taxon/taxon_n/taxon_v[/height_user_m/dbh_cm]`; `fields=taxon,h_user_m,dbh_cm` dense columns. Nothing is emitted for KGs without reports, so
   bodies / ETags / the 1-day cache of untouched KGs are unchanged; touched KGs get `u=<rev>` in the
   ETag and max-age 300 (`public_api.TREES_USER_MAX_AGE`). Delta feed `/api/v1/trees/taxa?since=`,
   history `/api/v1/trees/taxa/history`, dictionary `/api/v1/trees/taxa/dict` (`TAXA`, ~90 rows with

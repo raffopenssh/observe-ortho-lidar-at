@@ -62,7 +62,7 @@ _SCHEMA = [
         kg INTEGER NOT NULL,
         op INTEGER NOT NULL,                -- 0 species | 1 add | 2 retract | 3 moderated (ref = hidden rev)
         sp INTEGER,                         -- dict id (kind 'taxon')
-        h_dm INTEGER,                       -- op 0: apex height when matched; op 1: reporter's height estimate (dm)
+        h_dm INTEGER,                       -- apex height when matched (dm; NULL for added trees)
         reporter BLOB NOT NULL,             -- 8-byte salted hash, never returned
         source INTEGER,                     -- dict id
         epoch INTEGER,                      -- dict id (kind 'epoch'): product epoch the version was made against
@@ -70,6 +70,10 @@ _SCHEMA = [
     )""",
     'CREATE INDEX IF NOT EXISTS tv_kg ON tree_ver(kg, x, y)',
 ]
+_ADD_COLS = (('uh_dm', 'INTEGER'),      # reporter's own height measurement / estimate (dm)
+             ('dbh_mm', 'INTEGER'))     # reporter's diameter at breast height (mm)
+DBH_CM = (1.0, 600.0)
+H_M = (1.0, 70.0)
 
 # (scientific name, German, English, model class of /trees/bbox `species`)
 _T = """Picea abies|Fichte|Norway spruce|spruce
@@ -228,6 +232,13 @@ def _conn():
     if getattr(pf._TLS, 'tu_c', None) is not c:
         for s in _SCHEMA:
             c.execute(s)
+        have = {r[1] for r in c.execute('PRAGMA table_info(tree_ver)')}
+        for col, typ in _ADD_COLS:
+            if col not in have:
+                try:
+                    c.execute(f'ALTER TABLE tree_ver ADD COLUMN {col} {typ}')
+                except Exception:  # noqa: BLE001 — another worker won the race
+                    pass
         pf._TLS.tu_c = c
     return c
 
@@ -262,19 +273,25 @@ def _derive(rows) -> dict:
     """rows of ONE tree in rev order → its current answer."""
     hidden = {r['ref'] for r in rows if r['op'] == OP_MODERATE}
     votes: dict = {}         # reporter -> (rev, sp)
-    adds: dict = {}          # reporter -> h_dm | None
+    adds: set = set()        # reporters who added the tree
+    uh: dict = {}            # reporter -> own height (dm)
+    dbh: dict = {}           # reporter -> dbh (mm)
     apex_h = None
     for r in rows:
         if r['op'] == OP_MODERATE or r['rev'] in hidden:
             continue
         rep = bytes(r['reporter'])
         if r['op'] == OP_RETRACT:
-            votes.pop(rep, None); adds.pop(rep, None)
+            votes.pop(rep, None); adds.discard(rep); uh.pop(rep, None); dbh.pop(rep, None)
             continue
         if r['op'] == OP_ADD:
-            adds[rep] = r['h_dm']
+            adds.add(rep)
         elif r['h_dm'] is not None:
             apex_h = r['h_dm']
+        if r['uh_dm'] is not None:
+            uh[rep] = r['uh_dm']
+        if r['dbh_mm'] is not None:
+            dbh[rep] = r['dbh_mm']
         if r['sp'] is not None:
             votes[rep] = (r['rev'], r['sp'])
     sp = None; n = 0
@@ -283,13 +300,14 @@ def _derive(rows) -> dict:
         for rev, s in votes.values():
             a = cnt.setdefault(s, [0, 0]); a[0] += 1; a[1] = max(a[1], rev)
         sp, (n, _) = max(cnt.items(), key=lambda kv: (kv[1][0], kv[1][1]))
-    hs = sorted(h for h in adds.values() if h is not None)
-    return {'sp': sp, 'n': n, 'added': bool(adds), 'h_dm': hs[len(hs) // 2] if hs else None, 'apex_h': apex_h,
-            'v': len(rows), 'rev': rows[-1]['rev'], 'reporters': len(set(votes) | set(adds))}
+    hs = sorted(uh.values()); ds = sorted(dbh.values())          # several reporters → median
+    return {'sp': sp, 'n': n, 'added': bool(adds), 'h_dm': hs[len(hs) // 2] if hs else None,
+            'dbh_mm': ds[len(ds) // 2] if ds else None, 'apex_h': apex_h,
+            'v': len(rows), 'rev': rows[-1]['rev'], 'reporters': len(set(votes) | adds | set(uh) | set(dbh))}
 
 
 def _load(c, kg: int) -> dict:
-    rows = c.execute('SELECT rev, x, y, op, sp, h_dm, reporter, ref FROM tree_ver WHERE kg=? ORDER BY rev', (kg,)).fetchall()
+    rows = c.execute('SELECT rev, x, y, op, sp, h_dm, uh_dm, dbh_mm, reporter, ref FROM tree_ver WHERE kg=? ORDER BY rev', (kg,)).fetchall()
     if not rows:
         return dict(_EMPTY, path=str(pf.DB_PATH))
     by: dict = {}
@@ -304,8 +322,9 @@ def _load(c, kg: int) -> dict:
           'added': np.array([d['added'] for d in cur], bool), 'v': np.array([d['v'] for d in cur], np.int32),
           'trev': np.array([d['rev'] for d in cur], np.int64),
           'h': np.array([np.nan if d['h_dm'] is None else d['h_dm'] / 10.0 for d in cur]),
+          'dbh': np.array([np.nan if d['dbh_mm'] is None else d['dbh_mm'] / 10.0 for d in cur]),
           'apex_h': np.array([np.nan if d['apex_h'] is None else d['apex_h'] / 10.0 for d in cur])}
-    st['live'] = (st['sp'] > 0) | st['added']
+    st['live'] = (st['sp'] > 0) | st['added'] | np.isfinite(st['h']) | np.isfinite(st['dbh'])
     return st
 
 
@@ -368,18 +387,23 @@ def annotate(x: np.ndarray, y: np.ndarray, h: np.ndarray, kgs) -> dict | None:
     if not sts:
         return None
     key = (x.astype(np.int64) << 32) | y.astype(np.int64)
-    out_i: list = []; out_sp: list = []; out_n: list = []; out_v: list = []
+    out_i: list = []; out_sp: list = []; out_n: list = []; out_v: list = []; out_h: list = []; out_d: list = []
+
+    def take(k, j):
+        out_i.append(k); out_sp.append(int(ssp[j])); out_n.append(int(scn[j])); out_v.append(int(sv[j]))
+        out_h.append(_num(suh[j])); out_d.append(_num(sdb[j]))
+
     for s in sts:
-        m = (s['sp'] > 0) & ~s['added']
+        m = s['live'] & ~s['added']
         if not m.any():
             continue
-        sk = s['key'][m]; ssp = s['sp'][m]; scn = s['cnt'][m]; sv = s['v'][m]
+        sk = s['key'][m]; ssp = s['sp'][m]; scn = s['cnt'][m]; sv = s['v'][m]; suh = s['h'][m]; sdb = s['dbh'][m]
         order = np.argsort(key, kind='stable')
         pos = np.searchsorted(key[order], sk)
         pos[pos >= key.size] = 0
         hit = key[order][pos] == sk
         for j in np.nonzero(hit)[0].tolist():
-            out_i.append(int(order[pos[j]])); out_sp.append(int(ssp[j])); out_n.append(int(scn[j])); out_v.append(int(sv[j]))
+            take(int(order[pos[j]]), j)
         miss = np.nonzero(~hit)[0]
         if miss.size and miss.size <= 500:      # apex moved by a rebuild: same spot ± 1.5 m and same height
             sx = s['x'][m]; sy = s['y'][m]; sh = s['apex_h'][m]
@@ -389,13 +413,21 @@ def annotate(x: np.ndarray, y: np.ndarray, h: np.ndarray, kgs) -> dict | None:
                 d2 = (x - sx[j]).astype(np.float64) ** 2 + (y - sy[j]).astype(np.float64) ** 2
                 k = int(np.argmin(d2))
                 if d2[k] <= ORPHAN_M ** 2 and abs(float(h[k]) - float(sh[j])) <= ORPHAN_DH_M:
-                    out_i.append(k); out_sp.append(int(ssp[j])); out_n.append(int(scn[j])); out_v.append(int(sv[j]))
+                    take(k, j)
     if not out_i:
         return None
     o = sorted(range(len(out_i)), key=out_i.__getitem__)
     seen = set(); keep = [j for j in o if not (out_i[j] in seen or seen.add(out_i[j]))]
-    return {'i': [out_i[j] for j in keep], 'taxon': [_taxon(out_sp[j]) for j in keep],
-            'n': [out_n[j] for j in keep], 'v': [out_v[j] for j in keep]}
+    u = {'i': [out_i[j] for j in keep], 'taxon': [_taxon(out_sp[j]) for j in keep],
+         'n': [out_n[j] for j in keep], 'v': [out_v[j] for j in keep]}
+    for name, col in (('h_user_m', out_h), ('dbh_cm', out_d)):       # only when someone measured one
+        if any(col[j] is not None for j in keep):
+            u[name] = [col[j] for j in keep]
+    return u
+
+
+def _num(v) -> float | None:
+    return round(float(v), 1) if np.isfinite(v) else None
 
 
 def added(w, s, e, n, kgs, min_h: float = 0.0, max_h: float | None = None) -> dict | None:
@@ -406,7 +438,7 @@ def added(w, s, e, n, kgs, min_h: float = 0.0, max_h: float | None = None) -> di
     g = global_rev()
     if not g:
         return None
-    out = {'lon': [], 'lat': [], 'h_m': [], 'taxon': [], 'n': [], 'v': []}
+    out = {'lon': [], 'lat': [], 'h_m': [], 'taxon': [], 'n': [], 'v': [], 'dbh_cm': []}
     seen = set()
     for k in kgs:
         st = state(k, g)
@@ -422,9 +454,13 @@ def added(w, s, e, n, kgs, min_h: float = 0.0, max_h: float | None = None) -> di
                 continue
             seen.add(kk)
             out['lon'].append(round(float(st['lon'][j]), 6)); out['lat'].append(round(float(st['lat'][j]), 6))
-            out['h_m'].append(None if not np.isfinite(st['h'][j]) else round(float(st['h'][j]), 1))
+            out['h_m'].append(_num(st['h'][j])); out['dbh_cm'].append(_num(st['dbh'][j]))
             out['taxon'].append(_taxon(st['sp'][j])); out['n'].append(int(st['cnt'][j])); out['v'].append(int(st['v'][j]))
-    return out if out['lon'] else None
+    if not out['lon']:
+        return None
+    if all(v is None for v in out['dbh_cm']):
+        del out['dbh_cm']
+    return out
 
 
 # === SECTION: write (called from public_flags.record) ===
@@ -486,7 +522,8 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
     exp = body.get('expected') if isinstance(body.get('expected'), dict) else {}
     has_sp = any(k in d for d in (body, exp) for k in ('species', 'taxon'))
     raw = next((d[k] for d in (body, exp) for k in ('species', 'taxon') if d.get(k) not in (None, '')), None)
-    h_m = body.get('h_m', exp.get('h_m', exp.get('height_m')))
+    uh_dm = _measure(body, exp, ('h_m', 'height_m'), H_M, 10, 'h_m', 'm')
+    dbh_mm = _measure(body, exp, ('dbh_cm', 'dbh'), DBH_CM, 10, 'dbh_cm', 'cm')
     lon, lat = subj['lon'], subj['lat']
     px, py = _to_3035(lon, lat)
     latin = known = None
@@ -500,10 +537,10 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
                                     'To add a tree we do not have: claim "missing" with the same point.',
                                hint={'layer': 'trees', 'claim': 'missing'})
         kind, x, y, kg, dist, apex_h = m
-        if latin is None:
+        if latin is None and uh_dm is None and dbh_mm is None:
             if not has_sp:
-                raise pf.FlagError(400, 'species required: {"species": "Quercus robur"} (null withdraws your report)',
-                                   dict='/api/v1/trees/taxa/dict')
+                raise pf.FlagError(400, 'say something about the tree: species, dbh_cm and / or h_m '
+                                        '("species": null withdraws your report)', dict='/api/v1/trees/taxa/dict')
             op, sp, h_dm = OP_RETRACT, None, None
         else:
             op, h_dm = OP_SPECIES, (None if apex_h is None else int(round(apex_h * 10)))
@@ -519,13 +556,7 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
             if not subj.get('kg'):
                 raise pf.FlagError(400, 'point lies in no KG we know')
             kind, x, y, kg, dist, apex_h = 'added', int(round(px)), int(round(py)), int(subj['kg']), 0.0, None
-        op = OP_ADD
-        try:
-            h_dm = None if h_m in (None, '') else int(round(float(h_m) * 10))
-        except (TypeError, ValueError):
-            raise pf.FlagError(400, 'h_m must be a number (metres)')
-        if h_dm is not None and not (10 <= h_dm <= 700):
-            raise pf.FlagError(400, 'h_m must be 1–70 m')
+        op, h_dm = OP_ADD, None
     if latin is not None and not known and not _free_taxa_ok(c, latin):
         raise pf.FlagError(400, 'too many free-form species names; use one from the dictionary', dict='/api/v1/trees/taxa/dict')
     sp = pf._dict_id(c, 'taxon', latin) if latin else None
@@ -535,29 +566,33 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
     with pf._LOCK:
         c.execute('BEGIN IMMEDIATE')
         try:
-            rows = c.execute('SELECT rev, op, sp, h_dm, reporter, ref FROM tree_ver WHERE kg=? AND x=? AND y=? ORDER BY rev',
+            rows = c.execute('SELECT rev, op, sp, uh_dm, dbh_mm, reporter, ref FROM tree_ver WHERE kg=? AND x=? AND y=? ORDER BY rev',
                              (kg, x, y)).fetchall()
             hidden = {r['ref'] for r in rows if r['op'] == OP_MODERATE}
             mine = [r for r in rows if bytes(r['reporter']) == rep and r['op'] != OP_MODERATE and r['rev'] not in hidden]
-            last = mine[-1] if mine else None
+            since = 0                               # my versions after my last retraction
+            for i, r in enumerate(mine):
+                if r['op'] == OP_RETRACT:
+                    since = i + 1
+            cur = mine[since:]
+
+            def latest(col):
+                return next((r[col] for r in reversed(cur) if r[col] is not None), None)
+
             if op == OP_RETRACT:
-                if last is None or last['op'] == OP_RETRACT:
-                    folded = True
-            elif op == OP_ADD:
-                mine_add = any(r['op'] == OP_ADD for r in mine) and (last is None or last['op'] != OP_RETRACT)
-                cur_sp = next((r['sp'] for r in reversed(mine) if r['sp'] is not None), None) if mine_add else None
-                cur_h = next((r['h_dm'] for r in reversed(mine) if r['op'] == OP_ADD), None) if mine_add else None
-                if mine_add and (sp is None or sp == cur_sp) and (h_dm is None or h_dm == cur_h):
-                    folded = True
-            elif last is not None and last['op'] != OP_RETRACT and last['sp'] == sp:
-                folded = True
+                folded = not cur
+            else:
+                folded = bool(cur) and all(v is None or v == latest(col)
+                                           for col, v in (('sp', sp), ('uh_dm', uh_dm), ('dbh_mm', dbh_mm)))
+                if op == OP_ADD and not any(r['op'] == OP_ADD for r in cur):
+                    folded = False
             if not folded:
                 if len(rows) >= MAX_VERSIONS_PER_TREE:
                     raise pf.FlagError(429, f'this tree already has {MAX_VERSIONS_PER_TREE} versions')
                 if c.execute('SELECT COUNT(*) FROM tree_ver').fetchone()[0] >= MAX_ROWS:
                     raise pf.FlagError(507, 'tree store full')
-                c.execute('INSERT INTO tree_ver(ts, x, y, kg, op, sp, h_dm, reporter, source, epoch) VALUES (?,?,?,?,?,?,?,?,?,?)',
-                          (now, x, y, kg, op, sp, h_dm, rep, source_id, ep))
+                c.execute('INSERT INTO tree_ver(ts, x, y, kg, op, sp, h_dm, reporter, source, epoch, uh_dm, dbh_mm) '
+                          'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', (now, x, y, kg, op, sp, h_dm, rep, source_id, ep, uh_dm, dbh_mm))
             c.execute('COMMIT')
         except Exception:
             c.execute('ROLLBACK')
@@ -569,6 +604,19 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
     if latin is not None and not known:
         out['warning'] = 'species not in our dictionary — stored as written; check /api/v1/trees/taxa/dict'
     return out
+
+
+def _measure(body, exp, keys, rng, scale, name, unit) -> int | None:
+    v = next((d[k] for d in (body, exp) for k in keys if d.get(k) not in (None, '')), None)
+    if v is None:
+        return None
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        raise pf.FlagError(400, f'{name} must be a number ({unit})')
+    if not (rng[0] <= v <= rng[1]):
+        raise pf.FlagError(400, f'{name} must be {rng[0]:g}–{rng[1]:g} {unit}')
+    return int(round(v * scale))
 
 
 def tree_at(kg: int, x: int, y: int) -> dict | None:
@@ -585,7 +633,9 @@ def _public(st: dict, j: int) -> dict:
          'class': taxon_class(t), 'n': int(st['cnt'][j]), 'v': int(st['v'][j]), 'rev': int(st['trev'][j]),
          'added': bool(st['added'][j])}
     if np.isfinite(st['h'][j]):
-        d['h_m'] = round(float(st['h'][j]), 1)
+        d['h_m'] = round(float(st['h'][j]), 1)          # reporters' own height (median), not the LiDAR one
+    if np.isfinite(st['dbh'][j]):
+        d['dbh_cm'] = round(float(st['dbh'][j]), 1)
     return d
 
 
@@ -605,7 +655,7 @@ def moderate(rev: int) -> dict | None:
 
 # === SECTION: listing / history / stats ===
 
-LIST_FIELDS = ('lon', 'lat', 'taxon', 'n', 'v', 'rev', 'added', 'h_m')
+LIST_FIELDS = ('lon', 'lat', 'taxon', 'n', 'v', 'rev', 'added', 'h_m', 'dbh_cm')
 
 
 def listing(bbox=None, kg=None, since: int = 0, limit: int = LIST_LIMIT) -> dict:
@@ -645,7 +695,7 @@ def listing(bbox=None, kg=None, since: int = 0, limit: int = LIST_LIMIT) -> dict
         cols['lon'].append(round(float(st['lon'][j]), 6)); cols['lat'].append(round(float(st['lat'][j]), 6))
         cols['taxon'].append(_taxon(st['sp'][j])); cols['n'].append(int(st['cnt'][j])); cols['v'].append(int(st['v'][j]))
         cols['rev'].append(int(st['trev'][j])); cols['added'].append(int(st['added'][j]))
-        cols['h_m'].append(None if not np.isfinite(st['h'][j]) else round(float(st['h'][j]), 1))
+        cols['h_m'].append(_num(st['h'][j])); cols['dbh_cm'].append(_num(st['dbh'][j]))
     out['count'] = len(rows)
     return out
 
@@ -666,7 +716,7 @@ def history(lon: float, lat: float) -> dict | None:
     if best is None:
         return None
     d, st, j, kg = best
-    rows = _conn().execute('SELECT rev, ts, op, sp, h_dm, source, epoch, ref FROM tree_ver WHERE kg=? AND x=? AND y=? '
+    rows = _conn().execute('SELECT rev, ts, op, sp, uh_dm, dbh_mm, source, epoch, ref FROM tree_ver WHERE kg=? AND x=? AND y=? '
                            'ORDER BY rev', (kg, int(st['x'][j]), int(st['y'][j]))).fetchall()
     hidden = {r['ref'] for r in rows if r['op'] == OP_MODERATE}
     vs = []
@@ -674,8 +724,10 @@ def history(lon: float, lat: float) -> dict | None:
         v = {'v': i, 'rev': r['rev'], 'ts': r['ts'], 'op': OP_NAMES[r['op']]}
         if r['sp'] is not None:
             v['taxon'] = _taxon(r['sp'])
-        if r['op'] == OP_ADD and r['h_dm'] is not None:
-            v['h_m'] = r['h_dm'] / 10.0
+        if r['uh_dm'] is not None:
+            v['h_m'] = r['uh_dm'] / 10.0
+        if r['dbh_mm'] is not None:
+            v['dbh_cm'] = r['dbh_mm'] / 10.0
         if r['source'] is not None:
             v['source'] = pf._dict_val(r['source'])
         if r['epoch'] is not None:
@@ -693,6 +745,9 @@ def taxa_dict() -> dict:
             'classes': sorted(set(_CLASS.values())),
             'accepts': 'any taxon / de / en value above (case- and umlaut-insensitive), or a well-formed scientific '
                        'binomial not listed (stored as written, flagged with a warning)',
+            'measures': {'dbh_cm': list(DBH_CM), 'h_m': list(H_M),
+                         'note': 'optional on any tree report; several reporters → median; h_m is the reporter\'s '
+                                 'height and never replaces the LiDAR height_m'},
             'limits': {'taxon_chars': MAX_TAXON_CHARS, 'versions_per_tree': MAX_VERSIONS_PER_TREE,
                        'match_m': [MATCH_MIN_M, MATCH_MAX_M], 'added_fold_m': ADDED_MATCH_M, 'exists_m': EXISTS_M}}
 
