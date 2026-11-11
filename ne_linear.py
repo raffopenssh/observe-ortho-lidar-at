@@ -335,8 +335,6 @@ def detect(x, y, h, crown_m2):
 SOURCE = 'auto-linear'
 HINT = 'linear'
 _KEY_TTL = 60.0
-_keys_cache: dict = {}
-_tok_cache: dict = {'t': 0.0, 'v': {}}
 
 
 def _db_path():
@@ -354,7 +352,10 @@ def _conn(write: bool = False):
     c = sqlite3.connect(str(p), timeout=30)
     c.execute('PRAGMA journal_mode=WAL')
     c.execute('CREATE TABLE IF NOT EXISTS kg (kg TEXT PRIMARY KEY, digest TEXT, ver INTEGER, n_apex INTEGER,'
-              ' n_flag INTEGER, n_runs INTEGER, ts INTEGER) WITHOUT ROWID')
+              ' n_flag INTEGER, n_runs INTEGER, ts INTEGER, sig INTEGER) WITHOUT ROWID')
+    if 'sig' not in {r[1] for r in c.execute('PRAGMA table_info(kg)')}:
+        c.execute('ALTER TABLE kg ADD COLUMN sig INTEGER')
+    c.execute('PRAGMA synchronous=NORMAL')
     c.execute('CREATE TABLE IF NOT EXISTS run (kg TEXT, cell INTEGER, x0 INTEGER, y0 INTEGER, x1 INTEGER, y1 INTEGER,'
               ' n INTEGER, len_m REAL, h_med REAL, sags INTEGER, sag_m REAL, chord REAL, crown_med REAL,'
               ' lat_rms REAL, keys BLOB)')
@@ -433,15 +434,27 @@ def process_kg(kg: str, conn=None, force: bool = False, flags: bool = True) -> d
                      r['h_med'], r['sags'], r['sag_m'], r['res_m'], r['crown_med'], r['lat_rms'], keys.tobytes()))
         items.setdefault(cell, {'cell': cell, 'x': int(d['x'][mid]), 'y': int(d['y'][mid]), 'n': int(r['n']),
                                 'len_m': int(round(r['len_m'])), 'h_m': float(d['h'][mid])})
+    import zlib
+    rows.sort(key=lambda r: (r[2], r[3], r[4], r[5]))
+    sig = 0
+    for r in rows:
+        sig = zlib.crc32(r[14], zlib.crc32(str(r[1]).encode(), sig))
+    prev = c.execute('SELECT sig, ts FROM kg WHERE kg=?', (kg,)).fetchone()
+    same = bool(prev and prev[0] == sig and not force)
     old = {int(r[0]) for r in c.execute('SELECT DISTINCT cell FROM run WHERE kg=?', (kg,))}
     with c:
-        c.execute('DELETE FROM run WHERE kg=?', (kg,))
-        c.executemany('INSERT INTO run VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', rows)
-        c.execute('INSERT OR REPLACE INTO kg VALUES (?,?,?,?,?,?,?)',
-                  (kg, d['digest'], VERSION, int(d['x'].size), int(m.sum()), len(runs), int(time.time())))
+        if not same:
+            c.execute('DELETE FROM run WHERE kg=?', (kg,))
+            c.executemany('INSERT INTO run VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', rows)
+        c.execute('INSERT OR REPLACE INTO kg VALUES (?,?,?,?,?,?,?,?)',
+                  (kg, d['digest'], VERSION, int(d['x'].size), int(m.sum()), len(runs),
+                   prev[1] if same else int(time.time()), sig))
     out = {'kg': kg, 'n_apex': int(d['x'].size), 'n_flag': int(m.sum()), 'runs': len(runs)}
     gone = [cl for cl in old - set(items)
             if not c.execute('SELECT 1 FROM run WHERE cell=? LIMIT 1', (cl,)).fetchone()]
+    if same:
+        out['unchanged'] = True
+        return out
     if flags and (items or gone):
         try:
             out['flags'] = sync_flags(kg, list(items.values()), gone)
@@ -467,71 +480,138 @@ def sync_flags(kg: str, items: list, gone: list) -> dict:
 
 
 # === SECTION: read side (ne_trees) ===
+# The whole store is a few MB (one uint64 per hidden apex), so a serving process keeps ONE
+# in-memory snapshot {kg: sorted keys}.  A request costs dict lookups + one searchsorted per
+# chunk that can contain a hit; the disk is touched only by a stat() every _STAT_S seconds
+# and re-read only when the store file changed (or a report verdict may have: _KEY_TTL).
 
-def _rejected_cells(kg: str) -> set:
+_STAT_S = 10.0
+_snap = {'t': 0.0, 'stamp': None, 'loaded': 0.0, 'keys': {}, 'tok': {}, 'grid': {}}
+_snap_lock = __import__('threading').Lock()
+_EMPTY = np.zeros(0, np.uint64)
+
+
+def _stamp():
+    out = []
+    p = _db_path()
+    for q in (p, p.with_name(p.name + '-wal')):
+        try:
+            st = q.stat(); out.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append(None)
+    return tuple(out)
+
+
+def _rejected() -> set:
     try:
         import public_flags as pf
-        return pf.auto_cells(kg, SOURCE, status='rejected')
+        return pf.auto_cells(None, SOURCE, status='rejected')
     except Exception:  # noqa: BLE001
         return set()
 
 
-def _kg_keys(kg: str) -> np.ndarray:
+def _snapshot() -> dict:
     import time
     now = time.time()
-    hit = _keys_cache.get(kg)
-    if hit and now - hit[0] < _KEY_TTL:
-        return hit[1]
-    v = np.zeros(0, np.uint64)
-    c = _conn()
-    if c is not None:
-        try:
-            rows = c.execute('SELECT cell, keys FROM run WHERE kg=?', (kg,)).fetchall()
-            if rows:
-                rej = _rejected_cells(kg)
-                parts = [np.frombuffer(k, np.uint64) for cell, k in rows if int(cell) not in rej]
-                if parts:
-                    v = np.unique(np.concatenate(parts))
-        except Exception:  # noqa: BLE001
-            pass
-        finally:
+    sn = _snap
+    if now - sn['t'] < _STAT_S:
+        return sn
+    with _snap_lock:
+        if now - _snap['t'] < _STAT_S:
+            return _snap
+        stamp = _stamp()
+        if stamp == _snap['stamp'] and now - _snap['loaded'] < _KEY_TTL:
+            _snap['t'] = now
+            return _snap
+        rej = _rejected()
+        if stamp == _snap['stamp'] and rej == _snap.get('rej'):
+            _snap.update(t=now, loaded=now)
+            return _snap
+        keys, tok, grid = {}, {}, {}
+        c = _conn() if stamp[0] else None
+        if c is not None:
+            try:
+                parts = {}
+                for kg, cell, k in c.execute('SELECT kg, cell, keys FROM run'):
+                    if int(cell) not in rej:
+                        parts.setdefault(kg, []).append(np.frombuffer(k, np.uint64))
+                for kg, p in parts.items():
+                    v = np.unique(np.concatenate(p)); keys[kg] = v; grid[kg] = _key_grid(v)
+                rk = {}
+                for kg, cell in c.execute('SELECT kg, cell FROM run'):
+                    if int(cell) in rej:
+                        rk.setdefault(kg, []).append(int(cell))
+                for kg, sig in c.execute('SELECT kg, sig FROM kg WHERE n_runs > 0'):
+                    r = rk.get(kg)
+                    tok[kg] = f'{(sig or 0):x}' + (f'-{len(r)}' if r else '')
+            except Exception:  # noqa: BLE001
+                c.close()
+                _snap['t'] = now            # keep serving the previous snapshot
+                return _snap
             c.close()
-    _keys_cache[kg] = (now, v)
-    if len(_keys_cache) > 4000:
-        _keys_cache.pop(next(iter(_keys_cache)))
-    return v
+        _snap.update(t=now, loaded=now, stamp=stamp, rej=rej, keys=keys, tok=tok, grid=grid)
+        return _snap
+
+
+def _kg_keys(kg: str) -> np.ndarray:
+    return _snapshot()['keys'].get(kg, _EMPTY)
 
 
 def hidden_keys(kgs) -> np.ndarray:
     """Sorted apex keys to hide for a request touching ``kgs`` (union: KG files overlap)."""
-    parts = [k for k in (_kg_keys(str(g).zfill(5)) for g in kgs) if k.size]
+    k = _snapshot()['keys']
+    parts = [k[g] for g in (str(g).zfill(5) for g in kgs) if g in k]
     if not parts:
-        return np.zeros(0, np.uint64)
+        return _EMPTY
     return parts[0] if len(parts) == 1 else np.unique(np.concatenate(parts))
 
 
-def is_hidden(x, y, keys: np.ndarray) -> np.ndarray:
-    k = apex_keys(x, y)
-    i = np.searchsorted(keys, k)
-    return keys[np.minimum(i, keys.size - 1)] == k
+GRID_SHIFT = 8          # 256 m coarse grid: "can this chunk hold a hidden apex?" is a set lookup
+
+
+def grid_ids(x, y) -> frozenset:
+    """Coarse grid cells touched by these points (bounding box, as ints)."""
+    x0, x1 = int(np.min(x)) >> GRID_SHIFT, int(np.max(x)) >> GRID_SHIFT
+    y0, y1 = int(np.min(y)) >> GRID_SHIFT, int(np.max(y)) >> GRID_SHIFT
+    return frozenset((gx << 20) | gy for gx in range(x0, x1 + 1) for gy in range(y0, y1 + 1))
+
+
+def _key_grid(keys: np.ndarray) -> frozenset:
+    g = ((keys >> np.uint64(32 + GRID_SHIFT)) << np.uint64(20)) | ((keys & np.uint64(0xFFFFFFFF)) >> np.uint64(GRID_SHIFT))
+    return frozenset(np.unique(g).tolist())
+
+
+def hidden(kgs) -> tuple:
+    """(sorted keys, coarse grid set) to hide for a request touching ``kgs``."""
+    sn = _snapshot()
+    k = sn['keys']
+    ks = [g for g in (str(g).zfill(5) for g in kgs) if g in k]
+    if not ks:
+        return _EMPTY, frozenset()
+    if len(ks) == 1:
+        return k[ks[0]], sn['grid'][ks[0]]
+    return np.unique(np.concatenate([k[g] for g in ks])), frozenset().union(*(sn['grid'][g] for g in ks))
+
+
+def is_hidden(x, y, keys: np.ndarray, sel=None) -> np.ndarray:
+    """Bool per apex; with ``sel`` (bool mask) only those are tested."""
+    if sel is None:
+        k = apex_keys(x, y)
+        i = np.searchsorted(keys, k)
+        return keys[np.minimum(i, keys.size - 1)] == k
+    out = np.zeros(sel.shape, bool)
+    j = np.flatnonzero(sel)
+    if j.size and keys.size:
+        k = apex_keys(x[j], y[j])
+        i = np.searchsorted(keys, k)
+        out[j] = keys[np.minimum(i, keys.size - 1)] == k
+    return out
 
 
 def state_token(kgs) -> str:
-    """Changes when the result of any of ``kgs`` changes (part of the /trees/bbox ETag)."""
-    import time
-    now = time.time()
-    if now - _tok_cache['t'] > _KEY_TTL:
-        v = {}
-        c = _conn()
-        if c is not None:
-            try:
-                v = {k: t for k, t in c.execute('SELECT kg, ts FROM kg WHERE n_runs > 0')}
-            except Exception:  # noqa: BLE001
-                pass
-            finally:
-                c.close()
-        _tok_cache.update(t=now, v=v)
-    v = _tok_cache['v']
+    """Changes when the served result of any of ``kgs`` changes (part of the /trees/bbox ETag):
+    content signature of the KG's runs, not a timestamp - a recompute with the same result keeps it."""
+    v = _snapshot()['tok']
     return ','.join(f'{k}:{v[k]}' for k in sorted(str(g).zfill(5) for g in kgs) if k in v)
 
 

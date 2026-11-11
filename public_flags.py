@@ -661,7 +661,10 @@ def auto_sync(kg: str, source: str, layer: str, claim: str, items: list, gone: l
                 'ON CONFLICT(skey, layer, claim, reporter) DO UPDATE SET ts_last = excluded.ts_last, '
                 'expected = excluded.expected, observed = excluded.observed, epoch = excluded.epoch, '
                 'lon_e6 = excluded.lon_e6, lat_e6 = excluded.lat_e6, '
-                'status = CASE WHEN status IN (3, 4) THEN 0 ELSE status END', rows)
+                'status = CASE WHEN status IN (3, 4) THEN 0 ELSE status END '
+                # an identical re-run writes nothing: no page dirtied, no ts_last churn for delta readers
+                'WHERE status IN (3, 4) OR expected IS NOT excluded.expected OR observed IS NOT excluded.observed '
+                'OR lon_e6 IS NOT excluded.lon_e6 OR lat_e6 IS NOT excluded.lat_e6', rows)
             st = 0
             for cell in gone or ():
                 st += c.execute('UPDATE report SET status=4, status_ts=? WHERE skey=? AND layer=? AND claim=? '
@@ -674,15 +677,17 @@ def auto_sync(kg: str, source: str, layer: str, claim: str, items: list, gone: l
     return {'upserted': len(rows), 'stale': st}
 
 
-def auto_cells(kg: str, source: str, status: str = 'rejected') -> set:
+def auto_cells(kg, source: str, status: str = 'rejected') -> set:
     """Subject cells of the machine reports of ``source`` in ``kg`` with this status."""
     c = _conn()
     _load_dict(c)
     sid = _DICT.get(('source', source))
     if sid is None:
         return set()
-    return {int(r[0]) for r in c.execute('SELECT skey FROM report WHERE kg=? AND reporter=? AND status=?',
-                                         (kg, _reporter_hash(source, 'auto'), _STATUS_ID[status]))}
+    q, a = 'SELECT skey FROM report WHERE reporter=? AND status=?', [_reporter_hash(source, 'auto'), _STATUS_ID[status]]
+    if kg is not None:
+        q += ' AND kg=?'; a.append(kg)
+    return {int(r[0]) for r in c.execute(q, a)}
 
 
 def source_id(source: str):

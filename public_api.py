@@ -366,7 +366,7 @@ def heightfield():
     return _json(payload, st, max_age=3600)
 
 
-TREES_REV = 'trees-c3'          # bump when the /trees/bbox body layout or QA rules change (part of the ETag)
+TREES_REV = 'trees-c4'          # bump when the /trees/bbox body layout or QA rules change (part of the ETag)
 TREES_USER_MAX_AGE = 300       # KGs with user-reported taxa: revalidate (304, index-only) every 5 min
 TREES_MAX_AGE = 86400          # answers change only when a KG is reprocessed; ETag revalidation is index-only
 
@@ -376,6 +376,14 @@ def _flag_arg(name: str, default: bool) -> bool:
     if v is None or v == '':
         return default
     return str(v).strip().lower() not in ('0', 'false', 'no', 'off')
+
+
+try:
+    import orjson as _orjson
+except Exception:  # noqa: BLE001
+    _orjson = None
+_TREES_BODY = mem_lru.ByteLRU('trees_body', 24, sizer=lambda v: len(v[1]) + 96, env='TREES_BODY_MB')
+_TREES_BODY_TTL = 600.0
 
 
 @app.route('/api/v1/trees/bbox')
@@ -452,6 +460,20 @@ def trees_bbox():
     inm = request.headers.get('If-None-Match') or ''
     if etag in [x.strip() for x in inm.split(',')] or inm.strip() == '*':
         return Response(status=304, headers=hdrs)
+    # Finished bodies (gzipped) of ready tiles, keyed by the ETag (= data state + query):
+    # the next reader of the same tile band costs a dict lookup.  Short TTL = the flag caches'.
+    gz_ok = 'gzip' in (request.headers.get('Accept-Encoding') or '')
+    pretty = bool(request.args.get('pretty'))
+    hit = None if pretty else _TREES_BODY.get(etag)
+    if hit is not None and time.time() - hit[0] < _TREES_BODY_TTL:
+        resp = Response(hit[1] if gz_ok else gzip.decompress(hit[1]), mimetype='application/json')
+        for k, v in hdrs.items():
+            resp.headers[k] = v
+        if gz_ok:
+            resp.headers['Content-Encoding'] = 'gzip'
+            resp.headers.add('Vary', 'Accept-Encoding')
+        resp.headers['X-Cache'] = 'HIT'
+        return resp
     try:
         if fmt == 'columns':
             t = ne_trees.columns_bbox(*bb, kind, fields=fields, min_height=min_h, max_height=max_h, limit=limit,
@@ -508,11 +530,25 @@ def trees_bbox():
                 **{k: t[k] for k in ('added', 'reported') if t.get(k)},
                 'truncated': t['truncated'], 'dropped_qa': t['dropped_qa'], 'kgs': t['kgs'],
                 'ready': ready, **extra, 'meta': _meta(**meta)}
-    resp = Response(json.dumps(body, separators=(',', ':'), ensure_ascii=False,
-                               indent=1 if request.args.get('pretty') else None).encode(),
-                    mimetype='application/json')
+    raw = None
+    if not pretty and _orjson is not None:
+        try:
+            raw = _orjson.dumps(body)           # ~8x faster than json on 100k-row column bodies
+        except Exception:  # noqa: BLE001
+            raw = None
+    if raw is None:
+        raw = json.dumps(body, separators=(',', ':'), ensure_ascii=False, indent=1 if pretty else None).encode()
+    gzd = None
+    if len(raw) >= 1024 and (gz_ok or (ready and not extra.get('error'))) and not pretty:
+        gzd = gzip.compress(raw, 6 if len(raw) < 512 * 1024 else 1)
+        if ready and not extra.get('error') and len(gzd) <= 2 * 2 ** 20:
+            _TREES_BODY.put(etag, (time.time(), gzd))
+    resp = Response(gzd if (gzd is not None and gz_ok) else raw, mimetype='application/json')
     for k, v in hdrs.items():
         resp.headers[k] = v
+    if gzd is not None and gz_ok:
+        resp.headers['Content-Encoding'] = 'gzip'
+        resp.headers.add('Vary', 'Accept-Encoding')
     return resp
 
 

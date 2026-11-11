@@ -50,6 +50,13 @@ Sample of 250 random KGs (2026-11): 190 runs, 51 km, 0.05 % of all apices;
   result), for every KG file that carries them. `auto-linear` reports are
   excluded from the whole-cell rule that human `spurious` flags trigger.
   The `/trees/bbox` ETag includes `ne_linear.state_token`.
+* Cost on the read path: a serving process holds ONE in-memory snapshot of the
+  store (`_snapshot`: `{kg: sorted keys}` + a 256 m grid set per KG), refreshed by
+  a `stat()` every 10 s and re-read only when the file changed. Per chunk the
+  test is a set lookup against the chunk's cached grid ids; only chunks that can
+  hold a hidden apex do array work. The token is a content signature (`kg.sig`),
+  so a recompute with the same result changes neither rows, flags nor ETags.
+  The hourly job runs `Nice=19`, `CPUQuota=70%`, idle IO, in its own process.
 * Humans can report chains we missed: `claim: spurious`, layer `trees`,
   `expected: {"absent": true, "hint": "linear"}`. `python3 ne_linear.py
   --misses` lists those not on any stored run — the tuning set.

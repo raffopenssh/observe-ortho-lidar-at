@@ -104,6 +104,41 @@ def main():
                    'expected': {'absent': True, 'hint': 'linear'}}, 'test')
         hr = pf.hinted_reports('linear', exclude_source=nl.SOURCE)
         assert len(hr) == 1 and abs(hr[0]['lon'] - 14.9) < 1e-6, hr
+        # read side: one in-memory snapshot; a rejected run's apices come back; token = content
+        import cells_api as ca
+        ca.NE_DIR = Path(td) / 'ne'
+        c = nl._conn(write=True)
+        k1 = np.sort(nl.apex_keys(np.arange(4700000, 4700050), np.full(50, 2700000)))
+        k2 = np.sort(nl.apex_keys(np.arange(4710000, 4710030), np.full(30, 2700500)))
+        with c:
+            for cell, k in ((cells[0], k1), (cells[1], k2)):
+                c.execute('INSERT INTO run VALUES (?,?,0,0,0,0,0,0,0,0,0,0,0,0,?)', ('77214', cell, k.tobytes()))
+            c.execute("INSERT INTO kg VALUES ('77214','d',1,1,80,2,1,123)")
+        nl._snap.update(t=0.0, stamp=None)
+        hk = nl.hidden_keys(['77214', '00001'])
+        assert hk.size == 30, hk.size                          # cells[0] was rejected above -> served again
+        x = np.array([4710005, 4710005, 4700005]); y = np.array([2700500, 2700501, 2700000])
+        assert nl.is_hidden(x, y, hk).tolist() == [True, False, False]
+        assert nl.is_hidden(x, y, hk, np.array([False, True, True])).tolist() == [False, False, False]
+        assert nl.is_hidden(x, y, hk, np.array([True, True, True])).tolist() == [True, False, False]
+        tok = nl.state_token(['77214'])
+        assert tok and nl.state_token(['00001']) == ''
+        with c:
+            c.execute("UPDATE kg SET ts = 999 WHERE kg='77214'")   # recompute, same result
+        nl._snap.update(t=0.0)
+        assert nl.state_token(['77214']) == tok
+        # an identical machine re-sync writes nothing
+        it = [{'cell': 5, 'lon': 14.9, 'lat': 46.9, 'expected': '{"absent":true}', 'observed': '{}'}]
+        pf.auto_sync('77214', nl.SOURCE, 'trees', 'spurious', it)
+        cc = pf._conn(); t0 = cc.total_changes
+        pf.auto_sync('77214', nl.SOURCE, 'trees', 'spurious', it)
+        assert cc.total_changes == t0
+    # a point report on a tree names ONE apex: nearest within 2.5 m, the reported height preferred
+    import ne_trees
+    d = {'x': np.array([100, 101, 110]), 'y': np.array([100, 100, 100]), 'h': np.array([12.0, 4.25, 4.25], np.float32)}
+    assert ne_trees._flag_hits(d, np.array([[100.2, 100.0, 4.25]])) == [1]
+    assert ne_trees._flag_hits(d, np.array([[100.2, 100.0, float('nan')]])) == [0]
+    assert ne_trees._flag_hits(d, np.array([[105.0, 100.0, 4.25]])) == []
     print('ok')
 
 

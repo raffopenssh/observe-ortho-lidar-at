@@ -197,16 +197,24 @@ _pf_lock = threading.Lock()
 _PF_TTL = 600.0
 
 
-def flagged_cells(kg: str, kind: str) -> set[int]:
-    """res-12 cell ids in ``kg`` with an open / confirmed public flag on this
-    kind's layers and a negative claim (public_flags.sqlite)."""
+FLAG_APEX_M = 2.5            # a point report on a tree hides the apex within this distance of it
+
+
+def _flags(kg: str, kind: str) -> tuple:
+    """(cells, points) of ``kg`` with an open / confirmed negative public flag on this kind's layers.
+
+    A report on the ``trees`` layer that carries a point is about ONE tree: it becomes a row
+    of ``points`` ([x, y, h_m | nan] in EPSG:3035) and hides only the apex it names
+    (:func:`_flag_hits`).  Everything else (cell-keyed reports, ``cells.trees``, structures)
+    hides the res-12 cell as before."""
     key = (kg, kind); now = time.time()
     with _pf_lock:
         hit = _pf_cache.get(key)
         if hit and now - hit[0] < _PF_TTL:
             return hit[1]
-    cells: set[int] = set()
+    cells: set[int] = set(); pts = []
     try:
+        import json
         import public_flags as pf
         c = pf._conn()
         pf._load_dict(c)
@@ -214,19 +222,57 @@ def flagged_cells(kg: str, kind: str) -> set[int]:
         clm = [pf._DICT.get(('claim', x)) for x in NEGATIVE_CLAIMS]
         lay = [x for x in lay if x is not None]; clm = [x for x in clm if x is not None]
         if lay and clm:
-            # machine reports of ne_linear hide single apices (ne_linear.hidden_keys), never the whole cell
+            # machine reports of ne_linear hide single apices (ne_linear.hidden), never the whole cell
             auto = pf._DICT.get(('source', 'auto-linear'))
-            q = ('SELECT cell FROM report WHERE kg=? AND cell IS NOT NULL AND status IN (0,1) '
-                 'AND layer IN (%s) AND claim IN (%s) AND (source IS NULL OR source != ?)'
+            tree_layer = pf._DICT.get(('layer', 'trees')) if kind == 'trees' else None
+            q = ('SELECT cell, layer, lon_e6, lat_e6, observed FROM report WHERE kg=? AND cell IS NOT NULL '
+                 'AND status IN (0,1) AND layer IN (%s) AND claim IN (%s) AND (source IS NULL OR source != ?)'
                  % (','.join('?' * len(lay)), ','.join('?' * len(clm))))
-            cells = {int(r[0]) for r in c.execute(q, (kg, *lay, *clm, -1 if auto is None else auto))}
+            ll = []
+            for cell, layer, lo, la, obs in c.execute(q, (kg, *lay, *clm, -1 if auto is None else auto)):
+                if tree_layer is not None and layer == tree_layer and lo is not None and la is not None:
+                    h = None
+                    try:
+                        o = json.loads(obs) if obs else {}
+                        h = o.get('h_m', (o.get('nearest') or {}).get('h_m'))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    ll.append((lo / 1e6, la / 1e6, float('nan') if h is None else float(h)))
+                else:
+                    cells.add(int(cell))
+            if ll:
+                xs, ys = ca._tf('EPSG:4326', 'EPSG:3035').transform([p[0] for p in ll], [p[1] for p in ll])
+                pts = [(x, y, p[2]) for x, y, p in zip(xs, ys, ll)]
     except Exception as ex:  # noqa: BLE001
-        log.debug('ne_trees flagged_cells %s: %s', kg, ex)
+        log.debug('ne_trees flags %s: %s', kg, ex)
+    val = (cells, np.array(pts, np.float64).reshape(-1, 3))
     with _pf_lock:
-        _pf_cache[key] = (now, cells)
+        _pf_cache[key] = (now, val)
         if len(_pf_cache) > 4000:
             _pf_cache.pop(next(iter(_pf_cache)))
-    return cells
+    return val
+
+
+def flagged_cells(kg: str, kind: str) -> set[int]:
+    return _flags(kg, kind)[0]
+
+
+def _flag_hits(d: dict, pts: np.ndarray) -> list:
+    """Indices of the apices of chunk ``d`` that the point reports ``pts`` name: per report
+    the nearest apex within FLAG_APEX_M, preferring one of the reported height."""
+    out = []
+    x = d['x']; y = d['y']
+    for px, py, ph in pts:
+        dd = np.hypot(x - px, y - py)
+        near = np.flatnonzero(dd <= FLAG_APEX_M)
+        if not near.size:
+            continue
+        if ph == ph:
+            same = near[np.abs(d['h'][near] - ph) <= 0.26]
+            if same.size:
+                near = same
+        out.append(int(near[np.argmin(dd[near])]))
+    return out
 
 
 def legacy_flagged_points(kg: str, kind: str) -> set:
@@ -381,6 +427,22 @@ DEFAULT_COLUMNS = {'trees': ('lon', 'lat', 'h_m', 'crown_m2'), 'structures': ('l
 COLUMN_FIELDS = {'trees': _TREE_FIELDS, 'structures': _STRUCT_FIELDS}
 
 
+def _chunk_ext(d: dict) -> dict:
+    """Scalar extents of a decoded chunk (see collect)."""
+    lon, lat, hs, cell = d['lon'], d['lat'], d['h'], d['cell']
+    ext = {'w': float(lon.min()), 'e': float(lon.max()), 's': float(lat.min()), 'n': float(lat.max()),
+           'hmin': float(hs.min()), 'hmax': float(hs.max()), 'all_ok': bool(d['ok'].all()),
+           'c0': np.uint64(cell.min()), 'c1': np.uint64(cell.max()), 'grid': frozenset(),
+           'x0': int(d['x'].min()), 'x1': int(d['x'].max()), 'y0': int(d['y'].min()), 'y1': int(d['y'].max())}
+    if True:
+        try:
+            import ne_linear
+            ext['grid'] = ne_linear.grid_ids(d['x'], d['y'])
+        except Exception:  # noqa: BLE001
+            pass
+    return ext
+
+
 def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int = DEFAULT_LIMIT,
             realistic: bool = True, types: set | None = None, max_height: float | None = None,
             max_limit: int = MAX_LIMIT) -> dict:
@@ -409,19 +471,22 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
         type_codes = np.array(sorted(i for i, t in enumerate(ca.STRUCTURE_TYPES) if t in types), dtype=np.uint8)
     hdrs: dict = {}
     scanned = 0; exhausted = True; kth = -1.0; n_at_kth = 0
-    parts: list[tuple[dict, np.ndarray, str]] = []     # (decoded chunk, selected idx, kg)
+    parts: list[tuple[dict, np.ndarray, int]] = []     # (decoded chunk, selected idx | None = all, kg index)
     n_acc = 0; dropped = 0; dropped_lin = 0
-    legacy: dict = {}
-    lin = np.zeros(0, np.uint64)
+    kg_ix: dict = {}                                   # kg -> index into kg_names
+    kg_names: list = []
+    fcs: dict = {}                                     # kg -> sorted flagged res-12 ids (or None)
+    legacy: dict = {}                                  # kg -> (set, lon array, lat array) | None
+    lin = np.zeros(0, np.uint64); lin_grid = frozenset()
     if realistic and kind == 'trees':
         try:                                # apices of detected linear-noise runs (ne_linear.py)
             import ne_linear
-            lin = ne_linear.hidden_keys(st['kgs'])
+            lin, lin_grid = ne_linear.hidden(st['kgs'])
         except Exception as ex:  # noqa: BLE001
             log.debug('ne_trees linear keys: %s', ex)
 
     def kth_now() -> float:
-        hs = np.concatenate([p[0]['h'][p[1]] for p in parts])
+        hs = np.concatenate([p[0]['h'] if p[1] is None else p[0]['h'][p[1]] for p in parts])
         return float(np.partition(hs, hs.size - lim)[hs.size - lim])
 
     for r in rows:
@@ -455,43 +520,98 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
         scanned += 1
         if not d or not d['n']:
             continue
+        # chunk extents, computed once and kept with the cached chunk: every test below
+        # first asks "can this chunk be affected at all?" with plain scalars - the common
+        # chunk (inside the bbox, no flag, no hidden apex) costs one or two array ops
+        x_ = d.get('ext')
+        if x_ is None:
+            x_ = d['ext'] = _chunk_ext(d)
         hs = d['h']
-        m = (hs >= min_h) & (d['lon'] >= w) & (d['lon'] <= e) & (d['lat'] >= s) & (d['lat'] <= n)
-        if max_h is not None:
-            m &= hs < max_h
+        m = None                            # None = every object of the chunk
+        if x_['hmin'] < min_h:
+            m = hs >= min_h
+        if not (x_['w'] >= w and x_['e'] <= e and x_['s'] >= s and x_['n'] <= n):
+            mb = (d['lon'] >= w) & (d['lon'] <= e) & (d['lat'] >= s) & (d['lat'] <= n)
+            m = mb if m is None else m & mb
+        if max_h is not None and x_['hmax'] >= max_h:
+            mb = hs < max_h
+            m = mb if m is None else m & mb
         if realistic:
-            m &= d['ok']
-            if lin.size and m.any():
-                hit = m & ne_linear.is_hidden(d['x'], d['y'], lin)
+            if not x_['all_ok']:
+                m = d['ok'] if m is None else m & d['ok']
+            if lin_grid and not lin_grid.isdisjoint(x_['grid']):
+                hit = ne_linear.is_hidden(d['x'], d['y'], lin, m)
                 if hit.any():
-                    m &= ~hit; dropped_lin += int(hit.sum())
-            fc = flagged_cells(kg, kind)
-            if fc:
-                m &= ~np.isin(d['cell'], np.fromiter(fc, np.uint64))
-            fs = legacy.get(kg)
-            if fs is None:
-                fs = legacy[kg] = legacy_flagged_points(kg, kind)
-            if fs and m.any():
-                idx = np.nonzero(m)[0]
+                    m = ~hit if m is None else m & ~hit; dropped_lin += int(hit.sum())
+            if kg not in fcs:
+                fc, fp = _flags(kg, kind)
+                fcs[kg] = (np.sort(np.fromiter(fc, np.uint64, len(fc))) if fc else None, fp if len(fp) else None)
+            fc, fp = fcs[kg]
+            if fc is not None:
+                i0 = int(np.searchsorted(fc, x_['c0'])); i1 = int(np.searchsorted(fc, x_['c1'], side='right'))
+                if i1 > i0:
+                    mb = ~np.isin(d['cell'], fc[i0:i1])
+                    m = mb if m is None else m & mb
+            if fp is not None:                           # reports about single trees: hide just that apex
+                pn = fp[(fp[:, 0] >= x_['x0'] - FLAG_APEX_M) & (fp[:, 0] <= x_['x1'] + FLAG_APEX_M)
+                        & (fp[:, 1] >= x_['y0'] - FLAG_APEX_M) & (fp[:, 1] <= x_['y1'] + FLAG_APEX_M)]
+                if len(pn):
+                    bad = _flag_hits(d, pn)
+                    if bad:
+                        if m is None:
+                            m = np.ones(d['n'], bool)
+                        dropped += int(m[bad].sum()); m[bad] = False
+            if kg not in legacy:
+                fs = legacy_flagged_points(kg, kind)
+                legacy[kg] = (fs, np.array([p[0] for p in fs]), np.array([p[1] for p in fs])) if fs else None
+            lg = legacy[kg]
+            if lg is not None and ((lg[1] >= x_['w'] - 2e-5) & (lg[1] <= x_['e'] + 2e-5)
+                                   & (lg[2] >= x_['s'] - 2e-5) & (lg[2] <= x_['n'] + 2e-5)).any():
+                fs = lg[0]
+                idx = np.arange(d['n']) if m is None else np.nonzero(m)[0]
                 bad = [i for i in idx.tolist() if (round(float(d['lon'][i]), 5), round(float(d['lat'][i]), 5)) in fs]
                 if bad:
+                    if m is None:
+                        m = np.ones(d['n'], bool)
                     m[bad] = False; dropped += len(bad)
         if type_codes is not None:
-            m &= np.isin(d['type'], type_codes)
-        if not m.any():
-            continue
-        sel = np.nonzero(m)[0]
-        parts.append((d, sel, kg))
-        n_acc += int(sel.size)
+            mb = np.isin(d['type'], type_codes)
+            m = mb if m is None else m & mb
+        if m is None:
+            sel = None; ns = int(d['n'])
+        else:
+            sel = np.flatnonzero(m); ns = int(sel.size)
+            if not ns:
+                continue
+            if ns == d['n']:
+                sel = None
+        ki = kg_ix.get(kg)
+        if ki is None:
+            ki = kg_ix[kg] = len(kg_names); kg_names.append(kg)
+        parts.append((d, sel, ki, ns))
+        n_acc += ns
     out: dict = {}
     if n_acc:
-        cols = [k for k in parts[0][0] if k not in ('n', 'ok')]
+        cols = [k for k in parts[0][0] if k not in ('n', 'ok', 'ext')]
+        # tallest first, cut to the limit BEFORE the other columns are gathered
+        hcat = np.concatenate([p[0]['h'] if p[1] is None else p[0]['h'][p[1]] for p in parts])
+        if hcat.size > lim + 1:
+            # same rows as a stable full sort: everything above the cut height, then the
+            # first ones (input order) AT the cut height
+            cut = float(np.partition(hcat, hcat.size - lim - 1)[hcat.size - lim - 1])
+            above = np.flatnonzero(hcat > cut)
+            at = np.flatnonzero(hcat == cut)[:lim + 1 - above.size]
+            keep = np.concatenate([above, at]); keep.sort()
+            order = keep[np.argsort(-hcat[keep], kind='stable')]
+        else:
+            order = np.argsort(-hcat, kind='stable')
         for k in cols:
-            out[k] = np.concatenate([p[0][k][p[1]] for p in parts])
-        out['kg'] = np.concatenate([np.full(p[1].size, p[2], dtype=object) for p in parts])
-        order = np.argsort(-out['h'], kind='stable')[:lim + 1]
-        for k in list(out):
-            out[k] = out[k][order]
+            if k == 'h':
+                out[k] = hcat[order]
+            else:
+                out[k] = np.concatenate([p[0][k] if p[1] is None else p[0][k][p[1]] for p in parts])[order]
+        kidx = np.repeat(np.array([p[2] for p in parts], np.int32), [p[3] for p in parts])[order]
+        out['kg'] = np.array(kg_names, dtype=object)[kidx]
     n_out = int(out['h'].size) if n_acc else 0
     truncated = n_out > lim or not exhausted
     if n_out > lim:
