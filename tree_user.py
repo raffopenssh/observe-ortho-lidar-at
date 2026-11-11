@@ -918,6 +918,14 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
 
             if op == OP_RETRACT:
                 same = not cur
+                if same and not mine:
+                    # never reported on this tree: say so (403) instead of a silent no-op.  The reporter hash
+                    # is reporter id + key (or network), so a different / absent "reporter" lands here too.
+                    raise pf.FlagError(403, 'nothing of yours on this tree — only your own reports can be withdrawn '
+                                            '(same "reporter" and reporter key as the report)',
+                                       reason='not_yours', tree=tree_at(kg, x, y))
+                if same:
+                    warnings.append('already withdrawn — nothing of yours left on this tree')
             else:
                 same = bool(cur) and meta_same() and all(
                     v is None or v == latest(col)

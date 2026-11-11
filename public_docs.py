@@ -366,10 +366,17 @@ IDENTITY — say which tree you mean, in this order of preference:
        anything else is a new tree (two stems 0.8 m apart stay two). ≤ 2 m from one of our apexes → 409 + tree{{…}}
        and NOTHING is written, unless "force": true (second stem, understorey) or that apex already carries a report.
        → 201 {{id, tally, tree{{…added:true, client_id?}}}}
-  Withdraw: {{…identity…, "species": null}} or {{…, "retract": true}} (with claim "missing": withdraws your added
-       tree) → op:"retract"; never writes a flag row. Only your own reports are withdrawn.
-  Batches {{"reports":[…]}} ≤ 50 → 200 {{results:[{{…, "http": 201|200|4xx}}…], errors}} — one result per item, in
-       order, each with its own status; one bad item does not fail the others.
+  Withdraw: {{…identity…, "species": null}} or {{…identity…, "retract": true}} → op:"retract"; never writes a flag
+       row. identity = tree_id | client_id | lon+lat; layer / claim are optional (a body with retract:true and no
+       layer is a tree withdraw, never a generic flag). It withdraws everything YOU said about that tree — for a
+       tree you added, the tree itself. Only your own reports (same "reporter" + reporter key) are withdrawn:
+         201 withdrawn | 200 folded:true + tree.warning "already withdrawn …" (yours, withdrawn before)
+         403 {{error, reason:"not_yours", tree{{…}}}} you never reported on this tree — nothing written
+         404 no such tree (unknown client_id / nothing in reach of the point)
+  Batches {{"reports":[…]}} ≤ 50 → 201 {{results:[{{…, "http": 201|200|4xx}}…], count, errors}} — results[i] answers
+       reports[i] (input order, always the same length); EVERY item carries "http"; tree reports carry tree{{…}},
+       flags carry id + tally (an add, claim "missing", carries all three); a failed item is {{error, http, …}} and
+       does not fail the others.
   Reporter keys (optional, recommended): POST /api/v1/flags/token {{"name":"<app, organisation or handle>"}}
        → 201 {{reporter_key:"trk_…", holder:"<name>~<4 hex>", daily_cap}} — anyone may ask (≤ 20 keys per client per
        day); shown once, we keep only its hash. One key per app (tell users apart with "reporter"), or one per user /
@@ -382,6 +389,8 @@ IDENTITY — say which tree you mean, in this order of preference:
   Read back — cheapest first:
   1. /api/v1/trees/bbox grows ONLY where something was reported (untouched KGs: byte-identical, 1-day cache;
      touched KGs: ETag carries the newest revision, max-age 300):
+       top-level "rev" (format=columns | json; absent = nothing reported in these KGs = 0): the tree revision this
+                        body reflects — start /api/v1/trees/taxa?since=<rev> from it, no since=0 round needed
        format=columns → "user": {{i:[row index…], taxon:[… | null], n:[…], v:[…][, h_user_m:[…], dbh_cm:[…], tree_id:[…]]}}
                         "added": {{lon, lat, h_m, taxon, n, v[, dbh_cm, client_id]}}       (trees people added)
                         "reported": {{tree_id, lon, lat, h_m, taxon, n, v[, dbh_cm]}}     (inventory trees reported by

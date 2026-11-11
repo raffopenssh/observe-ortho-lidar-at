@@ -489,6 +489,7 @@ def trees_bbox():
         meta['columns_note'] = docs.TREES_COLUMNS_NOTE
         body = {'bbox': list(bb), 'objects': kind, 'format': 'columns', 'fields': t['fields'], 'order': t['order'],
                 'columns': t['columns'], 'count': n_out, 'truncated': t['truncated'], 'dropped_qa': t['dropped_qa'],
+                **({'rev': urev} if urev else {}),
                 **{k: t[k] for k in ('user', 'added', 'reported') if t.get(k)},
                 'kgs': t['kgs'], 'ready': ready, **extra, 'meta': _meta(**meta)}
     elif fmt == 'geojson':
@@ -501,6 +502,7 @@ def trees_bbox():
                               kgs=t['kgs'], ready=ready, **extra, **meta)}
     else:
         body = {'bbox': list(bb), 'objects': kind, key: t['trees'], 'count': n_out,
+                **({'rev': urev} if urev else {}),
                 **{k: t[k] for k in ('added', 'reported') if t.get(k)},
                 'truncated': t['truncated'], 'dropped_qa': t['dropped_qa'], 'kgs': t['kgs'],
                 'ready': ready, **extra, 'meta': _meta(**meta)}

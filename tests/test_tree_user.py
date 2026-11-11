@@ -209,6 +209,26 @@ def main() -> int:
         assert [x['http'] for x in res] == [201, 404] and r.get_json()['errors'] == 1, res
         hv = c.get(f'/api/v1/trees/taxa/history?client_id={cid}').get_json()['versions']
         assert hv[-1]['by'] == 'forestry' and 'by' not in hv[0], hv
+        # withdraw by somebody who never reported on the tree: 403 not_yours, nothing written (was 200 folded)
+        rev0 = tu.global_rev(); nfl = pf._conn().execute('SELECT COUNT(*) FROM report').fetchone()[0]
+        for body in ({'client_id': cid, 'layer': 'trees', 'claim': 'missing', 'retract': True, 'reporter': 'stranger'},
+                     {'client_id': cid, 'retract': True, 'reporter': 'stranger'}):
+            r = c.post('/api/v1/flags', json=body)
+            assert r.status_code == 403 and r.get_json()['reason'] == 'not_yours' and r.get_json()['tree']['added'], r.data
+        assert tu.global_rev() == rev0
+        # bare {lon, lat, retract:true} (no layer / claim) is a tree withdraw, never a generic flag; a batch
+        # keeps input order, every item has "http", flags carry "tally"
+        wd = {'lon': j1['tree']['lon'], 'lat': j1['tree']['lat'], 'retract': True, 'reporter': 'u1'}
+        r = c.post('/api/v1/flags', json={'reports': [wd, {'lon': j1['tree']['lon'], 'lat': j1['tree']['lat'],
+                                                            'layer': 'trees', 'claim': 'too_tall', 'reporter': 'u1'},
+                                                      {'client_id': cid, 'retract': True, 'reporter': 'u1'}]})
+        res = r.get_json()['results']
+        assert [x['http'] for x in res] == [201, 201, 200] and r.get_json()['count'] == 3, res
+        assert res[0]['tree']['op'] == 'retract' and res[0]['layer'] == 'trees' and 'id' not in res[0], res[0]
+        assert res[1]['claim'] == 'too_tall' and res[1]['tally']['claims'].get('too_tall') == 1 and 'other' not in res[1]['tally']['claims'], res[1]
+        assert res[2]['folded'] and 'already withdrawn' in res[2]['tree']['warning'], res[2]
+        assert pf._conn().execute('SELECT COUNT(*) FROM report').fetchone()[0] == nfl + 1
+        assert not pf._names_tree({'lon': 1, 'lat': 2, 'layer': 'cells.cover', 'retract': True}) and not pf._names_tree({'retract': True})
         # anyone can get a key; self-issued holders are marked
         r = c.post('/api/v1/flags/token', json={'name': 'Wald App'})
         tk = r.get_json()

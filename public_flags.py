@@ -386,12 +386,25 @@ _KNOWN = {'cell', 'lon', 'lat', 'kg', 'kg_code', 'layer', 'claim', 'observed', '
 TREE_LAYERS = ('trees', 'cells.trees')
 
 
+def _names_tree(body: dict) -> bool:
+    """Anything only a tree report carries makes it one — also the two withdraw
+    spellings without layer / claim: ``"species": null`` and ``"retract": true``
+    (retract exists for trees only; an explicit non-tree layer keeps it a flag)."""
+    if any(body.get(k) not in (None, '') for k in ('species', 'taxon', 'dbh_cm', 'tree_id', 'client_id')):
+        return True
+    if any(k in body for k in ('species', 'taxon')):
+        return True
+    r = body.get('retract')
+    return ((r is True or str(r).strip().lower() in ('1', 'true', 'yes'))
+            and str(body.get('layer') or 'trees').strip().lower() in TREE_LAYERS
+            and body.get('lon') is not None and body.get('lat') is not None)
+
+
 def record(body: dict, client: str, org: str | None = None) -> dict:
     if not isinstance(body, dict):
         raise FlagError(400, 'report must be a JSON object')
     # anything only a tree report carries makes it one (also "species": null = withdraw)
-    names_tree = (any(body.get(k) not in (None, '') for k in ('species', 'taxon', 'dbh_cm', 'tree_id', 'client_id'))
-                  or any(k in body for k in ('species', 'taxon')))
+    names_tree = _names_tree(body)
     if names_tree or str(body.get('layer') or '').strip().lower() in TREE_LAYERS:
         import tree_user as tu
         tu.prefill(body)                # tree_id / client_id → lon, lat
@@ -924,8 +937,7 @@ def _request_key(body):
 
 
 def _is_tree_report(it) -> bool:
-    return isinstance(it, dict) and (str(it.get('layer') or '').lower() in TREE_LAYERS or any(
-        k in it for k in ('species', 'taxon', 'dbh_cm', 'tree_id', 'client_id')))
+    return isinstance(it, dict) and (str(it.get('layer') or '').lower() in TREE_LAYERS or _names_tree(it))
 
 
 def _daily_ok(client: str, n: int, cap: int = DAILY_CAP) -> bool:

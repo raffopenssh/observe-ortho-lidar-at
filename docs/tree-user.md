@@ -22,12 +22,15 @@ Public contract: `public_docs.FLAGS_TXT → #tree-species`. Test: `python3 tests
   different value is a new version; current value = median of each reporter's latest. The LiDAR
   `height_m` / `h_m` is never replaced — the reported height is served as `h_user_m` / `height_user_m`
   (`h_dm` in the table is only the apex height at match time, used for the orphan re-attach).
+* **Withdraw** = op 2 by the same reporter hash: `"species": null` or `"retract": true` with a tree identity
+  (`public_flags._names_tree`: layer / claim optional — never a generic flag row). Nothing of that reporter on the
+  tree → 403 `reason: not_yours`; withdrawn before → 200 folded + `tree.warning`.
 * **Current answer** (`_derive`): each reporter's latest live version votes; plurality, tie → newest.
   Cached per KG (`_state`), revalidated across workers with one `MAX(rev)` query per request.
 * **Out**: `ne_trees.collect` → `_user_blocks`: sparse `user {i, taxon, n, v[, h_user_m, dbh_cm]}` + `added {…}`;
   rows get `taxon/taxon_n/taxon_v[/height_user_m/dbh_cm]`; `fields=taxon,h_user_m,dbh_cm` dense columns. Nothing is emitted for KGs without reports, so
   bodies / ETags / the 1-day cache of untouched KGs are unchanged; touched KGs get `u=<rev>` in the
-  ETag and max-age 300 (`public_api.TREES_USER_MAX_AGE`). Delta feed `/api/v1/trees/taxa?since=`,
+  ETag, a top-level `rev` (start of a `/trees/taxa?since=` poll) and max-age 300 (`public_api.TREES_USER_MAX_AGE`). Delta feed `/api/v1/trees/taxa?since=`,
   history `/api/v1/trees/taxa/history`, dictionary `/api/v1/trees/taxa/dict` (`TAXA`, ~90 rows with
   de/en names and our model class).
 * After a KG rebuild an apex may move: exact (x, y) join first, then ≤ 1.5 m **and** height within 3 m
