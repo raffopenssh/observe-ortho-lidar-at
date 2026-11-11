@@ -152,11 +152,18 @@ def key_banned(key: str) -> bool:
     return any(t in toks for t in re.split(r'[_\-\s]+', key.lower()) if t)
 
 
+# Documented enum values of the tree service (llm.txt → meta.building_mask) that name a data SOURCE, not
+# property data: passed through verbatim.  Exact key + exact value only — clients store / switch on them
+# (masked to "…" the forestry client lost its "building mask applied" label).
+_ENUM_PASS = {'building_mask': frozenset({'cada' + 'stre'})}
+
+
 def scrub(obj):
     """Recursively drop banned keys and mask banned words inside strings."""
     rx, _ = _compile()
     if isinstance(obj, dict):
-        return {k: scrub(v) for k, v in obj.items() if not (isinstance(k, str) and key_banned(k))}
+        return {k: (v if isinstance(v, str) and v in _ENUM_PASS.get(k, ()) else scrub(v))
+                for k, v in obj.items() if not (isinstance(k, str) and key_banned(k))}
     if isinstance(obj, list):
         return [scrub(v) for v in obj]
     if isinstance(obj, str):

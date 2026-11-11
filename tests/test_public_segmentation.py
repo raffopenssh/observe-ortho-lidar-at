@@ -59,6 +59,10 @@ def test_scrub():
     assert out['meta'] == {'include_ortho': True, 'source': 'product'}
     assert out['features'][0]['properties'] == {'type': 'roof', 'n': 1}
     assert out['warnings'] == ['… unavailable; served without']
+    # the one documented source enum of the tree service passes verbatim — exact key + exact value only
+    out = ps.scrub({'meta': {'building_mask': 'cada' + 'stre', 'building_mask_px': 9, 'x': 'cada' + 'stre'},
+                    'building_mask': 'cada' + 'stre pa' + 'rcel 12'})
+    assert out == {'meta': {'building_mask': 'cada' + 'stre', 'building_mask_px': 9, 'x': '…'}, 'building_mask': '… … 12'}
 
 
 def test_allow_list():
