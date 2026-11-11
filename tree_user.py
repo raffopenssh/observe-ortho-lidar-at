@@ -38,6 +38,8 @@ log = logging.getLogger('tree_user')
 
 OP_SPECIES, OP_ADD, OP_RETRACT, OP_MODERATE = 0, 1, 2, 3
 OP_NAMES = ('species', 'add', 'retract', 'moderated')
+# "retract": "last" (undo) is stored as an op-3 row WITH the reporter's hash (a moderation row has b''): it hides
+# that reporter's latest version exactly like a moderation, so every reader of ``hidden`` follows unchanged.
 MATCH_MIN_M = 1.5            # a point this close to an apex means that tree …
 MATCH_CROWN_FRAC = 0.5       # … or within this share of its crown radius (whichever is larger)
 MATCH_SURE_M = 0.75          # the apex coordinate itself (metre-snapped corpus) — never ambiguous
@@ -691,7 +693,8 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
     if raw is not None:
         latin, known = normalise(raw)
     empty = latin is None and uh_dm is None and dbh_mm is None
-    retract = _truthy(body.get('retract')) or (empty and has_sp)
+    undo = str(body.get('retract')).strip().lower() == 'last'      # drop only my latest version of this tree
+    retract = undo or _truthy(body.get('retract')) or (empty and has_sp)
     c = _conn()
     e_dm = n_dm = None
     new_tree = False
@@ -737,7 +740,8 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
             # my own added tree at this spot (never somebody else's, never one with other measures)
             lim = ADDED_NAME_M if retract else ADDED_FOLD_M
             m = next((t for t in cs if t['kind'] == 'added' and t['d'] <= lim
-                      and _mine_ok(c, t, rep, None if retract else (uh_dm, dbh_mm))), None)
+                      and (_mine_ok(c, t, rep, None if retract else (uh_dm, dbh_mm))
+                           or (undo and _any_mine(c, t, rep)))), None)
         if retract:
             if m is None:
                 raise pf.FlagError(404, 'no tree added by you at this point (send client_id, or the point you added it at)')
@@ -794,7 +798,18 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
                         return False
                 return True
 
-            if op == OP_RETRACT:
+            undone = None
+            if undo:
+                same = not mine
+                if same and not any(bytes(r['reporter']) == rep for r in rows):
+                    raise pf.FlagError(403, 'nothing of yours on this tree — only your own reports can be undone '
+                                            '(same "reporter" and reporter key as the report)',
+                                       reason='not_yours', tree=tree_at(kg, x, y))
+                if same:
+                    warnings.append('nothing left to undo — no version of yours is current on this tree')
+                else:
+                    undone = mine[-1]
+            elif op == OP_RETRACT:
                 same = not cur
                 if same and not mine:
                     # never reported on this tree: say so (403) instead of a silent no-op.  The reporter hash
@@ -815,10 +830,14 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
                     raise pf.FlagError(429, f'this tree already has {MAX_VERSIONS_PER_TREE} versions')
                 if c.execute('SELECT COUNT(*) FROM tree_ver').fetchone()[0] >= MAX_ROWS:
                     raise pf.FlagError(507, 'tree store full')
-                c.execute('INSERT INTO tree_ver(ts, x, y, kg, op, sp, h_dm, reporter, source, epoch, uh_dm, dbh_mm, '
-                          'e_dm, n_dm, cid, mts, meta, org) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                          (now, x, y, kg, op, sp, h_dm, rep, source_id, ep, uh_dm, dbh_mm, e_dm, n_dm,
-                           cid if op == OP_ADD else None, mts, meta, org_id))
+                if undone is not None:
+                    c.execute('INSERT INTO tree_ver(ts, x, y, kg, op, reporter, source, ref, org) VALUES (?,?,?,?,?,?,?,?,?)',
+                              (now, x, y, kg, OP_MODERATE, rep, source_id, undone['rev'], org_id))
+                else:
+                    c.execute('INSERT INTO tree_ver(ts, x, y, kg, op, sp, h_dm, reporter, source, epoch, uh_dm, dbh_mm, '
+                              'e_dm, n_dm, cid, mts, meta, org) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                              (now, x, y, kg, op, sp, h_dm, rep, source_id, ep, uh_dm, dbh_mm, e_dm, n_dm,
+                               cid if op == OP_ADD else None, mts, meta, org_id))
                 written = True
             c.execute('COMMIT')
         except Exception:
@@ -828,7 +847,9 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
     # folded: nothing new was created — a repeat (no version written) or, for an add, the report landed on
     # a tree that already existed.  written: a version was appended.
     out.update(folded=(not written) or (op == OP_ADD and not new_tree), written=written,
-               op=OP_NAMES[op], matched=kind, dist_m=round(dist, 1))
+               op='undo' if undo else OP_NAMES[op], matched=kind, dist_m=round(dist, 1))
+    if undo and undone is not None:
+        out.update(undone_rev=undone['rev'], undone_op=OP_NAMES[undone['op']])
     if tid is not None:
         out['matched_by'] = 'tree_id'
         if kind == 'id':
@@ -843,6 +864,11 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
     if warnings:
         out['warning'] = '; '.join(warnings)
     return out
+
+
+def _any_mine(c, t, rep: bytes) -> bool:
+    return bool(c.execute('SELECT 1 FROM tree_ver WHERE kg=? AND x=? AND y=? AND reporter=? LIMIT 1',
+                          (t['kg'], t['x'], t['y'], rep)).fetchone())
 
 
 def _mine_ok(c, t, rep: bytes, measures) -> bool:
@@ -1006,12 +1032,14 @@ def history(lon: float | None = None, lat: float | None = None, tree_id=None, cl
     if best is None:
         return None
     d, st, j, kg = best
-    rows = _conn().execute('SELECT rev, ts, op, sp, uh_dm, dbh_mm, source, epoch, ref, e_dm, n_dm, mts, meta, org FROM tree_ver '
+    rows = _conn().execute('SELECT rev, ts, op, sp, uh_dm, dbh_mm, source, epoch, ref, e_dm, n_dm, mts, meta, org, '
+                           'length(reporter) AS rl FROM tree_ver '
                            'WHERE kg=? AND x=? AND y=? ORDER BY rev', (kg, int(st['x'][j]), int(st['y'][j]))).fetchall()
     hidden = {r['ref'] for r in rows if r['op'] == OP_MODERATE}
     vs = []
     for i, r in enumerate(rows, 1):
-        v = {'v': i, 'rev': r['rev'], 'ts': r['ts'], 'op': OP_NAMES[r['op']]}
+        v = {'v': i, 'rev': r['rev'], 'ts': r['ts'],
+             'op': 'undo' if r['op'] == OP_MODERATE and r['rl'] else OP_NAMES[r['op']]}
         if r['sp'] is not None:
             v['taxon'] = _taxon(r['sp'])
         if r['uh_dm'] is not None:

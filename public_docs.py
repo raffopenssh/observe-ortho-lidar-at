@@ -297,6 +297,14 @@ what you expect, and send `looks_right` too: a confirmation is as useful as a co
        reporters, open, claims{{…}}}}, warnings?}}. Same subject + layer + claim + reporter folds into ONE row
     (n += 1) — repeat freely, you never create duplicates. Unknown fields are ignored and named in warnings.
     Limits: body ≤ 32 KB; ≤ 1 r/s sustained (burst 10), ≤ 500 reports / client / day → 429 + Retry-After.
+  Withdraw (undo) your own flag: same subject + layer + claim + reporter (+ reporter key) and "retract": true →
+    your contribution leaves that row (n -= yours, reporters -= 1; gone at 0). Every claim except tree | species
+    and trees + point + missing (those: "Tree species" below). Works in batches (per-item "http").
+       201 {{retracted:true, id, n (what you had), tally}}     tally = AFTER the withdraw
+       200 {{retracted:true, folded:true, tally}}              already withdrawn
+       403 {{error, reason:"not_yours", tally}}                others flagged this, you never did — nothing written
+       404 {{error, reason:"no_flag"}}                         nobody holds such a flag
+    Reads follow within their max-age (ETag changes); flagging again afterwards starts a fresh row at n = 1.
 
   GET  /api/v1/flags?bbox=w,s,e,n                  span ≤ 0.05° (viewport tile) — grouped: one row per subject
   GET  /api/v1/flags?cell=<h3>                     res 12 exact; res 6–11 = everything inside that hexagon
@@ -374,6 +382,10 @@ IDENTITY — say which tree you mean, in this order of preference:
          201 withdrawn | 200 folded:true + tree.warning "already withdrawn …" (yours, withdrawn before)
          403 {{error, reason:"not_yours", tree{{…}}}} you never reported on this tree — nothing written
          404 no such tree (unknown client_id / nothing in reach of the point)
+  Undo one step: {{…identity…, "retract": "last"}} → hides only YOUR latest version of that tree (one new version,
+       op:"undo"); your previous one is current again. Latest was a withdraw → it is taken back; latest was the
+       add → the tree goes. Repeat to step further back.
+         201 tree{{…, op:"undo", undone_rev, undone_op}} | 200 folded:true (nothing of yours left) | 403 | 404 as above
   Batches {{"reports":[…]}} ≤ 50 → 201 {{results:[{{…, "http": 201|200|4xx}}…], count, errors}} — results[i] answers
        reports[i] (input order, always the same length); EVERY item carries "http"; tree reports carry tree{{…}},
        flags carry id + tally (an add, claim "missing", carries all three); a failed item is {{error, http, …}} and

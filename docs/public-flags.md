@@ -30,6 +30,16 @@ are never stored. `observed` / `expected` compact JSON ≤ 512 / 256 B,
 `MAX_ROWS_DB = 2 M`. Indexes: `cell`, `kg`, `(lat_e6, lon_e6)`, `ts_last`,
 `status`.
 
+**Withdraw** (`"retract": true` on any non-tree claim, `_retract`): the
+reporter's own row is **deleted** (so every read — tally, grouped, heat,
+`ne_trees.flagged_cells`, ETags — follows with no extra filter) and a marker
+goes to `withdrawn(skey, layer, claim, reporter, ts, n)`; the marker is what
+separates 200 "already withdrawn" from 403 `not_yours` / 404 `no_flag`. A
+re-flag removes the marker; markers older than 180 d are pruned. Moderated
+rows (confirmed / rejected …) can be withdrawn too. Tree claims
+(`tree` / `species`, `trees` + point + `missing`) never come here — they
+withdraw in `tree_user.py`.
+
 **Snapshot**: when a reporter omits `observed` and the cell is on disk we
 store what we serve *now* (`snapshot_cell`: dominant group + share, h_max,
 trees_n, structures_n, consistency; nearest apex / structure within 30 m
@@ -42,6 +52,7 @@ KG's current header epoch and mark `superseded: true`.
 | | |
 |---|---|
 | `POST /flags` | one report or `{reports:[…]}` ≤ 50 → 201 `{id, folded, n, status, subject, epoch, served, snapshot?, tally, warnings?}` |
+| `POST /flags` + `retract:true` | withdraw own flag → 201 `{retracted, id, n, tally}` \| 200 `folded` \| 403 `not_yours` \| 404 `no_flag` |
 | `GET /flags?bbox=\|cell=\|ids=\|lon=&lat=&k=\|kg=` | grouped per subject (default) or `group=report`; filters `layer`, `claim`, `status`, `since`, `limit`, `notes=0`; `format=json\|columns` |
 | `GET /flags/<id>` | one row + tally |
 | `GET /flags/heat?res=6..12[&status=all][&kg=][&layer=]` | national roll-up `{cells, n, open, reporters}` — 5-min cache, cleared on write |

@@ -116,6 +116,30 @@ def main() -> int:
         assert pf._conn().execute('SELECT COUNT(*) FROM report').fetchone()[0] == n_flags
         L = c.get(f'/api/v1/trees/taxa?since={rev0}').get_json()
         assert L['count'] == 1 and L['columns']['added'] == [0] and L['columns']['dbh_cm'] == [None], L
+        # --- "retract": "last" = undo only my latest version (previous one is current again)
+        U = {'lon': lon5 + 0.0004, 'lat': lat5 + 0.0004, 'layer': 'trees', 'claim': 'missing', 'reporter': 'undo',
+             'force': True, 'client_id': '0b9d0e86-aaaa-4222-8333-444455556666'}
+        assert c.post('/api/v1/flags', json={**U, 'dbh_cm': 10}).status_code == 201
+        CID = {'client_id': U['client_id'], 'reporter': 'undo'}
+        assert c.post('/api/v1/flags', json={**CID, 'dbh_cm': 20, 'species': 'Fichte'}).get_json()['tree']['dbh_cm'] == 20
+        assert c.post('/api/v1/flags', json={**CID, 'retract': 'last', 'reporter': 'other'}).status_code == 403
+        r = c.post('/api/v1/flags', json={**CID, 'retract': 'last'}); j = r.get_json()
+        assert r.status_code == 201 and j['tree']['op'] == 'undo' and j['tree']['undone_op'] == 'species', j
+        assert j['tree']['dbh_cm'] == 10 and j['tree']['taxon'] is None and j['tree']['added'], j
+        # a full retract can be undone too
+        assert not c.post('/api/v1/flags', json={**CID, 'retract': True}).get_json()['tree']['added']
+        j = c.post('/api/v1/flags', json={**CID, 'retract': 'last'}).get_json()
+        assert j['tree']['undone_op'] == 'retract' and j['tree']['added'] and j['tree']['dbh_cm'] == 10, j
+        # the add itself is the latest → the tree goes; then nothing is left (200)
+        rev0 = tu.global_rev()
+        j = c.post('/api/v1/flags', json={**CID, 'retract': 'last'}).get_json()
+        assert j['tree']['undone_op'] == 'add' and not j['tree']['added'], j
+        L = c.get(f'/api/v1/trees/taxa?since={rev0}').get_json()
+        assert L['count'] == 1 and L['columns']['added'] == [0], L
+        r = c.post('/api/v1/flags', json={**CID, 'retract': 'last'})
+        assert r.status_code == 200 and r.get_json()['folded'] and 'undo' in r.get_json()['tree']['warning'], r.data
+        hv = c.get(f'/api/v1/trees/taxa/history?client_id={U["client_id"]}').get_json()['versions']
+        assert [v['op'] for v in hv] == ['add', 'species', 'undo', 'retract', 'undo', 'undo'] and hv[1]['hidden'], hv
         # --- identity: tree_id binds exactly; a bare point must be unambiguous
         x6, y6 = base['columns']['x'][6], base['columns']['y'][6]
         tid = f't_{x6 * 10 + 5}_{y6 * 10 + 5}'                    # product apex whose metre snap is corpus row 6 (or a neighbour)

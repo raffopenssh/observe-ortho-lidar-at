@@ -134,6 +134,11 @@ _SCHEMA = [
     "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)",
     # self-issued reporter keys (POST /api/v1/flags/token): only the sha256 of a key is kept
     "CREATE TABLE IF NOT EXISTS rkey (h BLOB PRIMARY KEY, holder TEXT NOT NULL, ts INTEGER NOT NULL, client TEXT)",
+    # a reporter took a flag back ({…, "retract": true}): the report row is deleted, this marker tells
+    # "already withdrawn" (200) from "never yours" (403).  Removed again when the reporter re-flags.
+    """CREATE TABLE IF NOT EXISTS withdrawn (skey INTEGER NOT NULL, layer INTEGER NOT NULL, claim INTEGER NOT NULL,
+                                             reporter BLOB NOT NULL, ts INTEGER NOT NULL, n INTEGER NOT NULL,
+                                             PRIMARY KEY (skey, layer, claim, reporter)) WITHOUT ROWID""",
 ]
 
 _LOCK = threading.Lock()
@@ -224,6 +229,7 @@ def _reporter_hash(reporter: str | None, client: str, org: str | None = None) ->
 def _prune(c):
     now = int(time.time())
     c.execute('DELETE FROM report WHERE status IN (2,3,4) AND status_ts < ?', (now - CLOSED_RETENTION_S,))
+    c.execute('DELETE FROM withdrawn WHERE ts < ?', (now - CLOSED_RETENTION_S,))
     n = c.execute('SELECT COUNT(*) FROM report').fetchone()[0]
     if n > MAX_ROWS_DB:
         c.execute('DELETE FROM report WHERE id IN (SELECT id FROM report WHERE status != 0 ORDER BY ts_last LIMIT ?)',
@@ -389,15 +395,61 @@ TREE_LAYERS = ('trees', 'cells.trees')
 def _names_tree(body: dict) -> bool:
     """Anything only a tree report carries makes it one — also the two withdraw
     spellings without layer / claim: ``"species": null`` and ``"retract": true``
-    (retract exists for trees only; an explicit non-tree layer keeps it a flag)."""
+    (an explicit non-tree layer, or a claim that is not a tree claim, keeps it a
+    flag — and its retract withdraws that flag, ``_retract``)."""
     if any(body.get(k) not in (None, '') for k in ('species', 'taxon', 'dbh_cm', 'tree_id', 'client_id')):
         return True
     if any(k in body for k in ('species', 'taxon')):
         return True
-    r = body.get('retract')
-    return ((r is True or str(r).strip().lower() in ('1', 'true', 'yes'))
+    return (_retracts(body) and str(body.get('claim') or 'tree').strip().lower() in TREE_CLAIMS
             and str(body.get('layer') or 'trees').strip().lower() in TREE_LAYERS
             and body.get('lon') is not None and body.get('lat') is not None)
+
+
+TREE_CLAIMS = ('species', 'tree', 'missing')
+
+
+def _retracts(body: dict) -> bool:
+    r = body.get('retract')
+    return r is True or str(r).strip().lower() in ('1', 'true', 'yes', 'last')
+
+
+def _retract(c, subj: dict, layer: str, claim: str, rep: bytes) -> dict:
+    """Withdraw THIS reporter's row of subject + layer + claim (same reporter hash
+    as folding).  The row is deleted — every read is a plain query on ``report``,
+    so tallies, heat, marks and ETags follow without further work."""
+    lid, cid_ = _DICT.get(('layer', layer)), _DICT.get(('claim', claim))
+    key = (subj['skey'], lid, cid_)
+    out = {'retracted': True, 'layer': layer, 'claim': claim, 'subject': _subject_public(subj)}
+    with _LOCK:
+        c.execute('BEGIN IMMEDIATE')
+        try:
+            r = c.execute('DELETE FROM report WHERE skey=? AND layer=? AND claim=? AND reporter=? RETURNING id, n',
+                          (*key, rep)).fetchone()
+            if r is not None:
+                c.execute('INSERT OR REPLACE INTO withdrawn(skey, layer, claim, reporter, ts, n) VALUES (?,?,?,?,?,?)',
+                          (*key, rep, int(time.time()), r['n']))
+                out.update(id=r['id'], folded=False, n=r['n'])
+            elif c.execute('SELECT 1 FROM withdrawn WHERE skey=? AND layer=? AND claim=? AND reporter=?',
+                           (*key, rep)).fetchone():
+                out['folded'] = True
+            else:
+                others = c.execute('SELECT 1 FROM report WHERE skey=? AND layer=? AND claim=? LIMIT 1', key).fetchone()
+                c.execute('ROLLBACK')
+                if others:
+                    raise FlagError(403, 'this flag is not yours — only your own flags can be withdrawn (same '
+                                         '"reporter" and reporter key as the flag)', reason='not_yours',
+                                    tally=tally(subj['skey']))
+                raise FlagError(404, 'no such flag: nothing with this subject + layer + claim', reason='no_flag')
+            c.execute('COMMIT')
+        except FlagError:
+            raise
+        except Exception:
+            c.execute('ROLLBACK')
+            raise
+    _heat_cache.clear()
+    out['tally'] = tally(subj['skey'])
+    return out
 
 
 def record(body: dict, client: str, org: str | None = None) -> dict:
@@ -432,6 +484,14 @@ def record(body: dict, client: str, org: str | None = None) -> dict:
                          _dict_id(c, 'org', org) if org else None)
         out = {'rev': tree.get('rev'), 'folded': tree['folded'], 'status': 'open', 'layer': layer, 'claim': claim,
                'subject': _subject_public(subj), 'epoch': epoch, 'tree': tree}
+        warn = [k for k in body if k not in _KNOWN]
+        if warn:
+            out['warnings'] = [f'ignored unknown field(s): {", ".join(sorted(warn))}']
+        return out
+    if _retracts(body) and not (claim == 'missing' and layer in TREE_LAYERS and has_point):
+        rp = body.get('reporter')
+        out = _retract(_conn(), subj, layer, claim,
+                       _reporter_hash(str(rp)[:120] if rp not in (None, '') else None, client, org))
         warn = [k for k in body if k not in _KNOWN]
         if warn:
             out['warnings'] = [f'ignored unknown field(s): {", ".join(sorted(warn))}']
@@ -472,7 +532,7 @@ def record(body: dict, client: str, org: str | None = None) -> dict:
             raise
         except Exception as e:  # noqa: BLE001
             log.warning('tree add failed: %s', e)
-        if tree is not None and tree.get('op') == 'retract':
+        if tree is not None and tree.get('op') in ('retract', 'undo'):
             return {'rev': tree.get('rev'), 'folded': tree['folded'], 'status': 'open', 'layer': layer,
                     'claim': claim, 'subject': _subject_public(subj), 'epoch': epoch, 'tree': tree}
     lon_e6 = int(round(subj['lon'] * 1e6)) if subj['lon'] is not None else None
@@ -493,6 +553,8 @@ def record(body: dict, client: str, org: str | None = None) -> dict:
                 (now, now, subj['skey'], subj['cell'], subj['kg'], lon_e6, lat_e6, lid, cid_, sid, rep,
                  epoch, observed, expected, note))
             rid, n, st = cur.fetchone()
+            c.execute('DELETE FROM withdrawn WHERE skey=? AND layer=? AND claim=? AND reporter=?',
+                      (subj['skey'], lid, cid_, rep))
             _WRITES += 1
             if _WRITES % _PRUNE_EVERY == 0:
                 _prune(c)
@@ -988,7 +1050,7 @@ def flags_post():
             if need_key and not it_org and _is_tree_report(it):
                 raise FlagError(401, 'tree reports need a reporter_key: POST /api/v1/flags/token {"name": "…"}')
             r = record(it, client, it_org)
-            r['http'] = 201 if r.get('tree', {}).get('written', True) else 200
+            r['http'] = 201 if (r.get('tree', {}).get('written', True) and not (r.get('retracted') and r['folded'])) else 200
             results.append(r)
         except FlagError as e:
             if batch is None:

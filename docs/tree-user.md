@@ -70,3 +70,12 @@ sqlite3 data/public_flags.sqlite 'SELECT op, COUNT(*) FROM tree_ver GROUP BY 1'
 
 Not done yet: feeding confirmed taxa (n ≥ 2) into RF / species-model training labels; a picker in our
 own `/segmentation` UI (map clients are the UI).
+
+## Undo (`"retract": "last"`)
+
+Hides only the reporter's latest live version of the tree; stored as an
+op-3 row (`ref` = hidden rev) **carrying the reporter hash** (a moderation
+row has `b''`), so every `hidden` reader (`_derive`, `record`, `_mine_ok`,
+`history`) follows unchanged. `/history` labels it `op: "undo"`. Undoing a
+retract restores what was there; undoing the add removes the tree. Answers
+201 `tree{op:"undo", undone_rev, undone_op}` / 200 folded / 403 `not_yours`.
