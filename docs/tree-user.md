@@ -84,3 +84,23 @@ Withdrawing an added tree (`retract: true`, or `"last"` when the add was the
 latest) also deletes the reporter's `trees` / `missing` flag row that the add
 wrote (`public_flags._drop_added_flag`; answer carries `flag_removed` + `tally`).
 Undoing such a withdraw restores the tree but not that flag row.
+
+## State since the flight (`"state": "logged" | …`, 2026-11-11)
+
+A tree that was cut / burnt / blown down after the LiDAR date. The apex stays served (true when flown); the state
+is a training / change label.
+
+* Vocabulary `public_flags.TREE_STATES` (append only, ≤ 14): standing, logged, windthrow, burnt, dead, broken,
+  infested, gone; aliases `TREE_STATE_ALIAS`. `claim: logged|burnt|…` is rewritten to `claim: state` + `state`.
+* **Storage = nothing new but one column**: the state is the existing `status` nibble of `tree_ver.meta`
+  (index + 1; 15 = `ST_NONE`, the reporter took the statement back); the date is `sdate`, packed by
+  `pack_date` ((year − 1990) × 512 + month × 32 + day, 0 = not given → 2 bytes, precision kept). No table, index
+  or `report` row; a version row stays ~65 B.
+* **Current state** (`_derive`): each reporter's latest status votes (standing too), plurality, tie → newest;
+  standing winning = no state. `st['state']` / `st['sdate']` per KG state; a tree with only a state is `live`.
+* **Reverse**: `"state": null` or state claim + `retract: true` → `op: unstate` (nibble 15; species / measures stay);
+  `retract: "last"` undoes it as any version; `retract: true` without a state claim withdraws everything as before.
+* **Wire**: `state` / `state_date` appear in `user` / `added` / `reported` only when a tree of the result has one —
+  KGs without reports stay byte-identical (same ETag, 1-day cache). `/trees/taxa?state=logged|any` = training set.
+* Linear noise is a different thing (the apex was never a tree): `claim: spurious` + `expected.hint: "linear"`,
+  `docs/linear-noise.md`.

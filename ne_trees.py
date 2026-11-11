@@ -421,7 +421,7 @@ def bbox_state(w, s, e, n) -> dict:
 # ── query ──────────────────────────────────────────────────────────────
 
 MAX_LIMIT_COLUMNS = 100000      # format=columns: one call carries a whole 0.025° tile (≈ 31k apices ≥ 3 m)
-_TREE_FIELDS = ('lon', 'lat', 'h_m', 'crown_m2', 'species', 'vitality', 'ndsm_only', 'cell', 'kg_code', 'x', 'y', 'taxon', 'h_user_m', 'dbh_cm', 'tree_id')
+_TREE_FIELDS = ('lon', 'lat', 'h_m', 'crown_m2', 'species', 'vitality', 'ndsm_only', 'cell', 'kg_code', 'x', 'y', 'taxon', 'h_user_m', 'dbh_cm', 'tree_id', 'state', 'state_date')
 _STRUCT_FIELDS = ('lon', 'lat', 'h_m', 'type', 'h_robust_m', 'area_m2', 'confidence', 'dh_m', 'cell', 'kg_code', 'x', 'y')
 DEFAULT_COLUMNS = {'trees': ('lon', 'lat', 'h_m', 'crown_m2'), 'structures': ('lon', 'lat', 'h_m', 'type')}
 COLUMN_FIELDS = {'trees': _TREE_FIELDS, 'structures': _STRUCT_FIELDS}
@@ -701,7 +701,7 @@ def columns_bbox(w, s, e, n, kind: str = 'trees', fields: tuple | None = None, *
             cols[f] = c['kg'].tolist()
         elif f in ('x', 'y', 'area_m2'):
             cols[f] = c[f].tolist()
-        elif f in ('taxon', 'h_user_m', 'dbh_cm', 'tree_id'):
+        elif f in ('taxon', 'h_user_m', 'dbh_cm', 'tree_id', 'state', 'state_date'):
             col = [None] * n_out
             u = r.get('user') or {}
             for i, t in zip(u.get('i', ()), u.get(f, ())):
@@ -743,7 +743,7 @@ def points_bbox(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit:
     if u:
         for i, t, cnt, v in zip(u['i'], u['taxon'], u['n'], u['v']):
             out[i].update(taxon=t, taxon_n=cnt, taxon_v=v)
-        for name, key_ in (('h_user_m', 'height_user_m'), ('dbh_cm', 'dbh_cm'), ('tree_id', 'tree_id')):
+        for name, key_ in (('h_user_m', 'height_user_m'), ('dbh_cm', 'dbh_cm'), ('tree_id', 'tree_id'), ('state', 'state'), ('state_date', 'state_date')):
             for i, val in zip(u['i'], u.get(name, ())):
                 if val is not None:
                     out[i][key_] = val
@@ -752,13 +752,15 @@ def points_bbox(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit:
         r['added'] = [{'lon': a['lon'][i], 'lat': a['lat'][i], 'height_m': a['h_m'][i], 'taxon': a['taxon'][i],
                        'taxon_n': a['n'][i], 'taxon_v': a['v'][i], 'added': True,
                        **({'dbh_cm': a['dbh_cm'][i]} if a.get('dbh_cm') and a['dbh_cm'][i] is not None else {}),
-                       **({'client_id': a['client_id'][i]} if a.get('client_id') and a['client_id'][i] else {})}
+                       **({'client_id': a['client_id'][i]} if a.get('client_id') and a['client_id'][i] else {}),
+                       **{k: a[k][i] for k in ('state', 'state_date') if a.get(k) and a[k][i]}}
                       for i in range(len(a['lon']))]
     a = r.get('reported')
     if a:
         r['reported'] = [{'tree_id': a['tree_id'][i], 'lon': a['lon'][i], 'lat': a['lat'][i], 'height_user_m': a['h_m'][i],
                           'taxon': a['taxon'][i], 'taxon_n': a['n'][i], 'taxon_v': a['v'][i],
-                          **({'dbh_cm': a['dbh_cm'][i]} if a.get('dbh_cm') and a['dbh_cm'][i] is not None else {})}
+                          **({'dbh_cm': a['dbh_cm'][i]} if a.get('dbh_cm') and a['dbh_cm'][i] is not None else {}),
+                          **{k: a[k][i] for k in ('state', 'state_date') if a.get(k) and a[k][i]}}
                          for i in range(len(a['lon']))]
     r = dict(r); r.pop('cols'); r.pop('state'); r.pop('user', None)
     r['trees' if kind == 'trees' else 'structures'] = out

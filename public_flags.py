@@ -96,6 +96,7 @@ CLAIMS = (
     'looks_right',   # positive confirmation — counts as QA evidence
     'species',       # layer trees + a point: describe the tree there — species, dbh_cm, h_m (versioned, tree_user.py)
     'tree',          # same as species (clearer name when only dbh_cm / h_m are sent)
+    'state',         # layer trees + a tree: what happened to it since our flight — state logged | burnt | … [date] (tree_user.py)
     'other',
 )
 STATUS = ('open', 'confirmed', 'rejected', 'fixed', 'stale')
@@ -388,7 +389,32 @@ def _clean_note(s) -> str | None:
 
 _KNOWN = {'cell', 'lon', 'lat', 'kg', 'kg_code', 'layer', 'claim', 'observed', 'expected', 'note', 'source',
           'reporter', 'epoch', 'species', 'taxon', 'h_m', 'dbh_cm', 'tree_id', 'tree_id_v2', 'client_id', 'force',
-          'retract', 'measured_at', 'dbh_method', 'h_method', 'vitality', 'status', 'reporter_key'}
+          'retract', 'measured_at', 'dbh_method', 'h_method', 'vitality', 'status', 'reporter_key',
+          'state', 'date', 'state_date', 'logged_at', 'felled_at'}
+# what can have happened to a tree since our flight (stored index + 1 in 4 bits — append only, max 14)
+TREE_STATES = ('standing',    # still there, alive (also: contradicts somebody's report)
+               'logged',      # cut down / harvested
+               'windthrow',   # blown down or uprooted (storm, snow load, avalanche, slide)
+               'burnt',       # fire
+               'dead',        # standing dead (snag)
+               'broken',      # top or stem snapped, tree still standing
+               'infested',    # bark beetle / disease / dieback — alive, dying
+               'gone')        # not there any more, cause unknown
+TREE_STATE_ALIAS = {
+    'stehend': 'standing', 'alive': 'standing', 'lebend': 'standing', 'ok': 'standing',
+    'felled': 'logged', 'gefaellt': 'logged', 'geschlaegert': 'logged', 'geschlagen': 'logged', 'cut': 'logged',
+    'cut_down': 'logged', 'harvested': 'logged', 'removed': 'logged', 'gerodet': 'logged', 'cleared': 'logged',
+    'windwurf': 'windthrow', 'storm': 'windthrow', 'sturm': 'windthrow', 'uprooted': 'windthrow', 'blown_down': 'windthrow',
+    'fallen': 'windthrow', 'umgefallen': 'windthrow', 'avalanche': 'windthrow', 'lawine': 'windthrow',
+    'burned': 'burnt', 'fire': 'burnt', 'verbrannt': 'burnt', 'brand': 'burnt',
+    'tot': 'dead', 'abgestorben': 'dead', 'snag': 'dead', 'duerr': 'dead', 'totholz': 'dead',
+    'snapped': 'broken', 'gebrochen': 'broken', 'bruch': 'broken', 'windbruch': 'broken', 'schneebruch': 'broken',
+    'wipfelbruch': 'broken', 'damaged': 'broken',
+    'bark_beetle': 'infested', 'borkenkaefer': 'infested', 'kaefer': 'infested', 'beetle': 'infested',
+    'diseased': 'infested', 'krank': 'infested', 'dieback': 'infested', 'dying': 'infested', 'befallen': 'infested',
+    'missing': 'gone', 'weg': 'gone', 'fehlt': 'gone', 'absent': 'gone',
+}
+_STATE_CLAIMS = frozenset(TREE_STATES[1:]) | {'felled', 'cut', 'cut_down', 'harvested', 'state'}
 TREE_LAYERS = ('trees', 'cells.trees')
 
 
@@ -401,12 +427,14 @@ def _names_tree(body: dict) -> bool:
         return True
     if any(k in body for k in ('species', 'taxon')):
         return True
+    if 'state' in body or str(body.get('claim') or '').strip().lower() in _STATE_CLAIMS:
+        return True
     return (_retracts(body) and str(body.get('claim') or 'tree').strip().lower() in TREE_CLAIMS
             and str(body.get('layer') or 'trees').strip().lower() in TREE_LAYERS
             and body.get('lon') is not None and body.get('lat') is not None)
 
 
-TREE_CLAIMS = ('species', 'tree', 'missing')
+TREE_CLAIMS = ('species', 'tree', 'missing', 'state')
 
 
 def _retracts(body: dict) -> bool:
@@ -480,6 +508,12 @@ def _drop_added_flag(c, subj: dict, tree: dict, rep: bytes) -> dict:
 def record(body: dict, client: str, org: str | None = None) -> dict:
     if not isinstance(body, dict):
         raise FlagError(400, 'report must be a JSON object')
+    cl = str(body.get('claim') or '').strip().lower()
+    if cl in _STATE_CLAIMS or ('state' in body and cl in ('', 'tree', 'species')):
+        # {"claim": "logged"} is short for {"claim": "state", "state": "logged"}; a bare "state" key needs no claim
+        body = {**body, 'claim': 'state', 'layer': body.get('layer') or 'trees'}
+        if cl not in ('state', '', 'tree', 'species'):
+            body.setdefault('state', cl)
     # anything only a tree report carries makes it one (also "species": null = withdraw)
     names_tree = _names_tree(body)
     if names_tree or str(body.get('layer') or '').strip().lower() in TREE_LAYERS:
@@ -495,10 +529,10 @@ def record(body: dict, client: str, org: str | None = None) -> dict:
     has_point = body.get('lon') is not None and body.get('lat') is not None
     if claim == 'tree':
         claim = 'species'
-    if claim == 'species':
+    if claim in ('species', 'state'):
         # per-tree, versioned: lives in tree_ver only (no folded report row)
         if layer not in TREE_LAYERS or not has_point:
-            raise FlagError(400, 'claim "species" / "tree" needs layer "trees" and a point: {lon, lat, species | dbh_cm | h_m}')
+            raise FlagError(400, 'claim "species" / "tree" / "state" needs layer "trees" and a point: {lon, lat, species | dbh_cm | h_m | state}')
         import tree_user as tu
         c = _conn()
         src = _clean_note(body.get('source'))
@@ -958,7 +992,7 @@ def dict_block() -> dict:
                     'else a salted hash of the client IP; neither is stored or returned)',
             'superseded': 'read-side flag: the KG product was rebuilt since the report (epoch differs)',
             'trees': 'layer trees + lon,lat: claim species (= tree) {species, dbh_cm, h_m} describes the tree at the point, '
-                     'claim missing [{species, dbh_cm, h_m}] adds one we do not have — versioned per tree; /api/v1/trees/taxa[/dict|/history]'}
+                     'claim missing [{species, dbh_cm, h_m}] adds one we do not have, "state": logged | windthrow | burnt | dead | broken | infested | gone [+ date] says what happened to one since our flight — versioned per tree; /api/v1/trees/taxa[/dict|/history]'}
 
 
 # === SECTION: HTTP ===

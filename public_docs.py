@@ -364,7 +364,7 @@ IDENTITY — say which tree you mean, in this order of preference:
        Metadata is stored per version (English vocabulary; common synonyms and German terms are normalised):
          measured_at  ISO 8601, when it was measured (`ts` of a version stays our receive time)
          dbh_method   caliper | tape | estimate          h_method  hypsometer | laser | estimate
-         vitality     alive | dead                       status    standing | felled
+         vitality     alive | dead                       (status = older name of "state" below)
        An unknown value is dropped with tree.warning — never a 400.
        → 201 (version written) | 200 (identical repeat, folded:true)
          {{rev, folded, claim, subject, epoch, tree{{tree_id?, client_id?, lon, lat, taxon, class, n, v, rev, added,
@@ -389,6 +389,22 @@ IDENTITY — say which tree you mean, in this order of preference:
        op:"undo"); your previous one is current again. Latest was a withdraw → it is taken back; latest was the
        add → the tree goes. Repeat to step further back.
          201 tree{{…, op:"undo", undone_rev, undone_op}} | 200 folded:true (nothing of yours left) | 403 | 404 as above
+  State since our flight — a tree that was cut, burnt, blown down … after the LiDAR date (the apex stays in the
+       data, it was true when flown; the state is what training / change detection needs):
+       {{…identity…, "state": "logged", "date": "2025-03"[, "reporter", "source"]}}        (no layer / claim needed;
+         "claim": "logged" is the same as "state": "logged"; may ride on any tree report or an add)
+         state  standing | logged (cut, harvested) | windthrow (blown down, uprooted, avalanche) | burnt | dead
+                (standing dead) | broken (top / stem snapped) | infested (bark beetle, disease, dying) | gone (not
+                there, cause unknown). German / common synonyms are normalised; unknown → 400 + states[].
+         date   "YYYY" | "YYYY-MM" | "YYYY-MM-DD", as precise as you know it, 1990 … today; optional.
+       → 201 | 200 folded, tree{{…, state: "logged" | null, state_date?, op:"state"}}. Each reporter's latest state
+         votes ("standing" is a vote too: use it to contradict); plurality, tie → newest. One state per reporter.
+       Take it back: {{…identity…, "state": null}} (or the same claim + "retract": true) → op:"unstate", only your
+         state goes, species / measures stay. 201 | 200 folded (already taken back) | 403 not_yours | 404. Or
+         "retract": "last" right after the report. Stored in the tree versions (2 bytes), no flag row.
+       Read: /trees/bbox "user" / "added" / "reported" gain state:[…], state_date:[…] only where one exists
+         (fields=…,state,state_date dense; json rows: state, state_date); /trees/taxa columns state, state_date and
+         filter &state=logged | any; /history versions carry state (null = taken back) + state_date.
   Batches {{"reports":[…]}} ≤ 50 → 201 {{results:[{{…, "http": 201|200|4xx}}…], count, errors}} — results[i] answers
        reports[i] (input order, always the same length); EVERY item carries "http"; tree reports carry tree{{…}},
        flags carry id + tally (an add, claim "missing", carries all three); a failed item is {{error, http, …}} and
@@ -420,8 +436,8 @@ IDENTITY — say which tree you mean, in this order of preference:
      model class). Added / reported trees fall into the height window by h_m (3 m when none was given).
   2. GET /api/v1/trees/taxa?bbox=w,s,e,n | kg=63349 | (nothing = national) [&since=<rev>][&limit≤5000]
        → {{rev, since, fields, order:"rev_asc", columns:{{lon, lat, taxon, n, v, rev, added, h_m, dbh_cm, tree_id,
-          client_id}}, count, truncated, next_since?}} — poll with since=<last rev>: only trees changed after it
-       (a row with taxon, h_m, dbh_cm all null and added 0 = drop it). ETag → 304, max-age 30.
+          client_id, state, state_date}}, count, truncated, next_since?}} — poll with since=<last rev>: only trees changed after it
+       (a row with taxon, h_m, dbh_cm, state all null and added 0 = drop it). ETag → 304, max-age 30.
   3. GET /api/v1/trees/taxa/history?tree_id= | client_id= | lon=&lat= → {{tree, kg, dist_m, versions:[{{v, rev, ts,
        op: species | add | retract | moderated, taxon?, h_m?, dbh_cm?, measured_at?, dbh_method?, h_method?,
        vitality?, status?, tree_id?, by?, source?, epoch?, hidden?}}]}} — every version of one tree, with its metadata.

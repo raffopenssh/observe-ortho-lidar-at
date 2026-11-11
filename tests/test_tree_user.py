@@ -163,6 +163,45 @@ def main() -> int:
         col = ne_trees.columns_bbox(*BB, 'trees', min_height=20, limit=50, fields=('lon', 'tree_id'))
         assert tid in col['user']['tree_id'] and tid in col['columns']['tree_id']
         assert c.post('/api/v1/flags', json={'tree_id': 't_1_2', 'dbh_cm': 4}).status_code == 400
+        # --- state since the flight: logged / burnt / … with a date; reversible; plurality across reporters
+        assert tu.date_str(tu.pack_date('2025')) == '2025' and tu.date_str(tu.pack_date('2025-3')) == '2025-03'
+        assert tu.date_str(tu.pack_date('2025-03-14T10:00:00Z')) == '2025-03-14' and tu.pack_date('2025-03-14') < 32768
+        S = {'lon': base['columns']['lon'][9], 'lat': base['columns']['lat'][9]}
+        r = c.post('/api/v1/flags', json={**S, 'claim': 'logged', 'date': '2025-03', 'reporter': 's1'}); j = r.get_json()
+        assert r.status_code == 201 and j['claim'] == 'state' and j['tree']['state'] == 'logged', j
+        assert j['tree']['state_date'] == '2025-03' and j['tree']['op'] == 'state' and j['tree']['matched'] == 'apex', j
+        assert c.post('/api/v1/flags', json={**S, 'state': 'gefällt', 'date': '2025-03', 'reporter': 's1'}).status_code == 200
+        assert c.post('/api/v1/flags', json={**S, 'state': 'logged', 'date': '2031', 'reporter': 's1'}).status_code == 400
+        assert c.post('/api/v1/flags', json={**S, 'state': 'eaten', 'reporter': 's1'}).status_code == 400
+        assert c.post('/api/v1/flags', json={**S, 'claim': 'state', 'reporter': 's1'}).status_code == 400
+        col = ne_trees.columns_bbox(*BB, 'trees', min_height=20, limit=50, fields=('lon', 'state', 'state_date'))
+        k = col['user']['i'][col['user']['state'].index('logged')]
+        assert col['columns']['state'][k] == 'logged' and col['columns']['state_date'][k] == '2025-03', col['user']
+        row = ne_trees.trees_bbox(*BB, min_height=20, limit=50)['trees'][k]
+        assert row['state'] == 'logged' and row['state_date'] == '2025-03', row
+        L = c.get('/api/v1/trees/taxa?state=logged').get_json()
+        assert L['count'] == 1 and L['columns']['state'] == ['logged'] and L['columns']['state_date'] == ['2025-03'], L
+        assert c.get('/api/v1/trees/taxa?state=burnt').get_json()['count'] == 0
+        # somebody else: not theirs to take back; their "standing" ties → newest statement wins; a third says burnt
+        assert c.post('/api/v1/flags', json={**S, 'state': None, 'reporter': 's2'}).status_code == 403
+        j = c.post('/api/v1/flags', json={**S, 'state': 'standing', 'reporter': 's2'}).get_json()
+        assert j['tree']['state'] is None, j
+        j = c.post('/api/v1/flags', json={**S, 'state': 'burnt', 'date': 2026, 'reporter': 's3'}).get_json()
+        assert j['tree']['state'] == 'burnt' and j['tree']['state_date'] == '2026', j
+        # take back only the state (species stays), repeat = 200, undo brings it back
+        c.post('/api/v1/flags', json={**S, 'species': 'Fichte', 'reporter': 's3'})
+        r = c.post('/api/v1/flags', json={**S, 'claim': 'burnt', 'retract': True, 'reporter': 's3'}); j = r.get_json()
+        assert r.status_code == 201 and j['tree']['op'] == 'unstate' and j['tree']['state'] is None and j['tree']['taxon'] == 'Picea abies', j
+        r = c.post('/api/v1/flags', json={**S, 'state': None, 'reporter': 's3'})
+        assert r.status_code == 200 and r.get_json()['folded'], r.data
+        j = c.post('/api/v1/flags', json={**S, 'retract': 'last', 'reporter': 's3'}).get_json()
+        assert j['tree']['op'] == 'undo' and j['tree']['state'] == 'burnt' and j['tree']['state_date'] == '2026', j
+        hv = c.get(f'/api/v1/trees/taxa/history?lon={S["lon"]}&lat={S["lat"]}').get_json()['versions']
+        assert hv[0]['state'] == 'logged' and hv[0]['state_date'] == '2025-03' and hv[1]['state'] == 'standing', hv
+        assert [v.get('state') for v in hv if 'state' in v][-1] is None, hv
+        for u in ('s1', 's2', 's3'):                                # all withdrawn → the tree carries nothing again
+            assert c.post('/api/v1/flags', json={**S, 'retract': True, 'reporter': u}).status_code == 201
+        assert 'state' not in c.get(f'/api/v1/trees/taxa/history?lon={S["lon"]}&lat={S["lat"]}').get_json()['tree']
         # an inventory tree the corpus has no apex for (a spot in the lake of trees: 30 m off) keeps its own record
         ghost = f't_{(x6 + 3) * 10 + 5}_{(y6 + 2) * 10 + 5}'
         near = tu._apices_near(*tu._tf('EPSG:3035', 'EPSG:4326').transform(x6 + 3.5, y6 + 2.5), 3.0)
