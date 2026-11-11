@@ -691,7 +691,7 @@ def _meta(**extra):
 def _404(_e):
     # unmatched /api/v1/* may be one of the analysis endpoints the public
     # /segmentation UI relays to app.py (explicit allow-list, public_segmentation.ROUTES)
-    if _seg is not None and (request.path or '').startswith('/api/v1/'):
+    if _seg is not None and (request.path or '').startswith(_seg.RELAY_PREFIXES):
         try:
             r = _seg.relay()
         except sg.Overloaded as e:

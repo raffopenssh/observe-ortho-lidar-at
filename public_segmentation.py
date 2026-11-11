@@ -77,7 +77,14 @@ ROUTES: tuple[tuple[str, str, str], ...] = (
     ('GET', r'/api/v1/share/[A-Za-z0-9_\-]+', 'light'),
     ('GET', r'/api/v1/share/[A-Za-z0-9_\-]+/download\.gpkg', 'heavy'),
     ('POST', r'/api/v1/share/[A-Za-z0-9_\-]+/rename', 'light'),
+    # forestry tree service — KEYED: needs a reporter key we assigned
+    # (data/reporter_keys.json; self-issued trk_ keys do not qualify)
+    ('POST', r'/api/v[23]/trees(/by-polygons)?', 'keyed'),
+    ('POST', r'/api/v[23]/changes/trees(/by-polygons)?', 'keyed'),
 )
+#: path prefixes public_api's 404 handler offers to :func:`relay`
+RELAY_PREFIXES = ('/api/v1/', '/api/v2/', '/api/v3/')
+KEYED_HDR = 'X-Srtm-Keyed'
 _ROUTE_RE = [(m, re.compile('^' + p + '$'), kind) for m, p, kind in ROUTES]
 
 _HOP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te',
@@ -85,7 +92,8 @@ _HOP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
 #: never forwarded — app.py must see the relay as a public-tier request; any
 #: operator credential a client might send is dropped here.
 _STRIP_IN = _HOP | {'x-forwarded-for', 'x-forwarded-host', 'x-real-ip', 'authorization',
-                    'x-operator-token', 'x-api-key', 'cookie', PUBLIC_HDR.lower(), 'x-srtm-tier'}
+                    'x-operator-token', 'x-api-key', 'cookie', PUBLIC_HDR.lower(), 'x-srtm-tier',
+                    'x-reporter-key', 'x-srtm-keyed'}
 
 HEAVY_GATE = sg.Gate('segmentation_heavy', 2, 3.0, env='SEG_MAX_CONCURRENT')
 HEAVY_RATE = sg.RateLimiter('segmentation_heavy', 0.5, 20, env='SEG_RATE_PER_S')   # 30/min sustained
@@ -237,6 +245,24 @@ def _limited(resp_json: dict, retry: float) -> Response:
     return r
 
 
+def keyed_holder() -> str | None:
+    """Holder of an operator-assigned reporter key on this request
+    (``X-Reporter-Key`` / ``Authorization: Bearer`` / ``?reporter_key=``), else None."""
+    import hmac
+    import public_flags as pf
+    k = request.headers.get('X-Reporter-Key') or request.args.get('reporter_key') or ''
+    if not k:
+        a = request.headers.get('Authorization') or ''
+        k = a[7:] if a.lower().startswith('bearer ') else ''
+    k = k.strip()
+    if not k:
+        return None
+    for kk, holder in pf.reporter_keys().items():
+        if hmac.compare_digest(kk.encode(), k.encode()):
+            return holder
+    return None
+
+
 def relay():
     """Forward the current request to app.py if (method, path) is allow-listed.
     Returns ``None`` when it is not (the caller answers 404)."""
@@ -246,6 +272,17 @@ def relay():
     if kind is None:
         return None
     key = sg.client_key(request)
+    holder = None
+    if kind == 'keyed':
+        holder = keyed_holder()
+        if holder is None:
+            r = Response(json.dumps({'error': 'reporter key required',
+                                     'detail': 'send the reporter key we assigned to your organisation as '
+                                               'X-Reporter-Key (self-issued keys do not open the tree service)'}),
+                         status=401, mimetype='application/json')
+            r.headers['Cache-Control'] = 'no-store'
+            return r
+        kind, key = 'heavy', 'k:' + holder
     ok, _left, retry = (HEAVY_RATE if kind == 'heavy' else LIGHT_RATE).take(key)
     if not ok:
         return _limited({'error': 'rate_limited', 'detail': 'too many analysis requests from this client'}, retry)
@@ -255,6 +292,10 @@ def relay():
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _STRIP_IN}
     headers[PUBLIC_HDR] = '1'
     headers['X-Public-Client'] = key
+    if holder:
+        headers[KEYED_HDR] = holder
+        if 'reporter_key=' in url:       # never forward / log the key itself
+            url = re.sub(r'([?&])reporter_key=[^&]*&?', r'\1', url).rstrip('?&')
     # The relay carries the client IP so app.py never treats a relayed
     # request as loopback (its loopback rule is what gates mutating routes).
     headers['X-Forwarded-For'] = key

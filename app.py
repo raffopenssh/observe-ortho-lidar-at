@@ -329,7 +329,20 @@ PUBLIC_MAX_HEAVY = max(1, int(os.environ.get('PUBLIC_MAX_HEAVY', '2')))
 _PUBLIC_SLOT_DIR = _config.RUNTIME_DIR / 'public_slots'
 _PUBLIC_HEAVY_RE = re.compile(
     r'^/api/v1/(segment|elevation|terrain|segment/overlay|(dtm|lidar|ortho|cir|hansen)/overlay'
-    r'|export/(geopackage|kml|mbtiles)|share/[A-Za-z0-9_\-]+/download\.gpkg)$')
+    r'|export/(geopackage|kml|mbtiles)|share/[A-Za-z0-9_\-]+/download\.gpkg)$'
+    r'|^/api/v[23]/(changes/)?trees(/by-polygons)?$')
+# Keyed public clients (operator-assigned reporter key, checked by the relay —
+# ``public_segmentation.keyed_holder``): the forestry tree service.  Same
+# untrusted treatment as every public relay, but the owner's area cap.
+PUBLIC_KEYED_HDR = 'X-Srtm-Keyed'
+PUBLIC_KEYED_MAX_AREA_SQM = int(float(os.environ.get('PUBLIC_KEYED_MAX_AREA_KM2', '25')) * 1e6)
+
+
+def _public_keyed() -> str:
+    try:
+        return (request.headers.get(PUBLIC_KEYED_HDR) or '') if _public_request() else ''
+    except RuntimeError:
+        return ''
 
 
 class _PublicSlot:
@@ -11562,7 +11575,7 @@ def _validate_area(geom_3035, public: bool | None = None):
     area = geom_3035.area
     cap = MAX_AREA_SQM
     if public or (public is None and _public_request()):
-        cap = min(cap, PUBLIC_MAX_AREA_SQM)
+        cap = min(cap, PUBLIC_KEYED_MAX_AREA_SQM if _public_keyed() else PUBLIC_MAX_AREA_SQM)
     if area > cap:
         raise ValueError(
             f"The selected area is too large ({area/1e6:.1f} km²). "
@@ -14796,10 +14809,11 @@ def _tree_endpoint(core_fn, geometry_fn=None):
         run_async = True
 
     if run_async:
-        task_id = request.args.get('task_id', '') or str(uuid.uuid4())
+        task_id = _accept_task_id(request.args.get('task_id', ''))
         with _TASK_QUEUE_LOCK:
             if _TASK_QUEUE_SIZE >= MAX_QUEUE_SIZE:
                 return _error('Server busy — too many tasks queued. Try again in a few minutes.', 503)
+        _mark_public_task(task_id)
         _progress_start(task_id)
         _cleanup_old_results()
         threading.Thread(target=_tree_task_worker,
