@@ -589,6 +589,18 @@ The set of Katastralgemeinden (BEV, 7 850 codes) is pinned per epoch:
   universe_agrees_contract (live index vs the pinned hash) so a drift is visible at once.
 
 {CELLS_TXT.replace("{{", "{").replace("}}", "}").replace("{NE_STATS_NOTE}", NE_STATS_NOTE)}{STATS_TXT.replace("{{", "{").replace("}}", "}")}{FLAGS_TXT.replace("{{", "{").replace("}}", "}")}
+## Tree service for forestry clients — keyed                                             #tree-service
+  Same host as this document — header X-Reporter-Key: <the key we assigned to your
+  organisation> (also Authorization: Bearer …; self-issued trk_ keys from /flags/token do NOT
+  open it → 401). Area ≤ 25 km², GeoJSON geometry body, ?async=true recommended:
+    POST /api/v3/trees | /api/v3/trees/by-polygons | /api/v3/changes/trees     product-backed
+    POST /api/v2/trees | /api/v2/trees/by-polygons | /api/v2/changes/trees     live apex inventory
+      → 202 {{task_id, poll, result}}; poll GET /api/v1/segment/progress?task_id=…, then
+        GET /api/v1/segment/result?task_id=…   (both tokenless; a task id is only visible here
+        when it was created through this host)
+  Parameters as before (detection_mode=fused, crown_geometry=polygon, legacy_ids, dataset=YYYYMMDD,
+  date_a / date_b, …). 30 POSTs/min per key, 2 concurrent; 429 / 503 carry Retry-After.
+
 ## Segmentation UI — the interactive map at /segmentation                                #segmentation
   {BASE}/segmentation — draw or upload an area (≤ {_config.PUBLIC_MAX_AREA_KM2:g} km²), run
   Segment / Elevation / Terrain, toggle the LiDAR / ortho / CIR / forest-change overlays, export
