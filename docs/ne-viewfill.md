@@ -189,7 +189,12 @@ Throughput chain once the walk is done (2026-11-04 tuning): staged → `consume_
 (≤200/tick) → `confirm_ne_server` re-POSTs (`ne_post_max_per_tick`, 30→50; the ingest
 tick takes ~12 min, so ~250 posts/h; `ne_post_gib_per_day` caps the day) and sweep
 results → `sliver_sweep.integrate` (oldest received first, ≤40/tick in 150 s).
-A KG walked with nothing left is not re-walked for 7 days (`RECHECK_S`); the
+A KG walked with nothing left is not re-walked for 7 days (`RECHECK_S`), and
+after that only when its file digest changed (local / mixed candidates; a
+moved view comes back through the NE server's `obs_missing`). A staged viewfill
+re-post whose rebuilt body digest equals the one the NE server holds is dropped
+without a POST (`recovered=`, `repost_noop_at`) — 2026-11-12: the expiring
+gate re-walked ~2 700 parents a week, 99 % no-op POSTs (~33 MB/h out). The
 same residual set is not re-queued for 7 days (`REPLAN_S`).
 
 ### Coverage re-post loop (2026-11-06, fixed)

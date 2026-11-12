@@ -56,8 +56,8 @@ STATE_FILE = VF_DIR / "state.json"
 LOCK_FILE = VF_DIR / "run.lock"
 CHANNEL = "viewfill"                 # inbound_budget channel (views + product pulls)
 MB_PER_H_DEFAULT = 5000.0            # knob viewfill_mb_per_h — 5 GB/h: the walk, not the primary link, is the limit for the 2026-11 pass
-RECHECK_S = 7 * 86400                # a KG whose view ETag + file digest are unchanged is not re-walked sooner
-REPLAN_S = 7 * 86400                 # the same residual cell set is not queued to the sweepers again sooner
+RECHECK_S = 7 * 86400                # local / mixed parents: not re-walked sooner; after it only when the file digest changed
+REPLAN_S = 7 * 86400                 # unused since 2026-11-12: the same residual cell set is never queued twice
 MIN_RESIDUAL_FOR_SWEEP = 1
 
 
@@ -202,7 +202,9 @@ def candidates(all_kgs: bool = False, st: dict | None = None) -> list[tuple[str,
         save_state(st)
         log.info("ne_viewfill: local scan: %d complete parents with %d unseen rows (%.0fs)", len(un), scan["cells"], scan["dt"])
     for kg, u in (scan.get("unseen") or {}).items():
-        if u > est.get(kg, (0, ""))[0]:
+        if kg in est:       # the NE server lists it: stays a "NE server" candidate (never gated on the file digest)
+            est[kg] = (max(int(u), est[kg][0]), est[kg][1])
+        else:
             est[kg] = (int(u), "local")
     for kg in mixed_parents(entries, idx):
         if kg not in est:
@@ -217,6 +219,16 @@ def candidates(all_kgs: bool = False, st: dict | None = None) -> list[tuple[str,
         if k.get("ts") and now - float(k["ts"]) < RECHECK_S and why in ("all", "local", "mixed") and not k.get("residual_n"):
             continue      # walked recently and nothing left we could do locally
         if not ne_ingest.path_for(kg).exists():
+            continue
+        # Past the gate a local / mixed parent is re-walked only when its file
+        # changed since the last walk.  A view that moved on the NE server's side and
+        # left blank rows brings the KG back through obs_missing (why="NE server").
+        # Until 2026-11-12 the gate simply expired: ~2 700 parents re-fetched
+        # their view (~0.2 MB) and re-POSTed an identical body (~0.4 MB,
+        # answer unchanged:true) every 7 days — ~50 no-op POSTs/h.
+        if why in ("all", "local", "mixed") and k.get("ts") and not k.get("error") and k.get("base_digest") \
+                and (not k.get("residual_n") or k.get("planned_ts") or k.get("residual_held")) \
+                and _file_digest(kg) == k["base_digest"]:
             continue
         out.append((kg, int(g), why))
     out.sort(key=lambda t: (-t[1], t[0]))
@@ -235,6 +247,37 @@ def _ids_observed(path: Path) -> tuple[np.ndarray, np.ndarray, str]:
     ids = ne_ingest._lu_ids(r["lu"], n)
     seen = ne_ingest.row_observed(r["obs"])
     return ids, ids[seen], str((hdr.get("neo1") or {}).get("digest") or "")
+
+
+def _file_digest(kg: str) -> str:
+    """NEO1 digest from the h3b header only (no body read); '' on error."""
+    import ne_ingest
+    import ne_h3
+    try:
+        return str((ne_h3.read_h3b_header(ne_ingest.path_for(kg)).get("neo1") or {}).get("digest") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+_SWEEP_KGS: dict | None = None
+
+
+def _view_swept(kg: str) -> bool:
+    """True when the parent's sweep is closed and holds at least one
+    view-fill unit (``source == "viewfill"``), all ``ok`` — the residual
+    of an earlier walk went through the pipeline."""
+    global _SWEEP_KGS
+    if _SWEEP_KGS is None:
+        try:
+            import sliver_sweep
+            _SWEEP_KGS = json.loads(Path(sliver_sweep.STATE_FILE).read_text()).get("kgs") or {}
+        except Exception as ex:  # noqa: BLE001
+            log.info("ne_viewfill: sweep state unreadable: %s", ex)
+            _SWEEP_KGS = {}
+    k = _SWEEP_KGS.get(kg) or {}
+    vu = [u for u in (k.get("units") or []) if u.get("source") == "viewfill"]
+    return bool(k.get("state") == "done" and vu and all(u.get("state") == "ok" for u in k.get("units") or [])
+                and not int(k.get("unswept") or 0) and not int(k.get("plan_deferred") or 0))
 
 
 def _view_ids(view) -> np.ndarray:
@@ -334,8 +377,18 @@ def process(kg: str, entries: dict | None = None, idx: dict | None = None, *, st
     # Nothing moved since the last walk (same view ETag, same file digest, no
     # error) → the previous result still stands; re-walking only re-staged a
     # duplicate repost every hour for the ~6 800 NE-server-listed parents.
-    may_skip = bool(prev.get("ts") and time.time() - float(prev["ts"]) < RECHECK_S and not prev.get("error")
+    # No age limit (2026-11-12): same view ETag + same file digest = same
+    # answer, however old the walk is.
+    may_skip = bool(prev.get("ts") and not prev.get("error")
                     and prev.get("view_etag") and prev.get("base_digest") == digest)
+    # residual already run through the sweepers — carried on every skip row
+    # (until 2026-11-12 a skip row dropped ``residual_held`` and a held row
+    # dropped ``planned_ts``: ne_h3.view_coverage then answered None forever
+    # and 47 border KGs stayed blank / ``unswept_held`` at the NE server)
+    held = bool(prev.get("residual_held") or (prev.get("residual_n") and not prev.get("planned_ts")
+                                               and _view_swept(kg)))
+    # a residual that never reached the sweepers must not hide behind a skip
+    may_skip = may_skip and bool(not prev.get("residual_n") or prev.get("planned_ts") or held)
     # The view comes from the stored copy (data/ne/declared/) whenever the
     # revisit row's declared_etag matches it — no request at all; otherwise
     # one GET with If-None-Match (304 = 0 bytes).  NE server bandwidth, 2026-11-09.
@@ -350,6 +403,7 @@ def process(kg: str, entries: dict | None = None, idx: dict | None = None, *, st
     if row["view_from"] in ("stored", "304") and may_skip and prev.get("view_etag") == view.header.get("_etag"):
         row.update(skip="unchanged", blank=prev.get("blank"), residual_n=prev.get("residual_n"),
                    residual_digest=prev.get("residual_digest"), planned_ts=prev.get("planned_ts"),
+                   residual_held=held or None,
                    view_etag=prev.get("view_etag"), view_n=prev.get("view_n"), view_digest=prev.get("view_digest"),
                    view_source=prev.get("view_source"), base_digest=digest, file_n=int(ids.size),
                    file_observed=int(seen.size))
@@ -362,7 +416,8 @@ def process(kg: str, entries: dict | None = None, idx: dict | None = None, *, st
     row.update(file_n=int(ids.size), file_observed=int(seen.size), base_digest=digest)
     if may_skip and prev.get("view_etag") == row.get("view_etag"):
         row.update(skip="unchanged", blank=prev.get("blank"), residual_n=prev.get("residual_n"),
-                   residual_digest=prev.get("residual_digest"), planned_ts=prev.get("planned_ts"))
+                   residual_digest=prev.get("residual_digest"), planned_ts=prev.get("planned_ts"),
+                   residual_held=held or None)
         return row
     gap = np.setdiff1d(vids, seen, assume_unique=True)
     row["blank"] = int(gap.size)                       # what NE server counts as blank + missing today
@@ -408,11 +463,17 @@ def process(kg: str, entries: dict | None = None, idx: dict | None = None, *, st
     row["residual_n"] = int(gap2.size)
     # 3. the pipeline — sweep units over what nobody observed
     plan = bool(gap2.size >= MIN_RESIDUAL_FOR_SWEEP)
-    if plan and prev.get("residual_digest") and prev.get("planned_ts"):
+    if plan and prev.get("residual_digest") and (prev.get("planned_ts") or held):
+        # the same cell set was already handed to the sweepers: never again
+        # (cells outside Austria / without ALS stay unobserved; a changed set
+        # has a new digest and is planned).  No REPLAN_S expiry since
+        # 2026-11-12 — it re-swept and re-posted the same residual weekly.
         rd = ne_h3.digest_of(gap2.tobytes())
-        if rd == prev["residual_digest"] and time.time() - float(prev["planned_ts"]) < REPLAN_S:
+        if rd == prev["residual_digest"]:
             plan = False
             row["residual_held"] = True
+            if prev.get("planned_ts"):
+                row["planned_ts"] = prev["planned_ts"]
     row["residual_digest"] = ne_h3.digest_of(gap2.tobytes()) if gap2.size else None
     if stage:
         STAGED_DIR.mkdir(parents=True, exist_ok=True)
@@ -492,7 +553,7 @@ def run(budget_s: float = 3000, max_kgs: int | None = None, kgs: list[str] | Non
                 out["residual"] += int(row.get("residual_n") or 0)
                 if row.get("staged_digest"):
                     out["staged"] += 1
-                if row.get("planned_ts"):
+                if row.get("planned_ts") and not row.get("residual_held"):
                     out["planned_kgs"] += 1
                     out["planned_cells"] += int(row.get("residual_n") or 0)
             st["kgs"][kg] = {k: v for k, v in row.items() if k not in ("merged_from",)} | \

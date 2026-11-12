@@ -1472,8 +1472,13 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
                 # ~200 parents cost a ~0.2 MB view GET every tick forever
                 # (2026-11-06: ~240 MB/h, the top line of net_stats).
                 rv = c.get("recovered") or {}
-                shortcut = not (k.get("cov_due") or c.get("repost") or k.get("on_index")
-                                or (rv.get("of") == want and rv.get("have") == have))
+                # A viewfill re-post takes the shortcut too (2026-11-12): equal
+                # body digest = the NE server holds exactly these rows, borrowed ones
+                # included — 941 of 953 forced re-posts in 24 h were answered
+                # ``unchanged:true`` (~0.4 MB each).  ``repost`` is cleared in
+                # the recovered branch, so the pair cannot loop.
+                shortcut = not (k.get("cov_due") or k.get("on_index")
+                                or (rv.get("of") == want and rv.get("have") == have and not c.get("repost")))
                 r, sec, st = _post_bare_on_view(parent, want, c, green_fix, held=have if shortcut else None)
                 nbytes = len(sec)
                 recovered = bool(isinstance(r, dict) and r.get("recovered"))
@@ -1514,6 +1519,8 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
                 c.update(confirmed_digest=want, confirmed_at=_now(), post_attempts=0, posted_digest=want)
                 c["recovered"] = {"of": want, "have": have, "at": _now()}
                 c.pop("post_next", None)
+                if c.pop("repost", None):
+                    c["repost_noop_at"] = _now()
                 out["recovered"] = int(out.get("recovered") or 0) + 1
                 continue       # no POST happened: no budget, no ladder step, no obs_missing record
             posts += 1
