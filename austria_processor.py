@@ -572,7 +572,9 @@ def _run_repair_probe(spec_path: str, progress) -> None:
     started = datetime.now(timezone.utc).isoformat()
     rep = {"started_at": started, "n_cells": len(cells), "year": year,
            "creds": os.environ.get("COPERNICUS_CRED_INDICES", "")}
-    progress.update(state="running", current_kg="repair-probe",
+    # current_kg stays None: every status reader expects a dict there
+    # (a str 500ed director/status, 2026-11-12); the mode is `repair_probe`.
+    progress.update(state="running", current_kg=None,
                     started_at=started, total_kgs=0, repair_probe=dict(rep))
     progress.save()
     log.info("repair probe: %d cell(s), year %d, budget %.0f s, creds=%s",

@@ -4666,6 +4666,13 @@ class PeerDirector:
             pid = peer['id']
             url = peer.get('url')
             ps = statuses.get(pid, {'state': 'unreachable'})
+            if isinstance(ps, dict) and ps.get('current_kg') \
+                    and not isinstance(ps.get('current_kg'), dict):
+                # repair-probe processors (< this commit) report
+                # current_kg="repair-probe" (a str) — every
+                # ``(ps.get('current_kg') or {}).get`` below would raise
+                # and 500 the whole status (2026-11-12).
+                ps = dict(ps, current_kg=None)
             # Refresh meta_cache from the live status (only when the peer
             # actually reported a value — never overwrite a known value
             # with an empty string from a stale/proxied response).
