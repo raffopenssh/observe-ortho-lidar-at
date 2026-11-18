@@ -762,6 +762,13 @@ def evict_merged_blocks(idx: dict, entries: dict, max_n: int = EVICT_PER_TICK,
         out["disabled"] = True
         return out
     now = time.time()
+    # one pass over the manifest instead of a full scan per parent (the
+    # per-parent scan was ~8 % of a core on an idle primary)
+    from kg_splitter import is_sweep_code
+    live: dict[str, list[str]] = {}
+    for k, e in entries.items():
+        if k.endswith("_json_v2") and "-" in k and _committed(e) and not is_sweep_code(k[:-8]):
+            live.setdefault(k.split("-", 1)[0], []).append(k[:-8])
     for parent, st in idx["parents"].items():
         if out["evicted"] >= max_n:
             break
@@ -774,7 +781,7 @@ def evict_merged_blocks(idx: dict, entries: dict, max_n: int = EVICT_PER_TICK,
         if age < min_age_s or not path_for(parent).exists():
             continue
         merged = set(st.get("blocks") or [])
-        for b in _live_blocks(parent, entries):
+        for b in sorted(live.get(parent, ())):
             p = path_for(b)
             if not p.exists():
                 continue
