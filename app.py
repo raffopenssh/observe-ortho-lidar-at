@@ -8607,25 +8607,17 @@ def _combined_log_compute():
     """
     from concurrent.futures import ThreadPoolExecutor
     import time as _time
-    d = pd.get_director()
-    status = d.get_status()
+    # Targets come straight from the peers config — NOT from
+    # ``get_status()``. The ticker below calls this every 30 s in each
+    # worker, which is exactly the status TTL, so it forced a full
+    # director-status recompute per TTL forever (~3% of a core on an idle
+    # primary during the run-complete hold). The status was only used as
+    # an "online" filter against connect timeouts, obsolete since the
+    # probe became push-only: ``get_pushed_status`` returns None for a
+    # peer without a fresh push.
     cfg = pd.load_peers_config()
-    targets = []
-    for p in status.get('peers', []):
-        pid = p.get('id')
-        if not pid:
-            continue
-        # Skip peers the director already knows are offline — they hang
-        # the response while we wait for connect timeout. Everything
-        # else (running, idle, paused, cache-only) is fair game: we want
-        # the merged ring to contain warnings from peers that never
-        # actually started a KG (e.g. auth failures, missing creds).
-        if not p.get('online', True):
-            continue
-        peer_cfg = pd.get_peer_by_id(cfg, pid)
-        if not peer_cfg:
-            continue
-        targets.append((pid, peer_cfg.get('url')))
+    targets = [(p.get('id'), p.get('url'))
+               for p in cfg.get('peers', []) if p.get('id')]
 
     # IMPORTANT: read pushed status only — do NOT trigger synchronous
     # HTTP probes here. Every peer pushes its full progress.json (incl.
@@ -8639,9 +8631,11 @@ def _combined_log_compute():
         pid, _url = t
         try:
             ent = pd.get_pushed_status(pid)
-            ps = (ent or {}).get('status') or {}
+            if not ent:
+                return pid, None
+            ps = ent.get('status') or {}
         except Exception:
-            ps = {}
+            return pid, None
         return pid, ps.get('recent_log') or []
 
     merged: list[dict] = []
@@ -8650,6 +8644,8 @@ def _combined_log_compute():
         with ThreadPoolExecutor(
                 max_workers=min(20, len(targets))) as pool:
             for pid, log_lines in pool.map(_probe, targets):
+                if log_lines is None:   # no fresh push = offline
+                    continue
                 seen_ids.append(pid)
                 for entry in log_lines:
                     e = dict(entry)
