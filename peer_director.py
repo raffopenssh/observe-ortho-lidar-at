@@ -4439,7 +4439,15 @@ class PeerDirector:
         if cached is not None and age is not None and age < self._STATUS_CACHE_STALE:
             if self._status_cache_inflight.acquire(blocking=False):
                 def _bg_refresh():
+                    xfd = None
                     try:
+                        # Single-flight across gunicorn workers: the
+                        # worker that holds the file lock computes, the
+                        # other keeps serving stale and adopts the disk
+                        # copy on its next call.
+                        xfd = self._status_xlock(0)
+                        if xfd is None or self._status_adopt_fresh_disk():
+                            return
                         # Re-snapshot the flag fingerprint at the
                         # moment of compute, not at the time the
                         # request came in.
@@ -4453,6 +4461,7 @@ class PeerDirector:
                     except Exception as _e:  # noqa: BLE001
                         log.warning('get_status background refresh: %s', _e)
                     finally:
+                        self._status_xunlock(xfd)
                         try:
                             self._status_cache_inflight.release()
                         except RuntimeError:
@@ -4480,19 +4489,75 @@ class PeerDirector:
                 if (self._status_cache_value is not None and
                         (_t.time() - self._status_cache_ts) < self._STATUS_CACHE_TTL):
                     return self._status_cache_value
-            sig = self._is_director_signature()
-            result = self._compute_status()
-            with self._status_cache_lock:
-                self._status_cache_value = result
-                self._status_cache_ts = _t.time()
-                self._status_cache_flag_sig = sig
-            self._status_cache_save_disk(result, sig)
-            return result
+            # Cross-worker single-flight: wait (bounded) for the other
+            # worker's compute and take its result; if it does not show
+            # up in time, compute anyway rather than fail the request.
+            xfd = self._status_xlock(20)
+            try:
+                adopted = self._status_adopt_fresh_disk()
+                if adopted is not None:
+                    return adopted
+                sig = self._is_director_signature()
+                result = self._compute_status()
+                with self._status_cache_lock:
+                    self._status_cache_value = result
+                    self._status_cache_ts = _t.time()
+                    self._status_cache_flag_sig = sig
+                self._status_cache_save_disk(result, sig)
+                return result
+            finally:
+                self._status_xunlock(xfd)
         finally:
             try:
                 self._status_cache_inflight.release()
             except RuntimeError:
                 pass
+
+    _STATUS_LOCK_FILE = Path('/tmp/srtm_director_status_cache.lock')
+
+    def _status_xlock(self, wait_s: float):
+        """Cross-process compute lock (flock).  → fd, or None when another
+        worker still holds it after *wait_s* (0 = one non-blocking try).
+        Released by the kernel if the holder dies."""
+        import fcntl
+        try:
+            fd = os.open(str(self._STATUS_LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o644)
+        except OSError:
+            return None
+        end = time.time() + max(0.0, wait_s)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except OSError:
+                if time.time() >= end:
+                    os.close(fd)
+                    return None
+                time.sleep(0.2)
+
+    @staticmethod
+    def _status_xunlock(fd) -> None:
+        if fd is not None:
+            try:
+                os.close(fd)   # closing drops the flock
+            except OSError:
+                pass
+
+    def _status_adopt_fresh_disk(self) -> dict | None:
+        """Adopt the disk copy if another worker wrote one within TTL for
+        the current director-flag state; → it, else None."""
+        disk = self._status_cache_load_disk()
+        if not disk:
+            return None
+        ts = float(disk.get('_cached_at', 0) or 0)
+        sig = (bool(disk.get('_flag_exists', False)), int(disk.get('_flag_mtime_ns', 0) or 0))
+        if sig != self._is_director_signature() or not (0 <= time.time() - ts < self._STATUS_CACHE_TTL):
+            return None
+        with self._status_cache_lock:
+            self._status_cache_value = disk
+            self._status_cache_ts = ts
+            self._status_cache_flag_sig = sig
+        return disk
 
     def _status_cache_load_disk(self) -> dict | None:
         try:
