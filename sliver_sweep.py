@@ -652,6 +652,30 @@ def _is_cache_miss(error: str | None) -> bool:
     return "not cached" in e or "cache_miss" in e or "cache-only" in e
 
 
+def _live_peers(st: dict) -> dict:
+    """``st['peers']`` with each worker's codes cut down to the parents it
+    still holds (state ``dispatched`` on that peer).  The stored list is
+    only rewritten by ``assign``, which stops running once the director
+    enters the run-complete hold — a parent finished just before the hold
+    stayed listed forever (``at12: 32022[2/2u …14h]``, 2026-11-18)."""
+    kgs = st.get("kgs") or {}
+    out = {}
+    for pid, ps in (st.get("peers") or {}).items():
+        codes = [c for c in (ps.get("codes") or [])
+                 if (kgs.get(c) or {}).get("state") == "dispatched" and (kgs.get(c) or {}).get("peer") == pid]
+        out[pid] = dict(ps, codes=codes)
+    return out
+
+
+def dispatched_by_peer() -> dict:
+    """``{peer_id: [parent, …]}`` of the parents currently dispatched."""
+    out: dict = {}
+    for c, k in (load_state().get("kgs") or {}).items():
+        if k.get("state") == "dispatched" and k.get("peer"):
+            out.setdefault(k["peer"], []).append(c)
+    return out
+
+
 def held_cells(limit: int = HOLD_MAX_CELLS) -> list[dict]:
     """Cells the held sweep units wait for — merged by the director into
     ``prewarm.repair_cells`` so a frontier fetches them (the same path a
@@ -1357,7 +1381,7 @@ def status() -> dict:
             "tolerant_open": tolerant_open, "cache_miss_total": int((st.get("stats") or {}).get("cache_miss") or 0),
             "done_24h": len(day), "rate_per_h": round(rate, 2),
             "scan_backlog": scan_backlog, "scan_rate_per_h": round(scan_rate, 2),
-            "eta_h": round(eta_h, 1) if eta_h is not None else None, "peers": st.get("peers") or {},
+            "eta_h": round(eta_h, 1) if eta_h is not None else None, "peers": _live_peers(st),
             "contrib_confirmed": confirmed, "stats": st.get("stats"), "products": prod,
             "knobs": {"sweep_peers": _knob("sweep_peers", SWEEP_PEERS_DEFAULT),
                       "sweep_per_peer": _knob("sweep_per_peer", SWEEP_PER_PEER_DEFAULT),

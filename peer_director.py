@@ -283,6 +283,7 @@ DIRECTOR_KNOBS = {
     # Repair probe (docs/product-repair.md → Repair probe): on/off, hours
     # between probes, cells per probe.
     'repair_probe': bool, 'repair_probe_h': float, 'repair_probe_cells': int,
+    'repair_probe_backoff_max_h': float,
 }
 _knob_cache: dict = {'at': 0.0, 'd': {}}
 
@@ -414,6 +415,21 @@ REPAIR_PROBE_INTERVAL_H = float(os.environ.get('REPAIR_PROBE_INTERVAL_H', '6'))
 REPAIR_PROBE_MAX_S = int(os.environ.get('REPAIR_PROBE_MAX_S', str(40 * 60)))
 REPAIR_PROBE_MAX_CELLS = int(os.environ.get('REPAIR_PROBE_MAX_CELLS', '24'))
 REPAIR_PROBE_HISTORY = 24
+# Back-off: after this many consecutive probes that filled nothing on an
+# unchanged cell set the interval doubles per further zero-fill run, up to
+# ``repair_probe_backoff_max_h`` (knob).  Any fill, or a change of the
+# open cell set, resets it.  (2026-11-18: 7 runs × 40 min of openEO on
+# the same two harmonics cells, 0 filled.)
+REPAIR_PROBE_BACKOFF_AFTER = 2
+REPAIR_PROBE_BACKOFF_MAX_H = float(os.environ.get('REPAIR_PROBE_BACKOFF_MAX_H', '72'))
+
+
+def repair_probe_interval_h(rp: dict | None, cfg=None) -> float:
+    """Effective hours between repair probes = base knob × zero-fill back-off."""
+    base = float(knob(cfg, 'repair_probe_h', REPAIR_PROBE_INTERVAL_H))
+    streak = int((rp or {}).get('zero_streak') or 0)
+    cap = max(base, float(knob(cfg, 'repair_probe_backoff_max_h', REPAIR_PROBE_BACKOFF_MAX_H)))
+    return min(cap, base * (2 ** max(0, streak - REPAIR_PROBE_BACKOFF_AFTER)))
 # Repair cells stay published while hourly openEO read-timeouts are
 # at most this many OR fewer than successful months (see _product_repair_plan).
 PRODUCT_REPAIR_OPENEO_MAX_TIMEOUTS = 3
@@ -12179,6 +12195,31 @@ class PeerDirector:
 
     # === SECTION: repair probe ===
 
+    def _sweep_pushed_reconcile(self) -> None:
+        """Drop ``sweep_pushed`` peers that no longer hold a dispatched
+        sweep parent and clear their spec.  The cache-only orchestrator
+        does this while it runs, but it stops with the run-complete hold:
+        a parent that finished just before the hold left its peer marked
+        forever (at12 / 32022, 2026-11-18) — never a repair-probe
+        candidate, and a restart would re-run the stale spec."""
+        sp = self.state.get('sweep_pushed') or {}
+        if not sp or time.time() - getattr(self, '_sweep_reconcile_at', 0) < 600:
+            return
+        self._sweep_reconcile_at = time.time()
+        import sliver_sweep as _sls
+        live = _sls.dispatched_by_peer()
+        for pid in [p for p in sp if not live.get(p)]:
+            pp = get_peer_by_id(self.cfg, pid)
+            try:
+                if pp and pp.get('url'):
+                    _push_sweep_spec(pp['url'], {})
+            except Exception as e:  # noqa: BLE001
+                log.debug('sweep spec clear on %s failed: %s', pid, e)
+                continue
+            with self._lock:
+                (self.state.get('sweep_pushed') or {}).pop(pid, None)
+            log.info('sweep: cleared settled spec on %s (no dispatched parent left)', pid)
+
     def _repair_probe_peer(self) -> str | None:
         """Peer id currently running the repair probe (excluded from both
         orchestrators + the hold's idle-stop), else None."""
@@ -12244,6 +12285,16 @@ class PeerDirector:
         with self._lock:
             rp = self.state.setdefault('repair_probe', {})
         active = rp.get('active') or {}
+        if 'zero_streak' not in rp:
+            # first tick with the back-off: seed from the trailing
+            # zero-fill runs already in the history
+            _n = 0
+            for _h in reversed(rp.get('history') or []):
+                if int(_h.get('filled') or 0) or str(_h.get('stop') or '').startswith('no report'):
+                    break
+                _n += 1
+            rp['zero_streak'] = _n
+            rp['zero_sig'] = None
         # --- finalize a running probe ---------------------------------
         if active:
             pid = active.get('peer')
@@ -12288,6 +12339,11 @@ class PeerDirector:
                 del hist[:-REPAIR_PROBE_HISTORY]
                 rp['active'] = None
                 rp['last_at'] = now
+                if filled:
+                    rp['zero_streak'] = 0
+                elif rep or timeout:
+                    rp['zero_streak'] = int(rp.get('zero_streak') or 0) + 1
+                rp['zero_sig'] = active.get('sig')
                 if not rep and not timeout:
                     # never reported (start raced / old code / crashed at
                     # argparse): retry on another peer in ~10 min, not 6 h
@@ -12303,7 +12359,10 @@ class PeerDirector:
                     f"repair probe {pid}: filled {len(filled)} / failed {len(failed)} / "
                     f"skipped {entry['skipped']} of {entry['n_cells']} cell(s) in {age/60:.0f} min "
                     f"(creds {entry['creds']}, stop={entry['stop']})"
-                    + (" — registry re-sweep queued" if filled else ""),
+                    + (" — registry re-sweep queued" if filled else "")
+                    + (f" — {rp.get('zero_streak')} zero-fill runs in a row, next probe in "
+                       f"{repair_probe_interval_h(rp, cfg):g} h" if not filled and
+                       int(rp.get('zero_streak') or 0) > REPAIR_PROBE_BACKOFF_AFTER else ""),
                     peer=pid, level='info' if filled or not failed else 'warning')
             except Exception:
                 pass
@@ -12317,7 +12376,24 @@ class PeerDirector:
         why = ''
         if (DATA_DIR / 'copernicus_paused').exists():
             why = 'copernicus_paused'
+        # zero-fill back-off: past the base interval but inside the
+        # backed-off one → only look (≤ once an hour) whether the open
+        # cell set changed; an unchanged set waits.
+        backoff_s = repair_probe_interval_h(rp, cfg) * 3600.0
+        in_backoff = backoff_s > interval_s and now - float(rp.get('last_at') or 0) < backoff_s
+        if in_backoff and now - float(rp.get('backoff_checked_at') or 0) < 3600:
+            return
         cells = [] if why else self._repair_probe_cells()
+        _sig = ';'.join(sorted(f"{float(c['w']):.2f},{float(c['s']):.2f}" for c in cells))
+        if in_backoff:
+            with self._lock:
+                rp['backoff_checked_at'] = now
+                if cells and _sig != (rp.get('zero_sig') or ''):
+                    rp['zero_streak'] = 0
+                    in_backoff = False
+            if in_backoff:
+                return
+            log.info('repair probe: open cell set changed — zero-fill back-off reset')
         if not why and not cells:
             why = 'no open cells'
         strikes = rp.get('cell_strikes') or {}
@@ -12415,7 +12491,7 @@ class PeerDirector:
                 rp.setdefault('peer_last_used', {})[peer['id']] = now  # rotate away next time
             return
         with self._lock:
-            rp['active'] = {'peer': peer['id'], 'creds': creds, 'n_cells': len(cells),
+            rp['active'] = {'peer': peer['id'], 'creds': creds, 'n_cells': len(cells), 'sig': _sig,
                             'started_at': now, 'max_seconds': REPAIR_PROBE_MAX_S,
                             'cells': [f"{float(c['w']):.2f},{float(c['s']):.2f}" for c in cells]}
             rp.setdefault('peer_last_used', {})[peer['id']] = now
@@ -15254,6 +15330,10 @@ class PeerDirector:
                         log.exception('primary park enforce failed')
                     # The repair probe is the only thing that moves during
                     # the hold (docs/product-repair.md → Repair probe).
+                    try:
+                        self._sweep_pushed_reconcile()
+                    except Exception:
+                        log.exception('sweep_pushed reconcile failed')
                     try:
                         self._repair_probe_tick(locals().get('_statuses') or {})
                     except Exception:

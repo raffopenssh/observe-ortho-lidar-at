@@ -20633,12 +20633,16 @@ def process_txt():
                     _ra = _rp.get('active') or {}
                     _rlast = _rp.get('last') or {}
                     _rsk = _rp.get('skip') or {}
-                    _ivl = pd.knob(None, 'repair_probe_h', pd.REPAIR_PROBE_INTERVAL_H)
+                    _base = pd.knob(None, 'repair_probe_h', pd.REPAIR_PROBE_INTERVAL_H)
+                    _ivl = pd.repair_probe_interval_h(_rp)
                     _on = pd.knob(None, 'repair_probe', True)
                     _nxt = ''
                     if _rp.get('last_at'):
                         _nxt = f" next≈{max(0, (float(_rp['last_at']) + float(_ivl) * 3600 - time.time()) / 60):.0f}m"
-                    _s = f"  probe:   {'on' if _on else 'OFF'} every {_ivl:g}h{_nxt}"
+                    _s = f"  probe:   {'on' if _on else 'OFF'} every {_base:g}h"
+                    if float(_ivl) > float(_base):
+                        _s += f" (backed off to {_ivl:g}h: {_rp.get('zero_streak')} zero-fill runs, resets on a fill or new cells)"
+                    _s += _nxt
                     if _ra:
                         _s += (f" · ACTIVE {_ra.get('peer')} cells={_ra.get('n_cells')} creds={_ra.get('creds')} "
                                f"{(time.time() - float(_ra.get('started_at') or 0)) / 60:.0f}m")

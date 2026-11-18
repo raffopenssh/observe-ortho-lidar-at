@@ -389,13 +389,66 @@ def _dup_r10s() -> np.ndarray:
     return np.asarray([int(r[0]) for r in rows], dtype=np.uint64)
 
 
+# A full build is ~50 min of one core.  The generation moves on *any*
+# re-ingested file, and in the endgame that is 1–4 sliver-sweep merges a
+# day (~100 cells of 276 M) — a daily rebuild for nothing visible in a
+# res-9 mean.  Minor drift is therefore deferred: same ALGO / green-fix /
+# file count, at most MINOR_FILES files touched since the last build and
+# the corpus cell total within MINOR_CELLS_FRAC, for at most MAX_DEFER_D
+# days since the last build.  ``--force`` always builds.
+MINOR_FILES = int(os.environ.get('CELLS_NATIONAL_MINOR_FILES', '25'))
+MINOR_CELLS_FRAC = float(os.environ.get('CELLS_NATIONAL_MINOR_CELLS_FRAC', '1e-4'))
+MAX_DEFER_D = float(os.environ.get('CELLS_NATIONAL_MAX_DEFER_D', '7'))
+
+
+def _corpus_sig(files: dict) -> dict:
+    return {'files': len(files), 'cells': sum(int(f.get('cells_n') or 0) for f in files.values()),
+            'partial': sum(1 for f in files.values() if f.get('partial'))}
+
+
+def minor_drift(meta: dict | None, files: dict, now: float | None = None) -> dict | None:
+    """→ ``{changed_files, cells_delta, age_d}`` when the corpus moved so
+    little since *meta*'s build that the rebuild can wait, else None."""
+    import calendar
+    if not meta or meta.get('algo') != ALGO or meta.get('green_fix') != _green_fix.FIX_ID:
+        return None
+    try:
+        built = calendar.timegm(time.strptime(meta['built_at'], '%Y-%m-%dT%H:%M:%SZ'))
+    except Exception:  # noqa: BLE001
+        return None
+    now = time.time() if now is None else now
+    age_d = (now - built) / 86400.0
+    if age_d > MAX_DEFER_D or int(meta.get('kgs') or -1) != len(files):
+        return None
+    start = float(meta.get('build_started') or built - float(meta.get('build_s') or 0))
+    changed = sum(1 for f in files.values() if float(f.get('mtime') or 0) > start)
+    if changed > MINOR_FILES:
+        return None
+    sig = _corpus_sig(files); old = meta.get('corpus') or {}
+    delta = None
+    if old:
+        if int(old.get('partial', -1)) != sig['partial']:
+            return None
+        delta = sig['cells'] - int(old.get('cells') or 0)
+        if abs(delta) > MINOR_CELLS_FRAC * max(1, sig['cells']):
+            return None
+    return {'changed_files': changed, 'cells_delta': delta, 'age_d': round(age_d, 2)}
+
+
 def build(verbose: bool = True, force: bool = False) -> dict:
     t0 = time.time()
     gen = current_gen()
     meta = read_meta()
-    if meta and meta.get('gen') == gen and not force and all((NAT_DIR / f'r{r}.nex.gz').exists() for r in RESES):
+    have = all((NAT_DIR / f'r{r}.nex.gz').exists() for r in RESES)
+    if meta and meta.get('gen') == gen and not force and have:
         return {'skipped': True, 'gen': gen}
     files = ca._files()
+    if have and not force:
+        d = minor_drift(meta, files)
+        if d is not None:
+            log.info('national: build deferred, minor corpus drift %s (serving gen %s)', d, meta.get('gen'))
+            return {'skipped': True, 'deferred': 'minor corpus drift', 'serving_gen': meta.get('gen'),
+                    'corpus_gen': gen, **d, 'rebuild_by_d': MAX_DEFER_D}
     kgs = sorted(files)
     dup = _dup_r10s(); dup_set = set(dup.tolist())
     acc = Acc(9)
@@ -436,7 +489,7 @@ def build(verbose: bool = True, force: bool = False) -> dict:
     NAT_DIR.mkdir(parents=True, exist_ok=True)
     out_meta = {'algo': ALGO, 'gen': gen, 'epoch': epoch, 'built_at': built_at, 'kgs': len(kgs), 'chunks': n_chunks,
                 'cells': acc.cells, 'dup_r10s': int(dup.size), 'rows': {}, 'bytes_gz': {}, 'fields': [f for f in FIELDS if f != 'id'],
-                'green_fix': _green_fix.FIX_ID}
+                'green_fix': _green_fix.FIX_ID, 'build_started': round(t0, 1), 'corpus': _corpus_sig(files)}
     reds = {9: red9, 8: rollup(red9, 9, 8)}
     for res in RESES:
         cols = finalise(reds[res])
@@ -548,7 +601,8 @@ def dict_block() -> dict:
                      'unit,agg}], ids: delta_u64|u64, verdicts[], groups[]} | column bytes in header order, rows sorted by id',
         'headers': {'ETag': '"n-r<res>-<gen>-<fields hash>" (If-None-Match → 304)', 'X-Cells-Gen': 'build generation — key your copy on this',
                     'X-Cells-Epoch': 'corpus epoch pin at build time', 'X-Cells-Built': 'build time (UTC)',
-                    'Cache-Control': 'public, max-age=86400 — rebuilt daily when the corpus changed'},
+                    'Cache-Control': 'public, max-age=86400 — rebuilt daily when the corpus changed; a handful of re-ingested '
+                                     'products is batched for up to 7 days (X-Cells-Built says how old the table is)'},
         'res': list(RESES), 'default_res': DEFAULT_RES, 'default_fields': list(DEFAULT_FIELDS), 'aliases': ALIASES,
         'fields': {k: {kk: vv for kk, vv in v.items() if kk != 'src'} | {'source': v['src']} for k, v in FIELDS.items() if k != 'id'},
         'source': 'observation rows + tree apices + man-made objects of the published .h3b products only (no 25 m grid '
