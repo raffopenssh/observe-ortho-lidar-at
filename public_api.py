@@ -153,7 +153,7 @@ def _preflight():
     # in-flight cap.  /k is token-gated fleet traffic, on-box probes are exempt;
     # tiles count for rate only (own render gate bounds their thread use).
     p = request.path or ''
-    if not p.startswith(tiers.PRIVATE_PREFIX) and not sg.is_local(request):
+    if not sg.is_local(request):
         key = sg.client_key(request)
         count = not p.startswith('/tiles/')
         ok, retry, why = sg.CLIENTS.enter(key, count_inflight=count)
