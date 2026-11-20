@@ -171,19 +171,38 @@ def bind(c, body: dict, subj: dict) -> dict:
     return {'skey': apex_skey(sx, sy), 'kg': kg, 'epoch': pf._epoch_now(kg), 'expected': exp, 'observed': observed, 'public': pub, 'warnings': warnings}
 
 
-def own_key(c, subj: dict, rep: bytes):
-    """Retract of trees / spurious at a point: the apex-keyed row it means — the reporter's own,
-    else their withdrawn marker, else somebody else's (→ 403); None = the cell row as before."""
+def _near_keys(subj: dict) -> list:
     import tree_user as tu
-    lid, cid = _ids(c)
-    if lid is None or cid is None:
-        return None
     px, py = tu._to_3035(subj['lon'], subj['lat'])
     x0, y0 = int(math.floor(px - APEX_M)), int(math.floor(py - APEX_M))
     n = int(2 * APEX_M) + 2
-    keys = sorted(((x - px) ** 2 + (y - py) ** 2, apex_skey(x, y)) for x in range(x0, x0 + n) for y in range(y0, y0 + n)
-                  if (x - px) ** 2 + (y - py) ** 2 <= APEX_M ** 2)
-    ks = [k for _, k in keys]
+    return [k for _, k in sorted(((x - px) ** 2 + (y - py) ** 2, apex_skey(x, y)) for x in range(x0, x0 + n)
+                                 for y in range(y0, y0 + n) if (x - px) ** 2 + (y - py) ** 2 <= APEX_M ** 2)]
+
+
+def merged_at(c, subj: dict):
+    """(skey, kg) of the merged extra top a point names (nearest apex-keyed "same tree" flag ≤ 2.5 m), or None.
+    A ``looks_right`` on trees at such a point is the objection to that merge and is keyed like it."""
+    lid, cid = _ids(c)
+    if lid is None or cid is None:
+        return None
+    ks = _near_keys(subj)
+    got = {r[0]: r[1] for r in c.execute('SELECT skey, kg FROM report WHERE skey IN (%s) AND layer=? AND claim=? AND status IN (0,1)'
+                                         % ','.join('?' * len(ks)), (*ks, lid, cid))}
+    k = next((k for k in ks if k in got), None)
+    return None if k is None else (k, got[k])
+
+
+def own_key(c, subj: dict, rep: bytes, claim: str = 'spurious'):
+    """Retract of trees / spurious (or looks_right) at a point: the apex-keyed row it means — the reporter's
+    own, else their withdrawn marker, else somebody else's (→ 403); None = the cell row as before."""
+    import public_flags as pf
+    lid, cid = _ids(c)
+    if claim != 'spurious':
+        cid = pf._DICT.get(('claim', claim))
+    if lid is None or cid is None:
+        return None
+    ks = _near_keys(subj)
     q = ','.join('?' * len(ks))
     rows = c.execute(f'SELECT skey, reporter FROM report WHERE skey IN ({q}) AND layer=? AND claim=?', (*ks, lid, cid)).fetchall()
     mine = {r[0] for r in rows if bytes(r[1]) == rep}
@@ -202,37 +221,100 @@ def own_key(c, subj: dict, rep: bytes):
 
 # === SECTION: read side (called from ne_trees._flags, cached there per KG) ===
 
-def merges(rows, epoch_now):
-    """rows = [(skey, expected json, observed json, epoch)] of one KG's open / confirmed tree flags →
-    (parent keys int64 (x << 32 | y), crown_m2 to add) sorted by key, chains resolved to the root.  Only flags
-    made against the product epoch being served take part (after a rebuild the extra top may be gone)."""
-    par: dict = {}; add: dict = {}
-    for skey, e, o, ep in rows:
-        if not is_apex_skey(skey) or not e or '"crown"' not in e:
+def resolve(rows, epoch_now):
+    """rows = [(skey, expected json, observed json, epoch, status, claim is looks_right)] — the apex-keyed tree
+    flags of one KG file, open / confirmed → ``(merge, tops, hide)``:
+
+    * ``merge`` (parent keys int64 (x << 32 | y), crown_m2 to add) sorted by key, chains resolved to the root;
+      only flags made against the product epoch being served take part (after a rebuild the top may be gone);
+      None when there is nothing to add.
+    * ``tops`` [(x, y, h_m | nan, crown_m2 | nan, of_x, of_y, reporters, objections)] — every extra top that IS
+      merged, with its root: what /trees/bbox shows in ``merged`` so people see it and can take it back.
+    * ``hide`` [(x, y)] of those tops.
+
+    A top is merged while more reporters say "same tree" than say "looks_right" on it (a tie releases it:
+    the product stands when people disagree), or while a moderator confirmed the flag."""
+    par: dict = {}; add: dict = {}; obs_: dict = {}; yes: dict = {}; no: dict = {}; conf = set()
+    for skey, e, o, ep, status, is_ok in rows:
+        if not is_apex_skey(skey):
+            continue
+        ch = skey_xy(skey)
+        if is_ok:
+            no[ch] = no.get(ch, 0) + 1
+            continue
+        if not e or '"crown"' not in e:
             continue
         try:
             of = json.loads(e).get('of') or {}
             k = (int(of['x']), int(of['y']))
         except (ValueError, KeyError, TypeError, AttributeError):
             continue
-        ch = skey_xy(skey)
+        yes[ch] = yes.get(ch, 0) + 1
+        if status == 1:
+            conf.add(ch)
+        if ch in par:
+            continue
         par[ch] = k
-        if epoch_now and ep == epoch_now and ch not in add:
-            try:
-                add[ch] = float((json.loads(o) if o else {}).get('crown_m2') or 0.0)
-            except (ValueError, TypeError, AttributeError):
-                pass
-    tot: dict = {}
-    for ch, a in add.items():
-        k = par[ch]; seen = {ch}
+        try:
+            ob = json.loads(o) if o else {}
+            obs_[ch] = (float(ob['h_m']) if ob.get('h_m') is not None else float('nan'),
+                        float(ob['crown_m2']) if ob.get('crown_m2') is not None else float('nan'))
+        except (ValueError, TypeError, AttributeError):
+            obs_[ch] = (float('nan'), float('nan'))
+        if epoch_now and ep == epoch_now and obs_[ch][1] > 0:
+            add[ch] = obs_[ch][1]
+    for ch in [ch for ch in par if ch not in conf and no.get(ch, 0) >= yes[ch]]:
+        del par[ch]                                  # released: an ordinary tree again
+    tot: dict = {}; tops = []
+    for ch, k in par.items():
+        seen = {ch}
         while k in par and k not in seen and len(seen) <= MAX_HOPS:
             seen.add(k); k = par[k]
-        if a > 0 and k not in seen:
-            tot[k] = tot.get(k, 0.0) + a
-    if not tot:
-        return None
+        loop = k in seen
+        if loop:
+            k = par[ch]
+        elif ch in add:
+            tot[k] = tot.get(k, 0.0) + add[ch]
+        tops.append((ch[0], ch[1], obs_[ch][0], obs_[ch][1], k[0], k[1], yes[ch], no.get(ch, 0)))
     ks = sorted(tot)
-    return (np.array([(x << 32) | y for x, y in ks], np.int64), np.array([tot[k] for k in ks], np.float64))
+    mg = (np.array([(x << 32) | y for x, y in ks], np.int64), np.array([tot[k] for k in ks], np.float64)) if ks else None
+    return mg, tops, [(t[0], t[1]) for t in tops]
+
+
+def merged_block(tops: list, w, s, e, n, min_h, max_h, cols) -> dict | None:
+    """The ``merged`` block of /trees/bbox: extra tops of the bbox / height window that were folded into
+    another tree.  ``of_i`` = row of that tree in this answer (null when it is outside the bbox / window / limit)."""
+    if not tops:
+        return None
+    import cells_api as ca
+    t = np.array(tops, np.float64).reshape(-1, 8)
+    hh = np.nan_to_num(t[:, 2], nan=0.0)
+    m = hh >= min_h
+    if max_h is not None:
+        m &= hh < max_h
+    t = t[m]
+    if not len(t):
+        return None
+    lon, lat = ca._tf('EPSG:3035', 'EPSG:4326').transform(t[:, 0], t[:, 1])
+    lon = np.asarray(lon); lat = np.asarray(lat)
+    m = (lon >= w) & (lon <= e) & (lat >= s) & (lat <= n)
+    if not m.any():
+        return None
+    t = t[m]; lon = lon[m]; lat = lat[m]
+    o = np.lexsort((t[:, 1], t[:, 0])); t = t[o]; lon = lon[o]; lat = lat[o]
+    of_i = [None] * len(t)
+    if cols is not None and len(cols.get('x', ())):
+        key = (cols['x'].astype(np.int64) << 32) | cols['y'].astype(np.int64)
+        so = np.argsort(key, kind='stable'); ks = key[so]
+        want = (t[:, 4].astype(np.int64) << 32) | t[:, 5].astype(np.int64)
+        pos = np.searchsorted(ks, want); pos[pos >= ks.size] = 0
+        of_i = [int(so[p]) if ks[p] == q else None for p, q in zip(pos.tolist(), want.tolist())]
+    num = lambda v, nd: None if v != v else round(float(v), nd)     # noqa: E731
+    return {'lon': [round(float(v), 6) for v in lon], 'lat': [round(float(v), 6) for v in lat],
+            'h_m': [num(v, 2) for v in t[:, 2]], 'crown_m2': [num(v, 1) for v in t[:, 3]],
+            'x': t[:, 0].astype(np.int64).tolist(), 'y': t[:, 1].astype(np.int64).tolist(),
+            'of_x': t[:, 4].astype(np.int64).tolist(), 'of_y': t[:, 5].astype(np.int64).tolist(), 'of_i': of_i,
+            'n': t[:, 6].astype(int).tolist(), 'against': t[:, 7].astype(int).tolist()}
 
 
 def apply(out: dict, ms: list) -> int:
@@ -268,6 +350,9 @@ def labels(kg: str | None = None, limit: int = 100000) -> list:
             of = json.loads(r['expected'])['of']; par[skey_xy(r['skey'])] = (int(of['x']), int(of['y']))
         except (ValueError, KeyError, TypeError):
             pass
+    okc = pf._DICT.get(('claim', 'looks_right'))
+    no = {r[0]: r[1] for r in c.execute('SELECT skey, COUNT(*) FROM report WHERE layer=? AND claim=? AND status IN (0,1) AND skey < ? '
+                                        'GROUP BY skey', (lid, -1 if okc is None else okc, _KEY_FLOOR))}
     out = []; ep_now: dict = {}
     for r in rows:
         ch = skey_xy(r['skey'])
@@ -286,7 +371,7 @@ def labels(kg: str | None = None, limit: int = 100000) -> list:
             ep_now[r['kg']] = pf._epoch_now(r['kg'])
         out.append({'kg': r['kg'], 'x': ch[0], 'y': ch[1], 'h_m': o.get('h_m'), 'crown_m2': o.get('crown_m2'),
                     'of_x': k[0], 'of_y': k[1], 'dist_m': round(math.hypot(k[0] - ch[0], k[1] - ch[1]), 1),
-                    'reporters': r['reps'], 'confirmed': r['status'] == 1, 'epoch': r['epoch'],
+                    'reporters': r['reps'], 'against': no.get(r['skey'], 0), 'confirmed': r['status'] == 1, 'epoch': r['epoch'],
                     'superseded': bool(r['epoch'] and ep_now[r['kg']] and ep_now[r['kg']] != r['epoch']), 'ts': r['ts']})
     return out
 

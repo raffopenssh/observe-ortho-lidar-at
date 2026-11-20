@@ -122,7 +122,7 @@ Several apices on one broad crown. A reader flags the extra (lower) top: layer `
 * **Retract** needs no `expected`: `tree_crown.own_key` finds the reporter's apex-keyed row within 2.5 m of the
   point (own row → own plain cell row → own withdrawn marker → somebody else's = 403).
 * **Read** (`ne_trees._flags`, the per-KG flag cache that already exists, 10 min): apex-keyed rows hide exactly that
-  apex and yield `tree_crown.merges` = (parent key, m² to add), chains resolved again; `collect` adds them to the
+  apex and yield `tree_crown.resolve` → (parent key, m² to add), the merged tops, the apices to hide, chains resolved again; `collect` adds them to the
   parents present in the result (`tree_crown.apply`, one `searchsorted`, only when a KG of the bbox has such flags).
   The area is added only while `row.epoch` = the epoch served (after a rebuild the top may be gone — hiding still
   follows the usual 2.5 m rule).
@@ -131,8 +131,13 @@ Several apices on one broad crown. A reader flags the extra (lower) top: layer `
   KG has such rows, so untouched KGs keep their ETag and their day-long max-age (flagged: 300 s). The same token
   validates the per-KG flag cache (`_flags`), so every gunicorn worker serves the new state on the next request.
   Cost: `PRAGMA data_version` per request; one indexed query per KG only after the DB changed.
+* **Still shown** (`tree_crown.merged_block`): `/trees/bbox` `realistic=1` carries `merged` = the hidden tops of the bbox /
+  height window with their root (`of_x`, `of_y`, `of_i` = row in the answer), `n` reporters, `against` objections.
+  Built from the report rows (`observed` h_m / crown_m2) — no corpus read. Not part of `count`.
+* **Objection** (`tree_crown.merged_at`): `looks_right` on layer `trees` at a merged top is stored apex-keyed like the
+  flag (same `skey`, KG file). `tree_crown.resolve`: merged while reporters > objections, or status `confirmed`.
 * **Labels**: `python3 tree_crown.py --labels [--kg N]` → JSONL `{kg, x, y, h_m, crown_m2, of_x, of_y, dist_m,
-  reporters, confirmed, superseded}`; `python3 tree_crown.py` = counts. Nothing consumes them automatically yet.
+  reporters, against, confirmed, superseded}`; `python3 tree_crown.py` = counts. Nothing consumes them automatically yet.
 
 ## Note (`"note"`, 2026-11-20)
 

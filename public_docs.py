@@ -293,7 +293,7 @@ what you expect, and send `looks_right` too: a confirmation is as useful as a co
                                                     "trees" in a dead straight row): {{absent:true, hint:"linear"}}
                                                     a second top of ONE tree: {{absent:true, hint:"crown", of:{{…}}}}
                                                     (see "Same tree" under #tree-species)
-     "note": "mown meadow, no trees",               ≤ 280 chars, shown publicly (no personal data please)
+     "note": "mown meadow, no trees",               ≤ 4 500 chars (limits.note_chars), shown publicly (no personal data please)
      "source": "my-client/glyph",                   your client label ≤ 40 (stats are grouped by it)
      "reporter": "opaque-id",                       optional; hashed with a server salt, never stored or returned
      "epoch": "…"}}                                  optional: meta.epoch / X-Cells-Epoch you read (else ours)
@@ -426,8 +426,21 @@ IDENTITY — say which tree you mean, in this order of preference:
          serve   /trees/bbox realistic=1 drops the extra top under the rule of every reader-flagged apex (open or
                  confirmed, one reporter is enough, at once — see Caching there; `rejected` brings it back) and adds its crown_m2 to
                  the parent's row — while the flag was made against the epoch being served. realistic=0 = raw.
+         shown   a merged top is not lost: realistic=1 answers carry a block next to user / added / reported, only
+                 when the bbox + height window has one —
+                   columns: merged:{{lon[], lat[], h_m[], crown_m2[], x[], y[], of_x[], of_y[], of_i[], n[], against[]}}
+                   json / geojson: merged:[{{lon, lat, height_m, crown_m2, x, y, merged:true, of:{{x, y, i}}, n, against}}]
+                 x, y = the top; of_x, of_y = its tree (root); of_i = that tree's row in THIS answer (null when it
+                 is outside the bbox / window / limit); h_m, crown_m2 = the top's own (the tree's crown_m2 already
+                 includes it); n = reporters who said "same tree", against = reporters who said it is not.
+                 Draw it as a secondary top tied to its tree; never count it as a tree (count excludes it).
+         correct your own flag: "retract": true (above). Somebody else's: say the top IS a tree of its own —
+                   POST /api/v1/flags {{"lon":…, "lat":… (the merged top), "layer":"trees", "claim":"looks_right", "reporter":"…"}}
+                 → 201 + crown:{{against:true, x, y}}. The top stays merged only while n > against (a tie gives the
+                 tree back: when people disagree the product stands) or a moderator confirmed the merge. Take the
+                 objection back with the same body + "retract": true. Both show on the next /trees/bbox request.
          use     the pairs are the label set for over-segmented crowns (apex finder tuning), as "linear" is for chains.
-  Note — a comment on a tree: "note": "≤ 280 chars" on any tree report (claim tree: species / dbh_cm / h_m /    #tree-note
+  Note — a comment on a tree: "note": "≤ 4 500 chars" (limits.note_chars) on any tree report (claim tree: species / dbh_cm / h_m /    #tree-note
        state; claim missing). Longer is cut (tree.warning). Stored per version, shown publicly, no personal data.
        Identity + note and nothing else is a report of its own: 201 tree{{…, note, op:"note"}}; the identical note
        again → 200 folded. One note per reporter per tree (a new one replaces yours); the tree shows the NEWEST.

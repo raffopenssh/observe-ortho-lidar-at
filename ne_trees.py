@@ -252,7 +252,7 @@ def _flags(kg: str, kind: str) -> tuple:
         hit = _pf_cache.get(key)
         if hit and now - hit[0] < _PF_TTL and hit[2] == rev:
             return hit[1]
-    cells: set[int] = set(); pts = []; mrg = None
+    cells: set[int] = set(); pts = []; mrg = None; tops = []
     try:
         import json
         import public_flags as pf
@@ -265,16 +265,17 @@ def _flags(kg: str, kind: str) -> tuple:
             # machine reports of ne_linear hide single apices (ne_linear.hidden), never the whole cell
             auto = pf._DICT.get(('source', 'auto-linear'))
             tree_layer = pf._DICT.get(('layer', 'trees')) if kind == 'trees' else None
-            q = ('SELECT cell, layer, lon_e6, lat_e6, observed, skey, expected, epoch FROM report WHERE kg=? AND cell IS NOT NULL '
-                 'AND status IN (0,1) AND layer IN (%s) AND claim IN (%s) AND (source IS NULL OR source != ?)'
+            ok_id = pf._DICT.get(('claim', 'looks_right'))
+            q = ('SELECT cell, layer, lon_e6, lat_e6, observed, skey, expected, epoch, status, claim FROM report WHERE kg=? AND cell IS NOT NULL '
+                 'AND status IN (0,1) AND layer IN (%s) AND (claim IN (%s) OR (claim=? AND skey < ?)) AND (source IS NULL OR source != ?)'
                  % (','.join('?' * len(lay)), ','.join('?' * len(clm))))
-            ll = []; apx = []; crows = []
-            for cell, layer, lo, la, obs, skey, exp, ep in c.execute(q, (kg, *lay, *clm, -1 if auto is None else auto)):
-                if tree_layer is not None and layer == tree_layer and skey < -(1 << 32):
-                    # "same tree" flag (tree_crown.py): keyed by the extra apex itself → hide exactly it,
-                    # and hand its crown area to the tree it belongs to
-                    apx.append((float(-skey >> 32), float(-skey & 0xFFFFFFFF), float('nan')))
-                    crows.append((skey, exp, obs, ep))
+            ll = []; crows = []
+            for cell, layer, lo, la, obs, skey, exp, ep, stt, clid in c.execute(
+                    q, (kg, *lay, *clm, -1 if ok_id is None else ok_id, -(1 << 32), -1 if auto is None else auto)):
+                if skey < -(1 << 32):
+                    # "same tree" flag (tree_crown.py) or the objection to one: keyed by the extra apex itself
+                    if tree_layer is not None and layer == tree_layer:
+                        crows.append((skey, exp, obs, ep, stt, clid == ok_id))
                 elif tree_layer is not None and layer == tree_layer and lo is not None and la is not None:
                     h = None
                     try:
@@ -288,13 +289,14 @@ def _flags(kg: str, kind: str) -> tuple:
             if ll:
                 xs, ys = ca._tf('EPSG:4326', 'EPSG:3035').transform([p[0] for p in ll], [p[1] for p in ll])
                 pts = [(x, y, p[2]) for x, y, p in zip(xs, ys, ll)]
-            if apx:
+            if crows:
+                # hide exactly the merged tops, hand their crown area to the tree they belong to
                 import tree_crown
-                pts = list(pts) + apx
-                mrg = tree_crown.merges(crows, pf._epoch_now(kg))
+                mrg, tops, hide = tree_crown.resolve(crows, pf._epoch_now(kg))
+                pts = list(pts) + [(float(x), float(y), float('nan')) for x, y in hide]
     except Exception as ex:  # noqa: BLE001
         log.debug('ne_trees flags %s: %s', kg, ex)
-    val = (cells, np.array(pts, np.float64).reshape(-1, 3), mrg)
+    val = (cells, np.array(pts, np.float64).reshape(-1, 3), mrg, tops)
     with _pf_lock:
         _pf_cache[key] = (now, val, rev)
         if len(_pf_cache) > 4000:
@@ -527,7 +529,7 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
     fcs: dict = {}                                     # kg -> sorted flagged res-12 ids (or None)
     legacy: dict = {}                                  # kg -> (set, lon array, lat array) | None
     lin = np.zeros(0, np.uint64); lin_grid = frozenset()
-    crown_add: list = []                               # per KG [[parent key, m²]] of "same tree" flags (tree_crown.py)
+    crown_add: list = []; crown_tops: list = []                               # per KG [[parent key, m²]] of "same tree" flags (tree_crown.py)
     if realistic and kind == 'trees':
         try:                                # apices of detected linear-noise runs (ne_linear.py)
             import ne_linear
@@ -594,7 +596,8 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
                 if hit.any():
                     m = ~hit if m is None else m & ~hit; dropped_lin += int(hit.sum())
             if kg not in fcs:
-                fc, fp, fm = _flags(kg, kind)
+                fc, fp, fm, ft = _flags(kg, kind)
+                crown_tops.extend(ft)
                 fcs[kg] = (np.sort(np.fromiter(fc, np.uint64, len(fc))) if fc else None, fp if len(fp) else None)
                 if fm is not None:
                     crown_add.append(fm)
@@ -677,7 +680,20 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
             'limit': lim, 'pending_kgs': st['pending'], 'not_processed': st['not_processed'],
             'dropped_qa': dropped, 'dropped_linear': dropped_lin, 'realistic': bool(realistic), 'truncated': truncated,
             'chunks_scanned': scanned, 'chunks_in_bbox': len(rows), 'ms': round((time.time() - t0) * 1000, 1),
-            'ready': st['ready'], 'state': st, **_user_blocks(kind, out if n_out else None, st['kgs'], w, s, e, n, min_h, max_h, notes)}
+            'ready': st['ready'], 'state': st, **_user_blocks(kind, out if n_out else None, st['kgs'], w, s, e, n, min_h, max_h, notes),
+            **_merged_block(crown_tops, w, s, e, n, min_h, max_h, out if n_out else None)}
+
+
+def _merged_block(tops, w, s, e, n, min_h, max_h, cols) -> dict:
+    if not tops:
+        return {}
+    try:
+        import tree_crown
+        b = tree_crown.merged_block(tops, w, s, e, n, min_h, max_h, cols)
+        return {'merged': b} if b else {}
+    except Exception as ex:  # noqa: BLE001
+        log.warning('ne_trees: merged block: %s', ex)
+        return {}
 
 
 def _user_blocks(kind, cols, kgs, w, s, e, n, min_h, max_h, notes: bool = True) -> dict:
@@ -813,6 +829,12 @@ def points_bbox(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit:
                        **({'client_id': a['client_id'][i]} if a.get('client_id') and a['client_id'][i] else {}),
                        **{k: a[k][i] for k in ('state', 'state_date', 'note') if a.get(k) and a[k][i]}}
                       for i in range(len(a['lon']))]
+    a = r.get('merged')
+    if a:
+        r['merged'] = [{'lon': a['lon'][i], 'lat': a['lat'][i], 'height_m': a['h_m'][i], 'crown_m2': a['crown_m2'][i],
+                        'x': a['x'][i], 'y': a['y'][i], 'merged': True,
+                        'of': {'x': a['of_x'][i], 'y': a['of_y'][i], 'i': a['of_i'][i]}, 'n': a['n'][i], 'against': a['against'][i]}
+                       for i in range(len(a['lon']))]
     a = r.get('reported')
     if a:
         r['reported'] = [{'tree_id': a['tree_id'][i], 'lon': a['lon'][i], 'lat': a['lat'][i], 'height_user_m': a['h_m'][i],

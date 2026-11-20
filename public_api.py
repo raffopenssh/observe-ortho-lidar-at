@@ -525,20 +525,20 @@ def trees_bbox():
         body = {'bbox': list(bb), 'objects': kind, 'format': 'columns', 'fields': t['fields'], 'order': t['order'],
                 'columns': t['columns'], 'count': n_out, 'truncated': t['truncated'], 'dropped_qa': t['dropped_qa'],
                 **({'rev': urev} if urev else {}),
-                **{k: t[k] for k in ('user', 'added', 'reported') if t.get(k)},
+                **{k: t[k] for k in ('user', 'added', 'reported', 'merged') if t.get(k)},
                 'kgs': t['kgs'], 'ready': ready, **extra, 'meta': _meta(**meta)}
     elif fmt == 'geojson':
         body = {'type': 'FeatureCollection',
                 'features': [{'type': 'Feature', 'geometry': {'type': 'Point', 'coordinates': [x['lon'], x['lat']]},
                               'properties': {k: v for k, v in x.items() if k not in ('lon', 'lat')}}
                              for x in t['trees']],
-                **{k: t[k] for k in ('added', 'reported') if t.get(k)},
+                **{k: t[k] for k in ('added', 'reported', 'merged') if t.get(k)},
                 'meta': _meta(count=n_out, truncated=t['truncated'], dropped_qa=t['dropped_qa'],
                               kgs=t['kgs'], ready=ready, **extra, **meta)}
     else:
         body = {'bbox': list(bb), 'objects': kind, key: t['trees'], 'count': n_out,
                 **({'rev': urev} if urev else {}),
-                **{k: t[k] for k in ('added', 'reported') if t.get(k)},
+                **{k: t[k] for k in ('added', 'reported', 'merged') if t.get(k)},
                 'truncated': t['truncated'], 'dropped_qa': t['dropped_qa'], 'kgs': t['kgs'],
                 'ready': ready, **extra, 'meta': _meta(**meta)}
     raw = None

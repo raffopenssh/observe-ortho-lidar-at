@@ -369,7 +369,7 @@ def trees_bbox(w, s, e, n, min_height=0.0, limit=2000, kg_rows=None, realistic=T
     r = ne_trees.points_bbox(w, s, e, n, kind, min_height=float(min_height),
                              limit=limit, realistic=realistic, types=types, max_height=max_height, notes=notes)
     key = 'trees' if kind == 'trees' else 'structures'
-    return {**{k: r[k] for k in ('added', 'reported') if r.get(k)},
+    return {**{k: r[k] for k in ('added', 'reported', 'merged') if r.get(k)},
             'trees': r[key], 'kgs': r['kgs'], 'dropped_qa': r['dropped_qa'], 'truncated': r['truncated'],
             'min_height': r['min_height'], 'max_height': r['max_height'], 'limit': r['limit'],
             'ready': r['ready'], 'pending_kgs': r['pending_kgs'], 'not_processed': r['not_processed'],

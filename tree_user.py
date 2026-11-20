@@ -86,7 +86,7 @@ _ADD_COLS = (('uh_dm', 'INTEGER'),      # reporter's own height measurement / es
              ('meta', 'INTEGER'),       # packed training metadata, 4 bits each (META_FIELDS order; 0 = not given)
              ('org', 'INTEGER'),        # dict id (kind 'org'): holder of the reporter key the version came with
              ('sdate', 'INTEGER'),      # date of the state, packed (pack_date: 2 bytes; NULL = not given)
-             ('note', 'TEXT'))          # reporter's comment ≤ 280 chars (NULL = none given, '' = taken back)
+             ('note', 'TEXT'))          # reporter's comment ≤ pf.MAX_NOTE chars (NULL = none given, '' = taken back)
 # training metadata vocabulary (standard English terms; value index + 1 is stored).  German field terms
 # and common synonyms are accepted and normalised.
 META_FIELDS = (
@@ -1230,7 +1230,7 @@ def taxa_dict() -> dict:
             'measures': {'dbh_cm': list(DBH_CM), 'h_m': list(H_M),
                          'note': 'optional on any tree report; several reporters → median; h_m is the reporter\'s '
                                  'height and never replaces the LiDAR height_m'},
-            'limits': {'taxon_chars': MAX_TAXON_CHARS, 'versions_per_tree': MAX_VERSIONS_PER_TREE,
+            'limits': {'note_chars': pf.MAX_NOTE, 'taxon_chars': MAX_TAXON_CHARS, 'versions_per_tree': MAX_VERSIONS_PER_TREE,
                        'match_m': MATCH_MIN_M, 'match_crown_frac': MATCH_CROWN_FRAC, 'match_sure_m': MATCH_SURE_M,
                        'match_ambiguous_ratio': MATCH_AMBIG_RATIO, 'added_name_m': ADDED_NAME_M,
                        'added_fold_m': ADDED_FOLD_M, 'exists_m': EXISTS_M},

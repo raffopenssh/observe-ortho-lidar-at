@@ -7,7 +7,7 @@ Design (docs/public-flags.md):
   * one SQLite file ``data/public_flags.sqlite`` (WAL, synchronous=NORMAL), one
     ``report`` row per (subject, layer, claim, reporter) — repeats FOLD into ``n``
     instead of new rows; strings go through a tiny dictionary table; coords are
-    int32 micro-degrees; notes ≤ 280 chars; observed/expected ≤ 512/256 B JSON.
+    int32 micro-degrees; notes ≤ 4500 chars; observed/expected ≤ 512/256 B JSON.
   * when the reporter omits ``observed`` we SNAPSHOT what we serve for that cell
     at report time (+ product epoch), so a flag can be judged after a rebuild.
   * reads are grouped tallies by default (one row per subject), ETag'd, gzip'd,
@@ -41,7 +41,7 @@ SALT_PATH = DATA_DIR / 'public_flags.salt'
 
 RES = 12
 MAX_BATCH = 50
-MAX_NOTE = 280
+MAX_NOTE = 4500
 MAX_OBSERVED_B = 512
 MAX_EXPECTED_B = 256
 MAX_SOURCE = 40
@@ -551,10 +551,10 @@ def record(body: dict, client: str, org: str | None = None) -> dict:
     if _retracts(body) and not (claim == 'missing' and layer in TREE_LAYERS and has_point):
         rp = body.get('reporter')
         rep = _reporter_hash(str(rp)[:120] if rp not in (None, '') else None, client, org)
-        if layer == 'trees' and claim == 'spurious' and has_point:
-            # "same tree" flags are keyed by the apex, not the cell (tree_crown.py)
+        if layer == 'trees' and claim in ('spurious', 'looks_right') and has_point:
+            # "same tree" flags (and the objections to them) are keyed by the apex, not the cell (tree_crown.py)
             import tree_crown as tc
-            k = tc.own_key(_conn(), subj, rep)
+            k = tc.own_key(_conn(), subj, rep, claim)
             if k is not None:
                 subj = {**subj, 'skey': k}
         out = _retract(_conn(), subj, layer, claim, rep)
@@ -572,6 +572,13 @@ def record(body: dict, client: str, org: str | None = None) -> dict:
         crown = tc.bind(_conn(), body, subj)
         body = {**body, 'expected': crown['expected'], 'observed': crown['observed'], 'epoch': crown['epoch']}
         subj = {**subj, 'skey': crown['skey'], 'kg': crown['kg']}
+    unmerge = None
+    if layer == 'trees' and claim == 'looks_right' and has_point:
+        # "this top IS a tree of its own": the objection to a "same tree" merge, keyed like it (tree_crown.py)
+        import tree_crown as tc
+        unmerge = tc.merged_at(_conn(), subj)
+        if unmerge is not None:
+            subj = {**subj, 'skey': unmerge[0], 'kg': unmerge[1]}
     observed = _compact_json(body.get('observed'), MAX_OBSERVED_B, 'observed')
     expected = _compact_json(body.get('expected'), MAX_EXPECTED_B, 'expected')
     note = _clean_note(body.get('note') or body.get('notes'))
@@ -649,6 +656,10 @@ def record(body: dict, client: str, org: str | None = None) -> dict:
     out['tally'] = tally(_tkey(subj))
     if tree is not None:
         out['tree'] = tree
+    if unmerge is not None:
+        import tree_crown as tc
+        ux, uy = tc.skey_xy(unmerge[0])
+        out['crown'] = {'against': True, 'x': ux, 'y': uy}       # counted against the merge of this top
     warn = [k for k in body if k not in _KNOWN]
     if warn:
         out['warnings'] = [f'ignored unknown field(s): {", ".join(sorted(warn))}']
@@ -1017,7 +1028,7 @@ def dict_block() -> dict:
                     'else a salted hash of the client IP; neither is stored or returned)',
             'superseded': 'read-side flag: the KG product was rebuilt since the report (epoch differs)',
             'trees': 'layer trees + lon,lat: claim species (= tree) {species, dbh_cm, h_m} describes the tree at the point, '
-                     'claim missing [{species, dbh_cm, h_m}] adds one we do not have, "note" (≤ 280 chars) comments one, claim spurious + expected {hint: crown, of: {tree_id | lon, lat}} says an apex is a second top of that tree, "state": logged | windthrow | burnt | dead | broken | infested | gone [+ date] says what happened to one since our flight — versioned per tree; /api/v1/trees/taxa[/dict|/history]'}
+                     'claim missing [{species, dbh_cm, h_m}] adds one we do not have, "note" (≤ 4500 chars) comments one, claim spurious + expected {hint: crown, of: {tree_id | lon, lat}} says an apex is a second top of that tree (shown in /trees/bbox merged; claim looks_right at it objects), "state": logged | windthrow | burnt | dead | broken | infested | gone [+ date] says what happened to one since our flight — versioned per tree; /api/v1/trees/taxa[/dict|/history]'}
 
 
 # === SECTION: HTTP ===

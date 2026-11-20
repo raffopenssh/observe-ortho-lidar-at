@@ -29,6 +29,7 @@ def main() -> int:
     from flask import Flask
     app = Flask(__name__); app.register_blueprint(pf.flags_bp)
     c = app.test_client()
+    assert pf.MAX_NOTE == 4500 and pf._limits()['note_chars'] == 4500 and tu.dictionary()['limits']['note_chars'] == 4500 if hasattr(tu, 'dictionary') else True
     assert pf.DAILY_CAP == 4500 and pf._key_cap(None) == 4500 and pf._key_cap('a~1f') >= 4500 and pf._key_cap('org') == 20000
     if not (ne_trees.status()['ok'] and ne_trees.bbox_state(*BB)['ready']):
         print('SKIP (no live corpus for the test bbox)'); return 0
@@ -81,6 +82,34 @@ def main() -> int:
     assert got['n'] == plain_n - 2, (got['n'], plain_n)
     raw = cols(realistic=False)
     assert raw['columns'] == base['columns']
+    # --- merged block: the dropped tops are still told, with their tree
+    M = got['merged']; mk = list(zip(M['x'], M['y']))
+    assert sorted(mk) == sorted([(x[B], y[B]), (x[D], y[D])]) and set(zip(M['of_x'], M['of_y'])) == {(x[A], y[A])}, M
+    assert M['of_i'] == [ia, ia] and M['n'][mk.index((x[B], y[B]))] == 1 and M['against'] == [0, 0]
+    assert abs(M['crown_m2'][mk.index((x[B], y[B]))] - C['crown_m2'][B]) < 0.1 and 'merged' not in raw
+    rows = ne_trees.points_bbox(*BB, 'trees', min_height=3, limit=20000)
+    assert len(rows['merged']) == 2 and rows['merged'][0]['merged'] and rows['merged'][0]['of']['x'] == int(x[A])
+    assert 'merged' not in ne_trees.columns_bbox(*BB, 'trees', min_height=float(h[A]) + 60, fields=F)
+    # somebody else says the top IS a tree (looks_right at it): 1 : 1 releases it; retracting that merges again
+    ok = {**P(B), 'layer': 'trees', 'claim': 'looks_right', 'reporter': 'v1'}
+    r = c.post('/api/v1/flags', json=ok); j = r.get_json()
+    assert r.status_code == 201 and j['crown'] == {'against': True, 'x': int(x[B]), 'y': int(y[B])}, j
+    g2 = ne_trees.columns_bbox(*BB, 'trees', min_height=3, fields=F)
+    k2 = list(zip(g2['columns']['x'], g2['columns']['y']))
+    assert (x[B], y[B]) in k2 and list(zip(g2['merged']['x'], g2['merged']['y'])) == [(x[D], y[D])]
+    assert abs(g2['columns']['crown_m2'][k2.index((x[A], y[A]))] - C['crown_m2'][A] - C['crown_m2'][D]) < 0.25
+    flag(B, P(A), rep='u7')                                   # 2 : 1 → merged again
+    g2 = ne_trees.columns_bbox(*BB, 'trees', min_height=3, fields=F)
+    i2 = list(zip(g2['merged']['x'], g2['merged']['y'])).index((x[B], y[B]))
+    assert g2['merged']['n'][i2] == 2 and g2['merged']['against'][i2] == 1
+    c.post('/api/v1/flags', json={**P(B), 'layer': 'trees', 'claim': 'spurious', 'retract': True, 'reporter': 'u7'})
+    assert c.post('/api/v1/flags', json={**ok, 'retract': True, 'reporter': 'zz'}).status_code == 403
+    r = c.post('/api/v1/flags', json={**ok, 'retract': True}); assert r.status_code == 201 and r.get_json()['retracted'], r.data
+    assert ne_trees.columns_bbox(*BB, 'trees', min_height=3, fields=F)['columns'] == got['columns']
+    # looks_right on an ordinary tree stays an ordinary cell flag
+    j = c.post('/api/v1/flags', json={**P(A), 'layer': 'trees', 'claim': 'looks_right', 'reporter': 'v1'}).get_json()
+    assert 'crown' not in j and pf._conn().execute('SELECT skey FROM report WHERE id=?', (j['id'],)).fetchone()[0] > 0
+    c.post('/api/v1/flags', json={**P(A), 'layer': 'trees', 'claim': 'looks_right', 'reporter': 'v1', 'retract': True})
     # --- ETag component: changes with every flag / retract, no cache clear needed
     kgB = str(C['kg_code'][B]).zfill(5); t1 = ne_trees.flag_rev(kgB); assert t1 and kgB + ':' in ne_trees.flags_token([kgB, '00000'])
     flag(B, P(A), rep='u9'); t2 = ne_trees.flag_rev(kgB); assert t2 != t1
@@ -114,21 +143,21 @@ def main() -> int:
     r = c.post('/api/v1/flags', json={**T, 'note': 'Naturdenkmal · Nr: 12'}); j = r.get_json()
     assert r.status_code == 201 and j['tree']['op'] == 'note' and j['tree']['note'] == 'Naturdenkmal · Nr: 12', j
     r = c.post('/api/v1/flags', json={**T, 'note': 'Naturdenkmal · Nr: 12'}); assert r.status_code == 200 and r.get_json()['folded']
-    j = c.post('/api/v1/flags', json={**T, 'species': 'Buche', 'note': 'x' * 400}).get_json()
-    assert j['tree']['op'] == 'species' and len(j['tree']['note']) == 280 and 'cut' in j['tree']['warning']
+    j = c.post('/api/v1/flags', json={**T, 'species': 'Buche', 'note': 'x' * 5000}).get_json()
+    assert j['tree']['op'] == 'species' and len(j['tree']['note']) == 4500 and 'cut' in j['tree']['warning']
     j = c.post('/api/v1/flags', json={**T, 'reporter': 'n2', 'note': 'second'}).get_json(); assert j['tree']['note'] == 'second'
     # species report with "note": null from someone without a note: no 403, nothing cleared
     r = c.post('/api/v1/flags', json={**T, 'reporter': 'n3', 'species': 'Buche', 'note': None}); assert r.status_code == 201
     assert r.get_json()['tree']['note'] == 'second'
     # undo n2's note → n1's is the newest again; unnote; folded; history
     j = c.post('/api/v1/flags', json={**T, 'reporter': 'n2', 'retract': 'last'}).get_json()
-    assert j['tree']['op'] == 'undo' and j['tree']['note'] == 'x' * 280
+    assert j['tree']['op'] == 'undo' and j['tree']['note'] == 'x' * 4500
     r = c.post('/api/v1/flags', json={**T, 'note': None}); j = r.get_json()
     assert r.status_code == 201 and j['tree']['op'] == 'unnote' and 'note' not in j['tree'] and j['tree']['taxon'] == 'Fagus sylvatica', j
     r = c.post('/api/v1/flags', json={**T, 'note': None}); assert r.status_code == 200 and r.get_json()['folded']
     hi = c.get(f'/api/v1/trees/taxa/history?lon={C["lon"][A]}&lat={C["lat"][A]}').get_json()
     ns = [v.get('note', '-') for v in hi['versions']]
-    assert ns == ['Naturdenkmal · Nr: 12', 'x' * 280, 'second', '-', '-', None], ns
+    assert ns == ['Naturdenkmal · Nr: 12', 'x' * 4500, 'second', '-', '-', None], ns
     assert all('note' not in v for v in c.get(f'/api/v1/trees/taxa/history?lon={C["lon"][A]}&lat={C["lat"][A]}&notes=0').get_json()['versions'])
     # bbox blocks: only where a note exists; notes=0; dense field; json rows; added tree
     assert 'note' not in cols()['user']
