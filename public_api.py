@@ -367,7 +367,7 @@ def heightfield():
 
 
 TREES_REV = 'trees-c4'          # bump when the /trees/bbox body layout or QA rules change (part of the ETag)
-TREES_USER_MAX_AGE = 300       # KGs with user-reported taxa: revalidate (304, index-only) every 5 min
+TREES_USER_MAX_AGE = 300       # KGs with user-reported taxa or reader flags: revalidate (304, index-only) every 5 min
 TREES_MAX_AGE = 86400          # answers change only when a KG is reprocessed; ETag revalidation is index-only
 
 
@@ -447,13 +447,23 @@ def trees_bbox():
         state += f'\nu={urev}'
     if kind == 'trees' and st.get('linear'):
         state += '\nl=' + st['linear']       # linear-noise runs (ne_linear.py) of these KGs changed
+    # reader flags (spurious / same-tree …) of these KGs: their state joins the ETag — again only where
+    # there is one — so a flag, a retract or a moderation shows on the next revalidation, in every worker.
+    frev = ''
+    if realistic:
+        try:
+            frev = ne_trees.flags_token(st['kgs'])
+        except Exception:  # noqa: BLE001
+            frev = ''
+    if frev:
+        state += '\nf=' + frev
     etag = '"t-' + hashlib.sha256((state + '\n' + canon + '\n' + TREES_REV).encode()).hexdigest()[:20] + '"'
     cacheable = st['ready']
     # Ready → a day of freshness. Not ready (a KG of the bbox still pending) →
     # *no-cache*, not no-store: the browser keeps the body and revalidates with
     # If-None-Match on every use (304 is index-only here, and the ETag covers the
     # pending/not_processed lists so it flips the moment the KG lands).
-    cc = f'public, max-age={TREES_USER_MAX_AGE if urev else TREES_MAX_AGE}' if cacheable else 'public, no-cache'
+    cc = f'public, max-age={TREES_USER_MAX_AGE if (urev or frev) else TREES_MAX_AGE}' if cacheable else 'public, no-cache'
     lm = email.utils.formatdate(st['mtime'], usegmt=True) if st['mtime'] else None
     hdrs = {'ETag': etag, 'Cache-Control': cc}
     if lm:

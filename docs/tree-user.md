@@ -125,7 +125,12 @@ Several apices on one broad crown. A reader flags the extra (lower) top: layer `
   apex and yield `tree_crown.merges` = (parent key, m² to add), chains resolved again; `collect` adds them to the
   parents present in the result (`tree_crown.apply`, one `searchsorted`, only when a KG of the bbox has such flags).
   The area is added only while `row.epoch` = the epoch served (after a rebuild the top may be gone — hiding still
-  follows the usual 2.5 m rule). `/trees/bbox` ETag unchanged (as for every reader flag).
+  follows the usual 2.5 m rule).
+* **ETag** (`ne_trees.flag_rev` / `flags_token`): with `realistic=1` the state of the non-machine `report` rows of the
+  KGs of the bbox (a hash of subject, claim, status, observed, expected, epoch — a folded repeat changes nothing) joins the `/trees/bbox` ETag — only where a
+  KG has such rows, so untouched KGs keep their ETag and their day-long max-age (flagged: 300 s). The same token
+  validates the per-KG flag cache (`_flags`), so every gunicorn worker serves the new state on the next request.
+  Cost: `PRAGMA data_version` per request; one indexed query per KG only after the DB changed.
 * **Labels**: `python3 tree_crown.py --labels [--kg N]` → JSONL `{kg, x, y, h_m, crown_m2, of_x, of_y, dist_m,
   reporters, confirmed, superseded}`; `python3 tree_crown.py` = counts. Nothing consumes them automatically yet.
 

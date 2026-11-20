@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import math
+import hashlib
 import threading
 import time
 
@@ -200,6 +201,45 @@ _PF_TTL = 600.0
 FLAG_APEX_M = 2.5            # a point report on a tree hides the apex within this distance of it
 
 
+_fr_cache: dict = {}
+
+
+def flag_rev(kg: str) -> str:
+    """State token of the reader flags of one KG file ('' = none) — part of the /trees/bbox ETag and the
+    validity key of :func:`_flags`, so a flag / retract / moderation shows on the next request in every
+    worker.  Machine rows (auto-linear) are left out: ``ne_linear.state_token`` covers them.
+    A hash of what the rows say (not of when / how often: a folded repeat changes nothing).
+    One tiny indexed query per KG, and only when the DB changed since the last look (data_version)."""
+    try:
+        import public_flags as pf
+        c = pf._conn()
+        gt = (str(pf.DB_PATH), c.execute('PRAGMA data_version').fetchone()[0], c.total_changes)
+        key = (id(c), str(kg))
+        hit = _fr_cache.get(key)
+        if hit and hit[0] == gt:
+            return hit[1]
+        pf._load_dict(c)
+        auto = pf._DICT.get(('source', 'auto-linear'))
+        h = hashlib.sha1(); n = 0
+        for row in c.execute('SELECT skey, cell, layer, claim, status, lon_e6, lat_e6, observed, expected, epoch FROM report '
+                             'WHERE kg=? AND cell IS NOT NULL AND (source IS NULL OR source != ?) ORDER BY id',
+                             (str(kg), -1 if auto is None else auto)):
+            h.update(repr(tuple(row)).encode()); n += 1
+        tok = f'{n}.{h.hexdigest()[:12]}' if n else ''
+        if len(_fr_cache) > 20000:
+            _fr_cache.clear()
+        _fr_cache[key] = (gt, tok)
+        return tok
+    except Exception as ex:  # noqa: BLE001
+        log.debug('ne_trees flag_rev %s: %s', kg, ex)
+        return ''
+
+
+def flags_token(kgs) -> str:
+    """'' when no KG of ``kgs`` has a reader flag, else 'kg:rev|…' (ETag component)."""
+    return '|'.join(f'{k}:{t}' for k, t in ((k, flag_rev(k)) for k in sorted(map(str, kgs))) if t)
+
+
 def _flags(kg: str, kind: str) -> tuple:
     """(cells, points) of ``kg`` with an open / confirmed negative public flag on this kind's layers.
 
@@ -207,10 +247,10 @@ def _flags(kg: str, kind: str) -> tuple:
     of ``points`` ([x, y, h_m | nan] in EPSG:3035) and hides only the apex it names
     (:func:`_flag_hits`).  Everything else (cell-keyed reports, ``cells.trees``, structures)
     hides the res-12 cell as before."""
-    key = (kg, kind); now = time.time()
+    key = (kg, kind); now = time.time(); rev = flag_rev(kg)
     with _pf_lock:
         hit = _pf_cache.get(key)
-        if hit and now - hit[0] < _PF_TTL:
+        if hit and now - hit[0] < _PF_TTL and hit[2] == rev:
             return hit[1]
     cells: set[int] = set(); pts = []; mrg = None
     try:
@@ -256,7 +296,7 @@ def _flags(kg: str, kind: str) -> tuple:
         log.debug('ne_trees flags %s: %s', kg, ex)
     val = (cells, np.array(pts, np.float64).reshape(-1, 3), mrg)
     with _pf_lock:
-        _pf_cache[key] = (now, val)
+        _pf_cache[key] = (now, val, rev)
         if len(_pf_cache) > 4000:
             _pf_cache.pop(next(iter(_pf_cache)))
     return val

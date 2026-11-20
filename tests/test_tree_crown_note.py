@@ -81,6 +81,17 @@ def main() -> int:
     assert got['n'] == plain_n - 2, (got['n'], plain_n)
     raw = cols(realistic=False)
     assert raw['columns'] == base['columns']
+    # --- ETag component: changes with every flag / retract, no cache clear needed
+    kgB = str(C['kg_code'][B]).zfill(5); t1 = ne_trees.flag_rev(kgB); assert t1 and kgB + ':' in ne_trees.flags_token([kgB, '00000'])
+    flag(B, P(A), rep='u9'); t2 = ne_trees.flag_rev(kgB); assert t2 != t1
+    _r = c.post('/api/v1/flags', json={**P(B), 'layer': 'trees', 'claim': 'spurious', 'retract': True, 'reporter': 'u9'})
+    assert ne_trees.flag_rev(kgB) == t1          # same rows again = same state
+    c.post('/api/v1/flags', json={**P(B), 'layer': 'trees', 'claim': 'spurious', 'retract': True, 'reporter': 'u1'})
+    G = ne_trees.columns_bbox(*BB, 'trees', min_height=3, fields=F)['columns']      # NOT cols(): flag cache must notice itself
+    assert (x[B], y[B]) in set(zip(G['x'], G['y']))
+    flag(B, P(A))
+    G = ne_trees.columns_bbox(*BB, 'trees', min_height=3, fields=F)['columns']
+    assert (x[B], y[B]) not in set(zip(G['x'], G['y']))
     # --- 1e labels
     ls = tc.labels()
     assert len(ls) == 2 and {(l['of_x'], l['of_y']) for l in ls} == {(int(x[A]), int(y[A]))} and ls[0]['crown_m2'] is not None

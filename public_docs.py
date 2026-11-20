@@ -424,7 +424,7 @@ IDENTITY — say which tree you mean, in this order of preference:
                  same cell id, own lon / lat): expected.spurious = {{absent, hint:"crown", of:{{tree_id?, lon, lat, x, y}}}},
                  the same place "linear" is. We keep the top's h_m and crown_m2 in observed.
          serve   /trees/bbox realistic=1 drops the extra top under the rule of every reader-flagged apex (open or
-                 confirmed, one reporter is enough, ≤ 10 min; `rejected` brings it back) and adds its crown_m2 to
+                 confirmed, one reporter is enough, at once — see Caching there; `rejected` brings it back) and adds its crown_m2 to
                  the parent's row — while the flag was made against the epoch being served. realistic=0 = raw.
          use     the pairs are the label set for over-segmented crowns (apex finder tuning), as "linear" is for chains.
   Note — a comment on a tree: "note": "≤ 280 chars" on any tree report (claim tree: species / dbh_cm / h_m /    #tree-note
@@ -611,8 +611,13 @@ GET /api/v1/trees/bbox?bbox=…[&min_height=3][&max_height=…][&limit=2000][&re
       ≥ 3 m is ~31k apices → one call; truncated:true still set when limit is hit or the chunk
       budget ran out).
     Caching: strong ETag + Last-Modified derived from the NE file state of the KGs in the bbox
-      (changes only when a KG is reprocessed / re-ingested) + the query string; If-None-Match →
-      304 before any scan; Cache-Control public, max-age=86400 when ready, public, no-cache while
+      (changes only when a KG is reprocessed / re-ingested) + the query string + (realistic=1) the state of
+      the reader flags and tree reports of these KGs — a flag, a retract or a moderation changes the ETag
+      on the next request; If-None-Match → 304 before any scan; Cache-Control public, max-age=86400 when
+      ready (300 once a KG of the bbox has a reader flag or a tree report). AFTER YOUR OWN POST /flags on
+      a tree, re-read the tile with a forced revalidation (fetch(url, {{cache: 'no-cache'}}) or request
+      header Cache-Control: no-cache) — your browser may hold the old body for up to a day otherwise;
+      it costs a 304 when nothing changed. public, no-cache while
       a KG of the bbox is still pending (keep the body, revalidate with If-None-Match — the ETag
       covers the pending list, so it flips when the KG lands; no-store only on a transient index
       error). A bbox outside Austria is ready:true, kgs:[] + note. ETag / Last-Modified are CORS-exposed. Chunks of a tile are decoded once and
