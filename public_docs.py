@@ -291,6 +291,8 @@ what you expect, and send `looks_right` too: a confirmation is as useful as a co
      "expected": {{"group": "gruen"}},                what it should be (≤ 256 B): {{group}}, {{type}}, {{h_m}}, {{absent:true}} …
                                                     trees that are really a line of noise (a chain of small
                                                     "trees" in a dead straight row): {{absent:true, hint:"linear"}}
+                                                    a second top of ONE tree: {{absent:true, hint:"crown", of:{{…}}}}
+                                                    (see "Same tree" under #tree-species)
      "note": "mown meadow, no trees",               ≤ 280 chars, shown publicly (no personal data please)
      "source": "my-client/glyph",                   your client label ≤ 40 (stats are grouped by it)
      "reporter": "opaque-id",                       optional; hashed with a server salt, never stored or returned
@@ -298,7 +300,7 @@ what you expect, and send `looks_right` too: a confirmation is as useful as a co
     → {{id, folded, n, status, layer, claim, subject{{cell, kg, lon, lat}}, epoch, served, snapshot?, tally{{n,
        reporters, open, claims{{…}}}}, warnings?}}. Same subject + layer + claim + reporter folds into ONE row
     (n += 1) — repeat freely, you never create duplicates. Unknown fields are ignored and named in warnings.
-    Limits: body ≤ 32 KB; ≤ 1 r/s sustained (burst 10), ≤ 500 reports / client / day → 429 + Retry-After.
+    Limits: body ≤ 32 KB; ≤ 1 r/s sustained (burst 10), ≤ 4 500 reports / client / day → 429 + Retry-After.
   Withdraw (undo) your own flag: same subject + layer + claim + reporter (+ reporter key) and "retract": true →
     your contribution leaves that row (n -= yours, reporters -= 1; gone at 0). Every claim except tree | species
     and trees + point + missing (those: "Tree species" below). Works in batches (per-item "http").
@@ -405,6 +407,39 @@ IDENTITY — say which tree you mean, in this order of preference:
        Read: /trees/bbox "user" / "added" / "reported" gain state:[…], state_date:[…] only where one exists
          (fields=…,state,state_date dense; json rows: state, state_date); /trees/taxa columns state, state_date and
          filter &state=logged | any; /history versions carry state (null = taken back) + state_date.
+  Same tree — several apices on one broad crown (beech, oak, old lime): flag the EXTRA top, name its tree   #same-tree
+       POST /api/v1/flags {{"tree_id":"t_…" | "lon":…, "lat":…,          the extra top — the LOWER one
+                           "layer":"trees", "claim":"spurious", "observed":{{"h_m":24.5}},
+                           "expected":{{"absent":true, "hint":"crown", "of":{{"tree_id":"t_…" | "lon":…, "lat":…}}}},
+                           "reporter":"…", "source":"…"}}
+       An ordinary spurious flag (fold, tally, "retract": true — no expected needed to retract — status, reads), plus:
+         of      must name one of our apices other than the subject, ≤ 25 m from it; tree_id wins over lon / lat.
+                 Else 400 {{error, reason:"bad_of"}}. A subject that is no apex of ours → 404 {{reason:"no_apex"}}.
+                 An "of" that is itself somebody's extra top is replaced by its root (answer crown.rebound:true); a
+                 loop (A of B, B of A) is a bad_of. Roots are resolved again on every read — no chains, ever.
+         answer  the flag answer + crown:{{of:{{tree_id?, lon, lat, x, y}}, dist_m, rebound?}}; warnings[] says so when
+                 the subject is the taller one. tree_id is there when you sent it or the tree was reported by id;
+                 x, y = EPSG:3035 integer metres = the x / y columns of /trees/bbox (join key).
+         rows    one flag row and one /flags subject row PER EXTRA TOP (several tops in one res-12 cell stay apart;
+                 same cell id, own lon / lat): expected.spurious = {{absent, hint:"crown", of:{{tree_id?, lon, lat, x, y}}}},
+                 the same place "linear" is. We keep the top's h_m and crown_m2 in observed.
+         serve   /trees/bbox realistic=1 drops the extra top under the rule of every reader-flagged apex (open or
+                 confirmed, one reporter is enough, ≤ 10 min; `rejected` brings it back) and adds its crown_m2 to
+                 the parent's row — while the flag was made against the epoch being served. realistic=0 = raw.
+         use     the pairs are the label set for over-segmented crowns (apex finder tuning), as "linear" is for chains.
+  Note — a comment on a tree: "note": "≤ 280 chars" on any tree report (claim tree: species / dbh_cm / h_m /    #tree-note
+       state; claim missing). Longer is cut (tree.warning). Stored per version, shown publicly, no personal data.
+       Identity + note and nothing else is a report of its own: 201 tree{{…, note, op:"note"}}; the identical note
+       again → 200 folded. One note per reporter per tree (a new one replaces yours); the tree shows the NEWEST.
+       Take it back: {{…identity…, "note": null}} → op:"unnote" (species / measures / state stay): 201 | 200 folded
+         (already taken back) | 403 not_yours (you left none) | 404. "retract": "last" right after undoes it as any
+         version; "retract": true takes it with everything else of yours. Next to other fields, "note": null clears
+         yours if there is one and is ignored otherwise (never a 403).
+       Read: /trees/taxa/history versions carry note (null = taken back); /trees/bbox "user" / "added" / "reported"
+         gain note:[…] only where one exists (fields=…,note dense; json rows: note); /trees/taxa has a last column
+         note; tree{{}} answers carry note. notes=0 drops them on all four, as on /flags. A tree with only a note is
+         listed (taxon null, n 0). Imports: send what a file carried beyond the known fields as plain text
+         ("key: value · key: value") — we do not parse it.
   Batches {{"reports":[…]}} ≤ 50 → 201 {{results:[{{…, "http": 201|200|4xx}}…], count, errors}} — results[i] answers
        reports[i] (input order, always the same length); EVERY item carries "http"; tree reports carry tree{{…}},
        flags carry id + tally (an add, claim "missing", carries all three); a failed item is {{error, http, …}} and
@@ -415,7 +450,7 @@ IDENTITY — say which tree you mean, in this order of preference:
        device. Send it as header `X-Reporter-Key: trk_…` (or `Authorization: Bearer trk_…`, or body
        "reporter_key"; a batch item may carry its own). Keyed reports are attributed (`by` in /history = holder),
        `reporter` ids are namespaced to the key and no longer depend on the network you post from, daily cap
-       2 000 per key instead of 500 per client. Holders without "~" are organisations we verified (cap 20 000 —
+       4 500 per key, as without one. Holders without "~" are organisations we verified (cap 20 000 —
        ask us). Wrong key → 401. The key works for every POST /api/v1/flags, not only trees.
 
   Read back — cheapest first:
@@ -436,11 +471,11 @@ IDENTITY — say which tree you mean, in this order of preference:
      model class). Added / reported trees fall into the height window by h_m (3 m when none was given).
   2. GET /api/v1/trees/taxa?bbox=w,s,e,n | kg=63349 | (nothing = national) [&since=<rev>][&limit≤5000]
        → {{rev, since, fields, order:"rev_asc", columns:{{lon, lat, taxon, n, v, rev, added, h_m, dbh_cm, tree_id,
-          client_id, state, state_date}}, count, truncated, next_since?}} — poll with since=<last rev>: only trees changed after it
-       (a row with taxon, h_m, dbh_cm, state all null and added 0 = drop it). ETag → 304, max-age 30.
+          client_id, state, state_date, note}}, count, truncated, next_since?}} — poll with since=<last rev>: only trees changed after it
+       (a row with taxon, h_m, dbh_cm, state, note all null and added 0 = drop it). ETag → 304, max-age 30.
   3. GET /api/v1/trees/taxa/history?tree_id= | client_id= | lon=&lat= → {{tree, kg, dist_m, versions:[{{v, rev, ts,
        op: species | add | retract | moderated, taxon?, h_m?, dbh_cm?, measured_at?, dbh_method?, h_method?,
-       vitality?, status?, tree_id?, by?, source?, epoch?, hidden?}}]}} — every version of one tree, with its metadata.
+       vitality?, status?, note?, tree_id?, by?, source?, epoch?, hidden?}}]}} — every version of one tree, with its metadata.
   GET /api/v1/trees/taxa/dict → {{rev, fields:[taxon, de, en, class, rank, codes, alt], taxa:[[…]…], classes, accepts,
        limits, match, metadata}}   (~280 trees of Austria: forest, street / park, orchard; max-age 1 d, ETag, ~11 kB gzip)
        Columns are only ever appended — read by index 0–3 or by `fields`. `rev` changes with any dictionary change.
@@ -587,7 +622,8 @@ GET /api/v1/trees/bbox?bbox=…[&min_height=3][&max_height=…][&limit=2000][&re
     realistic=1 (default) removes what the height distribution says are not trees: the saturated
     ≥ 60 m bin, local spikes ≥ 45 m (masts, wind turbines, cranes), flagged cells (dropped_qa) and
     the apices of machine-detected linear noise (straight chains of small "trees"; each run carries a
-    flag: layer trees, claim spurious, source auto-linear, expected.hint "linear"); realistic=0 gives the raw apices. objects=structures returns the non-tree objects
+    flag: layer trees, claim spurious, source auto-linear, expected.hint "linear") and the extra tops readers
+    flagged as part of another tree (expected.hint "crown", their crown_m2 goes to that tree — #same-tree); realistic=0 gives the raw apices. objects=structures returns the non-tree objects
     instead ({{type, lon, lat, height_m, height_robust_m, area_m2, confidence, dh_m, cell, kg_code}};
     types=mast,wind_turbine,roof,… to filter). ready:false (+ pending_kgs / retry_after_s or
     error) when a KG of the bbox is not on disk yet or the index is unusable — never a silent 0.

@@ -50,9 +50,9 @@ MAX_BBOX_SPAN_DEG = 0.05
 MAX_IDS = 512
 MAX_ROWS_OUT = 2000
 MAX_K = 3
-DAILY_CAP = 500                      # reports per client key per UTC day
+DAILY_CAP = 4_500                    # reports per client key per UTC day
 DAILY_CAP_KEYED = 20_000             # … per reporter key issued by us (organisations)
-DAILY_CAP_SELF = 2_000               # … per self-issued reporter key (POST /api/v1/flags/token)
+DAILY_CAP_SELF = 4_500               # … per self-issued reporter key (POST /api/v1/flags/token); never below DAILY_CAP
 TOKENS_PER_CLIENT_DAY = 20           # self-issued keys per client per UTC day
 MAX_SELF_KEYS = 200_000
 SELF_MARK = '~'                      # holder "name~1a2b" = self-issued, unverified
@@ -467,7 +467,7 @@ def _retract(c, subj: dict, layer: str, claim: str, rep: bytes) -> dict:
                 if others:
                     raise FlagError(403, 'this flag is not yours — only your own flags can be withdrawn (same '
                                          '"reporter" and reporter key as the flag)', reason='not_yours',
-                                    tally=tally(subj['skey']))
+                                    tally=tally(_tkey(subj)))
                 raise FlagError(404, 'no such flag: nothing with this subject + layer + claim', reason='no_flag')
             c.execute('COMMIT')
         except FlagError:
@@ -476,7 +476,7 @@ def _retract(c, subj: dict, layer: str, claim: str, rep: bytes) -> dict:
             c.execute('ROLLBACK')
             raise
     _heat_cache.clear()
-    out['tally'] = tally(subj['skey'])
+    out['tally'] = tally(_tkey(subj))
     return out
 
 
@@ -502,7 +502,7 @@ def _drop_added_flag(c, subj: dict, tree: dict, rep: bytes) -> dict:
     if not ids:
         return {}
     _heat_cache.clear()
-    return {'flag_removed': ids[0], 'tally': tally(subj['skey'])}
+    return {'flag_removed': ids[0], 'tally': tally(_tkey(subj))}
 
 
 def record(body: dict, client: str, org: str | None = None) -> dict:
@@ -550,12 +550,28 @@ def record(body: dict, client: str, org: str | None = None) -> dict:
         return out
     if _retracts(body) and not (claim == 'missing' and layer in TREE_LAYERS and has_point):
         rp = body.get('reporter')
-        out = _retract(_conn(), subj, layer, claim,
-                       _reporter_hash(str(rp)[:120] if rp not in (None, '') else None, client, org))
+        rep = _reporter_hash(str(rp)[:120] if rp not in (None, '') else None, client, org)
+        if layer == 'trees' and claim == 'spurious' and has_point:
+            # "same tree" flags are keyed by the apex, not the cell (tree_crown.py)
+            import tree_crown as tc
+            k = tc.own_key(_conn(), subj, rep)
+            if k is not None:
+                subj = {**subj, 'skey': k}
+        out = _retract(_conn(), subj, layer, claim, rep)
         warn = [k for k in body if k not in _KNOWN]
         if warn:
             out['warnings'] = [f'ignored unknown field(s): {", ".join(sorted(warn))}']
         return out
+    crown = None
+    if layer == 'trees' and claim == 'spurious' and isinstance(body.get('expected'), dict) \
+            and str(body['expected'].get('hint') or '').strip().lower() == 'crown':
+        # "these tops are one tree": validate "of", key the row by the apex (tree_crown.py)
+        if not has_point:
+            raise FlagError(400, 'hint "crown" needs the extra top itself: tree_id or lon, lat')
+        import tree_crown as tc
+        crown = tc.bind(_conn(), body, subj)
+        body = {**body, 'expected': crown['expected'], 'observed': crown['observed'], 'epoch': crown['epoch']}
+        subj = {**subj, 'skey': crown['skey'], 'kg': crown['kg']}
     observed = _compact_json(body.get('observed'), MAX_OBSERVED_B, 'observed')
     expected = _compact_json(body.get('expected'), MAX_EXPECTED_B, 'expected')
     note = _clean_note(body.get('note') or body.get('notes'))
@@ -630,12 +646,16 @@ def record(body: dict, client: str, org: str | None = None) -> dict:
         out['served'] = served
         if snap and body.get('observed') in (None, '', {}):
             out['snapshot'] = snap
-    out['tally'] = tally(subj['skey'])
+    out['tally'] = tally(_tkey(subj))
     if tree is not None:
         out['tree'] = tree
     warn = [k for k in body if k not in _KNOWN]
     if warn:
         out['warnings'] = [f'ignored unknown field(s): {", ".join(sorted(warn))}']
+    if crown is not None:
+        out['crown'] = crown['public']
+        if crown['warnings']:
+            out['warnings'] = out.get('warnings', []) + crown['warnings']
     return out
 
 
@@ -647,9 +667,14 @@ def _subject_public(subj: dict) -> dict:
     return d
 
 
+def _tkey(subj: dict) -> int:
+    return subj['cell'] if subj.get('cell') is not None else subj['skey']
+
+
 def tally(skey: int) -> dict:
+    """Per cell (id > 0: cell-keyed rows have skey = cell, apex-keyed "same tree" rows share the cell) or per KG subject."""
     c = _conn()
-    rows = c.execute('SELECT claim, status, SUM(n) AS n, COUNT(*) AS reporters FROM report WHERE skey=? '
+    rows = c.execute(f'SELECT claim, status, SUM(n) AS n, COUNT(*) AS reporters FROM report WHERE {"cell" if skey > 0 else "skey"}=? '
                      'GROUP BY claim, status', (skey,)).fetchall()
     claims: dict = {}
     n = rep = open_ = 0
@@ -992,7 +1017,7 @@ def dict_block() -> dict:
                     'else a salted hash of the client IP; neither is stored or returned)',
             'superseded': 'read-side flag: the KG product was rebuilt since the report (epoch differs)',
             'trees': 'layer trees + lon,lat: claim species (= tree) {species, dbh_cm, h_m} describes the tree at the point, '
-                     'claim missing [{species, dbh_cm, h_m}] adds one we do not have, "state": logged | windthrow | burnt | dead | broken | infested | gone [+ date] says what happened to one since our flight — versioned per tree; /api/v1/trees/taxa[/dict|/history]'}
+                     'claim missing [{species, dbh_cm, h_m}] adds one we do not have, "note" (≤ 280 chars) comments one, claim spurious + expected {hint: crown, of: {tree_id | lon, lat}} says an apex is a second top of that tree, "state": logged | windthrow | burnt | dead | broken | infested | gone [+ date] says what happened to one since our flight — versioned per tree; /api/v1/trees/taxa[/dict|/history]'}
 
 
 # === SECTION: HTTP ===
@@ -1257,7 +1282,7 @@ def flags_one(rid: int):
     d = get_one(rid)
     if d is None:
         raise FlagError(404, 'no such report')
-    d['tally'] = tally(_conn().execute('SELECT skey FROM report WHERE id=?', (rid,)).fetchone()[0])
+    d['tally'] = tally(_conn().execute('SELECT COALESCE(cell, skey) FROM report WHERE id=?', (rid,)).fetchone()[0])
     d['meta'] = _meta()
     return _resp(d)
 

@@ -404,6 +404,7 @@ def trees_bbox():
     if request.args.get('types'):
         types = {t.strip().lower() for t in request.args['types'].split(',') if t.strip()}
     realistic = _flag_arg('realistic', True)
+    notes = _flag_arg('notes', True)
     import ne_trees
     fmt = (request.args.get('format') or 'json').strip().lower()
     if fmt not in ('json', 'geojson', 'columns'):
@@ -477,10 +478,10 @@ def trees_bbox():
     try:
         if fmt == 'columns':
             t = ne_trees.columns_bbox(*bb, kind, fields=fields, min_height=min_h, max_height=max_h, limit=limit,
-                                      realistic=realistic, types=types)
+                                      realistic=realistic, types=types, notes=notes)
         else:
             t = lq.trees_bbox(*bb, min_height=min_h, max_height=max_h, limit=limit,
-                              realistic=realistic, kind=kind, types=types)
+                              realistic=realistic, kind=kind, types=types, notes=notes)
     except ValueError as e:
         return _err(str(e), 400)
     except Exception as e:  # noqa: BLE001

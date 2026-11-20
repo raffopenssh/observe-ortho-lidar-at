@@ -104,3 +104,39 @@ is a training / change label.
   KGs without reports stay byte-identical (same ETag, 1-day cache). `/trees/taxa?state=logged|any` = training set.
 * Linear noise is a different thing (the apex was never a tree): `claim: spurious` + `expected.hint: "linear"`,
   `docs/linear-noise.md`.
+
+## Same tree (`expected.hint: "crown"`, `tree_crown.py`, 2026-11-20)
+
+Several apices on one broad crown. A reader flags the extra (lower) top: layer `trees`, claim `spurious`,
+`expected {absent, hint:"crown", of:{tree_id | lon, lat}}`. Contract: `#same-tree`. Test: `python3 tests/test_tree_crown_note.py`.
+
+* **No table, no recompute.** It is a `report` row. Only the subject key differs: `skey = -(x << 32 | y)` of the
+  extra apex (EPSG:3035 m; below `-2^32`, KG subjects are `-1…-99999`, cells are positive), so several tops in one
+  res-12 cell do not fold into each other. `cell` / `lon_e6` / `lat_e6` are filled as for any point flag, so every
+  read (`_where`, heat, stats) follows; `tally()` counts by `cell` for positive ids. The row's `kg` is the KG **file**
+  that serves the apex (not the KG of the point — `ne_trees._flags` is per file), `epoch` that file's epoch.
+* **Write** (`tree_crown.bind`, called from `public_flags.record`): subject → apex ≤ 2.5 m (1.5 m for a tree_id,
+  preferring `observed.h_m`), `of` → apex ≤ 25 m away, not the subject; a parent that is itself an extra top is
+  replaced by its root (≤ 8 hops; loop → `bad_of`). Stored `of` = `{tree_id?, lon, lat, x, y}`; `observed` gains
+  `h_m` / `crown_m2` of the extra top (what the merge and the label need — no corpus read later).
+* **Retract** needs no `expected`: `tree_crown.own_key` finds the reporter's apex-keyed row within 2.5 m of the
+  point (own row → own plain cell row → own withdrawn marker → somebody else's = 403).
+* **Read** (`ne_trees._flags`, the per-KG flag cache that already exists, 10 min): apex-keyed rows hide exactly that
+  apex and yield `tree_crown.merges` = (parent key, m² to add), chains resolved again; `collect` adds them to the
+  parents present in the result (`tree_crown.apply`, one `searchsorted`, only when a KG of the bbox has such flags).
+  The area is added only while `row.epoch` = the epoch served (after a rebuild the top may be gone — hiding still
+  follows the usual 2.5 m rule). `/trees/bbox` ETag unchanged (as for every reader flag).
+* **Labels**: `python3 tree_crown.py --labels [--kg N]` → JSONL `{kg, x, y, h_m, crown_m2, of_x, of_y, dist_m,
+  reporters, confirmed, superseded}`; `python3 tree_crown.py` = counts. Nothing consumes them automatically yet.
+
+## Note (`"note"`, 2026-11-20)
+
+* Column `tree_ver.note TEXT` (NULL = none, `''` = taken back). No index; a version without a note costs 0 bytes.
+* `_derive`: each reporter's latest note (cleared by `''`, a retract, an undone version); the tree shows the newest.
+  A tree with only a note is `live`.
+* ops in answers: `note` (version carries nothing but a note), `unnote` (identity + `"note": null` only; 403 when the
+  reporter has none). Row `op` stays 0 / 1.
+* Reads: `_public`, `/history` (`note: null` = taken back), `annotate` / `added` / `reported` (`note` only when a
+  tree of the result has one), `/trees/taxa` last column; `notes=0` everywhere. Moderation = the version's
+  `/trees/taxa/<rev>/moderate`.
+* `/trees/bbox` json / geojson now also passes `reported` through (`landscape_query.trees_bbox` dropped it).

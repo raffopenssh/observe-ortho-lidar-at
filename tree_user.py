@@ -85,7 +85,8 @@ _ADD_COLS = (('uh_dm', 'INTEGER'),      # reporter's own height measurement / es
              ('mts', 'INTEGER'),        # measured_at (epoch s); ts stays the receive time
              ('meta', 'INTEGER'),       # packed training metadata, 4 bits each (META_FIELDS order; 0 = not given)
              ('org', 'INTEGER'),        # dict id (kind 'org'): holder of the reporter key the version came with
-             ('sdate', 'INTEGER'))      # date of the state, packed (pack_date: 2 bytes; NULL = not given)
+             ('sdate', 'INTEGER'),      # date of the state, packed (pack_date: 2 bytes; NULL = not given)
+             ('note', 'TEXT'))          # reporter's comment ≤ 280 chars (NULL = none given, '' = taken back)
 # training metadata vocabulary (standard English terms; value index + 1 is stored).  German field terms
 # and common synonyms are accepted and normalised.
 META_FIELDS = (
@@ -238,6 +239,7 @@ def _derive(rows) -> dict:
     uh: dict = {}            # reporter -> own height (dm)
     dbh: dict = {}           # reporter -> dbh (mm)
     stv: dict = {}           # reporter -> (rev, status nibble, packed logged date)
+    nt: dict = {}            # reporter -> (rev, note)
     apex_h = None
     tid = pos = cid = None
     for r in rows:
@@ -252,7 +254,7 @@ def _derive(rows) -> dict:
             continue
         rep = bytes(r['reporter'])
         if r['op'] == OP_RETRACT:
-            votes.pop(rep, None); adds.discard(rep); uh.pop(rep, None); dbh.pop(rep, None); stv.pop(rep, None)
+            votes.pop(rep, None); adds.discard(rep); uh.pop(rep, None); dbh.pop(rep, None); stv.pop(rep, None); nt.pop(rep, None)
             continue
         k = ((r['meta'] or 0) >> ST_SHIFT) & 15
         if k == ST_NONE:
@@ -260,6 +262,11 @@ def _derive(rows) -> dict:
         elif k:
             p = stv.get(rep)
             stv[rep] = (r['rev'], k, r['sdate'] or (p[2] if p and p[1] == k else None))
+        if r['note'] is not None:
+            if r['note']:
+                nt[rep] = (r['rev'], r['note'])
+            else:
+                nt.pop(rep, None)
         if r['op'] == OP_ADD:
             adds.add(rep)
         elif r['h_dm'] is not None:
@@ -288,13 +295,13 @@ def _derive(rows) -> dict:
             sk = 0
         else:
             sdate = next((v[2] for v in sorted(stv.values(), reverse=True) if v[1] == sk and v[2]), 0)
-    return {'state': sk, 'sdate': sdate, 'sp': sp, 'n': n, 'added': bool(adds), 'h_dm': hs[len(hs) // 2] if hs else None,
+    return {'note': max(nt.values())[1] if nt else None, 'state': sk, 'sdate': sdate, 'sp': sp, 'n': n, 'added': bool(adds), 'h_dm': hs[len(hs) // 2] if hs else None,
             'dbh_mm': ds[len(ds) // 2] if ds else None, 'apex_h': apex_h, 'tid': tid, 'pos': pos, 'cid': cid,
-            'v': len(rows), 'rev': rows[-1]['rev'], 'reporters': len(set(votes) | adds | set(uh) | set(dbh) | set(stv))}
+            'v': len(rows), 'rev': rows[-1]['rev'], 'reporters': len(set(votes) | adds | set(uh) | set(dbh) | set(stv) | set(nt))}
 
 
 def _load(c, kg: int) -> dict:
-    rows = c.execute('SELECT rev, x, y, op, sp, h_dm, uh_dm, dbh_mm, reporter, ref, e_dm, n_dm, cid, meta, sdate FROM tree_ver '
+    rows = c.execute('SELECT rev, x, y, op, sp, h_dm, uh_dm, dbh_mm, reporter, ref, e_dm, n_dm, cid, meta, sdate, note FROM tree_ver '
                      'WHERE kg=? ORDER BY rev', (kg,)).fetchall()
     if not rows:
         return dict(_EMPTY, path=str(pf.DB_PATH))
@@ -319,7 +326,9 @@ def _load(c, kg: int) -> dict:
           'apex_h': np.array([np.nan if d['apex_h'] is None else d['apex_h'] / 10.0 for d in cur])}
     st['state'] = np.array([d['state'] for d in cur], np.int8)
     st['sdate'] = [d['sdate'] for d in cur]
-    st['live'] = (st['sp'] > 0) | st['added'] | np.isfinite(st['h']) | np.isfinite(st['dbh']) | (st['state'] > 0)
+    st['note'] = [d['note'] for d in cur]
+    st['live'] = (st['sp'] > 0) | st['added'] | np.isfinite(st['h']) | np.isfinite(st['dbh']) | (st['state'] > 0) \
+        | np.array([t is not None for t in st['note']], bool)
     st['has_id'] = np.array([t is not None for t in st['tid']], bool)
     # inventory trees reported by id that the corpus had no apex for (apex-bound versions store the apex height)
     st['idonly'] = st['has_id'] & ~st['added'] & ~np.isfinite(st['apex_h'])
@@ -446,12 +455,12 @@ def annotate(x: np.ndarray, y: np.ndarray, h: np.ndarray, kgs) -> dict | None:
         return None
     key = (x.astype(np.int64) << 32) | y.astype(np.int64)
     out_i: list = []; out_sp: list = []; out_n: list = []; out_v: list = []; out_h: list = []; out_d: list = []
-    out_t: list = []; out_s: list = []; out_sd: list = []
+    out_t: list = []; out_s: list = []; out_sd: list = []; out_nt: list = []
 
     def take(k, j):
         out_s.append(_state_name(slg[j])); out_sd.append(date_str(sld[j]) if slg[j] else None)
         out_i.append(k); out_sp.append(int(ssp[j])); out_n.append(int(scn[j])); out_v.append(int(sv[j]))
-        out_h.append(_num(suh[j])); out_d.append(_num(sdb[j])); out_t.append(stid[j])
+        out_h.append(_num(suh[j])); out_d.append(_num(sdb[j])); out_t.append(stid[j]); out_nt.append(snt[j])
 
     for s in sts:
         m = s['live'] & ~s['added']
@@ -460,6 +469,7 @@ def annotate(x: np.ndarray, y: np.ndarray, h: np.ndarray, kgs) -> dict | None:
         sk = s['key'][m]; ssp = s['sp'][m]; scn = s['cnt'][m]; sv = s['v'][m]; suh = s['h'][m]; sdb = s['dbh'][m]
         stid = [t for t, k_ in zip(s['tid'], m.tolist()) if k_]
         slg = s['state'][m]; sld = [t for t, k_ in zip(s['sdate'], m.tolist()) if k_]
+        snt = [t for t, k_ in zip(s['note'], m.tolist()) if k_]
         order = np.argsort(key, kind='stable')
         pos = np.searchsorted(key[order], sk)
         pos[pos >= key.size] = 0
@@ -482,7 +492,7 @@ def annotate(x: np.ndarray, y: np.ndarray, h: np.ndarray, kgs) -> dict | None:
     seen = set(); keep = [j for j in o if not (out_i[j] in seen or seen.add(out_i[j]))]
     u = {'i': [out_i[j] for j in keep], 'taxon': [_taxon(out_sp[j]) for j in keep],
          'n': [out_n[j] for j in keep], 'v': [out_v[j] for j in keep]}
-    for name, col in (('h_user_m', out_h), ('dbh_cm', out_d), ('tree_id', out_t), ('state', out_s), ('state_date', out_sd)):   # only when any is known
+    for name, col in (('h_user_m', out_h), ('dbh_cm', out_d), ('tree_id', out_t), ('state', out_s), ('state_date', out_sd), ('note', out_nt)):   # only when any is known
         if any(col[j] is not None for j in keep):
             u[name] = [col[j] for j in keep]
     return u
@@ -512,7 +522,7 @@ def added(w, s, e, n, kgs, min_h: float = 0.0, max_h: float | None = None, which
     g = global_rev()
     if not g:
         return None
-    out = {'lon': [], 'lat': [], 'h_m': [], 'taxon': [], 'n': [], 'v': [], 'dbh_cm': [], 'client_id': [], 'tree_id': [], 'state': [], 'state_date': []}
+    out = {'lon': [], 'lat': [], 'h_m': [], 'taxon': [], 'n': [], 'v': [], 'dbh_cm': [], 'client_id': [], 'tree_id': [], 'state': [], 'state_date': [], 'note': []}
     seen = set()
     for k in kgs:
         st = state(k, g)
@@ -532,9 +542,10 @@ def added(w, s, e, n, kgs, min_h: float = 0.0, max_h: float | None = None, which
             out['taxon'].append(_taxon(st['sp'][j])); out['n'].append(int(st['cnt'][j])); out['v'].append(int(st['v'][j]))
             out['client_id'].append(st['cid'][j]); out['tree_id'].append(st['tid'][j] if which == 'idonly' else None)
             out['state'].append(_state_name(st['state'][j])); out['state_date'].append(date_str(st['sdate'][j]) if st['state'][j] else None)
+            out['note'].append(st['note'][j])
     if not out['lon']:
         return None
-    for k in ('dbh_cm', 'client_id', 'tree_id', 'state', 'state_date'):
+    for k in ('dbh_cm', 'client_id', 'tree_id', 'state', 'state_date', 'note'):
         if all(v is None for v in out[k]):
             del out[k]
     return out
@@ -755,6 +766,11 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
     warnings: list = []
     meta, mts = _metadata(body, exp, warnings)
     undo = str(body.get('retract')).strip().lower() == 'last'      # drop only my latest version of this tree
+    # comment on the tree (docs/tree-user.md → Note): stored per version; "note": null takes mine back
+    has_note = 'note' in body
+    note = pf._clean_note(body.get('note')) if has_note else None
+    if note is not None and len(str(body['note']).strip()) > pf.MAX_NOTE:
+        warnings.append(f'note cut to {pf.MAX_NOTE} characters')
     # state since our flight (docs/tree-user.md → State): "state": "logged" | … [+ "date"]; null / retract takes
     # back only my statement.  `status` (older metadata name) is the same field.
     stated = claim == 'state'
@@ -782,6 +798,10 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
         latin, known = normalise(raw)
     empty = latin is None and uh_dm is None and dbh_mm is None
     retract = undo or (not unstate and (_truthy(body.get('retract')) or (empty and has_sp)))
+    # identity + "note": null and nothing else = take my note back; riding on a report, null just clears mine if any
+    unnote = (has_note and note is None and empty and not retract and not unstate and not stated and meta is None
+              and mts is None and claim == 'species')
+    note_v = note
     c = _conn()
     e_dm = n_dm = None
     new_tree = False
@@ -810,7 +830,7 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
                                         f'{MATCH_CROWN_FRAC:g} × crown radius) of an apex, {ADDED_NAME_M:g} m of an added '
                                         'tree). Send tree_id, or add the tree: claim "missing" with the same point.',
                                    hint={'layer': 'trees', 'claim': 'missing'}, candidates=_cand_public(cs))
-        if empty and not retract and meta is None and mts is None:
+        if empty and not retract and meta is None and mts is None and not has_note:
             raise pf.FlagError(400, 'say something about the tree: species, dbh_cm and / or h_m '
                                     '("species": null or "retract": true withdraws your report)', dict='/api/v1/trees/taxa/dict')
         if retract:
@@ -862,7 +882,7 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
                     kg, x, y = _tree_by_cid(c, cid); new_tree = False
                 else:
                     x, y = _free_key(c, kg, x, y)
-            rows = c.execute('SELECT rev, op, sp, uh_dm, dbh_mm, mts, meta, sdate, reporter, ref FROM tree_ver '
+            rows = c.execute('SELECT rev, op, sp, uh_dm, dbh_mm, mts, meta, sdate, note, reporter, ref FROM tree_ver '
                              'WHERE kg=? AND x=? AND y=? ORDER BY rev', (kg, x, y)).fetchall()
             hidden = {r['ref'] for r in rows if r['op'] == OP_MODERATE}
             mine = [r for r in rows if bytes(r['reporter']) == rep and r['op'] != OP_MODERATE and r['rev'] not in hidden]
@@ -885,6 +905,8 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
                         return False
                 return True
 
+            if has_note and note is None and not unnote:
+                note_v = '' if latest('note') else None
             undone = None
             if undo:
                 same = not mine
@@ -915,10 +937,21 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
                                        reason='not_yours', tree=tree_at(kg, x, y))
                 if same:
                     warnings.append('already withdrawn — you report no state for this tree')
+            elif unnote:
+                k = latest('note')
+                same = not k
+                if k is None:
+                    raise pf.FlagError(403, 'you left no note on this tree — only your own note can be taken back '
+                                            '(same "reporter" and reporter key as the report)',
+                                       reason='not_yours', tree=tree_at(kg, x, y))
+                if same:
+                    warnings.append('already taken back — you have no note on this tree')
+                note_v = ''
             else:
                 same = bool(cur) and meta_same() and all(
                     v is None or v == latest(col)
-                    for col, v in (('sp', sp), ('uh_dm', uh_dm), ('dbh_mm', dbh_mm), ('mts', mts), ('sdate', sdate)))
+                    for col, v in (('sp', sp), ('uh_dm', uh_dm), ('dbh_mm', dbh_mm), ('mts', mts), ('sdate', sdate),
+                                   ('note', note_v)))
                 if op == OP_ADD and not any(r['op'] == OP_ADD for r in cur):
                     same = False
             if not same:
@@ -931,9 +964,10 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
                               (now, x, y, kg, OP_MODERATE, rep, source_id, undone['rev'], org_id))
                 else:
                     c.execute('INSERT INTO tree_ver(ts, x, y, kg, op, sp, h_dm, reporter, source, epoch, uh_dm, dbh_mm, '
-                              'e_dm, n_dm, cid, mts, meta, org, sdate) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                              'e_dm, n_dm, cid, mts, meta, org, sdate, note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                               (now, x, y, kg, op, sp, h_dm, rep, source_id, ep, uh_dm, dbh_mm, e_dm, n_dm,
-                               cid if op == OP_ADD else None, mts, meta, org_id, sdate))
+                               cid if op == OP_ADD else None, mts, meta, org_id, sdate,
+                               None if op == OP_RETRACT else note_v))
                 written = True
             c.execute('COMMIT')
         except Exception:
@@ -943,7 +977,9 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
     # folded: nothing new was created — a repeat (no version written) or, for an add, the report landed on
     # a tree that already existed.  written: a version was appended.
     out.update(folded=(not written) or (op == OP_ADD and not new_tree), written=written,
-               op='undo' if undo else 'unstate' if unstate else 'state' if stated else OP_NAMES[op],
+               op='undo' if undo else 'unstate' if unstate else 'state' if stated else 'unnote' if unnote
+               else 'note' if (note_v and empty and meta is None and mts is None and op != OP_RETRACT and not new_tree)
+               else OP_NAMES[op],
                matched=kind, dist_m=round(dist, 1))
     if stated or unstate:
         out.setdefault('state', None)               # always present on a state call: null = standing / unknown
@@ -1034,6 +1070,8 @@ def _public(st: dict, j: int) -> dict:
         d['state'] = _state_name(st['state'][j])
         if st['sdate'][j]:
             d['state_date'] = date_str(st['sdate'][j])
+    if st['note'][j]:
+        d['note'] = st['note'][j]
     return d
 
 
@@ -1053,10 +1091,11 @@ def moderate(rev: int) -> dict | None:
 
 # === SECTION: listing / history / stats ===
 
-LIST_FIELDS = ('lon', 'lat', 'taxon', 'n', 'v', 'rev', 'added', 'h_m', 'dbh_cm', 'tree_id', 'client_id', 'state', 'state_date')
+LIST_FIELDS = ('lon', 'lat', 'taxon', 'n', 'v', 'rev', 'added', 'h_m', 'dbh_cm', 'tree_id', 'client_id', 'state', 'state_date', 'note')
 
 
-def listing(bbox=None, kg=None, since: int = 0, limit: int = LIST_LIMIT, only: int | None = None) -> dict:
+def listing(bbox=None, kg=None, since: int = 0, limit: int = LIST_LIMIT, only: int | None = None,
+            notes: bool = True) -> dict:
     """Current answers as columns, oldest change first.  ``since`` = only trees
     changed after that revision (a tree that lost its last live version comes
     back once with taxon null, added 0 → drop it)."""
@@ -1098,11 +1137,12 @@ def listing(bbox=None, kg=None, since: int = 0, limit: int = LIST_LIMIT, only: i
         cols['h_m'].append(_num(st['h'][j])); cols['dbh_cm'].append(_num(st['dbh'][j]))
         cols['tree_id'].append(None if st['added'][j] else st['tid'][j]); cols['client_id'].append(st['cid'][j])
         cols['state'].append(_state_name(st['state'][j])); cols['state_date'].append(date_str(st['sdate'][j]) if st['state'][j] else None)
+        cols['note'].append(st['note'][j] if notes else None)
     out['count'] = len(rows)
     return out
 
 
-def history(lon: float | None = None, lat: float | None = None, tree_id=None, client_id=None) -> dict | None:
+def history(lon: float | None = None, lat: float | None = None, tree_id=None, client_id=None, notes: bool = True) -> dict | None:
     """Every version of one reported tree: by tree_id, by client_id, or the
     nearest to a point (≤ 5 m)."""
     g = global_rev()
@@ -1138,7 +1178,7 @@ def history(lon: float | None = None, lat: float | None = None, tree_id=None, cl
     if best is None:
         return None
     d, st, j, kg = best
-    rows = _conn().execute('SELECT rev, ts, op, sp, uh_dm, dbh_mm, source, epoch, ref, e_dm, n_dm, mts, meta, org, sdate, '
+    rows = _conn().execute('SELECT rev, ts, op, sp, uh_dm, dbh_mm, source, epoch, ref, e_dm, n_dm, mts, meta, org, sdate, note, '
                            'length(reporter) AS rl FROM tree_ver '
                            'WHERE kg=? AND x=? AND y=? ORDER BY rev', (kg, int(st['x'][j]), int(st['y'][j]))).fetchall()
     hidden = {r['ref'] for r in rows if r['op'] == OP_MODERATE}
@@ -1158,6 +1198,8 @@ def history(lon: float | None = None, lat: float | None = None, tree_id=None, cl
             v['state'] = v.get('status')                # null = statement taken back (`status` = older name)
             if r['sdate']:
                 v['state_date'] = date_str(r['sdate'])
+        if r['note'] is not None and notes:
+            v['note'] = r['note'] or None               # null = note taken back
         if r['e_dm'] is not None and r['op'] in (OP_SPECIES, OP_RETRACT):
             v['tree_id'] = tree_id_str((r['e_dm'], r['n_dm']))
         if r['source'] is not None:
@@ -1171,7 +1213,10 @@ def history(lon: float | None = None, lat: float | None = None, tree_id=None, cl
         elif r['rev'] in hidden:
             v['hidden'] = True
         vs.append(v)
-    return {'tree': _public(st, j), 'kg': f'{kg:05d}', 'dist_m': round(d, 1), 'versions': vs}
+    tree = _public(st, j)
+    if not notes:
+        tree.pop('note', None)
+    return {'tree': tree, 'kg': f'{kg:05d}', 'dist_m': round(d, 1), 'versions': vs}
 
 
 def taxa_dict() -> dict:
@@ -1326,14 +1371,18 @@ def stats() -> dict:
         c = _conn()
         r = c.execute('SELECT COUNT(*), COUNT(DISTINCT kg), COUNT(DISTINCT reporter), COALESCE(MAX(rev), 0), '
                       'COUNT(DISTINCT x * 4294967296 + y), SUM(op = 1), COUNT(DISTINCT sp), MAX(ts), '
-                      'SUM((meta >> 12) & 15 BETWEEN 2 AND 14) FROM tree_ver').fetchone()
+                      "SUM((meta >> 12) & 15 BETWEEN 2 AND 14), SUM(note != '') FROM tree_ver").fetchone()
         return {'versions': r[0], 'kgs': r[1], 'reporters': r[2], 'rev': r[3], 'trees': r[4], 'add_versions': r[5] or 0,
-                'taxa': r[6], 'last': r[7], 'state_versions': r[8] or 0}
+                'taxa': r[6], 'last': r[7], 'state_versions': r[8] or 0, 'note_versions': r[9] or 0}
     except Exception as e:  # noqa: BLE001
         return {'error': str(e)}
 
 
 # === SECTION: HTTP (mounted on the flags blueprint) ===
+
+def _notes_arg(a) -> bool:
+    return (a.get('notes') or '1') not in ('0', 'false', 'no')
+
 
 def _meta():
     return {'service': 'srtm-lidar-at', 'docs': '/api/v1/docs/llm.txt#tree-species', 'dict': '/api/v1/trees/taxa/dict'}
@@ -1364,7 +1413,8 @@ def taxa_get():
         if not (kg.isdigit() and len(kg) == 5):
             raise pf.FlagError(400, 'kg must be a 5-digit code')
     sf = a.get('state')
-    out = listing(bbox, kg, since, limit, only=None if not sf else 0 if sf in ('1', 'any') else state_id(sf))
+    out = listing(bbox, kg, since, limit, only=None if not sf else 0 if sf in ('1', 'any') else state_id(sf),
+                  notes=_notes_arg(a))
     out['meta'] = _meta()
     return pf._resp(out, max_age=TAXA_MAX_AGE)
 
@@ -1376,13 +1426,13 @@ def taxa_history():
         return lim
     a = request.args
     if a.get('tree_id') or a.get('client_id'):
-        d = history(tree_id=a.get('tree_id'), client_id=a.get('client_id'))
+        d = history(tree_id=a.get('tree_id'), client_id=a.get('client_id'), notes=_notes_arg(a))
     else:
         try:
             lon, lat = float(a['lon']), float(a['lat'])
         except (KeyError, ValueError):
             raise pf.FlagError(400, 'tree_id=, client_id= or lon=&lat= required')
-        d = history(lon, lat)
+        d = history(lon, lat, notes=_notes_arg(a))
     if d is None:
         raise pf.FlagError(404, 'no reported tree with this id / within 5 m')
     d['meta'] = _meta()

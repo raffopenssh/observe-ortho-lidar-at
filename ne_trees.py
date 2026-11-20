@@ -212,7 +212,7 @@ def _flags(kg: str, kind: str) -> tuple:
         hit = _pf_cache.get(key)
         if hit and now - hit[0] < _PF_TTL:
             return hit[1]
-    cells: set[int] = set(); pts = []
+    cells: set[int] = set(); pts = []; mrg = None
     try:
         import json
         import public_flags as pf
@@ -225,12 +225,17 @@ def _flags(kg: str, kind: str) -> tuple:
             # machine reports of ne_linear hide single apices (ne_linear.hidden), never the whole cell
             auto = pf._DICT.get(('source', 'auto-linear'))
             tree_layer = pf._DICT.get(('layer', 'trees')) if kind == 'trees' else None
-            q = ('SELECT cell, layer, lon_e6, lat_e6, observed FROM report WHERE kg=? AND cell IS NOT NULL '
+            q = ('SELECT cell, layer, lon_e6, lat_e6, observed, skey, expected, epoch FROM report WHERE kg=? AND cell IS NOT NULL '
                  'AND status IN (0,1) AND layer IN (%s) AND claim IN (%s) AND (source IS NULL OR source != ?)'
                  % (','.join('?' * len(lay)), ','.join('?' * len(clm))))
-            ll = []
-            for cell, layer, lo, la, obs in c.execute(q, (kg, *lay, *clm, -1 if auto is None else auto)):
-                if tree_layer is not None and layer == tree_layer and lo is not None and la is not None:
+            ll = []; apx = []; crows = []
+            for cell, layer, lo, la, obs, skey, exp, ep in c.execute(q, (kg, *lay, *clm, -1 if auto is None else auto)):
+                if tree_layer is not None and layer == tree_layer and skey < -(1 << 32):
+                    # "same tree" flag (tree_crown.py): keyed by the extra apex itself → hide exactly it,
+                    # and hand its crown area to the tree it belongs to
+                    apx.append((float(-skey >> 32), float(-skey & 0xFFFFFFFF), float('nan')))
+                    crows.append((skey, exp, obs, ep))
+                elif tree_layer is not None and layer == tree_layer and lo is not None and la is not None:
                     h = None
                     try:
                         o = json.loads(obs) if obs else {}
@@ -243,9 +248,13 @@ def _flags(kg: str, kind: str) -> tuple:
             if ll:
                 xs, ys = ca._tf('EPSG:4326', 'EPSG:3035').transform([p[0] for p in ll], [p[1] for p in ll])
                 pts = [(x, y, p[2]) for x, y, p in zip(xs, ys, ll)]
+            if apx:
+                import tree_crown
+                pts = list(pts) + apx
+                mrg = tree_crown.merges(crows, pf._epoch_now(kg))
     except Exception as ex:  # noqa: BLE001
         log.debug('ne_trees flags %s: %s', kg, ex)
-    val = (cells, np.array(pts, np.float64).reshape(-1, 3))
+    val = (cells, np.array(pts, np.float64).reshape(-1, 3), mrg)
     with _pf_lock:
         _pf_cache[key] = (now, val)
         if len(_pf_cache) > 4000:
@@ -421,7 +430,7 @@ def bbox_state(w, s, e, n) -> dict:
 # ── query ──────────────────────────────────────────────────────────────
 
 MAX_LIMIT_COLUMNS = 100000      # format=columns: one call carries a whole 0.025° tile (≈ 31k apices ≥ 3 m)
-_TREE_FIELDS = ('lon', 'lat', 'h_m', 'crown_m2', 'species', 'vitality', 'ndsm_only', 'cell', 'kg_code', 'x', 'y', 'taxon', 'h_user_m', 'dbh_cm', 'tree_id', 'state', 'state_date')
+_TREE_FIELDS = ('lon', 'lat', 'h_m', 'crown_m2', 'species', 'vitality', 'ndsm_only', 'cell', 'kg_code', 'x', 'y', 'taxon', 'h_user_m', 'dbh_cm', 'tree_id', 'state', 'state_date', 'note')
 _STRUCT_FIELDS = ('lon', 'lat', 'h_m', 'type', 'h_robust_m', 'area_m2', 'confidence', 'dh_m', 'cell', 'kg_code', 'x', 'y')
 DEFAULT_COLUMNS = {'trees': ('lon', 'lat', 'h_m', 'crown_m2'), 'structures': ('lon', 'lat', 'h_m', 'type')}
 COLUMN_FIELDS = {'trees': _TREE_FIELDS, 'structures': _STRUCT_FIELDS}
@@ -445,7 +454,7 @@ def _chunk_ext(d: dict) -> dict:
 
 def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int = DEFAULT_LIMIT,
             realistic: bool = True, types: set | None = None, max_height: float | None = None,
-            max_limit: int = MAX_LIMIT) -> dict:
+            max_limit: int = MAX_LIMIT, notes: bool = True) -> dict:
     """Column arrays (numpy) of all objects of ``kind`` in bbox, tallest first,
     ≤ limit (+1 row when more exist, so the caller can set ``truncated``).
 
@@ -478,6 +487,7 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
     fcs: dict = {}                                     # kg -> sorted flagged res-12 ids (or None)
     legacy: dict = {}                                  # kg -> (set, lon array, lat array) | None
     lin = np.zeros(0, np.uint64); lin_grid = frozenset()
+    crown_add: list = []                               # per KG [[parent key, m²]] of "same tree" flags (tree_crown.py)
     if realistic and kind == 'trees':
         try:                                # apices of detected linear-noise runs (ne_linear.py)
             import ne_linear
@@ -544,8 +554,10 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
                 if hit.any():
                     m = ~hit if m is None else m & ~hit; dropped_lin += int(hit.sum())
             if kg not in fcs:
-                fc, fp = _flags(kg, kind)
+                fc, fp, fm = _flags(kg, kind)
                 fcs[kg] = (np.sort(np.fromiter(fc, np.uint64, len(fc))) if fc else None, fp if len(fp) else None)
+                if fm is not None:
+                    crown_add.append(fm)
             fc, fp = fcs[kg]
             if fc is not None:
                 i0 = int(np.searchsorted(fc, x_['c0'])); i1 = int(np.searchsorted(fc, x_['c1'], side='right'))
@@ -612,6 +624,9 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
                 out[k] = np.concatenate([p[0][k] if p[1] is None else p[0][k][p[1]] for p in parts])[order]
         kidx = np.repeat(np.array([p[2] for p in parts], np.int32), [p[3] for p in parts])[order]
         out['kg'] = np.array(kg_names, dtype=object)[kidx]
+        if crown_add:
+            import tree_crown
+            tree_crown.apply(out, crown_add)
     n_out = int(out['h'].size) if n_acc else 0
     truncated = n_out > lim or not exhausted
     if n_out > lim:
@@ -622,10 +637,10 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
             'limit': lim, 'pending_kgs': st['pending'], 'not_processed': st['not_processed'],
             'dropped_qa': dropped, 'dropped_linear': dropped_lin, 'realistic': bool(realistic), 'truncated': truncated,
             'chunks_scanned': scanned, 'chunks_in_bbox': len(rows), 'ms': round((time.time() - t0) * 1000, 1),
-            'ready': st['ready'], 'state': st, **_user_blocks(kind, out if n_out else None, st['kgs'], w, s, e, n, min_h, max_h)}
+            'ready': st['ready'], 'state': st, **_user_blocks(kind, out if n_out else None, st['kgs'], w, s, e, n, min_h, max_h, notes)}
 
 
-def _user_blocks(kind, cols, kgs, w, s, e, n, min_h, max_h) -> dict:
+def _user_blocks(kind, cols, kgs, w, s, e, n, min_h, max_h, notes: bool = True) -> dict:
     """What people told us about trees of this result (tree_user.py): ``user``
     = sparse {i, taxon, n, v} over the result rows, ``added`` = trees we have
     no apex for.  Empty dict (zero bytes on the wire) when the KGs carry none."""
@@ -643,6 +658,9 @@ def _user_blocks(kind, cols, kgs, w, s, e, n, min_h, max_h) -> dict:
         a = tu.reported(w, s, e, n, kgs, min_h, max_h)
         if a:
             d['reported'] = a
+        if not notes:
+            for b in d.values():
+                b.pop('note', None)
         return d
     except Exception as ex:  # noqa: BLE001
         log.warning('ne_trees: user blocks: %s', ex)
@@ -701,7 +719,7 @@ def columns_bbox(w, s, e, n, kind: str = 'trees', fields: tuple | None = None, *
             cols[f] = c['kg'].tolist()
         elif f in ('x', 'y', 'area_m2'):
             cols[f] = c[f].tolist()
-        elif f in ('taxon', 'h_user_m', 'dbh_cm', 'tree_id', 'state', 'state_date'):
+        elif f in ('taxon', 'h_user_m', 'dbh_cm', 'tree_id', 'state', 'state_date', 'note'):
             col = [None] * n_out
             u = r.get('user') or {}
             for i, t in zip(u.get('i', ()), u.get(f, ())):
@@ -713,11 +731,11 @@ def columns_bbox(w, s, e, n, kind: str = 'trees', fields: tuple | None = None, *
 
 
 def points_bbox(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int = DEFAULT_LIMIT,
-                realistic: bool = True, types: set | None = None, max_height: float | None = None) -> dict:
+                realistic: bool = True, types: set | None = None, max_height: float | None = None, notes: bool = True) -> dict:
     """All objects of ``kind`` in bbox as row dicts, tallest first, ≤ limit
     (see :func:`collect` for the scan semantics)."""
     r = collect(w, s, e, n, kind, min_height=min_height, limit=limit, realistic=realistic, types=types,
-                max_height=max_height)
+                max_height=max_height, notes=notes)
     c = r['cols']; out = []
     if r['n']:
         lon = np.round(c['lon'], 7).tolist(); lat = np.round(c['lat'], 7).tolist()
@@ -743,7 +761,7 @@ def points_bbox(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit:
     if u:
         for i, t, cnt, v in zip(u['i'], u['taxon'], u['n'], u['v']):
             out[i].update(taxon=t, taxon_n=cnt, taxon_v=v)
-        for name, key_ in (('h_user_m', 'height_user_m'), ('dbh_cm', 'dbh_cm'), ('tree_id', 'tree_id'), ('state', 'state'), ('state_date', 'state_date')):
+        for name, key_ in (('h_user_m', 'height_user_m'), ('dbh_cm', 'dbh_cm'), ('tree_id', 'tree_id'), ('state', 'state'), ('state_date', 'state_date'), ('note', 'note')):
             for i, val in zip(u['i'], u.get(name, ())):
                 if val is not None:
                     out[i][key_] = val
@@ -753,14 +771,14 @@ def points_bbox(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit:
                        'taxon_n': a['n'][i], 'taxon_v': a['v'][i], 'added': True,
                        **({'dbh_cm': a['dbh_cm'][i]} if a.get('dbh_cm') and a['dbh_cm'][i] is not None else {}),
                        **({'client_id': a['client_id'][i]} if a.get('client_id') and a['client_id'][i] else {}),
-                       **{k: a[k][i] for k in ('state', 'state_date') if a.get(k) and a[k][i]}}
+                       **{k: a[k][i] for k in ('state', 'state_date', 'note') if a.get(k) and a[k][i]}}
                       for i in range(len(a['lon']))]
     a = r.get('reported')
     if a:
         r['reported'] = [{'tree_id': a['tree_id'][i], 'lon': a['lon'][i], 'lat': a['lat'][i], 'height_user_m': a['h_m'][i],
                           'taxon': a['taxon'][i], 'taxon_n': a['n'][i], 'taxon_v': a['v'][i],
                           **({'dbh_cm': a['dbh_cm'][i]} if a.get('dbh_cm') and a['dbh_cm'][i] is not None else {}),
-                          **{k: a[k][i] for k in ('state', 'state_date') if a.get(k) and a[k][i]}}
+                          **{k: a[k][i] for k in ('state', 'state_date', 'note') if a.get(k) and a[k][i]}}
                          for i in range(len(a['lon']))]
     r = dict(r); r.pop('cols'); r.pop('state'); r.pop('user', None)
     r['trees' if kind == 'trees' else 'structures'] = out

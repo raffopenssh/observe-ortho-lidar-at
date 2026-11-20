@@ -13,7 +13,7 @@ and setup: `README.md`. Security model: `SECURITY.md`.
 | NE view-fill (every cell of the NE server's `/declared` view observed: corpus borrow → own-product union → sweep units on the view) | `docs/ne-viewfill.md` | `ne_viewfill.py`, `ne_ingest.consume_viewfill`, `sliver_sweep.plan_cells` |
 | public "this looks wrong" flags | `docs/public-flags.md` | `public_flags.py` |
 | linear noise in the tree apices | `docs/linear-noise.md` | `ne_linear.py`, `tests/test_ne_linear.py` |
-| per-tree user species + user-added trees (versioned, via `/flags`; sparse read-back on `/trees/bbox`, `/trees/taxa`) | `docs/tree-user.md` | `tree_user.py`, `tree_taxa.py` (species dictionary + resolver), `ne_trees._user_blocks` |
+| per-tree user species + user-added trees (versioned, via `/flags`; notes; same-tree `spurious` + `hint: crown` in `tree_crown.py`; sparse read-back on `/trees/bbox`, `/trees/taxa`) | `docs/tree-user.md` | `tree_user.py`, `tree_taxa.py` (species dictionary + resolver), `ne_trees._user_blocks` |
 | the Austria-wide processor, tiles, checkpoints, splitting | `docs/austria-processor.md` | `austria_processor.py`, `kg_splitter.py`, `tile_checkpoint_registry.py` |
 | director (single machine / `SRTM_PEERS`) | `docs/peer-director.md` | `peer_director.py` |
 | endgame triage (last blocks: stale claims from stopped peers, quarantined work cell) | `docs/peer-director.md → Endgame triage` | `app.processing_peers_status`, `peer_director` barren cells |
