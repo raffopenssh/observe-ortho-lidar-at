@@ -1,0 +1,15 @@
+[Unit]
+Description=srtm-lidar-at: rebuild the grid25 registration table, then the country-wide hillshade seam check (docs/hillshade-seams.md)
+After=network.target
+
+[Service]
+Type=oneshot
+User=exedev
+WorkingDirectory=/home/exedev/srtm-lidar
+ExecStart=/usr/bin/python3 grid25_registration.py --build
+ExecStart=/usr/bin/python3 tools/hillshade_seam_check.py --country --z 15
+Nice=15
+CPUWeight=20
+IOSchedulingClass=idle
+MemoryMax=2500M
+TimeoutStartSec=6h

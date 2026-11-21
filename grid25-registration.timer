@@ -1,0 +1,9 @@
+[Unit]
+Description=srtm-lidar-at: weekly grid25 registration rebuild + hillshade seam check
+
+[Timer]
+OnCalendar=Sun *-*-* 02:10:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

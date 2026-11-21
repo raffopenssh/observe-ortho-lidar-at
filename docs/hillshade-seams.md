@@ -56,6 +56,45 @@ python3 tools/hillshade_seam_check.py --status              # also in /tiles/hil
 The country run calls the renderer in-process (no HTTP, no cache, no render
 gate) so the public service is unaffected. Exit 1 on any seam.
 
+### Automation
+`grid25-registration.timer` (weekly, Sun 02:10 UTC; unit files in the repo
+root, installed in `/etc/systemd/system`) runs `grid25-registration.service`:
+`grid25_registration.py --build` then `tools/hillshade_seam_check.py
+--country` (~45 min, niced, in-process). The registration version only
+changes when the offsets change, so a no-op rebuild does not invalidate
+client tile caches. A failed unit = seams found (`systemctl status
+grid25-registration`, list in `data/hillshade_seam_report.json`).
+
+## Open: products that need a real regeneration (NOT done — decided 2026-11-21)
+Do not re-investigate; this is the state:
+
+* **166 "mixed" products (149 parents)** — list: `mixed` in
+  `data/grid25_registration.json`. Some of their tiles are 5 m shifted,
+  some not, so one offset cannot fix them; terrain inside is up to 5 m off.
+  Tiles look fine (edges blended).
+* **Products with a corrupt tile** — the country seam check finds these as
+  real seams, e.g. 90102 grid #5 has a 400 m jump between two adjacent
+  columns at E 4321437 N 2646373 (tile 15/17294/11534 col 190). First
+  country run 2026-11-21: see `data/hillshade_seam_report.json`.
+* The 416 offset-corrected products are fine in every reader here, but
+  their **Zenodo `_full_gpkg` rasters stay 5 m shifted**.
+
+Paths considered:
+1. *Re-upgrade from the v1 GPKG* (`v2_regen`-style): useless — the GPKG
+   itself carries the shift.
+2. *Local repair of grid25 from BEV 1 m DTM*: ~2.5 GB of range reads on the
+   metered primary, and leaves the Zenodo products wrong. Rejected.
+3. **Fleet reprocess (the way to do it)**: the pipeline fix is deployed
+   (`_align_tdata_to_tile`), so a fresh run is correct. Use
+   `POST /processing/queue {kgs:[parents], position:0, skip_processed:false,
+   keep_products:true}` — `keep_products` keeps the current products served
+   until replaced (without it a split parent loses every block's manifest
+   entry, `docs/app.md → Re-queueing`). The run is in RUN-COMPLETE hold with
+   ~7 live peers; queue in batches (≤ 20 parents), confirm peers are on a
+   commit ≥ eead178 first, clear the tile checkpoints of the affected KGs
+   (old pickles would be restored), then `grid25_registration.py --build`
+   and the seam check once they are ingested.
+
 ## Contract (unchanged)
 Grey PNG, flat = 180, lit > 180, shaded < 180; alpha 0|255 only.
 Tileset version = `RENDER_VERSION.registration_version`; bump

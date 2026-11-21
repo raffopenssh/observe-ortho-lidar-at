@@ -191,6 +191,12 @@ def build(write=True, progress=print):
                      'pairs': n_pairs, 'decisive': len(decisive), 'shifted': len(offsets),
                      'mixed': len(mixed), 'secs': round(time.time() - t0)},
            'mixed': sorted(mixed)}
+    try:    # offsets unchanged → keep the version (it keys every client's tile cache)
+        prev = json.loads(OUT.read_text())
+        if prev.get('offsets') == offsets:
+            doc['version'] = prev['version']
+    except Exception:  # noqa: BLE001
+        pass
     if write:
         OUT.parent.mkdir(parents=True, exist_ok=True)
         tmp = OUT.with_suffix('.tmp')
