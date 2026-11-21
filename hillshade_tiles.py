@@ -194,8 +194,9 @@ def _grids(kg_code):
     # key on the parent's ingest stamp too: a sweep unit / block re-ingested
     # after the first render must not keep serving the old grid list from RAM
     # (the PNG key already carries the stamp; the grid LRU did not)
+    import grid25_sample as g25
     try:
-        ckey = f'{kg_code}|{kvs.parents_stamp([kg_code])[0][1]}'
+        ckey = f'{kg_code}|{kvs.parents_stamp([kg_code])[0][1]}|{g25.registration()["version"]}'
     except Exception:  # noqa: BLE001
         ckey = kg_code
     g = _grid_cache.get(ckey)
@@ -206,27 +207,47 @@ def _grids(kg_code):
         try:
             sec = kvs.get_grid25(code)
             if sec and sec.get('terrain'):
-                out.append(v21.decode_terrain_grid25(sec['terrain']))
+                g = g25.register(code, v21.decode_terrain_grid25(sec['terrain']))
+                g.pop('slope', None)                 # unused here; halves the cached bytes
+                g25._feather(g, g['elev'])           # build before put() so the LRU sizes it
+                out.append(g)
         except Exception as e:  # noqa: BLE001
             log.debug('grid25 %s: %s', code, e)
     _grid_cache.put(ckey, out)
     return out
 
 
-RENDER_VERSION = 3       # bump when render() output changes (v3: interior-cells-win grid25 merge)
+RENDER_VERSION = 4       # bump when render() output changes
+#   v3: interior-cells-win grid25 merge
+#   v4 (2026-11-21, docs/hillshade-seams.md): per-product registration offsets,
+#       feathered mosaic (no hand-over lines), Catmull-Rom DTM interpolation,
+#       alpha strictly 0|255 with nodata-touching gradients transparent
+NATIVE_RES_M = 25
+NATIVE_MAXZOOM = 13      # ≈13 m/px at 47.5°N — beyond this tiles are interpolated, no new detail
+FLAT_GREY = 180          # contract: flat ground = 180 (sin 45° × 255), lit > 180, shaded < 180
+
+
+def tileset_version() -> str:
+    """``<render>.<registration>`` — changes whenever already-served tiles
+    may differ (clients key their caches on it; header ``X-Tileset-Version``)."""
+    try:
+        import grid25_sample as g25
+        return f'{RENDER_VERSION}.{g25.registration()["version"]}'
+    except Exception:  # noqa: BLE001
+        return f'{RENDER_VERSION}.0'
 
 
 def _stamp(kgs) -> str:
-    """8-hex stamp of (renderer version, parent, latest ingest) over the KGs a
+    """8-hex stamp of (tileset version, parent, latest ingest) over the KGs a
     tile spans → the cache key changes exactly when one of those products is
-    re-ingested or the renderer changes."""
+    re-ingested or the renderer / registration table changes."""
     import kg_v2_store as kvs
     try:
         rows = kvs.parents_stamp(kgs)
     except Exception as e:  # noqa: BLE001
         log.debug('stamp: %s', e)
         rows = sorted(kgs)
-    return hashlib.blake2b(repr((RENDER_VERSION, rows)).encode(), digest_size=4).hexdigest()
+    return hashlib.blake2b(repr((tileset_version(), rows)).encode(), digest_size=4).hexdigest()
 
 
 def tile_bounds(z, x, y):
@@ -238,62 +259,98 @@ def tile_bounds(z, x, y):
     return lon0, lat0, lon1, lat1
 
 
-def _sample(grid, E, N):
-    """Kept for callers/tests: NaN-aware bilinear (see grid25_sample)."""
-    from grid25_sample import sample
-    return sample(grid, E, N)[0]
-
-
-def render(z, x, y, kind='hillshade', kgs=None):
-    """→ PNG bytes or None (no data).  Pure compute — no caches, no gate."""
+def tile_lattice(z, x, y, apron=1, span=1):
+    """EPSG:3035 E, N of the pixel centres of a tile (or a *span*×*span*
+    block of tiles starting at x, y) plus *apron* px on every side (for the
+    gradient stencil)."""
     lon0, lat0, lon1, lat1 = tile_bounds(z, x, y)
-    if kgs is None:
-        import search_index as si
-        kgs = si.get_index().kgs_in_bbox(lon0, lat0, lon1, lat1)
-    if not kgs:
-        return None
-    grids = [g for kg in kgs for g in _grids(kg)]
-    if not grids:
-        return None
-    # pixel centres with a 1-px apron for gradients
-    n = TILE + 2
-    lons = lon0 + (np.arange(n) - 0.5) / TILE * (lon1 - lon0)
+    n = TILE * span + 2 * apron
+    lons = lon0 + (np.arange(n) - apron + 0.5) / TILE * (lon1 - lon0)
     # mercator-linear in y
     my0 = math.log(math.tan(math.pi / 4 + math.radians(lat1) / 2))
     my1 = math.log(math.tan(math.pi / 4 + math.radians(lat0) / 2))
-    mys = my0 + (np.arange(n) - 0.5) / TILE * (my1 - my0)
+    mys = my0 + (np.arange(n) - apron + 0.5) / TILE * (my1 - my0)
     lats = np.degrees(2 * np.arctan(np.exp(mys)) - np.pi / 2)
     LON, LAT = np.meshgrid(lons, lats)
     E, N = _to3035().transform(LON, LAT)
-    E = np.asarray(E, np.float64); N = np.asarray(N, np.float64)
-    from grid25_sample import merge
-    elev = merge(grids, E, N)      # clean bilinear beats block-edge samples → no seams
-    core = elev[1:-1, 1:-1]
-    if not np.isfinite(core).any():
+    return np.asarray(E, np.float64), np.asarray(N, np.float64)
+
+
+def shade(z, x, y, kind='hillshade', kgs=None, grids=None, span=1, footprints=None, merge_fn=None):
+    """→ ``(grey float HxW 0..255 | rgb, alpha uint8)`` or None.
+
+    One seamless DTM for the tile first (``grid25_sample.merge``: every
+    product at its registered position, feather-blended, one cubic
+    resampling straight to the tile's pixel lattice), THEN the gradient —
+    with a 1 px halo so the stencil never sees a tile edge.
+
+    ``span`` / ``footprints`` / ``merge_fn`` serve the seam check
+    (``tools/hillshade_seam_check.py``): a block of span×span tiles in one
+    go, and the per-product coverage masks (haloed lattice) appended to
+    *footprints*."""
+    lon0, lat0, _, lat1 = tile_bounds(z, x, y)
+    lat0 = tile_bounds(z, x, y + span - 1)[1]
+    lon1 = tile_bounds(z, x + span - 1, y)[2]
+    if grids is None:
+        if kgs is None:
+            import search_index as si
+            kgs = si.get_index().kgs_in_bbox(lon0, lat0, lon1, lat1)
+        if not kgs:
+            return None
+        grids = [g for kg in kgs for g in _grids(kg)]
+    if not grids:
+        return None
+    E, N = tile_lattice(z, x, y, 1, span)
+    if merge_fn is None:
+        import grid25_sample as g25
+        # z ≥ 12: mosaic on the 25 m lattice, then ONE cubic resampling.
+        # Below that a pixel spans ≥ 2 cells — the mosaic array would be
+        # huge for nothing; feather-weighted direct sampling is equivalent.
+        coarse = 156543.03392 * math.cos(math.radians((lat0 + lat1) / 2)) / (2 ** z) > 2 * NATIVE_RES_M
+        merge_fn = g25.merge if coarse else g25.merge_mosaic
+    elev = merge_fn(grids, E, N, kernel='cubic', footprints=footprints)
+    fin = np.isfinite(elev)
+    if not fin[1:-1, 1:-1].any():
         return None
     # metres per pixel (at tile centre)
     lat_c = math.radians((lat0 + lat1) / 2)
     mpp = 156543.03392 * math.cos(lat_c) / (2 ** z)
-    filled = np.where(np.isfinite(elev), elev, np.nanmean(core))
-    dzdy, dzdx = np.gradient(filled, mpp)
+    # central differences on the haloed mosaic; a pixel whose stencil touches
+    # nodata is transparent (never shade against a fill value → no fake cliff
+    # along the national border / unprocessed edge)
+    dzdy = (elev[2:, 1:-1] - elev[:-2, 1:-1]) / (2 * mpp)
+    dzdx = (elev[1:-1, 2:] - elev[1:-1, :-2]) / (2 * mpp)
+    ok = fin[1:-1, 1:-1] & fin[2:, 1:-1] & fin[:-2, 1:-1] & fin[1:-1, 2:] & fin[1:-1, :-2]
+    if not ok.any():
+        return None
+    dzdy = np.where(ok, dzdy, 0.0); dzdx = np.where(ok, dzdx, 0.0)
     if kind == 'slope':
-        slope = np.degrees(np.arctan(np.hypot(dzdx, dzdy)))[1:-1, 1:-1]
+        slope = np.degrees(np.arctan(np.hypot(dzdx, dzdy)))
         val = np.clip(slope / 60.0, 0, 1)
-        rgb = np.stack([255 - 200 * val, 255 - 120 * val, 255 - 60 * val], -1)
+        img = np.stack([255 - 200 * val, 255 - 120 * val, 255 - 60 * val], -1)
     else:
         az = math.radians(315.0); alt = math.radians(45.0)
         slope = np.arctan(np.hypot(dzdx, dzdy))
         aspect = np.arctan2(-dzdx, dzdy)
         hs = (math.sin(alt) * np.cos(slope)
               + math.cos(alt) * np.sin(slope) * np.cos(az - aspect))
-        hs = np.clip(hs, 0, 1)[1:-1, 1:-1]
-        g8 = (hs * 255)
-        rgb = np.stack([g8, g8, g8], -1)
-    alpha = np.where(np.isfinite(core), 255, 0).astype(np.uint8)
-    img = np.dstack([rgb.astype(np.uint8), alpha])
+        img = np.clip(hs, 0, 1) * 255
+    alpha = np.where(ok, 255, 0).astype(np.uint8)
+    return img, alpha
+
+
+def render(z, x, y, kind='hillshade', kgs=None):
+    """→ PNG bytes or None (no data).  Pure compute — no caches, no gate."""
+    r = shade(z, x, y, kind, kgs=kgs)
+    if r is None:
+        return None
+    img, alpha = r[0], r[1]
+    rgb = img if img.ndim == 3 else np.stack([img, img, img], -1)
+    rgb = np.where(alpha[..., None] > 0, rgb, 0)
+    out = np.dstack([rgb.astype(np.uint8), alpha])
     from PIL import Image
     buf = io.BytesIO()
-    Image.fromarray(img, 'RGBA').save(buf, format='PNG', optimize=False, compress_level=6)
+    Image.fromarray(out, 'RGBA').save(buf, format='PNG', optimize=False, compress_level=6)
     return buf.getvalue()
 
 
@@ -379,6 +436,7 @@ def _tile_resp(z, x, y, kind):
         return jsonify({'error': str(e)}), 500
     etag = '"' + hashlib.blake2b(png, digest_size=8).hexdigest() + '"'
     common = {'Cache-Control': 'public, max-age=31536000, immutable', 'X-Resolution-M': '25',
+              'X-Tileset-Version': tileset_version(), 'X-Native-Maxzoom': str(NATIVE_MAXZOOM),
               'Access-Control-Allow-Origin': '*', 'ETag': etag, 'X-Tile-Source': src,
               'X-Tile-Ms': f'{(time.monotonic() - t0) * 1000:.0f}'}
     if request.headers.get('If-None-Match') == etag:
@@ -400,6 +458,46 @@ def hillshade_tile(z, x, y):
 @bp.route('/tiles/slope/<int:z>/<int:x>/<int:y>.png')
 def slope_tile(z, x, y):
     return _tile_resp(z, x, y, 'slope')
+
+
+def _tilejson(kind):
+    base = request.url_root.rstrip('/')
+    if request.headers.get('X-Forwarded-Proto') == 'https' and base.startswith('http://'):
+        base = 'https://' + base[7:]
+    d = {'tilejson': '3.0.0', 'name': f'srtm-lidar-at {kind}', 'scheme': 'xyz', 'format': 'png',
+         'version': tileset_version(),
+         'tiles': [f'{base}/tiles/{kind}/{{z}}/{{x}}/{{y}}.png'],
+         'minzoom': ZMIN, 'maxzoom': ZMAX,
+         'native_resolution_m': NATIVE_RES_M, 'native_maxzoom': NATIVE_MAXZOOM,
+         'oversampling': f'z > {NATIVE_MAXZOOM} is the {NATIVE_RES_M} m DTM interpolated (Catmull-Rom) '
+                         'to the tile lattice before shading — smooth, no extra detail',
+         'bounds': [9.4, 46.3, 17.2, 49.1],
+         'alpha': 'binary: 255 where data, 0 elsewhere (nodata tiles answer 204)',
+         'attribution': 'BEV ALS DTM (CC BY 4.0)'}
+    if kind == 'hillshade':
+        d['encoding'] = {'flat': FLAT_GREY, 'lit': f'> {FLAT_GREY}', 'shaded': f'< {FLAT_GREY}',
+                         'light': 'azimuth 315°, altitude 45°'}
+    try:    # last country-wide seam regression run (tools/hillshade_seam_check.py)
+        import json as _json
+        rep = _json.loads((Path(__file__).resolve().parent / 'data' / 'hillshade_seam_report.json').read_text())
+        d['seam_check'] = {k: rep.get(k) for k in ('tileset_version', 'z', 'complete', 'next', 'blocks',
+                                                   'tiles_with_data', 'seam_count', 'updated_at', 'rule')}
+    except Exception:  # noqa: BLE001
+        d['seam_check'] = None
+    r = jsonify(d)
+    r.headers['Cache-Control'] = 'public, max-age=300'
+    r.headers['Access-Control-Allow-Origin'] = '*'
+    return r
+
+
+@bp.route('/tiles/hillshade.json')
+def hillshade_tilejson():
+    return _tilejson('hillshade')
+
+
+@bp.route('/tiles/slope.json')
+def slope_tilejson():
+    return _tilejson('slope')
 
 
 @bp.route('/tiles/ndsm/<int:z>/<int:x>/<int:y>.png')

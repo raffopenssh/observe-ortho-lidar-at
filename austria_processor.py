@@ -3409,6 +3409,56 @@ def _gpkg_heartbeat(detail: str, force: bool = False) -> None:
         pass
 
 
+def _align_tdata_to_tile(tdata: dict, tr: dict) -> dict:
+    """Crop / pad a ``read_dtm_dsm``-shaped dict onto the tile's own pixel
+    grid (``tr["bounds_3035"]`` + ``tr["shape"]``), by its transform.
+
+    Callers index the arrays with the tile's offsets, never with
+    ``tdata["transform"]``, so an array that starts anywhere else (padded
+    re-read, a sidecar persisted from one) is silently misregistered.  No-op
+    when already aligned or when the transform is unknown / not 1 m."""
+    try:
+        tf = tdata.get("transform")
+        b = tr.get("bounds_3035"); shp = tr.get("shape")
+        if b is None or shp is None:
+            return tdata
+        th, tw = int(shp[0]), int(shp[1])
+        h, w = tdata["dtm"].shape[:2]
+        if tf is None:
+            # multi-date sidecars carry no transform: one persisted from the
+            # old padded re-read is exactly 2×5 px larger than the tile
+            if (h - th, w - tw) != (10, 10):
+                return tdata
+            from rasterio.transform import Affine as _Aff
+            tf = _Aff(1.0, 0.0, float(b[0]) - 5.0, 0.0, -1.0, float(b[3]) + 5.0)
+        if abs(abs(tf.a) - 1.0) > 1e-6:
+            return tdata
+        dc = int(round(b[0] - tf.c)); dr = int(round(tf.f - b[3]))
+        if dc == 0 and dr == 0 and (h, w) == (th, tw):
+            return tdata
+        from rasterio.transform import Affine
+        out = dict(tdata)
+        for k in ("dtm", "dsm", "ndsm", "mask"):
+            a = tdata.get(k)
+            if a is None:
+                continue
+            fill = False if k == "mask" else np.nan
+            dst = np.full((th, tw), fill, dtype=bool if k == "mask" else np.float32)
+            r0, c0 = max(dr, 0), max(dc, 0)
+            r1, c1 = min(dr + th, h), min(dc + tw, w)
+            if r1 > r0 and c1 > c0:
+                dst[r0 - dr:r1 - dr, c0 - dc:c1 - dc] = a[r0:r1, c0:c1]
+            out[k] = dst
+        out["transform"] = Affine(1.0, 0.0, float(b[0]), 0.0, -1.0, float(b[3]))
+        out["shape"] = (th, tw)
+        if dc or dr:
+            log.info("tile raster re-aligned to tile grid: offset (%+d, %+d) px", dc, dr)
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning("_align_tdata_to_tile failed (%s) — using raster as read", e)
+        return tdata
+
+
 def _read_dtm_for_tile(tr, kg_code: str | None = None, tile_idx: int | None = None):
     """Re-read DTM/DSM for a tile.
 
@@ -3427,12 +3477,18 @@ def _read_dtm_for_tile(tr, kg_code: str | None = None, tile_idx: int | None = No
             cached = _trs.load_dtm_dsm(ckpt_root, kg_code, tile_idx, "default")
             if cached is not None:
                 _sidecar_stat("dtm_hit")
-                return cached
+                return _align_tdata_to_tile(cached, tr)
         except Exception:
             pass
     if kg_code is not None and tile_idx is not None:
         _sidecar_stat("dtm_miss")
-    tdata = _rio.read_dtm_dsm(box(*tr["bounds_3035"]), _ti.DEFAULT_DATASET)
+    # pad=0: ``bounds_3035`` IS the tile's (already padded) pixel grid.  The
+    # default 5 m pad returned an array starting 5 m further NW which every
+    # caller then pasted at the tile's own offset (``[:th, :tw]``) — full-GPKG
+    # DTM/DSM/ortho 5 m off, inherited by every upgrade product's grid25
+    # (hillshade seams, docs/hillshade-seams.md).
+    tdata = _align_tdata_to_tile(
+        _rio.read_dtm_dsm(box(*tr["bounds_3035"]), _ti.DEFAULT_DATASET, pad=0.0), tr)
     if kg_code is not None and tile_idx is not None:
         try:
             import tile_raster_sidecar as _trs
@@ -4548,9 +4604,11 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
                     d2 = None
                 if d2 is not None:
                     _sidecar_stat("dtm_multi_hit")
+                    d2 = _align_tdata_to_tile(d2, tr)
                 else:
                     _sidecar_stat("dtm_multi_miss")
-                    d2 = _rio.read_dtm_dsm(box(*tr["bounds_3035"]), date_key)
+                    d2 = _align_tdata_to_tile(
+                        _rio.read_dtm_dsm(box(*tr["bounds_3035"]), date_key, pad=0.0), tr)
                     try:
                         import tile_raster_sidecar as _trs
                         _trs.persist_dtm_dsm(

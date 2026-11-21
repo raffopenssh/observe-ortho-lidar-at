@@ -238,7 +238,8 @@ def grids_for_kg(kg_code: str) -> list[dict]:
             sec = kvs.get_grid25(code)
             if not sec or not sec.get('terrain'):
                 continue
-            t = v21.decode_terrain_grid25(sec['terrain'])
+            import grid25_sample
+            t = grid25_sample.register(code, v21.decode_terrain_grid25(sec['terrain']))
             lc = v21.decode_landcover_grid25(sec['landcover']) if sec.get('landcover') else None
             # aspect (deg clockwise from N) from the DTM gradient; NaN where undefined
             e = t['elev']

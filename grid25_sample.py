@@ -18,6 +18,8 @@ first, partial / edge samples only where nothing clean exists.
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 
@@ -86,18 +88,260 @@ def sample_nearest(grid, E, N):
     return out
 
 
-def merge(grids, E, N):
-    """Elevation from several (possibly overlapping) grids: samples built
-    only from interior cells win over edge / partial-cell samples regardless
-    of grid order; edge samples still fill where nothing better exists."""
-    Z = np.full(E.shape, np.nan, np.float32)
-    edge = np.full(E.shape, np.nan, np.float32)
+# --------------------------------------------------------------------------
+# registration (docs/hillshade-seams.md)
+# --------------------------------------------------------------------------
+# Products upgraded from a v1 full GPKG whose DTM had been pasted 5 m off
+# (austria_processor._read_dtm_for_tile padded re-read, fixed 2026-11-21)
+# carry a terrain grid25 whose cell (r, c) really describes the ground at
+# declared position + (dE, dN).  ``data/grid25_registration.json`` holds the
+# measured correction per product code (``grid25_registration.py``); it is
+# applied to the grid ORIGIN here, once, for every reader — never resample.
+
+_REG = {'mtime': None, 'map': {}, 'version': 0}
+_REG_PATH = None
+
+
+def _reg_path():
+    global _REG_PATH
+    if _REG_PATH is None:
+        import os
+        from pathlib import Path
+        _REG_PATH = Path(os.environ.get('GRID25_REGISTRATION',
+                         str(Path(__file__).resolve().parent / 'data' / 'grid25_registration.json')))
+    return _REG_PATH
+
+
+def registration() -> dict:
+    """→ {'map': {code: [dE, dN]}, 'version': int} (mtime-cached)."""
+    p = _reg_path()
+    try:
+        mt = p.stat().st_mtime
+    except OSError:
+        return _REG
+    if mt != _REG['mtime']:
+        try:
+            import json
+            d = json.loads(p.read_text())
+            _REG.update(mtime=mt, map=d.get('offsets') or {}, version=int(d.get('version') or 0))
+        except Exception:  # noqa: BLE001
+            _REG['mtime'] = mt
+    return _REG
+
+
+def _drop_zero_fill(grid):
+    """Some products carry 0.0 m where the DTM had no data (outside the
+    national border, missing ALS sheets) and, next to it, cells averaged
+    half over that fill.  No Austrian ground is below 100 m: zero cells and
+    their 8 neighbours become nodata (also drops the dependent slope)."""
+    a = grid.get('elev')
+    if a is None:
+        return
+    z = a == 0
+    if not z.any():
+        return
+    from scipy import ndimage
+    bad = ndimage.binary_dilation(z, structure=np.ones((3, 3), bool))
+    a = np.array(a, np.float32, copy=True)
+    a[bad] = np.nan
+    grid['elev'] = a
+    sl = grid.get('slope')
+    if sl is not None and getattr(sl, 'shape', None) == a.shape:
+        sl = np.array(sl, np.float32, copy=True)
+        sl[bad] = np.nan
+        grid['slope'] = sl
+
+
+def register(code, grid: dict) -> dict:
+    """Shift a decoded *terrain* grid's origin by its measured registration
+    offset (idempotent; landcover grids are not affected by the bug)."""
+    if grid is None or grid.get('_reg') is not None:
+        return grid
+    _drop_zero_fill(grid)
+    off = registration()['map'].get(str(code))
+    if off and (off[0] or off[1]):
+        grid['x0'] = float(grid['x0']) + float(off[0])
+        grid['y0'] = float(grid['y0']) + float(off[1])
+        grid['_reg'] = (float(off[0]), float(off[1]))
+    else:
+        grid['_reg'] = (0.0, 0.0)
+    return grid
+
+
+# --------------------------------------------------------------------------
+# seamless mosaic: C2 cubic B-spline taps + feathered blend across products
+# --------------------------------------------------------------------------
+FEATHER_CELLS = 6.0      # weight ramps 0 → 1 over this many cells from a grid's data edge
+_EPS_PARTIAL = 1e-9     # extrapolated half-cell rim (see sample_smooth)
+_EPS_W = 1e-4            # finite-but-edge samples still fill where nothing better exists
+
+
+def _feather(grid, a):
+    """Per-cell blend weight: 0 on the outer (partial block-mean) ring of
+    the product's data footprint, rising linearly to 1 ``FEATHER_CELLS``
+    further in.  Cached on the grid dict."""
+    w = grid.get('_feather')
+    if w is None or w.shape != a.shape:
+        from scipy.ndimage import distance_transform_edt
+        f = np.zeros((a.shape[0] + 2, a.shape[1] + 2), bool)
+        f[1:-1, 1:-1] = np.isfinite(a)
+        d = distance_transform_edt(f)[1:-1, 1:-1]
+        w = np.clip((d - 1.0) / FEATHER_CELLS, 0.0, 1.0).astype(np.float32)
+        grid['_feather'] = w
+    return w
+
+
+def _cubic_w(t):
+    """Catmull-Rom weights for taps −1, 0, +1, +2 (interpolating, C1 →
+    continuous gradient, so no faceted 25 m cells in the shading)."""
+    t2 = t * t; t3 = t2 * t
+    return (-0.5 * t + t2 - 0.5 * t3, 1 - 2.5 * t2 + 1.5 * t3,
+            0.5 * t + 2 * t2 - 1.5 * t3, -0.5 * t2 + 0.5 * t3)
+
+
+def _linear_w(t):
+    return (np.zeros_like(t), 1 - t, t, np.zeros_like(t))
+
+
+def sample_smooth(grid, E, N, kernel='cubic'):
+    """→ ``(value, weight)``: NaN-aware interpolation on cell centres
+    (``cubic`` = Catmull-Rom for shading, ``linear`` = bilinear for data
+    APIs) and the bilinear-interpolated feather weight.  Only the
+    sub-rectangle of the sample arrays that falls on the grid is computed."""
+    a = grid['elev'] if 'elev' in grid else grid['cls']
+    cell = grid['cell_m']
+    rows, cols = a.shape
+    out = np.full(E.shape, np.nan, np.float32)
+    wout = np.zeros(E.shape, np.float32)
+    fx = (E - grid['x0']) / cell - 0.5
+    fy = (grid['y0'] - N) / cell - 0.5
+    inside = (fx > -1.0) & (fx < cols) & (fy > -1.0) & (fy < rows)
+    if not inside.any():
+        return out, wout
+    if E.ndim == 2:
+        rr = np.flatnonzero(inside.any(1)); cc = np.flatnonzero(inside.any(0))
+        sl = (slice(rr[0], rr[-1] + 1), slice(cc[0], cc[-1] + 1))
+    else:
+        ii = np.flatnonzero(inside)
+        sl = (slice(ii[0], ii[-1] + 1),)
+    fx = fx[sl]; fy = fy[sl]
+    feather = _feather(grid, a)
+    ix = np.floor(fx).astype(np.int64); iy = np.floor(fy).astype(np.int64)
+    tx = fx - ix; ty = fy - iy
+    kw = _cubic_w if kernel == 'cubic' else _linear_w
+    wxs = kw(tx); wys = kw(ty)
+    lx = _linear_w(tx); ly = _linear_w(ty)
+    num = np.zeros(fx.shape, np.float64); den = np.zeros(fx.shape, np.float64)
+    lnum = np.zeros(fx.shape, np.float64); lden = np.zeros(fx.shape, np.float64)
+    wacc = np.zeros(fx.shape, np.float64)
+    allfin = np.ones(fx.shape, bool)
+    for j in range(4):
+        r = iy + (j - 1)
+        rok = (r >= 0) & (r < rows)
+        rc = np.clip(r, 0, rows - 1)
+        for i in range(4):
+            central = j in (1, 2) and i in (1, 2)
+            if kernel != 'cubic' and not central:
+                continue
+            c = ix + (i - 1)
+            ok = rok & (c >= 0) & (c < cols)
+            cc_ = np.clip(c, 0, cols - 1)
+            v = a[rc, cc_].astype(np.float64)
+            ok &= np.isfinite(v)
+            v = np.where(ok, v, 0.0)
+            allfin &= ok
+            k = wys[j] * wxs[i]
+            num += v * k
+            den += np.where(ok, k, 0.0)
+            if central:
+                kl = ly[j] * lx[i]
+                lnum += v * kl
+                lden += np.where(ok, kl, 0.0)
+                wacc += np.where(ok, feather[rc, cc_] * kl, 0.0)
+    # all 16 (4) taps finite → the kernel as is; otherwise fall back to the
+    # NaN-aware bilinear of the central 2×2 (weights renormalised) — this
+    # only happens on the outer cells of a product, where the feather weight
+    # is ~0 unless no other product covers the spot.
+    good = lden > 1e-6
+    val = np.full(fx.shape, np.nan, np.float32)
+    val[good] = (lnum[good] / lden[good]).astype(np.float32)
+    val[allfin] = num[allfin].astype(np.float32)
+    out[sl] = val
+    # full = all four surrounding cell centres are data (true interpolation);
+    # partial = extrapolated past the outermost cell centres (flat) — given a
+    # vanishing weight so it only ever fills where nothing interpolates.
+    full = lden > 1.0 - 1e-6
+    wout[sl] = np.where(full, wacc + _EPS_W, np.where(good, _EPS_PARTIAL, 0.0))
+    return out, wout
+
+
+def merge(grids, E, N, kernel='linear', footprints=None, rim=True):
+    """Seamless elevation mosaic of several (overlapping) product grids:
+    feather-weighted mean of the per-grid samples (``kernel='cubic'`` for shading).  A product's weight
+    falls to ~0 at its own data edge, so the mosaic is continuous wherever
+    one product ends inside another — no hard hand-over line, whatever the
+    residual disagreement between two products is.
+
+    ``rim=False`` drops the extrapolated half-cell rim past a product's
+    outermost cell centres (flat → a gradient kink): the shaded tiles end at
+    the last true interpolation instead."""
+    num = np.zeros(E.shape, np.float64); den = np.zeros(E.shape, np.float64)
     for g in grids:
-        v, clean = sample(g, E, N)
-        m = np.isnan(Z) & clean
-        Z[m] = v[m]
-        m2 = np.isnan(edge) & np.isfinite(v)
-        edge[m2] = v[m2]
-    m = np.isnan(Z) & np.isfinite(edge)
-    Z[m] = edge[m]
+        v, w = sample_smooth(g, E, N, kernel)
+        m = w > (0 if rim else _EPS_PARTIAL * 10)
+        if footprints is not None and m.any():
+            footprints.append(m)
+        num[m] += v[m].astype(np.float64) * w[m]
+        den[m] += w[m]
+    Z = np.full(E.shape, np.nan, np.float32)
+    m = den > 0
+    Z[m] = (num[m] / den[m]).astype(np.float32)
+    return Z
+
+
+def merge_mosaic(grids, E, N, kernel='cubic', footprints=None):
+    """Mosaic first, resample once (the tile path).
+
+    1. every product is put on ONE common 25 m lattice covering the sample
+       points (+3 cells): products are natively on that lattice, so this is
+       a plain paste — only the ones carrying a registration offset are
+       bilinearly re-gridded by their 5 m;
+    2. where several products cover a cell they are feather-blended;
+    3. the single seamless grid is interpolated (Catmull-Rom) to E, N.
+
+    Unlike per-product sampling (``merge``) this interpolates *across* two
+    products that merely abut, and never extrapolates: samples beyond the
+    outermost cell centres of the mosaic are NaN."""
+    live = [g for g in grids if g is not None]
+    if not live:
+        return np.full(E.shape, np.nan, np.float32)
+    cell = float(live[0]['cell_m'])
+    pad = 3
+    c0 = math.floor(float(E.min()) / cell) - pad; c1 = math.ceil(float(E.max()) / cell) + pad
+    r0 = math.floor(float(N.min()) / cell) - pad; r1 = math.ceil(float(N.max()) / cell) + pad
+    cols = int(c1 - c0); rows = int(r1 - r0)
+    x0 = c0 * cell; y0 = r1 * cell
+    Em, Nm = np.meshgrid(x0 + (np.arange(cols) + 0.5) * cell, y0 - (np.arange(rows) + 0.5) * cell)
+    num = np.zeros((rows, cols), np.float64); den = np.zeros((rows, cols), np.float64)
+    masks = []
+    for g in live:
+        v, w = sample_smooth(g, Em, Nm, 'linear')
+        m = w > _EPS_PARTIAL * 10                    # true cells only, no extrapolated rim
+        if not m.any():
+            continue
+        if footprints is not None:
+            masks.append(m)
+        num[m] += v[m].astype(np.float64) * w[m]
+        den[m] += w[m]
+    mos = np.full((rows, cols), np.nan, np.float32)
+    m = den > 0
+    mos[m] = (num[m] / den[m]).astype(np.float32)
+    mg = {'elev': mos, 'x0': x0, 'y0': y0, 'cell_m': cell, 'rows': rows, 'cols': cols,
+          '_feather': np.ones((rows, cols), np.float32)}
+    Z, w = sample_smooth(mg, E, N, kernel)
+    Z[w < 0.5] = np.nan
+    if footprints is not None and masks:
+        ci = np.clip(np.floor((E - x0) / cell).astype(np.int64), 0, cols - 1)
+        ri = np.clip(np.floor((y0 - N) / cell).astype(np.int64), 0, rows - 1)
+        footprints.extend(mk[ri, ci] for mk in masks)
     return Z

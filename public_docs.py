@@ -666,6 +666,14 @@ GET /tiles/hillshade/{{z}}/{{x}}/{{y}}.png  ·  GET /tiles/slope/{{z}}/{{x}}/{{y
     256 px XYZ tiles, z 10–17, rendered from the 25 m DTM grid (X-Resolution-M: 25).
     204 = no data in this tile. Cache-Control 1 year, immutable, strong ETag (send
     If-None-Match → 304) — cache them. X-Tile-Source: hit|render.
+    Metadata: GET /tiles/hillshade.json (TileJSON: version, maxzoom, native_maxzoom,
+    encoding, seam_check). X-Tileset-Version on every tile = that version; it changes
+    when already-served tiles may differ — key your cache on it (the URL does not
+    change; any query string, e.g. ?v=<version>, is ignored and safe as a cache-buster).
+    Contract: grey PNG, flat ground = 180, lit > 180, shaded < 180 (light 315°/45°).
+    Alpha is binary: 255 = data, 0 = no data (never partial). The DTM is one seamless
+    25 m mosaic interpolated (Catmull-Rom) to the tile pixels, then shaded; z > 13
+    (native_maxzoom) is oversampled — smooth, no extra detail.
     Fair use: rendering is budgeted. Cache hits are free and unlimited; cache MISSES
     are limited to 25 renders/s per client (burst 150) → 429 + Retry-After, and the
     renderer itself answers 503 + Retry-After when saturated. Clients MUST honour

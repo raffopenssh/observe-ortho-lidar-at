@@ -11037,7 +11037,8 @@ def _grid25_for_kg(kg_code):
         if not g or not g.get('terrain'):
             continue
         try:
-            t = _v21.decode_terrain_grid25(g['terrain'])
+            import grid25_sample as _g25s
+            t = _g25s.register(code, _v21.decode_terrain_grid25(g['terrain']))
             lc = _v21.decode_landcover_grid25(g['landcover']) if g.get('landcover') else None
         except Exception as e:  # noqa: BLE001
             log.warning('grid25 decode %s: %s', code, e)
