@@ -79,6 +79,20 @@ Do not re-investigate; this is the state:
 * The 416 offset-corrected products are fine in every reader here, but
   their **Zenodo `_full_gpkg` rasters stay 5 m shifted**.
 
+* **Trees / NE cells / segments of the same products (inferred, not yet
+  measured)**: the v2 upgrade re-ran the whole pipeline on the GPKG rasters
+  (`v2_source.install` patches `read_dtm_dsm` + `read_ortho_for_als`), so
+  everything derived there — `tree_apices`, crowns, segments, `.h3b` NE
+  cells — should carry the same shift: stored position = true position
+  + (5 m E, −5 m N). Internally consistent (LiDAR and ortho moved
+  together), so classes/heights are right, only the position is off; an H3
+  res-12 cell (~9 m edge) can be the neighbour of the right one. Nothing
+  is corrected at read time yet. Verify first (apices of a shifted product
+  vs. a fresh overlapping one), then either add the registration offset in
+  `ne_trees` or leave it to the reprocess. User tree reports / flags are
+  keyed to the served positions — moving apices needs their match
+  tolerance checked (`docs/tree-user.md`).
+
 Paths considered:
 1. *Re-upgrade from the v1 GPKG* (`v2_regen`-style): useless — the GPKG
    itself carries the shift.
