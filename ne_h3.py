@@ -1875,6 +1875,8 @@ def neo1_section_from_h3b(path: str | Path, green_fix: bool = True) -> bytes:
         import ne_green_fix as _gf
         h["source"] = OBS_SOURCE_FIXED      # the NE server's manifest shows which KGs carry the corrected export
         h.update(_gf.header_note(n_fix, hdr["cells_n"], cnt.get("tree")))
+        if cnt.get("tree_qa"):
+            h["tree_qa"] = {"apices_hidden": int(cnt["tree_qa"]), "rule": "tree_n / tree_h_max count only the apices /api/v1/trees/bbox returns by default (realistic=1)"}
     als = _als_header_for(hdr, obs)
     if als:
         h["als_years"] = als                # header only — digest covers the rows, no re-post needed

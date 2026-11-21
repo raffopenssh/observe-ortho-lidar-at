@@ -453,7 +453,7 @@ columns as unavailable for every filtered row.
 ## 12e. Tree QA: cell tree fields = the default `/trees/bbox` apex set (`tree_qa.py`, 2026-11-21)
 
 `tree_h` / `tree_h_n`, `tree_n`, `tree_h_max`, `canopy_h_p50/p90` (bins, blocks, sample, `/cells`,
-KG container, national `tree_n` / `tree_hh`, the NEO1 rows posted to umfeld) are computed from the
+KG container, national `tree_n` / `tree_hh`, the NEO1 rows posted to the NE server) are computed from the
 apices `/api/v1/trees/bbox` returns by default (`realistic=1`, `min_height=3`). `h_max`, `h_p90`,
 `crown_frac` stay raw nDSM surface statistics.
 
