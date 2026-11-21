@@ -1,22 +1,27 @@
-"""tree_qa — keeps the per-cell tree fields of the cells products (``cells_bins``: tree_h /
-tree_h_n / tree_n / tree_h_max / canopy_h_p50|p90) equal to what ``/api/v1/trees/bbox``
-returns by default (realistic=1, min_height=3).
+"""tree_qa — the cell products show exactly the tree apices ``/api/v1/trees/bbox`` returns by
+default (realistic=1, min_height=3).
 
-The predicate itself lives in ``ne_trees`` (``_qa_mask`` / ``chunk_keep``) and is applied by
-``cells_bins.build_bin``.  This module only answers "which bins does it change?": a tiny
-store ``data/ne/tree_qa.sqlite`` with one row per candidate 0.025° bin —
+One predicate: ``ne_trees._qa_mask`` (height rule, linear-noise runs, reader flags, legacy QA
+flags).  It is evaluated here, per KG file, on the few res-10 chunks that can be affected, and
+the result — the NET1 row indices it hides — is kept in ``data/ne/tree_qa.sqlite``.  Readers
+never evaluate anything: ``cells_api._load_chunk`` looks the chunk up in an in-memory snapshot
+(O(1), nothing for an unaffected chunk) and, on a hit, drops those apex rows and rewrites
+``tree_n`` / ``tree_h_max`` of the cells that lost one (:func:`patch`).  Everything built from
+chunks follows: /cells (all formats), bins / blocks / sample, national + stats aggregates, the
+public KG container, and the NEO1 rows posted upstream (``ne_h3.neo1_rows_from_h3b``).
+The KG files stay the raw inventory (``/trees/bbox?realistic=0`` is unchanged).
 
-    in_sig  hash of everything the hidden set of the bin can depend on
-    tok     hash of the hidden (cell, apex word) rows, '' when nothing is hidden
+Cache validity: ``chunk_rev`` (chunk LRU key), ``kg_tok`` (per-KG ETags, pub container, posted
+digest cache), ``bin_tok`` (folded into the bin generation only when non-empty — untouched bins
+keep bytes, generation and ETag).
 
-``tok`` (when non-empty) is folded into the bin generation (``cells_bins._gen``), so only
-bins whose bytes change get a new gen / ETag.  ``refresh()`` (hourly, in front of the
-``cells_bins --prewarm`` pass, same niced unit) re-evaluates the bins whose ``in_sig``
-changed, block by block, and rebuilds a bin + its prebuilt blocks right after flipping its
-token — the public workers never have to build one on demand.  Resumable (one commit per
-bin), bounded memory (one bin's candidate chunks at a time), budgeted.
+``refresh()`` — hourly in front of ``cells_bins --prewarm`` (same niced unit), single-flight,
+resumable per KG (one transaction each), bounded memory, budgeted: re-evaluates KGs whose
+inputs changed (file digest, position tag, linear-noise token, flag revisions), then patches
+the tree columns of the affected cells inside the stored bins (no bin rebuild) and re-stores
+their blocks, so the public workers do not build on demand.
 
-    python3 tree_qa.py --status | --refresh [--budget-s N] [--limit N] [--dry]
+    python3 tree_qa.py --status | --refresh [--budget-s N] [--limit N] | --kg 92001
 """
 from __future__ import annotations
 
@@ -27,309 +32,492 @@ import os
 import sqlite3
 import threading
 import time
+import zlib
 
 import numpy as np
 
-import cells_api as ca
 import ne_h3
 
 log = logging.getLogger('tree_qa')
 
-DB_PATH = ca.NE_DIR / 'tree_qa.sqlite'
-STATE_PATH = ca.NE_DIR / 'tree_qa.json'
+DB_PATH = ne_h3.NE_DIR / 'tree_qa.sqlite'
 BIN_DEG = 0.025
-R10_PAD_DEG = 0.0013           # res-10 cell circumradius (~76 m) in degrees, generous
-_STAT_S = 30.0                  # token reload (and bin-manifest recompute) at most this often per worker
+_STAT_S = 30.0                  # snapshot reload at most this often per process
+RULE_ID = 'tq-1'                # bump to force a re-evaluation of every KG
 
-_cache = {'t': 0.0, 'ver': None, 'tok': {}}
+_snap = {'t': 0.0, 'ver': None, 'hid': {}, 'kg': {}, 'dig': {}, 'bin': {}, 'binkg': {}}
 _lock = threading.Lock()
 
 
-# === SECTION: store (read side: request path) ===
+def _db_path():
+    return DB_PATH
+
+
+# === SECTION: store + snapshot (request path) ===
 
 def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(str(DB_PATH), timeout=30)
-    c.execute('CREATE TABLE IF NOT EXISTS bin (i INTEGER, j INTEGER, in_sig TEXT, tok TEXT, n INTEGER, cells INTEGER, '
-              'ts INTEGER, PRIMARY KEY (i, j)) WITHOUT ROWID')
+    c = sqlite3.connect(str(_db_path()), timeout=60)
+    c.executescript(
+        'CREATE TABLE IF NOT EXISTS hid (kg TEXT, r10 INTEGER, idx BLOB, PRIMARY KEY (kg, r10)) WITHOUT ROWID;'
+        'CREATE TABLE IF NOT EXISTS kg (kg TEXT PRIMARY KEY, in_sig TEXT, tok TEXT, n INTEGER, cells INTEGER, ts INTEGER, dig TEXT) WITHOUT ROWID;'
+        'CREATE TABLE IF NOT EXISTS binkg (i INTEGER, j INTEGER, kg TEXT, sig TEXT, PRIMARY KEY (i, j, kg)) WITHOUT ROWID;')
     return c
 
 
 def version():
-    """Changes whenever the store is written (part of the bin-manifest cache key)."""
     try:
-        st = os.stat(DB_PATH)
+        st = os.stat(_db_path())
         return (st.st_mtime_ns, st.st_size)
     except OSError:
         return None
 
 
-def _tokens() -> dict:
+def _bin_tok(per_kg: dict) -> str:
+    return hashlib.sha1(json.dumps(sorted(per_kg.items())).encode()).hexdigest()[:12] if per_kg else ''
+
+
+def _snapshot() -> dict:
     now = time.time()
-    if now - _cache['t'] < _STAT_S:
-        return _cache['tok']
+    s = _snap
+    if now - s['t'] < _STAT_S:
+        return s
     with _lock:
         ver = version()
-        if ver != _cache['ver']:
-            tok = {}
+        if ver != _snap['ver']:
+            hid: dict = {}; kgt: dict = {}; binkg: dict = {}; dig: dict = {}
             if ver is not None:
                 try:
-                    c = sqlite3.connect(f'file:{DB_PATH}?mode=ro', uri=True, timeout=10)
+                    c = sqlite3.connect(f'file:{_db_path()}?mode=ro', uri=True, timeout=10)
                     try:
-                        tok = {(i, j): t for i, j, t in c.execute("SELECT i, j, tok FROM bin WHERE tok != ''")}
+                        c.execute('BEGIN')
+                        for kg, r10, idx in c.execute('SELECT kg, r10, idx FROM hid'):
+                            hid[(kg, r10)] = idx
+                        for k, t, d in c.execute("SELECT kg, tok, dig FROM kg WHERE tok != ''"):
+                            kgt[k] = t; dig[k] = d
+                        for i, j, kg, sig in c.execute('SELECT i, j, kg, sig FROM binkg'):
+                            binkg.setdefault((i, j), {})[kg] = sig
                     finally:
                         c.close()
                 except sqlite3.Error as e:
-                    log.warning('tree_qa: store unreadable (%s) — keeping previous tokens', e)
-                    tok = _cache['tok']; ver = _cache['ver']
-            _cache['tok'] = tok; _cache['ver'] = ver
-        _cache['t'] = now
-        return _cache['tok']
+                    log.warning('tree_qa: store unreadable (%s) — keeping the previous snapshot', e)
+                    _snap['t'] = now
+                    return _snap
+            _snap.update(ver=ver, hid=hid, kg=kgt, dig=dig, binkg=binkg, bin={ij: _bin_tok(v) for ij, v in binkg.items()})
+        _snap['t'] = now
+        return _snap
 
 
-def tok(i: int, j: int) -> str:
-    """'' unless the default tree filter hides ≥ 1 apex of this bin."""
-    return _tokens().get((i, j), '')
+def chunk_idx(kg: str, r10: int, digest: str | None = None):
+    """Hidden NET1 row indices (u16 LE bytes) of one stored chunk, or None.  With *digest*
+    (the file's NEO1 digest) a store entry evaluated on another file version is ignored."""
+    s = _snapshot()
+    b = s['hid'].get((kg, int(r10)))
+    if b is not None and digest is not None and s['dig'].get(kg) != digest:
+        return None
+    return b
 
 
-# === SECTION: candidates (cheap: index + flag stores only) ===
+def kg_tok(kg: str, digest: str | None = None) -> str:
+    s = _snapshot()
+    if digest is not None and s['dig'].get(str(kg)) != digest:
+        return ''
+    return s['kg'].get(str(kg), '')
 
-def _bins_of_r10(hn, r10: int) -> list:
-    la, lo = hn.cell_to_latlng(r10)
-    return list({(int(np.floor((lo + a) / BIN_DEG)), int(np.floor((la + b) / BIN_DEG)))
-                 for a in (-R10_PAD_DEG, R10_PAD_DEG) for b in (-R10_PAD_DEG, R10_PAD_DEG)})
+
+def kgs_tok(kgs) -> str:
+    s = _snapshot()['kg']
+    return '|'.join(f'{k}:{s[k]}' for k in sorted(map(str, kgs)) if k in s)
 
 
-def candidates() -> dict:
-    """bin (i, j) → {'r10': set, 'items': set} — every res-10 chunk that can hold an apex the
-    default filter hides: tallest apex ≥ TREE_SPIKE_H (height rule), a linear-noise key, a
-    reader flag (cell / point) or a legacy QA point (each ± one res-10 ring)."""
+def bin_tok(i: int, j: int) -> str:
+    return _snapshot()['bin'].get((i, j), '')
+
+
+# === SECTION: the override (one implementation for chunks and posted rows) ===
+
+_TN_OFF = None
+
+
+def _offsets():
+    global _TN_OFF
+    if _TN_OFF is None:
+        import cells_api as ca
+        _TN_OFF = (ca.OBS_DT.fields['tn'][1], ca.OBS_DT.fields['thx'][1], ca.OBS_DT.itemsize)
+    return _TN_OFF
+
+
+def quant_h(h_m: np.ndarray) -> np.ndarray:
+    """Apex height → u8 ×0.5 m (1..254) — the scale of tree_h / tree_h_max."""
+    return np.clip(np.round(h_m * 2.0), 1, 254).astype(np.uint8)
+
+
+def patch(obs: bytes, trees: bytes, idx: bytes) -> tuple[bytes, bytes]:
+    """NEO1 rows + NET1 rows of one chunk without the hidden apices: rows dropped, and for
+    the cells that lost one ``tree_n`` = kept count, ``tree_h_max`` = tallest kept (255 = none)."""
+    o_tn, o_thx, rec = _offsets()
+    rows = np.frombuffer(obs, np.uint8).reshape(-1, rec).copy()
+    w = np.frombuffer(trees, '<u4')
+    hide = np.frombuffer(idx, '<u2').astype(np.int64)
+    hide = hide[hide < w.size]
+    if not hide.size:
+        return obs, trees
+    n = rows.shape[0]
+    cell = np.repeat(np.arange(n), rows[:, o_tn].astype(np.int64))[:w.size]
+    keep = np.ones(w.size, bool); keep[hide] = False
+    touched = np.unique(cell[hide])
+    cnt = np.bincount(cell[keep], minlength=n)
+    mx = np.zeros(n, np.uint8)
+    np.maximum.at(mx, cell[keep], quant_h(((w[keep] >> 10) & 0xFF) * 0.25))
+    rows[touched, o_tn] = np.minimum(cnt[touched], 255)
+    rows[touched, o_thx] = np.where(cnt[touched] > 0, mx[touched], 255)
+    return rows.tobytes(), np.ascontiguousarray(w[keep]).tobytes()
+
+
+# === SECTION: evaluation per KG (refresh side) ===
+
+def _static_candidates() -> dict:
+    """kg → [r10] of the chunks whose tallest apex can trip the height rule (index only)."""
+    import cells_api as ca
     import ne_trees as nt
-    hn = ca._h3n()
     out: dict = {}
-    bins_memo: dict = {}
-
-    def add(r10: int, item) -> None:
-        b = bins_memo.get(r10)
-        if b is None:
-            b = bins_memo[r10] = _bins_of_r10(hn, r10)
-        for ij in b:
-            e = out.get(ij)
-            if e is None:
-                e = out[ij] = {'r10': set(), 'items': set()}
-            e['r10'].add(r10)
-            if item is not None:
-                e['items'].add(item)
-
-    def add_points(lon, lat, item) -> None:
-        seen = set()
-        for lo, la in zip(lon, lat):
-            c = int(hn.latlng_to_cell(float(la), float(lo), 10))
-            if c not in seen:
-                seen.add(c)
-                for r in hn.grid_disk(c, 1):
-                    add(int(r), item)
-
-    files = ca._files()
     c = ca._idx_conn()
-    for r10, kg in c.execute('SELECT r10, kg FROM chunk WHERE hmax >= ? AND trees > 0', (int(nt.TREE_SPIKE_H * 4),)):
-        if kg in files:
-            add(int(r10), None)
-    tf = ca._tf('EPSG:3035', 'EPSG:4326')
-    try:
-        import ne_linear
-        sn = ne_linear._snapshot()
-        for kg, keys in sn['keys'].items():
-            if kg not in files or not keys.size:
-                continue
-            x = (keys >> np.uint64(32)).astype(np.int64); y = (keys & np.uint64(0xFFFFFFFF)).astype(np.int64)
-            lon, lat = tf.transform(x, y)
-            add_points(lon, lat, f'l:{kg}:{sn["tok"].get(kg)}')
-    except Exception as e:  # noqa: BLE001
-        log.warning('tree_qa: linear keys: %s', e)
-    try:
-        import public_flags as pf
-        for (kg,) in pf._conn().execute('SELECT DISTINCT kg FROM report WHERE status IN (0,1) AND cell IS NOT NULL').fetchall():
-            kg = str(kg)
-            if kg not in files:
-                continue
-            fc, fp, _, _ = nt._flags(kg, 'trees')
-            item = f'f:{kg}:{nt.flag_rev(kg)}'
-            for cell in fc:
-                add(int(hn.cell_to_parent(int(cell), 10)), item)
-            if len(fp):
-                lon, lat = tf.transform(fp[:, 0], fp[:, 1])
-                add_points(lon, lat, item)
-    except Exception as e:  # noqa: BLE001
-        log.warning('tree_qa: reader flags: %s', e)
-    try:
-        import landscape_query as lq
-        fb = lq.flags_db()
-        per: dict = {}
-        if fb is not None:
-            for kg, lo, la in fb.execute(
-                    'SELECT kg_code, centroid_lon, centroid_lat FROM flags WHERE kind=? AND severity IN (%s) AND centroid_lon IS NOT NULL'
-                    % ','.join('?' * len(lq.FLAG_SEVERITIES)), (nt.LEGACY_FLAG_KIND['trees'], *lq.FLAG_SEVERITIES)):
-                per.setdefault(str(kg), []).append((lo, la))
-        for kg, pts in per.items():
-            if kg in files:
-                a = np.array(sorted(pts))
-                add_points(a[:, 0], a[:, 1], 'q:%s:%s' % (kg, hashlib.sha1(a.tobytes()).hexdigest()[:10]))
-    except Exception as e:  # noqa: BLE001
-        log.warning('tree_qa: legacy flags: %s', e)
+    if c is not None:
+        for r10, kg in c.execute('SELECT r10, kg FROM chunk WHERE hmax >= ? AND trees > 0', (int(nt.TREE_SPIKE_H * 4),)):
+            out.setdefault(kg, []).append(int(r10))
     return out
 
 
-def _in_sig(i: int, j: int, cand: dict) -> str:
-    import cells_bins as cb
+def _legacy_points() -> dict:
+    import landscape_query as lq
+    import ne_trees as nt
+    per: dict = {}
+    fb = lq.flags_db()
+    if fb is not None:
+        for kg, lo, la in fb.execute(
+                'SELECT kg_code, centroid_lon, centroid_lat FROM flags WHERE kind=? AND severity IN (%s) AND centroid_lon IS NOT NULL'
+                % ','.join('?' * len(lq.FLAG_SEVERITIES)), (nt.LEGACY_FLAG_KIND['trees'], *lq.FLAG_SEVERITIES)):
+            per.setdefault(str(kg), []).append((lo, la))
+    return per
+
+
+class _Ctx:
+    """Inputs of one pass, read once: height-rule candidates, linear keys, flag / legacy KGs."""
+
+    def __init__(self):
+        import cells_api as ca
+        import ne_trees as nt
+        import ne_linear
+        self.ca = ca; self.nt = nt
+        self.files = ca._files()
+        self.static = _static_candidates()
+        self.sn = ne_linear._snapshot()
+        self.lin_all = ne_linear.hidden(list(self.sn['keys']))
+        try:
+            import public_flags as pf
+            self.flag_kgs = {str(k) for (k,) in pf._conn().execute(
+                'SELECT DISTINCT kg FROM report WHERE status IN (0,1) AND cell IS NOT NULL')}
+        except Exception as e:  # noqa: BLE001
+            log.warning('tree_qa: reader flags: %s', e); self.flag_kgs = set()
+        try:
+            self.legacy = _legacy_points()
+        except Exception as e:  # noqa: BLE001
+            log.warning('tree_qa: legacy flags: %s', e); self.legacy = {}
+        self._nb: dict = {}
+
+    def neighbours(self, kg: str) -> list:
+        v = self._nb.get(kg)
+        if v is None:
+            bb = self.ca._kg_bbox(kg)
+            v = self._nb[kg] = sorted(set(self.ca._kgs_intersecting(*bb)) | {kg}) if bb else [kg]
+        return v
+
+    def lin_kgs(self, kg: str) -> list:
+        return [k for k in self.neighbours(kg) if k in self.sn['keys']]
+
+    def has_inputs(self, kg: str) -> bool:
+        return bool(kg in self.static or kg in self.flag_kgs or kg in self.legacy or self.lin_kgs(kg))
+
+    def in_sig(self, kg: str) -> str:
+        f = self.files[kg]
+        parts = [RULE_ID, str(f.get('neo1_digest')), self.ca._pos_fix.tag(kg),
+                 ','.join(f'{k}:{self.sn["tok"].get(k)}' for k in self.lin_kgs(kg)),
+                 self.nt.flag_rev(kg) if kg in self.flag_kgs else '',
+                 hashlib.sha1(repr(sorted(self.legacy[kg])).encode()).hexdigest()[:10] if kg in self.legacy else '']
+        return hashlib.sha1('|'.join(parts).encode()).hexdigest()[:20]
+
+
+def _ring_r10(hn, lon, lat) -> set:
+    out: set = set(); seen: set = set()
+    for lo, la in zip(lon, lat):
+        c = int(hn.latlng_to_cell(float(la), float(lo), 10))
+        if c not in seen:
+            seen.add(c); out.update(int(r) for r in hn.grid_disk(c, 1))
+    return out
+
+
+def evaluate_kg(kg: str, ctx: _Ctx) -> tuple[dict, dict]:
+    """→ ({r10: hidden row idx u16 bytes}, {(i, j): sig of the hidden apices whose cell is in that bin})."""
+    ca, nt = ctx.ca, ctx.nt
+    hn = ca._h3n()
+    hdr = ca.header(kg, with_chunks=True)
+    if hdr is None:
+        return {}, {}
+    rows = {int(c['r10'], 16): c for c in hdr['chunks'] if int(c.get('trees') or 0) > 0}
+    cand = set(ctx.static.get(kg, ()))
+    tf = ca._tf('EPSG:3035', 'EPSG:4326')
+    for k in ctx.lin_kgs(kg):
+        keys = ctx.sn['keys'][k]
+        x = (keys >> np.uint64(32)).astype(np.int64); y = (keys & np.uint64(0xFFFFFFFF)).astype(np.int64)
+        lon, lat = tf.transform(x, y)
+        cand |= _ring_r10(hn, lon, lat)
+    if kg in ctx.flag_kgs:
+        fc, fp, _, _ = nt._flags(kg, 'trees')
+        cand |= {int(hn.cell_to_parent(int(c), 10)) for c in fc}
+        if len(fp):
+            lon, lat = tf.transform(fp[:, 0], fp[:, 1])
+            cand |= _ring_r10(hn, lon, lat)
+    if kg in ctx.legacy:
+        a = np.array(ctx.legacy[kg])
+        cand |= _ring_r10(hn, a[:, 0], a[:, 1])
+    q = nt._qa_state((), 'trees')
+    q['lin'], q['lin_grid'] = ctx.lin_all
+    hid: dict = {}; cells = []; words = []
+    for r10 in sorted(cand & set(rows)):
+        c = rows[r10]
+        row = dict(c, r10=r10, trees=int(c.get('trees') or 0), bld=int(c.get('bld') or 0))
+        ch = ca._load_chunk(kg, row, hdr, qa=False)
+        m = nt.chunk_keep(ch, q, hdr)
+        if m is None:
+            continue
+        bad = np.flatnonzero(~m)
+        hid[r10] = bad.astype('<u2').tobytes()
+        cell_idx = np.repeat(np.arange(ch.cells), ch.obs['tn'].astype(np.int64))[:ch.trees.size]
+        cells.append(ch.ids[cell_idx[bad]].astype(np.uint64)); words.append(((ch.trees[bad] >> 10) & 0xFF).astype(np.uint64))
+    bins: dict = {}
+    if cells:
+        cells = np.concatenate(cells); words = np.concatenate(words)
+        uc, inv = np.unique(cells, return_inverse=True)
+        ll = np.array([hn.cell_to_latlng(int(c)) for c in uc])
+        bi = np.floor(ll[:, 1] / BIN_DEG).astype(np.int64)[inv]; bj = np.floor(ll[:, 0] / BIN_DEG).astype(np.int64)[inv]
+        o = np.lexsort((words, cells, bj, bi))
+        bi, bj, cells, words = bi[o], bj[o], cells[o], words[o]
+        cut = np.flatnonzero(np.diff(bi) | np.diff(bj)) + 1
+        for a, b in zip(np.concatenate([[0], cut]), np.concatenate([cut, [cells.size]])):
+            h = hashlib.sha1(); h.update(cells[a:b].tobytes()); h.update(words[a:b].tobytes())
+            bins[(int(bi[a]), int(bj[a]))] = (h.hexdigest()[:12], cells[a:b])
+    return hid, bins
+
+
+def _kg_tok(hid: dict) -> str:
+    if not hid:
+        return ''
     h = hashlib.sha1()
-    h.update(cb.bin_inputs(i, j)['base_gen'].encode())
-    h.update(json.dumps(sorted(cand['r10'])).encode()); h.update(json.dumps(sorted(cand['items'])).encode())
-    return h.hexdigest()[:20]
+    for r10 in sorted(hid):
+        h.update(str(r10).encode()); h.update(hid[r10])
+    return h.hexdigest()[:12]
 
 
-# === SECTION: evaluation (the shared predicate on the bin's candidate chunks) ===
-
-def evaluate(i: int, j: int, r10s) -> tuple[str, int, int]:
-    """(tok, hidden apices, cells touched) of one bin — same cell selection and the same
-    keep-mask ``cells_bins.build_bin`` uses, restricted to the candidate chunks."""
-    import cells_bins as cb
-    inp = cb.bin_inputs(i, j)
-    if not inp['on_disk'] or not r10s:
-        return '', 0, 0
-    ids = np.sort(ca.ids_in_bbox(*inp['bbox']))
-    sub = ids[np.isin(ne_h3.h3_parent_vec(ids, ca.CHUNK_RES), np.fromiter(r10s, np.uint64, len(r10s)))]
-    if not sub.size:
-        return '', 0, 0
-    tb, _, _ = ca.select(sub, inp['bbox'])
-    if not len(tb):
-        return '', 0, 0
-    ci, words = tb.gather_trees()
-    keep = cb.tree_keep(tb, inp['on_disk']) if words.size else None
-    if keep is None:
-        return '', 0, 0
-    hid = ~keep
-    cells = tb.ids[ci[hid]].astype(np.uint64); w = words[hid].astype(np.uint64)
-    o = np.lexsort((w, cells))
-    h = hashlib.sha1(); h.update(cells[o].tobytes()); h.update(w[o].tobytes())
-    return h.hexdigest()[:16], int(hid.sum()), int(np.unique(cells).size)
+def _hidden_cells(con, kg: str, ca) -> dict:
+    """bin → cell ids currently hidden-from for one KG (what a change must re-patch)."""
+    out: dict = {}
+    hdr = None
+    hn = ca._h3n()
+    for r10, idx in con.execute('SELECT r10, idx FROM hid WHERE kg=?', (kg,)).fetchall():
+        if hdr is None:
+            hdr = ca.header(kg, with_chunks=True)
+            rows = {int(c['r10'], 16): c for c in (hdr or {}).get('chunks') or []}
+        c = rows.get(int(r10)) if hdr else None
+        if c is None:
+            continue
+        try:
+            ch = ca._load_chunk(kg, dict(c, r10=int(r10), trees=int(c.get('trees') or 0), bld=int(c.get('bld') or 0)), hdr, qa=False)
+        except Exception:  # noqa: BLE001
+            continue
+        cell_idx = np.repeat(np.arange(ch.cells), ch.obs['tn'].astype(np.int64))[:ch.trees.size]
+        bad = np.frombuffer(idx, '<u2').astype(np.int64); bad = bad[bad < cell_idx.size]
+        for cid in np.unique(ch.ids[cell_idx[bad]]).tolist():
+            la, lo = hn.cell_to_latlng(int(cid))
+            out.setdefault((int(np.floor(lo / BIN_DEG)), int(np.floor(la / BIN_DEG))), set()).add(int(cid))
+    return out
 
 
-# === SECTION: refresh pass ===
+def _commit_kg(con, kg: str, sig: str | None, hid: dict, bins: dict, dig: str | None = None) -> None:
+    con.execute('BEGIN IMMEDIATE')
+    con.execute('DELETE FROM hid WHERE kg=?', (kg,)); con.execute('DELETE FROM binkg WHERE kg=?', (kg,))
+    if sig is None:
+        con.execute('DELETE FROM kg WHERE kg=?', (kg,))
+    else:
+        con.executemany('INSERT INTO hid VALUES (?,?,?)', [(kg, r, b) for r, b in hid.items()])
+        con.executemany('INSERT INTO binkg VALUES (?,?,?,?)', [(i, j, kg, s) for (i, j), (s, _) in bins.items()])
+        con.execute('INSERT OR REPLACE INTO kg VALUES (?,?,?,?,?,?,?)',
+                    (kg, sig, _kg_tok(hid), sum(len(b) // 2 for b in hid.values()), sum(int(np.unique(c).size) for _, c in bins.values()), int(time.time()), dig))
+    con.commit()
+    with _lock:                              # this process sees its own write at once (no full reload)
+        s = _snap
+        for k in [k for k in s['hid'] if k[0] == kg]:
+            del s['hid'][k]
+        for ij in [ij for ij, v in s['binkg'].items() if kg in v]:
+            s['binkg'][ij].pop(kg, None)
+            if not s['binkg'][ij]:
+                del s['binkg'][ij]; s['bin'].pop(ij, None)
+            else:
+                s['bin'][ij] = _bin_tok(s['binkg'][ij])
+        s['kg'].pop(kg, None); s['dig'].pop(kg, None)
+        if sig is not None:
+            for r, b in hid.items():
+                s['hid'][(kg, r)] = b
+            for ij, (sg, _) in bins.items():
+                s['binkg'].setdefault(ij, {})[kg] = sg; s['bin'][ij] = _bin_tok(s['binkg'][ij])
+            t = _kg_tok(hid)
+            if t:
+                s['kg'][kg] = t; s['dig'][kg] = dig
+        s['ver'] = version(); s['t'] = time.time()
 
-def refresh(budget_s: float | None = None, limit: int | None = None, dry: bool = False, verbose: bool = True) -> dict:
+
+def refresh_kg(kg: str) -> dict:
+    """Evaluate one KG now (ingest hook): store only — its bins change generation with the new file anyway."""
+    kg = str(kg).zfill(5)
+    _snapshot()
+    ctx = _Ctx()
+    if kg not in ctx.files:
+        return {'kg': kg, 'skipped': 'no file'}
+    con = _conn()
+    try:
+        if not ctx.has_inputs(kg):
+            if con.execute('SELECT 1 FROM kg WHERE kg=?', (kg,)).fetchone():
+                _commit_kg(con, kg, None, {}, {})
+            return {'kg': kg, 'hidden': 0}
+        hid, bins = evaluate_kg(kg, ctx)
+        _commit_kg(con, kg, ctx.in_sig(kg), hid, bins, ctx.files[kg].get('neo1_digest'))
+        return {'kg': kg, 'hidden': sum(len(b) // 2 for b in hid.values()), 'bins': len(bins)}
+    finally:
+        con.close()
+
+
+def refresh(budget_s: float | None = None, limit: int | None = None, verbose: bool = True, bins: bool = True) -> dict:
     """Single-flight across processes (flock): a second caller returns at once."""
     import fcntl
-    if dry:
-        return _refresh(budget_s, limit, True, verbose)
-    with open(ca.NE_DIR / 'tree_qa.lock', 'w') as lk:
+    with open(_db_path().with_suffix('.lock'), 'w') as lk:
         try:
             fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return {'skipped': 'another refresh is running'}
-        return _refresh(budget_s, limit, False, verbose)
+        return _refresh(budget_s, limit, verbose, bins)
 
 
-def _refresh(budget_s, limit, dry, verbose) -> dict:
+def _refresh(budget_s, limit, verbose, do_bins) -> dict:
+    import cells_api as ca
     import cells_bins as cb
     import cells_blocks
     t0 = time.time()
-    cand = candidates()
+    _snap['t'] = 0.0; _snapshot()
+    ctx = _Ctx()
     con = _conn()
-    stored = {(i, j): (s, t) for i, j, s, t in con.execute('SELECT i, j, in_sig, tok FROM bin')}
+    stored = {k: s for k, s in con.execute('SELECT kg, in_sig FROM kg')}
     todo = []
-    for ij in set(cand) | set(stored):
-        sig = _in_sig(*ij, cand[ij]) if ij in cand else None
-        if sig is None or stored.get(ij, (None,))[0] != sig:
-            todo.append((ij, sig))
-    todo.sort(key=lambda x: (x[0][0] // cb.BLOCK_N, x[0][1] // cb.BLOCK_N, x[0]))
-    t_cand = time.time() - t0
+    for kg in sorted(set(ctx.files) | set(stored)):
+        if kg not in ctx.files or not ctx.has_inputs(kg):
+            if kg in stored:
+                todo.append((kg, None))
+        elif stored.get(kg) != ctx.in_sig(kg):
+            todo.append((kg, ctx.in_sig(kg)))
+    st = {'kgs_with_inputs': sum(1 for k in ctx.files if ctx.has_inputs(k)), 'todo': len(todo), 'kgs_evaluated': 0,
+          'kgs_changed': 0, 'bins_patched': 0, 'bins_rebuilt': 0, 'bins_left_to_prewarm': 0, 'blocks_stored': 0,
+          'cells_patched': 0, 'errors': 0, 'stopped_on_budget': False, 'plan_s': round(time.time() - t0, 1)}
     if verbose:
-        print(f'tree_qa: {len(cand)} candidate bins, {len(stored)} stored, {len(todo)} to evaluate ({t_cand:.0f}s)', flush=True)
-    st = {'candidates': len(cand), 'todo': len(todo), 'evaluated': 0, 'changed_bins': 0, 'rebuilt_bins': 0,
-          'rebuilt_blocks': 0, 'hidden': 0, 'cells': 0, 'errors': 0, 'stopped_on_budget': False}
-    dirty: set = set(); cur_block = None
+        print(f"tree_qa: {st['kgs_with_inputs']} KGs with inputs, {len(stored)} stored, {len(todo)} to evaluate ({st['plan_s']}s)", flush=True)
+    dirty: set = set(); t_flush = time.time()
 
-    def flush_block(blk) -> None:
-        if blk is None or blk not in dirty or dry:
-            return
-        dirty.discard(blk)
-        for fs in cells_blocks.prewarm_fieldsets():
-            try:
-                if cells_blocks.stored_meta(blk[0], blk[1], fs) is not None:      # only blobs that exist get refreshed here
-                    cells_blocks.store_block(blk[0], blk[1], fs); st['rebuilt_blocks'] += 1
-            except Exception as e:  # noqa: BLE001
-                log.warning('tree_qa: block %s: %s', blk, e)
+    def flush() -> None:
+        nonlocal t_flush
+        for blk in sorted(dirty):
+            for fs in cells_blocks.prewarm_fieldsets():
+                try:
+                    if cells_blocks.stored_meta(blk[0], blk[1], fs) is not None:
+                        cells_blocks.store_block(blk[0], blk[1], fs); st['blocks_stored'] += 1
+                except Exception as e:  # noqa: BLE001
+                    log.warning('tree_qa: block %s: %s', blk, e)
+        dirty.clear(); t_flush = time.time()
 
-    for (i, j), sig in todo:
-        blk = (i // cb.BLOCK_N, j // cb.BLOCK_N)
-        if blk != cur_block:
-            flush_block(cur_block); cur_block = blk
-            if (budget_s is not None and time.time() - t0 > budget_s) or (limit and st['evaluated'] >= limit):
-                st['stopped_on_budget'] = True
-                break
+    for kg, sig in todo:
+        if (budget_s is not None and time.time() - t0 > budget_s) or (limit and st['kgs_evaluated'] >= limit):
+            st['stopped_on_budget'] = True
+            break
         try:
-            t, n, k = evaluate(i, j, cand[(i, j)]['r10']) if sig is not None else ('', 0, 0)
+            old_tok = dict(_snap['bin'])
+            old_gen = {}
+            before = _hidden_cells(con, kg, ca) if kg in stored else {}
+            hid, kbins = evaluate_kg(kg, ctx) if sig is not None else ({}, {})
+            touched = set(before) | set(kbins)
+            if do_bins:
+                for ij in touched:
+                    old_gen[ij] = cb.bin_inputs(*ij)['gen']
+            _commit_kg(con, kg, sig, hid, kbins, (ctx.files.get(kg) or {}).get('neo1_digest'))
+            st['kgs_evaluated'] += 1
+            for ij in sorted(touched):
+                if _snap['bin'].get(ij, '') == old_tok.get(ij, ''):
+                    continue
+                if not do_bins:
+                    continue
+                cells = set(before.get(ij, ())) | set(kbins[ij][1].tolist() if ij in kbins else ())
+                r = cb.patch_tree_cols(ij[0], ij[1], np.array(sorted(cells), np.uint64), old_gen[ij])
+                st['bins_' + r] += 1; st['cells_patched'] += len(cells) if r == 'patched' else 0
+                dirty.add((ij[0] // cb.BLOCK_N, ij[1] // cb.BLOCK_N))
+            st['kgs_changed'] += int(bool(touched))
         except Exception as e:  # noqa: BLE001
             st['errors'] += 1
-            log.warning('tree_qa: evaluate %d_%d: %s', i, j, e)
-            continue
-        st['evaluated'] += 1; st['hidden'] += n; st['cells'] += k
-        old = stored.get((i, j), (None, ''))[1] or ''
-        if dry:
-            st['changed_bins'] += int(t != old)
-            continue
-        if sig is None:
-            con.execute('DELETE FROM bin WHERE i=? AND j=?', (i, j))
-        else:
-            con.execute('INSERT OR REPLACE INTO bin VALUES (?,?,?,?,?,?,?)', (i, j, sig, t, n, k, int(time.time())))
-        con.commit()
-        if t != old:
-            st['changed_bins'] += 1
-            with _lock:                      # this process sees its own write at once
-                _cache['t'] = 0.0; _cache['ver'] = None
-            try:
-                cb.load_bin(i, j, rebuild=True); st['rebuilt_bins'] += 1; dirty.add(blk)
-            except Exception as e:  # noqa: BLE001
-                st['errors'] += 1
-                log.warning('tree_qa: rebuild %d_%d: %s', i, j, e)
-        if verbose and st['evaluated'] % 200 == 0:
-            print(f"  {st['evaluated']}/{len(todo)} evaluated, {st['changed_bins']} changed … {time.time() - t0:.0f}s", flush=True)
-    else:
-        flush_block(cur_block)
-    flush_block(cur_block)
+            log.warning('tree_qa: %s: %s', kg, e)
+        if time.time() - t_flush > 20:
+            flush()
+        if verbose and st['kgs_evaluated'] and st['kgs_evaluated'] % 250 == 0:
+            print(f"  {st['kgs_evaluated']}/{len(todo)} KGs, {st['bins_patched']} bins patched … {time.time() - t0:.0f}s", flush=True)
+    flush()
     con.close()
-    st.update(seconds=round(time.time() - t0, 1), candidates_s=round(t_cand, 1),
-              finished_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
-    if not dry:
-        try:
-            STATE_PATH.write_text(json.dumps(st))
-        except OSError:
-            pass
+    st.update(seconds=round(time.time() - t0, 1), finished_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+    try:
+        _db_path().with_suffix('.json').write_text(json.dumps(st))
+    except OSError:
+        pass
     return st
 
 
 def status() -> dict:
-    out = {'db': str(DB_PATH), 'exists': DB_PATH.exists()}
+    out = {'db': str(_db_path()), 'exists': _db_path().exists(), 'rule': RULE_ID}
     if out['exists']:
         c = _conn()
-        a = c.execute("SELECT COUNT(*), SUM(tok != ''), SUM(n), SUM(cells), MAX(ts) FROM bin").fetchone()
+        a = c.execute("SELECT COUNT(*), SUM(tok != ''), SUM(n), SUM(cells) , MAX(ts) FROM kg").fetchone()
+        out.update(kgs_tracked=a[0], kgs_filtered=a[1] or 0, apices_hidden=a[2] or 0, cells_touched=a[3] or 0, last_ts=a[4],
+                   chunks=c.execute('SELECT COUNT(*) FROM hid').fetchone()[0],
+                   bins=c.execute('SELECT COUNT(*) FROM (SELECT DISTINCT i, j FROM binkg)').fetchone()[0],
+                   blocks=c.execute('SELECT COUNT(*) FROM (SELECT DISTINCT i/4, j/4 FROM binkg)').fetchone()[0])
         c.close()
-        out.update(bins_tracked=a[0], bins_filtered=a[1] or 0, apices_hidden=a[2] or 0, cells_touched=a[3] or 0, last_ts=a[4])
     try:
-        out['last_run'] = json.loads(STATE_PATH.read_text())
+        out['last_run'] = json.loads(_db_path().with_suffix('.json').read_text())
     except (OSError, ValueError):
         pass
     return out
+
+
+def text_line() -> str:
+    s = status()
+    lr = s.get('last_run') or {}
+    return (f"tree_qa: {s.get('kgs_filtered', 0)} KGs / {s.get('bins', 0)} bins / {s.get('cells_touched', 0)} cells / "
+            f"{s.get('apices_hidden', 0)} apices hidden from cell products (= /trees/bbox default); last refresh "
+            f"{lr.get('finished_at', '-')}: {lr.get('kgs_evaluated', 0)}/{lr.get('todo', 0)} KGs, {lr.get('bins_patched', 0)} bins patched, "
+            f"{lr.get('errors', 0)} errors{' (budget stop)' if lr.get('stopped_on_budget') else ''}")
 
 
 if __name__ == '__main__':
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument('--status', action='store_true'); ap.add_argument('--refresh', action='store_true')
-    ap.add_argument('--dry', action='store_true'); ap.add_argument('--budget-s', type=float); ap.add_argument('--limit', type=int)
+    ap.add_argument('--no-bins', action='store_true'); ap.add_argument('--kg')
+    ap.add_argument('--budget-s', type=float); ap.add_argument('--limit', type=int)
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
     if a.refresh:
-        print(json.dumps(refresh(a.budget_s, a.limit, dry=a.dry)))
+        print(json.dumps(refresh(a.budget_s, a.limit, bins=not a.no_bins)))
+    elif a.kg:
+        print(json.dumps(refresh_kg(a.kg)))
     else:
-        print(json.dumps(status(), indent=1))
+        print(json.dumps(status(), indent=1)); print(text_line())

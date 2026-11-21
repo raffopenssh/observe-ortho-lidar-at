@@ -59,9 +59,9 @@ import numpy as np
 import cells_api as ca
 import ne_h3
 import ne_green_fix as _green_fix
+import tree_qa as _tree_qa
 import ne_pos_fix as _pos_fix
 import mem_lru as _mem_lru
-import tree_qa as _tree_qa
 
 log = logging.getLogger('cells_bins')
 
@@ -233,23 +233,20 @@ def bin_inputs(i: int, j: int) -> dict:
     on_disk = [k for k in inter if k in files]
     missing = [k for k in inter if k not in files]
     parts = [(k, str(files[k].get('neo1_digest')) + _pos_fix.tag(k), int(files[k].get('partial') or 0)) for k in on_disk]
-    base = _base_gen(i, j, parts, _store_stamps({k.split('-')[0] for k in inter}))
-    gen = _with_tree_qa(i, j, base)
+    gen = _gen(i, j, parts, _store_stamps({k.split('-')[0] for k in inter}))
     epochs = sorted({str(files[k].get('epoch')) for k in on_disk if files[k].get('epoch')})
     return {'i': i, 'j': j, 'bbox': (w, s, e, n), 'kgs': inter, 'on_disk': on_disk, 'missing': missing,
-            'partial_files': [k for k, _, p in parts if p], 'gen': gen, 'base_gen': base,
+            'partial_files': [k for k, _, p in parts if p], 'gen': gen,
             'epoch': epochs[-1] if epochs else None}
 
 
-def _with_tree_qa(i: int, j: int, base: str) -> str:
-    """Fold the tree-QA token in — only for bins where the default /trees/bbox filter hides
-    ≥ 1 apex (``tree_qa.py``); every other bin keeps its generation, bytes and ETag."""
-    t = _tree_qa.tok(i, j)
-    return hashlib.sha256(f'{base}|tq|{t}'.encode()).hexdigest()[:24] if t else base
-
-
 def _gen(i: int, j: int, parts: list, stamps: list) -> str:
-    return _with_tree_qa(i, j, _base_gen(i, j, parts, stamps))
+    """Bin generation.  The tree-QA token (``tree_qa.py``: apices hidden by the default
+    /trees/bbox filter) is folded in only where it is non-empty — every other bin keeps
+    its generation, bytes and ETag."""
+    base = _base_gen(i, j, parts, stamps)
+    t = _tree_qa.bin_tok(i, j)
+    return hashlib.sha256(f'{base}|tq|{t}'.encode()).hexdigest()[:24] if t else base
 
 
 def _base_gen(i: int, j: int, parts: list, stamps: list) -> str:
@@ -375,19 +372,6 @@ def ragged_heights(cell_idx: np.ndarray, h_m: np.ndarray, n: int) -> tuple[np.nd
     o = np.lexsort((q, cell_idx))
     cnt = np.bincount(cell_idx, minlength=n)
     return np.minimum(cnt, 65535).astype('<u2'), np.ascontiguousarray(q[o])
-
-
-def tree_keep(tb, kgs):
-    """Keep-mask parallel to ``tb.gather_trees()`` = the apices /trees/bbox returns by default
-    (``ne_trees.chunk_keep`` — the one predicate); None when nothing is hidden."""
-    import ne_trees
-    q = ne_trees._qa_state(kgs)
-    masks = [ne_trees.chunk_keep(ch, q) for ch in tb.chunks]
-    if all(m is None for m in masks):
-        return None
-    arrs = [np.ones(ch.trees.size, bool) if m is None else m for ch, m in zip(tb.chunks, masks)]
-    keep = ca._gather_rows(tb, 'tree_off', 'trees', arrs)[1].astype(bool)
-    return None if keep.all() else keep
 
 
 def ragged_offsets(counts: np.ndarray) -> np.ndarray:
@@ -565,22 +549,10 @@ def build_bin(i: int, j: int, inputs: dict | None = None) -> dict:
     cols['stories_max'] = sm
     cols['roof_dom'] = _roof_hints(parents, ids)
     cols['struct_h_max'] = _u8h(any_max, np.isfinite(any_max), unknown)
-    # --- NET1 apices → canopy height percentiles ------------------------------
-    c90 = np.full(N, np.nan); c50 = np.full(N, np.nan)
-    th_n = np.zeros(N, '<u2'); th = np.zeros(0, np.uint8); qa_cells = np.zeros(0, np.int64); qa_hidden = 0
-    if len(tb):
-        ci, words = tb.gather_trees()
-        if words.size:
-            h = ca.decode_trees(words)['h_m']; tcell = pos[ci]
-            keep = tree_keep(tb, inp['on_disk'])       # same apex set as /trees/bbox default (realistic=1)
-            if keep is not None:
-                qa_cells = np.unique(tcell[~keep]); qa_hidden = int((~keep).sum())
-                tcell = tcell[keep]; h = h[keep]
-            t_max, c50, c90, t_cnt = _per_cell_stats(tcell, h, N)
-            th_n, th = ragged_heights(tcell, h, N)
-    cols['canopy_h_p90'] = _u8h(c90, np.isfinite(c90), unknown)
-    cols['canopy_h_p50'] = _u8h(c50, np.isfinite(c50), unknown)
-    cols['tree_h_n'] = th_n; cols['tree_h'] = th
+    # --- NET1 apices → canopy height percentiles + apex lists (already QA-filtered at chunk load, tree_qa.py)
+    tcols = tree_cols_for(tb, ids, unknown)
+    for k in ('canopy_h_p90', 'canopy_h_p50', 'tree_h_n', 'tree_h'):
+        cols[k] = tcols[k]
     cols['lc25'] = lc25; cols['lc25_frac'] = lcf; cols['canopy25'] = can25; cols['woody25'] = wood25
     # --- ALS years ------------------------------------------------------------
     ay_new = np.full(N, U16_UNK, '<u2'); ay_old = np.full(N, U16_UNK, '<u2')
@@ -592,11 +564,6 @@ def build_bin(i: int, j: int, inputs: dict | None = None) -> dict:
     for name, (sf, _kind) in ca.OBS_PUBLIC.items():
         v = obs_full[sf]
         cols[name] = np.ascontiguousarray(v.astype(NP_DT[FIELDS[name]['dtype']]))
-    if qa_cells.size:        # cells that lost an apex to the filter: count / tallest from the kept set (others stay raw)
-        tn = cols['tree_n'].copy(); tx = cols['tree_h_max'].copy()
-        tn[qa_cells] = np.minimum(t_cnt[qa_cells], 255)
-        tx[qa_cells] = ne_h3._q_u8(t_max[qa_cells], 2.0)
-        cols['tree_n'] = tn; cols['tree_h_max'] = tx
     hdr = {
         'algo': ALGO, 'bin_deg': BIN_DEG, 'ij': [i, j], 'bbox': [w, s, e, n], 'n': int(N), 'gen': inp['gen'],
         'epoch': inp['epoch'], 'kgs': kgs, 'kgs_intersecting': inp['kgs'], 'kgs_missing': inp['missing'],
@@ -606,8 +573,6 @@ def build_bin(i: int, j: int, inputs: dict | None = None) -> dict:
         'lc25_legend': lc_legend, 'built_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
         'build_ms': int((time.time() - t0) * 1000),
     }
-    if qa_hidden:
-        hdr['tree_qa'] = {'hidden': qa_hidden, 'cells': int(qa_cells.size)}
     return {'hdr': hdr, 'cols': cols}
 
 
@@ -766,6 +731,88 @@ def load_bin(i: int, j: int, *, rebuild: bool = False, need=None) -> tuple[dict,
             log.warning('cells_bins: store %s: %s', p, e)
         _blob_lru.put(key, (hdr, cols))
         return hdr, cols, inp
+
+
+def _store_blob(i: int, j: int, hdr: dict, cols) -> None:
+    p = _path(i, j)
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix('.tmp')
+    tmp.write_bytes(zlib.compress(encode(hdr, cols, None, 'delta_u64'), 6))
+    os.replace(tmp, p)
+    with _stored_gen_guard:
+        _stored_gen_cache.pop(p.name, None)
+
+
+TREE_COLS = ('tree_h_n', 'tree_h', 'canopy_h_p50', 'canopy_h_p90', 'tree_n', 'tree_h_max')
+
+
+def tree_cols_for(tb, ids: np.ndarray, unknown: np.ndarray) -> dict:
+    """The apex-derived columns for the cell list *ids* from a Table — used by ``build_bin``
+    and by ``patch_tree_cols`` (one implementation, so a patched bin equals a rebuilt one)."""
+    N = ids.size
+    pos = np.searchsorted(ids, tb.ids) if len(tb) else np.zeros(0, np.int64)
+    c90 = np.full(N, np.nan); c50 = np.full(N, np.nan)
+    th_n = np.zeros(N, '<u2'); th = np.zeros(0, np.uint8)
+    if len(tb):
+        ci, words = tb.gather_trees()
+        if words.size:
+            h = ca.decode_trees(words)['h_m']
+            _, c50, c90, _ = _per_cell_stats(pos[ci], h, N)
+            th_n, th = ragged_heights(pos[ci], h, N)
+    tn = np.zeros(N, np.uint8); thx = np.full(N, 255, np.uint8)
+    if len(tb):
+        tn[pos] = tb.obs['tn']; thx[pos] = tb.obs['thx']
+    return {'canopy_h_p90': _u8h(c90, np.isfinite(c90), unknown), 'canopy_h_p50': _u8h(c50, np.isfinite(c50), unknown),
+            'tree_h_n': th_n, 'tree_h': th, 'tree_n': tn, 'tree_h_max': thx}
+
+
+def patch_tree_cols(i: int, j: int, cell_ids: np.ndarray, old_gen: str) -> str:
+    """After a tree-QA change: rewrite only the apex-derived columns of *cell_ids* inside the
+    stored bin (no grid25 / raster join) and stamp it with the new generation.
+    'patched' | 'rebuilt' (patch not possible → full build) | 'left_to_prewarm' (the stored
+    blob was not current before the change — the prewarm rebuilds it anyway)."""
+    if stored_gen(i, j) != old_gen:
+        return 'left_to_prewarm'
+    inp = bin_inputs(i, j)
+    if inp['gen'] == old_gen:
+        return 'patched'
+    with _lock_for((i, j)):
+        try:
+            hdr, cols = decode(zlib.decompress(_path(i, j).read_bytes()))
+            if hdr.get('gen') != old_gen or hdr.get('algo') != ALGO or any(c not in cols for c in TREE_COLS):
+                raise ValueError('stored blob not patchable')
+            ids = np.asarray(cols['id']).astype(np.uint64)
+            sub = np.intersect1d(np.asarray(cell_ids, np.uint64), ids)
+            if sub.size:
+                rows = np.searchsorted(ids, sub)
+                tb, _, _ = ca.select(sub, tuple(inp['bbox']))
+                unknown = np.asarray(cols['obs'])[rows] == 0 if 'obs' in cols else np.zeros(sub.size, bool)
+                new = tree_cols_for(tb, sub, unknown)
+                cols = OrderedDict((k, np.array(v)) for k, v in cols.items())
+                old_n = cols['tree_h_n'].astype(np.int64); new_n = old_n.copy(); new_n[rows] = new['tree_h_n']
+                keep = np.ones(ids.size, bool); keep[rows] = False
+                blob = np.zeros(int(new_n.sum()), np.uint8)
+                off = ragged_offsets(new_n)[:-1]
+                kidx = np.flatnonzero(keep)
+                if kidx.size and old_n[kidx].sum():
+                    c = old_n[kidx]
+                    dst = np.repeat(off[kidx] - (np.cumsum(c) - c), c) + np.arange(int(c.sum()))
+                    blob[dst] = cols['tree_h'][np.repeat(keep, old_n)]
+                c = new['tree_h_n'].astype(np.int64)
+                if c.sum():
+                    dst = np.repeat(off[rows] - (np.cumsum(c) - c), c) + np.arange(int(c.sum()))
+                    blob[dst] = new['tree_h']
+                cols['tree_h_n'] = new_n.astype('<u2'); cols['tree_h'] = blob
+                for k in ('canopy_h_p50', 'canopy_h_p90', 'tree_n', 'tree_h_max'):
+                    cols[k][rows] = new[k]
+            hdr = dict(hdr, gen=inp['gen'], tree_qa_patched_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+            _store_blob(i, j, hdr, cols)
+            _blob_lru.put((i, j, inp['gen']), (hdr, cols))
+            return 'patched'
+        except Exception as e:  # noqa: BLE001
+            log.warning('cells_bins: tree patch %s,%s: %s — rebuilding', i, j, e)
+    load_bin(i, j, rebuild=True)
+    return 'rebuilt'
 
 
 # === SECTION: manifest (every bin that touches a published product) ===
@@ -1032,16 +1079,16 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
     runs with a 30 min budget until all of Austria is on disk).  The on-disk
     generation is read from the blob header only (:func:`stored_gen`), so a
     pass over an all-current corpus costs ~2 s."""
-    from concurrent.futures import ThreadPoolExecutor
-    # phase 0 (tree_qa): re-evaluate the default tree filter where its inputs changed; flips a
-    # bin's generation and rebuilds that bin + its stored blocks in one go (≤ 60 % of the budget)
+    # phase 0 (tree_qa): re-evaluate the default tree filter where its inputs changed and patch
+    # the affected cells inside the stored bins + re-store their blocks (≤ 50 % of the budget)
     tq = None; t00 = time.time()
     try:
-        tq = _tree_qa.refresh(None if budget_s is None else budget_s * 0.6, limit, verbose=verbose)
+        tq = _tree_qa.refresh(None if budget_s is None else budget_s * 0.5, None, verbose=verbose)
     except Exception as e:  # noqa: BLE001
         log.warning('cells_bins: tree_qa refresh: %s', e); tq = {'error': str(e)}
     if budget_s is not None:
         budget_s = max(30.0, budget_s - (time.time() - t00))
+    from concurrent.futures import ThreadPoolExecutor
     m = manifest(); b = m['bins']
     t0 = time.time()
     todo_missing = []; todo_stale = []; n_ok = 0
@@ -1088,7 +1135,6 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
            'remaining': len(todo_missing) + len(todo_stale) - n_built,
            'budget_s': budget_s, 'stopped_on_budget': bool(stop), 'seconds': round(time.time() - t0, 1),
            'finished_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'generation': m['generation']}
-    out['tree_qa'] = tq
     # phase 2 + 3 (cells_blocks): prebuilt NEXB v2 blocks, then the national
     # sample — both derived from the bins just (re)built, same budget.
     if blocks and not stop:
@@ -1107,6 +1153,7 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
                 log.warning('cells_bins: prewarm sample: %s', e); out['sample'] = {'error': str(e)}
         out['seconds'] = round(time.time() - t0, 1)
         out['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    out['tree_qa'] = tq
     try:
         BIN_DIR.mkdir(parents=True, exist_ok=True)
         STATE_PATH.write_text(json.dumps(out, indent=1))

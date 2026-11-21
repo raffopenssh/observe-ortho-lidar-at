@@ -382,7 +382,7 @@ def load_kg(kg: str) -> dict | None:
             continue
         row = dict(hrow, r10=int(hrow['r10'], 16), trees=nt, bld=int(hrow.get('bld') or 0))
         try:
-            ch = ca._load_chunk(kg, row, hdr)
+            ch = ca._load_chunk(kg, row, hdr, qa=False)
         except Exception:  # noqa: BLE001
             continue
         d = ca.decode_trees(ch.trees)

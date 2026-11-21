@@ -450,6 +450,34 @@ columns as unavailable for every filtered row.
   `?h3=<that res-10 cell>` figure for figure; the full 0.1° list and its
   1-in-49 sample × 49 agree within ~3 %.
 
+## 12e. Tree QA: cell tree fields = the default `/trees/bbox` apex set (`tree_qa.py`, 2026-11-21)
+
+`tree_h` / `tree_h_n`, `tree_n`, `tree_h_max`, `canopy_h_p50/p90` (bins, blocks, sample, `/cells`,
+KG container, national `tree_n` / `tree_hh`, the NEO1 rows posted to umfeld) are computed from the
+apices `/api/v1/trees/bbox` returns by default (`realistic=1`, `min_height=3`). `h_max`, `h_p90`,
+`crown_frac` stay raw nDSM surface statistics.
+
+* **One predicate**: `ne_trees._qa_mask` (height rule, linear-noise runs, reader flags, legacy QA
+  flags). `/trees/bbox` applies it per request on the stored inventory (`_load_chunk(qa=False)`).
+* **Materialised once**: `tree_qa.refresh()` evaluates it per KG on the candidate res-10 chunks only
+  and stores the hidden NET1 row indices in `data/ne/tree_qa.sqlite` (`hid`, `kg`, `binkg`).
+* **Applied at one choke point**: `cells_api._load_chunk` (default `qa=True`) looks the chunk up in an
+  in-memory snapshot and calls `tree_qa.patch` — rows dropped, `tn` / `thx` rewritten for the cells
+  that lost an apex. `ne_h3.neo1_rows_from_h3b` uses the same `patch` for posted rows. KG files are
+  never modified (`realistic=0` = raw inventory).
+* **Validity**: chunk LRU key + per-KG ETags + pub-container name carry the chunk / KG token; a bin's
+  generation folds `tree_qa.bin_tok` **only when non-empty** — unaffected bins keep bytes, gen, ETag.
+  Store entries are bound to the file's NEO1 digest; a re-ingested file is re-evaluated at index time
+  (`ne_ingest._index_cells` → `refresh_kg`).
+* **Refresh** = phase 0 of the hourly `cells-bins.service` (≤ 50 % of its budget, flock single-flight,
+  one transaction per KG, resumable). A changed KG's bins are *patched* (`cells_bins.patch_tree_cols`:
+  only the apex columns of the affected cells; same `tree_cols_for` as `build_bin`) and their blocks
+  re-stored, so public workers never build on demand.
+* Ops: `python3 tree_qa.py --status`, `--refresh [--budget-s N]`, `--kg 92001`; `tree_qa:` line in
+  `/process.txt`; `python3 tests/test_tree_qa.py`. `RULE_ID` bump = re-evaluate every KG.
+* Known: `/trees/bbox` returns a cell's apices once per KG file that stores the cell (KG-overlap
+  duplicates); the cell products keep the owner KG's copy only. Compare per owner KG.
+
 ## 12d. Apex-height lists and national histogram (2026-11-03)
 
 * Bins, NEXB v2 blocks and the centre-child sample accept `tree_h`:

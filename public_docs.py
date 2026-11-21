@@ -160,6 +160,10 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
     in row order, each SORTED ASCENDING); off = [0, cumsum(tree_h_n)], cell k = tree_h[off[k]:off[k+1]], a
     height-range count = two searchsorted per cell. columns[] entry carries shape:"ragged", counts:"tree_h_n".
     Only materialised when tree_h is in fields= (≈ +1 B per apex, ≈ +40 % on a glyph block zstd).
+    Tree fields and /trees/bbox agree (since 2026-11-21): tree_h / tree_h_n / tree_n / tree_h_max / canopy_h_p50 /
+    canopy_h_p90 count exactly the apices /api/v1/trees/bbox returns by default (realistic=1, min_height=3) for
+    the cell's kg; h_max / h_p90 / crown_frac stay raw surface statistics. A bin's gen changes only when its apex
+    set does.
     fields=* for everything, ~17 k cells per bin, ≤ ~60 KB gz for the 9-field terrain+building set.
     Headers: ETag "b-<gen>-<fields>" (strong; If-None-Match → 304 without touching the blob),
     X-Cells-Gen = the bin generation — KEY YOUR COPY ON THIS (changes iff a contributing product changed;

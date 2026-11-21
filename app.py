@@ -20539,6 +20539,12 @@ def process_txt():
                 out.append(_line)
         except Exception as _e:
             out.append(f'v2_regen: unavailable ({_e})')
+        # tree_qa: apices hidden from the cell products (= /trees/bbox default set)
+        try:
+            import tree_qa as _tq
+            out.append(_tq.text_line())
+        except Exception as _e:
+            out.append(f'tree_qa: unavailable ({_e})')
         # label_mix: products stitched with colliding label ids (restored
         # tile checkpoints, Oct 2026) — detected from the NE cells, auto-
         # requeued for a full rerun (label_mix.py); grep `?q=label_mix`.

@@ -100,7 +100,7 @@ def chunk_max_from_file(kg: str, hdr: dict | None = None) -> dict[int, tuple[int
             continue
         row = dict(hrow, r10=r10, trees=nt, bld=nb)
         try:
-            ch = ca._load_chunk(kg, row, h)
+            ch = ca._load_chunk(kg, row, h, qa=False)
         except Exception as ex:  # noqa: BLE001
             log.warning('ne_trees: chunk %s/%x unreadable for hmax: %s', kg, r10, ex)
             continue
@@ -416,7 +416,7 @@ def _decoded_chunk(kg: str, r: dict, hdr: dict, kind: str) -> dict | None:
 
 
 def _decode_chunk_uncached(key, kg: str, r: dict, hdr: dict, kind: str) -> dict:
-    ch = ca._load_chunk(kg, r, hdr)
+    ch = ca._load_chunk(kg, r, hdr, qa=False)        # the stored inventory — QA is applied per request
     hs, cell_idx, dec = _decode(kind, ch)
     if hs.size == 0:
         d = {'n': 0}
@@ -559,13 +559,13 @@ def _qa_mask(d: dict, x_: dict, kg: str, m, q: dict):
     return m
 
 
-def chunk_keep(ch, q: dict):
+def chunk_keep(ch, q: dict, hdr: dict | None = None):
     """Keep-mask over the NET1 rows of a loaded ``cells_api.Chunk`` = exactly the apices
-    /trees/bbox returns by default (realistic=1, min_height=3).  None = every apex."""
+    /trees/bbox returns by default (realistic=1, min_height=3).  None = every apex.
+    *ch* must be the stored inventory (``_load_chunk(…, qa=False)``); used by ``tree_qa``."""
     if not ch.trees.size:
         return None
-    hdr = ca.header(ch.kg)
-    d = _decoded_chunk(ch.kg, ch.row, hdr, 'trees')
+    d = _decoded_chunk(ch.kg, ch.row, hdr or ca.header(ch.kg), 'trees')
     if not d or not d['n']:
         return None
     x_ = d.get('ext')

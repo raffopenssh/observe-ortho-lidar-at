@@ -26,6 +26,7 @@ import os
 import sqlite3
 import ne_green_fix as _green_fix
 import ne_pos_fix as _pos_fix
+import tree_qa as _tree_qa
 import struct
 import threading
 import time
@@ -604,9 +605,14 @@ class Chunk:
         return self.pub_z
 
 
-def _load_chunk(kg: str, row: dict, hdr: dict, raw: bool = False) -> Chunk:
-    """``raw=True`` (ne_pos_fix measurement only): stored positions, not cached."""
-    key = (kg, hdr['neo1_digest'], int(row['r10']), _green_fix.FIX_ID + _pos_fix.tag(kg))
+def _load_chunk(kg: str, row: dict, hdr: dict, raw: bool = False, qa: bool = True) -> Chunk:
+    """``raw=True`` (ne_pos_fix measurement only): stored positions, not cached.
+    ``qa`` (default): the apices /trees/bbox hides by default are dropped and tree_n /
+    tree_h_max follow (``tree_qa.py``); ``qa=False`` = the stored inventory (ne_trees,
+    ne_linear, tree_qa itself)."""
+    qa_idx = _tree_qa.chunk_idx(kg, int(row['r10']), hdr['neo1_digest']) if qa and not raw else None
+    key = (kg, hdr['neo1_digest'], int(row['r10']), _green_fix.FIX_ID + _pos_fix.tag(kg)
+           + ('' if qa_idx is None else '|tq%08x' % zlib.crc32(qa_idx)))
     ch = None if raw else _lru_get(_chunk_lru, key)
     if ch is not None:
         return ch
@@ -633,6 +639,9 @@ def _load_chunk(kg: str, row: dict, hdr: dict, raw: bool = False) -> Chunk:
         return Chunk(kg, row, parts)
     # position override for KGs built on 5 m-shifted rasters (ne_pos_fix.py, measured per KG)
     parts['trees'], parts['bld'] = _pos_fix.fix_words(kg, parts['trees'], parts['bld'])
+    if qa_idx is not None:
+        parts['obs'], parts['trees'] = _tree_qa.patch(parts['obs'], parts['trees'], qa_idx)
+        row = dict(row, trees=len(parts['trees']) // 4)
     ch = Chunk(kg, row, parts)
     _lru_put(_chunk_lru, key, ch, CHUNK_LRU_N)
     return ch
@@ -749,15 +758,14 @@ class Table:
         return _gather_rows(self, 'bld_off', 'bld')
 
 
-def _gather_rows(t: Table, off_attr: str, arr_attr: str, arrs: list | None = None):
-    """``arrs`` = one array per chunk parallel to its rows (e.g. a keep-mask) gathered instead of the rows."""
+def _gather_rows(t: Table, off_attr: str, arr_attr: str):
     n = len(t)
     if n == 0:
         return np.zeros(0, np.int64), np.zeros(0, np.uint64)
     base = np.zeros(len(t.chunks) + 1, np.int64)
     for i, ch in enumerate(t.chunks):
         base[i + 1] = base[i] + len(getattr(ch, arr_attr))
-    allw = np.concatenate(arrs if arrs is not None else [getattr(ch, arr_attr) for ch in t.chunks]) if t.chunks else np.zeros(0)
+    allw = np.concatenate([getattr(ch, arr_attr) for ch in t.chunks]) if t.chunks else np.zeros(0)
     starts = np.empty(n, np.int64); cnt = np.empty(n, np.int64)
     for i, ch in enumerate(t.chunks):
         m = t.src_chunk == i
@@ -1446,7 +1454,8 @@ def pub_file(kg: str) -> Path | None:
     h = header(kg)
     if h is None:
         return None
-    out = PUB_DIR / f'{kg}-{h["neo1_digest"]}-{_green_fix.FIX_ID}{_pos_fix.tag(kg).replace("|", "-")}.h3b'
+    tq = _tree_qa.kg_tok(kg)
+    out = PUB_DIR / f'{kg}-{h["neo1_digest"]}-{_green_fix.FIX_ID}{_pos_fix.tag(kg).replace("|", "-")}{"-tq" + tq if tq else ""}.h3b'
     if out.exists():
         return out
     with _pub_lock:
@@ -1538,7 +1547,7 @@ def _format(allowed=FORMATS, default: str = 'json') -> str:
 
 
 def _etag(hdrs: dict, extra: str = '') -> str:
-    digs = sorted(str(h.get('neo1_digest')) + _pos_fix.tag(k) for k, h in hdrs.items())
+    digs = sorted(str(h.get('neo1_digest')) + _pos_fix.tag(k) + _tree_qa.kg_tok(k) for k, h in hdrs.items())
     canon = request.method + ' ' + request.path + '?' + '&'.join(f'{k}={v}' for k, v in sorted(request.args.items(multi=True)))
     if request.method == 'POST':
         canon += '#' + hashlib.sha256(request.get_data() or b'').hexdigest()[:16]
@@ -2055,7 +2064,7 @@ def kg_cells(code):
         if bb is None:
             raise CellsError(404, f'unknown KG {code}')
         return _not_ready({'kgs': [], 'kgs_missing': [code]})
-    etag = '"c-' + hashlib.sha256(f'{code}|{h["neo1_digest"]}{_pos_fix.tag(code)}|{fmt}|{_green_fix.FIX_ID}'.encode()).hexdigest()[:16] + '"'
+    etag = '"c-' + hashlib.sha256(f'{code}|{h["neo1_digest"]}{_pos_fix.tag(code)}{_tree_qa.kg_tok(code)}|{fmt}|{_green_fix.FIX_ID}'.encode()).hexdigest()[:16] + '"'
     if fmt == 'json':
         d = {'kg': code, 'ready': True, 'cells_n': h['cells_n'], 'epoch': h['epoch'], 'product_version': h['product_version'],
              'partial': bool(h.get('partial_cells')), 'neo1_digest': h['neo1_digest'], 'summary': h['summary'],

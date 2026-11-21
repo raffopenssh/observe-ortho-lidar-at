@@ -1828,8 +1828,19 @@ def neo1_rows_from_h3b(path: str | Path, green_fix: bool = True,
     hdr = read_h3b_header(path)
     obs = bytearray()
     n_fix = n_tree = 0
+    tq = None
     if green_fix:
         import ne_green_fix as _gf
+        # tree QA (tree_qa.py, primary only): tree_n / tree_h_max follow the default /trees/bbox apex set.
+        # Only for the corpus file the store was evaluated on (name + NEO1 digest).
+        if Path(path).name == f"{hdr.get('kg')}.h3b":
+            try:
+                import tree_qa as tq
+                if not tq.kg_tok(hdr["kg"], hdr["neo1"]["digest"]):
+                    tq = None
+            except Exception:  # noqa: BLE001
+                tq = None
+    n_qa = 0
     for ch in hdr["chunks"]:
         part = read_h3b_chunk(path, hdr, ch)
         o = part["obs"]
@@ -1837,10 +1848,15 @@ def neo1_rows_from_h3b(path: str | Path, green_fix: bool = True,
             o, kt, kg = _gf.fix_rows_detail(o, part["lu"])
             n_fix += kt + kg
             n_tree += kt
+            idx = tq.chunk_idx(hdr["kg"], int(ch["r10"], 16), hdr["neo1"]["digest"]) if tq else None
+            if idx is not None:
+                o, _ = tq.patch(o, part["trees"], idx)
+                n_qa += len(idx) // 2
         obs += o
     if counts is not None:
         counts["tree"] = n_tree
         counts["green"] = n_fix - n_tree
+        counts["tree_qa"] = n_qa
     return hdr, bytes(obs), n_fix
 
 

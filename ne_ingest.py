@@ -622,6 +622,8 @@ def _index_cells(path: Path) -> None:
     try:
         import cells_api
         cells_api.index_file(path)
+        import tree_qa
+        tree_qa.refresh_kg(path.stem)        # hidden-apex store follows the new file at once
     except Exception as ex:  # noqa: BLE001
         log.warning("ne_ingest: cells index %s failed: %s", path.name, ex)
 
@@ -1014,7 +1016,12 @@ def _our_digest(parent: str, idx: dict, green_fix: bool = True) -> str | None:
         return raw
     gf = (tgt or {}).get("green_fix") or {}
     import ne_green_fix
-    if gf.get("id") == ne_green_fix.FIX_ID and gf.get("of") == raw and gf.get("digest"):
+    try:
+        import tree_qa
+        tq = tree_qa.kg_tok(parent)          # tree_n / tree_h_max follow the default /trees/bbox apex set
+    except Exception:  # noqa: BLE001
+        tq = ""
+    if gf.get("id") == ne_green_fix.FIX_ID and gf.get("of") == raw and gf.get("digest") and (gf.get("tq") or "") == tq:
         return gf["digest"]
     if _gf_budget[0] <= 0:
         return None                                       # computed on a later tick (budget per confirm pass)
@@ -1027,7 +1034,7 @@ def _our_digest(parent: str, idx: dict, green_fix: bool = True) -> str | None:
         log.warning("ne_ingest: green-fix digest %s failed: %s", parent, ex)
         return raw
     if tgt is not None:
-        tgt["green_fix"] = {"id": ne_green_fix.FIX_ID, "of": raw, "digest": d, "cells": int(n),
+        tgt["green_fix"] = {"id": ne_green_fix.FIX_ID, "of": raw, "digest": d, "cells": int(n), "tq": tq,
                             "tree_cells": int(cnt.get("tree") or 0)}
     return d
 
