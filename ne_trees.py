@@ -34,6 +34,7 @@ import numpy as np
 
 import cells_api as ca
 import ne_pos_fix as _pos_fix
+import tree_rule
 
 log = logging.getLogger('ne_trees')
 
@@ -44,10 +45,12 @@ KINDS = ('trees', 'structures')
 # A "spike" (tallest apex of its res-10 chunk with h/p90 > 1.6, or > 15 m above
 # the second tallest) occurs in 0.2-0.4 % of ordinary trees but in 27 / 48 / 69 %
 # of the 50-55 / 55-60 / >= 60 m bands.  Below 45 m spikes are real trees.
-TREE_H_SATURATED = 60.0         # >= this: quantisation ceiling, treated as non-tree
-TREE_SPIKE_H = 45.0             # spike rules apply from here
-TREE_SPIKE_RATIO = 1.6          # h / p90(chunk)
-TREE_SPIKE_GAP = 15.0           # h - second tallest in chunk (m)
+# The rule itself lives in tree_rule.py (shared with the ne_h3 builder); files whose header
+# says it was applied at build time (net1.tree_rule) are not filtered again here.
+TREE_H_SATURATED = tree_rule.H_SATURATED
+TREE_SPIKE_H = tree_rule.SPIKE_H
+TREE_SPIKE_RATIO = tree_rule.SPIKE_RATIO
+TREE_SPIKE_GAP = tree_rule.SPIKE_GAP
 STRUCT_H_MAX = {                # per type, metres (realistic=1)
     'roof': 250.0, 'greenhouse': 15.0, 'solar_panel': 12.0, 'mast': 350.0, 'wind_turbine': 260.0,
     'substation': 40.0, 'bridge': 200.0, 'wall': 12.0, 'fence': 6.0,
@@ -429,12 +432,7 @@ def _decode_chunk_uncached(key, kg: str, r: dict, hdr: dict, kind: str) -> dict:
          'x': x.astype(np.int32), 'y': y.astype(np.int32), 'h': hs.astype(np.float32),
          'cell': ch.ids[cell_idx].astype(np.uint64)}
     if kind == 'trees':
-        ok = hs < TREE_H_SATURATED
-        if hs.size > 1 and hs.max() >= TREE_SPIKE_H:
-            srt = np.sort(hs)
-            p90 = float(np.percentile(hs, 90)); sec = float(srt[-2])
-            spike = (hs >= TREE_SPIKE_H) & ((hs / max(p90, 1.0) > TREE_SPIKE_RATIO) | (hs - sec > TREE_SPIKE_GAP))
-            ok &= ~spike
+        ok = np.ones(hs.size, bool) if tree_rule.built_with(hdr) else tree_rule.keep_mask(hs)
         d.update(crown_m2=dec['crown_m2'].astype(np.float32), species=dec['species'].astype(np.uint8),
                  vitality=dec['vitality'].astype(np.uint8), ndsm_only=dec['ndsm_only'].astype(bool))
     else:

@@ -473,6 +473,25 @@ apices `/api/v1/trees/bbox` returns by default (`realistic=1`, `min_height=3`). 
   one transaction per KG, resumable). A changed KG's bins are *patched* (`cells_bins.patch_tree_cols`:
   only the apex columns of the affected cells; same `tree_cols_for` as `build_bin`) and their blocks
   re-stored, so public workers never build on demand.
+* **Height rule = `tree_rule.keep_mask`** (pure numpy; constants + `RULE_ID` in `tree_rule.py`, the one
+  place to bump — `tree_qa.RULE_ID` is the same value). Two callers: `ne_trees._decode_chunk_uncached`
+  (read time) and `ne_h3.build_observed` (build time, on peers — height rule only, peers have no flags /
+  linear-noise data): the builder drops those apices before NET1 is written, `tree_n` / `tree_h_max`
+  come from the kept set (`quant_h`), `h_max` / `h_p90` / `crown_frac` stay raw, and the h3b header
+  records `net1.tree_rule = {id, dropped}`.
+* **Two file generations** (`tree_rule.built_with(hdr)`): no marker (every file built before
+  2026-11-21, never rebuilt) or another rule id → height rule at read time through `tree_qa`, as
+  before; marker with the current id → `ne_trees` skips the height rule and `tree_qa` drops the
+  height candidates (no double application); linear-noise / flag hides go through `tree_qa` for both.
+  `ne_ingest.merge_blocks` keeps the marker only when every source carries the same id (`merged: true`);
+  a merge with an old file is an old file. `tests/test_tree_rule.py`: built-with-rule bytes ==
+  unfiltered build + `tree_qa.patch`.
+* **Snapshot race guard** (`tree_qa.sync()`): the per-process snapshot is ≤ 30 s old; before a reader
+  builds or replaces a stored product on a generation mismatch (`cells_bins.load_bin`,
+  `cells_blocks.serve_block`, and `store_block` always) it stats the store (`version()`), reloads when
+  it changed and re-checks — a stale worker no longer rebuilds the refresher's patched bin with the
+  old filter. Builds therefore run on a current snapshot (chunk LRU key included).
+  `tests/test_tree_qa.py::test_snapshot_race`.
 * Ops: `python3 tree_qa.py --status`, `--refresh [--budget-s N]`, `--kg 92001`; `tree_qa:` line in
   `/process.txt`; `python3 tests/test_tree_qa.py`. `RULE_ID` bump = re-evaluate every KG.
 * Known: `/trees/bbox` returns a cell's apices once per KG file that stores the cell (KG-overlap

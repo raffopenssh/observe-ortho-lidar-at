@@ -217,6 +217,7 @@ def current_gen(bi: int, bj: int) -> tuple[str, list[dict]]:
 def store_block(bi: int, bj: int, fields, *, rebuild: bool = False) -> dict:
     """Build + write ``<bi>_<bj>.<fh>.nexb.zst`` and its meta → meta."""
     t0 = time.time()
+    cb._tree_qa.sync()                      # build on the current tree-QA store, never a stale snapshot
     hdr, raw, inps = build_block(bi, bj, fields, rebuild=rebuild)
     z = zcompress(raw)
     zp, mp = _paths(bi, bj, fields)
@@ -248,6 +249,8 @@ def serve_block(bi: int, bj: int, fields, *, rebuild: bool = False) -> tuple[byt
     if body is None:
         with cb._lock_for(('block', bi, bj, fields_hash(fields))):
             meta = None if rebuild else stored_meta(bi, bj, fields)
+            if not (meta and meta.get('gen') == gen) and cb._tree_qa.sync():
+                gen, inps = current_gen(bi, bj)      # stale snapshot: the stored block may be the newer one
             if meta and meta.get('gen') == gen and meta.get('algo') == ALGO and meta.get('zstd_level') == ZSTD_LEVEL:
                 body = zp.read_bytes()
             else:

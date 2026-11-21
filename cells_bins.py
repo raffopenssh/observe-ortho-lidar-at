@@ -695,42 +695,47 @@ def load_bin(i: int, j: int, *, rebuild: bool = False, need=None) -> tuple[dict,
     Returns (hdr, cols, inputs).  A blob of an older algo is accepted (its
     columns are byte-identical) unless a column in ``need`` is absent from it —
     then it is rebuilt in place (and the prewarm rebuilds all of them anyway)."""
-    inp = bin_inputs(i, j)
-    key = (i, j, inp['gen'])
     need = tuple(need or ())
+    for attempt in (0, 1):
+        inp = bin_inputs(i, j)
+        key = (i, j, inp['gen'])
 
-    def ok(hdr, cols):
-        return hdr.get('gen') == inp['gen'] and (hdr.get('algo') == ALGO or (hdr.get('algo') in COMPAT_ALGOS
-                                                                          and all(f in cols for f in need)))
-    hit = None if rebuild else _blob_lru.get(key)
-    if hit is not None and ok(*hit):
-        return hit[0], hit[1], inp
-    with _lock_for((i, j)):
+        def ok(hdr, cols):
+            return hdr.get('gen') == inp['gen'] and (hdr.get('algo') == ALGO or (hdr.get('algo') in COMPAT_ALGOS
+                                                                              and all(f in cols for f in need)))
         hit = None if rebuild else _blob_lru.get(key)
         if hit is not None and ok(*hit):
             return hit[0], hit[1], inp
-        p = _path(i, j)
-        if not rebuild and p.exists():
+        with _lock_for((i, j)):
+            hit = None if rebuild else _blob_lru.get(key)
+            if hit is not None and ok(*hit):
+                return hit[0], hit[1], inp
+            p = _path(i, j)
+            if not rebuild and p.exists():
+                try:
+                    hdr, cols = decode(zlib.decompress(p.read_bytes()))
+                    if ok(hdr, cols):
+                        _blob_lru.put(key, (hdr, cols))
+                        return hdr, cols, inp
+                except Exception as e:  # noqa: BLE001
+                    log.warning('cells_bins: unreadable %s: %s', p, e)
+            # about to build and replace the stored blob: never on a stale tree-QA snapshot
+            # (tree_qa.sync — the blob on disk may be the refresher's newer generation)
+            if attempt == 0 and _tree_qa.sync():
+                continue
+            b = build_bin(i, j, inp)
+            hdr, cols = b['hdr'], b['cols']
             try:
-                hdr, cols = decode(zlib.decompress(p.read_bytes()))
-                if ok(hdr, cols):
-                    _blob_lru.put(key, (hdr, cols))
-                    return hdr, cols, inp
+                BIN_DIR.mkdir(parents=True, exist_ok=True)
+                tmp = p.with_suffix('.tmp')
+                tmp.write_bytes(zlib.compress(encode(hdr, cols, None, 'delta_u64'), 6))
+                os.replace(tmp, p)
+                with _stored_gen_guard:
+                    _stored_gen_cache.pop(p.name, None)
             except Exception as e:  # noqa: BLE001
-                log.warning('cells_bins: unreadable %s: %s', p, e)
-        b = build_bin(i, j, inp)
-        hdr, cols = b['hdr'], b['cols']
-        try:
-            BIN_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_suffix('.tmp')
-            tmp.write_bytes(zlib.compress(encode(hdr, cols, None, 'delta_u64'), 6))
-            os.replace(tmp, p)
-            with _stored_gen_guard:
-                _stored_gen_cache.pop(p.name, None)
-        except Exception as e:  # noqa: BLE001
-            log.warning('cells_bins: store %s: %s', p, e)
-        _blob_lru.put(key, (hdr, cols))
-        return hdr, cols, inp
+                log.warning('cells_bins: store %s: %s', p, e)
+            _blob_lru.put(key, (hdr, cols))
+            return hdr, cols, inp
 
 
 def _store_blob(i: int, j: int, hdr: dict, cols) -> None:

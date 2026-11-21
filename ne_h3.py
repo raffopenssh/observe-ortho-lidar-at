@@ -1445,6 +1445,27 @@ def build_observed(declared: Section, seg_type_full: np.ndarray, ndsm_full: np.n
             w = (_bits(dx, 5) | (_bits(dy, 5) << 5) | (hq << 10) | (cq << 18) | (sp << 24)
                  | (vt << 28) | (fl << 31))
             net_rows[c].append(w)
+    # static apex-height rule (tree_rule.py — the same function /trees/bbox applies to files built
+    # without it): evaluated per res-10 chunk on the stored heights, apices dropped before NET1
+    # is written; tree_n / tree_h_max follow the kept set.  crown_frac / h_max / h_p90 stay raw.
+    import tree_rule as _trule
+    tree_rule_dropped = 0
+    _cnt = np.array([len(r) for r in net_rows], np.int64)
+    if _cnt.sum():
+        _w = np.fromiter((w for r in net_rows for w in r), np.uint32, int(_cnt.sum()))
+        _cell = np.repeat(np.arange(n_cells), _cnt)
+        _hq = ((_w >> np.uint32(10)) & np.uint32(255)).astype(np.float64) / 4.0
+        _keep = _trule.keep_mask(_hq, h3_parent_vec(cids, CHUNK_RES)[_cell])
+        if not _keep.all():
+            _off = np.concatenate([[0], np.cumsum(_cnt)])
+            for c in np.unique(_cell[~_keep]).tolist():
+                k = _keep[_off[c]:_off[c + 1]]
+                net_rows[c] = [w for w, kk in zip(net_rows[c], k) if kk]
+                tree_n[c] = len(net_rows[c])
+                # quantised like tree_qa.patch (quant_h of the stored 0.25 m height)
+                tree_h_max[c] = float(_trule.quant_h(_hq[_off[c]:_off[c + 1]][k]).max()) / 2.0 if k.any() else np.nan
+            tree_rule_dropped = int((~_keep).sum())
+            n_trees_total -= tree_rule_dropped
     crown_frac = np.clip(crown_m2 / cell_area, 0, 1)
 
     # --- man-made objects (NEB1) ----------------------------------------------
@@ -1605,6 +1626,7 @@ def build_observed(declared: Section, seg_type_full: np.ndarray, ndsm_full: np.n
                    **({"als_years": als_hdr} if als_hdr else {}))
     net_hdr = dict(common, algo=ALGO_TREES, rows_n=n_trees_total, record="u32: dx:5 dy:5 h:8(0.25m) crown:6(log2*5) species:4 vitality:3 flag:1",
                    species=list(SPECIES_CODES), vitality=list(VITALITY_CODES), min_h_m=3.0,
+                   tree_rule=_trule.marker(tree_rule_dropped),
                    origin="metre-snapped EPSG:3035 cell centre; rows in NEO1 cell order, count = tree_n")
     neb_hdr = dict(common, algo=ALGO_BLD, rows_n=n_bld_total,
                    record="u64: dx:5 dy:5 h_max:8(0.25m) h_robust:8(0.25m) area:16(m2) type:4 conf:4 dh:8(i8 0.25m)",
@@ -1652,6 +1674,7 @@ def build_observed(declared: Section, seg_type_full: np.ndarray, ndsm_full: np.n
         "neb1": pack_section(MAGIC_BLD, neb_hdr, neb),
         "neo1_raw": neo, "net1_raw": net, "neb1_raw": neb,
         "tree_n": tree_n_u8, "bld_n": bld_n_u8, "verdict": verdict, "cell_ids": cids,
+        "tree_rule": _trule.marker(tree_rule_dropped),
         "summary": summary,
     }
 
@@ -1720,7 +1743,10 @@ def write_h3b(path: str | Path, declared: Section, obs: dict, kg: str, product_v
         "nec1": dict(declared.header),
         "neo1": {"algo": ALGO_OBS, "digest": digest_of(neo_raw), "record": OBS_REC.format,
                  "epoch": s["observed"]["epoch"], "source": OBS_SOURCE},
-        "net1": {"algo": ALGO_TREES, "digest": digest_of(net_raw), "rows_n": len(net_raw) // 4},
+        # tree_rule = the apex-height rule the NET1 rows were built with (tree_rule.py); absent on
+        # files built before 2026-11-21 → the primary applies it at read time (tree_qa.py)
+        "net1": {"algo": ALGO_TREES, "digest": digest_of(net_raw), "rows_n": len(net_raw) // 4,
+                 **({"tree_rule": obs["tree_rule"]} if obs.get("tree_rule") else {})},
         "neb1": {"algo": ALGO_BLD, "digest": digest_of(neb_raw), "rows_n": len(neb_raw) // 8},
         "k_records": {"n": len(k_raw) // K_REC.size, "zlib_b64": __import__("base64").b64encode(zlib.compress(k_raw, 9)).decode()},
         "summary": s, "chunks": chunks,

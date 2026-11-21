@@ -7,6 +7,7 @@ bin-generation fold.  Synthetic rows only — no corpus needed.
 import os
 import sys
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -68,6 +69,83 @@ def test_gen_fold_and_snapshot():
     finally:
         tree_qa.DB_PATH = old
         tree_qa._snap.update(t=0.0, ver='x')
+
+
+def test_snapshot_race():
+    """A worker with a stale (< 30 s old) snapshot meets a bin / block the refresher of ANOTHER
+    process just patched to the new generation: no rebuild, no overwrite, new generation served."""
+    import hashlib
+    import json
+    import time
+    import cells_blocks
+    d = Path(tempfile.mkdtemp())
+    saved = (tree_qa.DB_PATH, cb.BIN_DIR, cb.bin_inputs, cb.build_bin, cells_blocks.BLOCK_DIR, cells_blocks.store_block, tree_qa.sync)
+    saved_fs = cells_blocks.FIELDSETS_PATH; cells_blocks.FIELDSETS_PATH = d / 'fieldsets.json'   # never the live registry
+    tree_qa.DB_PATH = d / 'tree_qa.sqlite'; cb.BIN_DIR = d / 'bins'; cells_blocks.BLOCK_DIR = d / 'nexb'
+    I, J = 4, 8                                   # block (1, 2)
+    parts = [('00001', 'd', 0)]
+    builds = []; stores = []
+    try:
+        cb.bin_inputs = lambda i, j: {'i': i, 'j': j, 'bbox': cb.bin_bbox(i, j), 'kgs': ['00001'], 'on_disk': ['00001'],
+                                       'missing': [], 'partial_files': [], 'gen': cb._gen(i, j, parts, []), 'epoch': None}
+
+        def fake_build(i, j, inp=None):
+            builds.append((i, j, inp['gen']))
+            return {'hdr': {'gen': inp['gen'], 'algo': cb.ALGO, 'n': 1, 'built_by': 'stale worker'},
+                    'cols': OrderedDict(id=np.array([5], '<u8'))}
+        cb.build_bin = fake_build
+        cells_blocks.store_block = lambda *a, **k: stores.append(a) or (_ for _ in ()).throw(AssertionError('block rebuilt'))
+        tree_qa._conn().close()                                        # empty store
+        tree_qa._snap.update(t=0.0, ver='x')
+        old_gen = cb.bin_inputs(I, J)['gen']
+        assert old_gen == cb._base_gen(I, J, parts, []) and tree_qa._snap['ver'] == tree_qa.version()
+        # --- the refresher (another process): commit the KG, then patch the stored bin + block
+        con = tree_qa._conn()
+        con.execute("INSERT INTO hid VALUES ('00001', 77, ?)", (np.array([3], '<u2').tobytes(),))
+        con.execute("INSERT INTO binkg VALUES (?, ?, '00001', 'abc')", (I, J))
+        con.execute("INSERT INTO kg VALUES ('00001', 'sig', 'tok', 1, 1, 0, 'd')")
+        con.commit(); con.close()
+        new_gen = hashlib.sha256(f"{old_gen}|tq|{tree_qa._bin_tok({'00001': 'abc'})}".encode()).hexdigest()[:24]
+        cb._store_blob(I, J, {'gen': new_gen, 'algo': cb.ALGO, 'n': 1, 'built_by': 'refresher'}, OrderedDict(id=np.array([5], '<u8')))
+        blob = cb._path(I, J).read_bytes()
+        fields = list(cb.DEFAULT_FIELDS)
+        gens = [new_gen if ij == (I, J) else cb._base_gen(*ij, parts, []) for ij in cb.block_bins(1, 2)]
+        zp, mp = cells_blocks._paths(1, 2, fields)
+        zp.parent.mkdir(parents=True, exist_ok=True); zp.write_bytes(b'patched-block')
+        meta = {'gen': cb.block_gen(gens), 'algo': cells_blocks.ALGO, 'zstd_level': cells_blocks.ZSTD_LEVEL, 'bytes': 13,
+                'etag': cells_blocks.block_etag(cb.block_gen(gens), fields)}
+        mp.write_text(json.dumps(meta))
+        # --- the worker: snapshot still inside its 30 s TTL → expects the OLD generation
+        assert time.time() - tree_qa._snap['t'] < tree_qa._STAT_S and cb.bin_inputs(I, J)['gen'] == old_gen
+        # without the guard the race is real: old filter rebuilt + the patched blob overwritten
+        tree_qa.sync = lambda: False
+        hdr, _, _ = cb.load_bin(I, J)
+        assert builds == [(I, J, old_gen)] and hdr['built_by'] == 'stale worker' and cb._path(I, J).read_bytes() != blob
+        tree_qa.sync = saved[6]; builds.clear(); cb._blob_lru.clear()
+        cb._store_blob(I, J, {'gen': new_gen, 'algo': cb.ALGO, 'n': 1, 'built_by': 'refresher'}, OrderedDict(id=np.array([5], '<u8')))
+        assert cb.bin_inputs(I, J)['gen'] == old_gen                  # still stale
+        # with the guard
+        hdr, _, inp = cb.load_bin(I, J)
+        assert builds == [], builds
+        assert hdr['gen'] == new_gen == inp['gen'] and hdr['built_by'] == 'refresher'
+        assert cb._path(I, J).read_bytes() == blob
+        assert tree_qa.chunk_idx('00001', 77, 'd') is not None        # chunk LRU key follows the reloaded snapshot
+        # block: stale snapshot again (store rolled forward by "the refresher" once more)
+        tree_qa._snap.update(t=time.time(), ver='stale', bin={}, binkg={})
+        assert cells_blocks.current_gen(1, 2)[0] != meta['gen']
+        body, _, etag, m = cells_blocks.serve_block(1, 2, fields)
+        assert body == b'patched-block' and etag == meta['etag'] and not stores
+        # a snapshot that is current triggers no reload and a real mismatch still builds
+        assert tree_qa.sync() is False
+        cb._blob_lru.clear(); cb._path(I, J).unlink()
+        cb.load_bin(I, J)
+        assert builds == [(I, J, new_gen)]
+    finally:
+        (tree_qa.DB_PATH, cb.BIN_DIR, cb.bin_inputs, cb.build_bin, cells_blocks.BLOCK_DIR, cells_blocks.store_block, tree_qa.sync) = saved
+        cells_blocks.FIELDSETS_PATH = saved_fs
+        tree_qa._snap.update(t=0.0, ver='x'); cb._blob_lru.clear()
+        with cb._stored_gen_guard:
+            cb._stored_gen_cache.clear()
 
 
 def test_tree_cols_shared():

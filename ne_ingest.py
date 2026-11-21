@@ -447,7 +447,8 @@ def merge_blocks(parent: str, block_paths: list[Path], out_path: Path, *, comple
         h = ne_h3.read_h3b_header(p)
         facts.append({"nec1": dict(h["nec1"] or {}), "cells_n": int(h["cells_n"]),
                       "epoch": str((h.get("neo1") or {}).get("epoch") or ""),
-                      "pv": str(h.get("product_version") or ""), "record_bytes": dict(h.get("record_bytes") or {})})
+                      "pv": str(h.get("product_version") or ""), "record_bytes": dict(h.get("record_bytes") or {}),
+                      "tree_rule": (h.get("net1") or {}).get("tree_rule")})
         del h
     # Declared layer: all blocks normally share the parent's NEC1.  Since bev
     # mode builds it per block (bevdirect viewport on each peer) they can
@@ -595,6 +596,11 @@ def merge_blocks(parent: str, block_paths: list[Path], out_path: Path, *, comple
     obs = {"cell_ids": declared.cell_ids(), "neo1_raw": neo_raw, "net1_raw": trees, "neb1_raw": bld,
            "tree_n": np.minimum(tree_n, 255).astype(np.uint8), "bld_n": np.minimum(bld_n, 255).astype(np.uint8),
            "summary": summary}
+    # apex-height rule marker (tree_rule.py): kept only when EVERY source was built with the same
+    # rule id — a merge with a pre-rule file stays a pre-rule file (primary filters it at read time)
+    _tr = [f.get("tree_rule") for f in facts]
+    if all(isinstance(t, dict) and t.get("id") for t in _tr) and len({t["id"] for t in _tr}) == 1:
+        obs["tree_rule"] = {"id": _tr[0]["id"], "dropped": sum(int(t.get("dropped") or 0) for t in _tr), "merged": True}
     pv = sorted({f["pv"] for f in facts})[-1]
     out_path.parent.mkdir(parents=True, exist_ok=True)
     hdr = ne_h3.write_h3b(out_path, declared, obs, parent, pv,

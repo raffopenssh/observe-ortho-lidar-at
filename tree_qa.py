@@ -37,13 +37,14 @@ import zlib
 import numpy as np
 
 import ne_h3
+import tree_rule
 
 log = logging.getLogger('tree_qa')
 
 DB_PATH = ne_h3.NE_DIR / 'tree_qa.sqlite'
 BIN_DEG = 0.025
 _STAT_S = 30.0                  # snapshot reload at most this often per process
-RULE_ID = 'tq-1'                # bump to force a re-evaluation of every KG
+RULE_ID = tree_rule.RULE_ID     # bump THERE (one place) to force a re-evaluation of every KG
 
 _snap = {'t': 0.0, 'ver': None, 'hid': {}, 'kg': {}, 'dig': {}, 'bin': {}, 'binkg': {}}
 _lock = threading.Lock()
@@ -107,6 +108,20 @@ def _snapshot() -> dict:
         return _snap
 
 
+def sync() -> bool:
+    """Bring this process's snapshot up to the store on disk NOW (one stat; reload only when the
+    store changed) → True when it changed.  Every reader that is about to BUILD or REPLACE a
+    stored product (``cells_bins.load_bin``, ``cells_blocks.serve_block`` / ``store_block``)
+    calls this on a generation mismatch and re-checks first: a worker whose ≤ 30 s old snapshot
+    predates a refresh would otherwise take the refresher's freshly patched blob for stale,
+    rebuild it with the old filter and overwrite it."""
+    if version() == _snap['ver']:
+        return False
+    _snap['t'] = 0.0
+    _snapshot()
+    return True
+
+
 def chunk_idx(kg: str, r10: int, digest: str | None = None):
     """Hidden NET1 row indices (u16 LE bytes) of one stored chunk, or None.  With *digest*
     (the file's NEO1 digest) a store entry evaluated on another file version is ignored."""
@@ -146,9 +161,7 @@ def _offsets():
     return _TN_OFF
 
 
-def quant_h(h_m: np.ndarray) -> np.ndarray:
-    """Apex height → u8 ×0.5 m (1..254) — the scale of tree_h / tree_h_max."""
-    return np.clip(np.round(h_m * 2.0), 1, 254).astype(np.uint8)
+quant_h = tree_rule.quant_h     # apex height → u8 ×0.5 m (shared with the ne_h3 builder)
 
 
 def patch(obs: bytes, trees: bytes, idx: bytes) -> tuple[bytes, bytes]:
@@ -263,7 +276,9 @@ def evaluate_kg(kg: str, ctx: _Ctx) -> tuple[dict, dict]:
     if hdr is None:
         return {}, {}
     rows = {int(c['r10'], 16): c for c in hdr['chunks'] if int(c.get('trees') or 0) > 0}
-    cand = set(ctx.static.get(kg, ()))
+    # height rule: only files built without it (new files carry net1.tree_rule — the builder
+    # already dropped those apices; linear-noise / flag candidates below apply to both)
+    cand = set() if tree_rule.built_with(hdr) else set(ctx.static.get(kg, ()))
     tf = ca._tf('EPSG:3035', 'EPSG:4326')
     for k in ctx.lin_kgs(kg):
         keys = ctx.sn['keys'][k]
