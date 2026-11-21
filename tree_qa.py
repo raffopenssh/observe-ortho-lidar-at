@@ -217,6 +217,19 @@ def evaluate(i: int, j: int, r10s) -> tuple[str, int, int]:
 # === SECTION: refresh pass ===
 
 def refresh(budget_s: float | None = None, limit: int | None = None, dry: bool = False, verbose: bool = True) -> dict:
+    """Single-flight across processes (flock): a second caller returns at once."""
+    import fcntl
+    if dry:
+        return _refresh(budget_s, limit, True, verbose)
+    with open(ca.NE_DIR / 'tree_qa.lock', 'w') as lk:
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return {'skipped': 'another refresh is running'}
+        return _refresh(budget_s, limit, False, verbose)
+
+
+def _refresh(budget_s, limit, dry, verbose) -> dict:
     import cells_bins as cb
     import cells_blocks
     t0 = time.time()
