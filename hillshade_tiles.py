@@ -196,7 +196,7 @@ def _grids(kg_code):
     # (the PNG key already carries the stamp; the grid LRU did not)
     import grid25_sample as g25
     try:
-        ckey = f'{kg_code}|{kvs.parents_stamp([kg_code])[0][1]}|{g25.registration()["version"]}'
+        ckey = f'{kg_code}|{kvs.parents_stamp([kg_code])[0][1]}|{tileset_version()}'
     except Exception:  # noqa: BLE001
         ckey = kg_code
     g = _grid_cache.get(ckey)
@@ -208,6 +208,7 @@ def _grids(kg_code):
             sec = kvs.get_grid25(code)
             if sec and sec.get('terrain'):
                 g = g25.register(code, v21.decode_terrain_grid25(sec['terrain']))
+                g['_code'] = code
                 g.pop('slope', None)                 # unused here; halves the cached bytes
                 g25._feather(g, g['elev'])           # build before put() so the LRU sizes it
                 out.append(g)
@@ -217,22 +218,30 @@ def _grids(kg_code):
     return out
 
 
-RENDER_VERSION = 4       # bump when render() output changes
+RENDER_VERSION = 5       # bump when render() output changes
 #   v3: interior-cells-win grid25 merge
 #   v4 (2026-11-21, docs/hillshade-seams.md): per-product registration offsets,
 #       feathered mosaic (no hand-over lines), Catmull-Rom DTM interpolation,
 #       alpha strictly 0|255 with nodata-touching gradients transparent
+#   v5 (2026-11-21): alpha cut on the national outline (austria_mask = the NE server's),
+#       product cells > 100 m abroad dropped, stale tiles rebuilt from BEV (grid25_patch)
 NATIVE_RES_M = 25
 NATIVE_MAXZOOM = 13      # ≈13 m/px at 47.5°N — beyond this tiles are interpolated, no new detail
 FLAT_GREY = 180          # contract: flat ground = 180 (sin 45° × 255), lit > 180, shaded < 180
 
 
 def tileset_version() -> str:
-    """``<render>.<registration>`` — changes whenever already-served tiles
+    """``<render>.<registration>.<patches>-<outline>`` — changes whenever already-served tiles
     may differ (clients key their caches on it; header ``X-Tileset-Version``)."""
     try:
         import grid25_sample as g25
-        return f'{RENDER_VERSION}.{g25.registration()["version"]}'
+        v = f'{RENDER_VERSION}.{g25.registration()["version"]}'
+    except Exception:  # noqa: BLE001
+        return f'{RENDER_VERSION}.0'
+    try:    # third part: grid25 patch generation + national outline in use
+        import austria_mask
+        import grid25_patch
+        return f'{v}.{grid25_patch.version()}-{austria_mask.version() or "nomask"}'
     except Exception:  # noqa: BLE001
         return f'{RENDER_VERSION}.0'
 
@@ -335,6 +344,18 @@ def shade(z, x, y, kind='hillshade', kgs=None, grids=None, span=1, footprints=No
         hs = (math.sin(alt) * np.cos(slope)
               + math.cos(alt) * np.sin(slope) * np.cos(az - aspect))
         img = np.clip(hs, 0, 1) * 255
+    # alpha 255 = inside Austria AND shaded; cut exactly on the national
+    # outline (austria_mask = the NE server's) for tiles the border crosses
+    try:
+        import austria_mask
+        if austria_mask.near_border(lon0, lat0, lon1, lat1):
+            ins = austria_mask.inside(E[1:-1, 1:-1], N[1:-1, 1:-1])
+            if ins is not None:
+                ok &= ins
+                if not ok.any():
+                    return None
+    except Exception as e:  # noqa: BLE001
+        log.debug('austria_mask: %s', e)
     alpha = np.where(ok, 255, 0).astype(np.uint8)
     return img, alpha
 
@@ -455,6 +476,19 @@ def hillshade_tile(z, x, y):
     return _tile_resp(z, x, y, 'hillshade')
 
 
+@bp.route('/tiles/hillshade/seams.json')
+def hillshade_seams_list():
+    """Remaining seams of the last country run: tile + row/col each."""
+    try:
+        import json as _json
+        rep = _json.loads((Path(__file__).resolve().parent / 'data' / 'hillshade_seam_report.json').read_text())
+    except Exception:  # noqa: BLE001
+        rep = {'seams': [], 'complete': False}
+    r = jsonify(rep)
+    r.headers['Cache-Control'] = 'public, max-age=300'
+    return r
+
+
 @bp.route('/tiles/slope/<int:z>/<int:x>/<int:y>.png')
 def slope_tile(z, x, y):
     return _tile_resp(z, x, y, 'slope')
@@ -472,8 +506,9 @@ def _tilejson(kind):
          'oversampling': f'z > {NATIVE_MAXZOOM} is the {NATIVE_RES_M} m DTM interpolated (Catmull-Rom) '
                          'to the tile lattice before shading — smooth, no extra detail',
          'bounds': [9.4, 46.3, 17.2, 49.1],
-         'alpha': 'binary: 255 where data, 0 elsewhere (nodata tiles answer 204)',
-         'attribution': 'BEV ALS DTM (CC BY 4.0)'}
+         'alpha': 'binary: 255 = inside Austria and terrain available, 0 elsewhere (nodata tiles answer 204); '
+                  'cut on the national outline the NE server serves (/api/v1/ne/glyph/admin/outline?c=AT)',
+         'attribution': 'BEV ALS DTM (CC BY 4.0); Staatsgrenze © OpenStreetMap contributors (ODbL)'}
     if kind == 'hillshade':
         d['encoding'] = {'flat': FLAT_GREY, 'lit': f'> {FLAT_GREY}', 'shaded': f'< {FLAT_GREY}',
                          'light': 'azimuth 315°, altitude 45°'}
@@ -482,8 +517,18 @@ def _tilejson(kind):
         rep = _json.loads((Path(__file__).resolve().parent / 'data' / 'hillshade_seam_report.json').read_text())
         d['seam_check'] = {k: rep.get(k) for k in ('tileset_version', 'z', 'complete', 'next', 'blocks',
                                                    'tiles_with_data', 'seam_count', 'updated_at', 'rule')}
+        d['seam_check']['list'] = f'{base}/tiles/hillshade/seams.json'
     except Exception:  # noqa: BLE001
         d['seam_check'] = None
+    try:    # stale / corrupt processing tiles rebuilt from BEV + the tile-edge rule in the 25 m domain
+        import austria_mask
+        import grid25_patch
+        st = grid25_patch.status()
+        d['tile_edge_check'] = {'edges_open': st['edges_open'], 'products_patched': st['products_patched'],
+                                'tiles_patched': st['tiles_patched'], **(st.get('edge_scan') or {})}
+        d['national_outline'] = {'sha': austria_mask.version(), 'notice': austria_mask.NOTICE}
+    except Exception:  # noqa: BLE001
+        pass
     r = jsonify(d)
     r.headers['Cache-Control'] = 'public, max-age=300'
     r.headers['Access-Control-Allow-Origin'] = '*'

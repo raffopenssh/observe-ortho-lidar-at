@@ -33,6 +33,7 @@ import time
 import numpy as np
 
 import cells_api as ca
+import ne_pos_fix as _pos_fix
 
 log = logging.getLogger('ne_trees')
 
@@ -329,7 +330,8 @@ def _flag_hits(d: dict, pts: np.ndarray) -> list:
 def legacy_flagged_points(kg: str, kind: str) -> set:
     try:
         import landscape_query as lq
-        return lq.flagged_points(kg, LEGACY_FLAG_KIND[kind])
+        # QA centroids were recorded in the product's stored frame (ne_pos_fix)
+        return _pos_fix.shift_lonlat_points(kg, lq.flagged_points(kg, LEGACY_FLAG_KIND[kind]))
     except Exception:  # noqa: BLE001
         return set()
 
@@ -401,7 +403,7 @@ _dec_locks = [threading.Lock() for _ in range(256)]   # striped single-flight: c
 
 
 def _decoded_chunk(kg: str, r: dict, hdr: dict, kind: str) -> dict | None:
-    key = (kg, hdr['neo1_digest'], int(r['r10']), kind)
+    key = (kg, hdr['neo1_digest'] + _pos_fix.tag(kg), int(r['r10']), kind)
     d = _dec_lru.get(key)
     if d is not None:
         return d
@@ -456,7 +458,7 @@ def bbox_state(w, s, e, n) -> dict:
     files = ca._files()
     have = [k for k in kgs_all if k in files]
     pending, not_proc = ca.split_missing([k for k in kgs_all if k not in files])
-    digs = sorted(f'{k}:{files[k].get("neo1_digest")}' for k in have)
+    digs = sorted(f'{k}:{files[k].get("neo1_digest")}{_pos_fix.tag(k)}' for k in have)
     mt = max([float(files[k].get('mtime') or 0) for k in have] or [0.0])
     # ready = nothing of the bbox is still on its way: a bbox that intersects
     # no KG at all (outside Austria) is a stable, cacheable empty answer.

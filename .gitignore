@@ -59,3 +59,6 @@ data/ne/
 data/rate_friends
 data/tree_class_tally.json
 data/hillshade_seam_report.json*
+data/grid25_patches/
+data/austria_outline.json
+data/ne_pos_fix.json

@@ -8,6 +8,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _reg = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False)
 json.dump({'version': 7, 'offsets': {'B': [-5.0, 5.0]}}, _reg); _reg.close()
 os.environ['GRID25_REGISTRATION'] = _reg.name
+os.environ['AUSTRIA_OUTLINE'] = _reg.name + '.nomask'      # national clip / patches are tested in test_grid25_patch.py
+os.environ['GRID25_PATCH_DIR'] = _reg.name + '.patches'
 import numpy as np
 import grid25_sample as g25, hillshade_tiles as hs, hillshade_seams as sm
 
@@ -89,7 +91,7 @@ assert edge.max() < 40, edge.max()                          # no fake cliff at t
 # 6) registration is idempotent and versioned
 g = grid(0, 0, 4, 4); g25.register('B', g); g25.register('B', g)
 assert (g['x0'], g['y0']) == (-5.0, 5.0), (g['x0'], g['y0'])
-assert hs.tileset_version() == f'{hs.RENDER_VERSION}.7'
+assert hs.tileset_version() == f'{hs.RENDER_VERSION}.7.0-nomask', hs.tileset_version()
 os.unlink(_reg.name)
 print('ok')
 

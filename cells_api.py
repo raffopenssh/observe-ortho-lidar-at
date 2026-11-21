@@ -25,6 +25,7 @@ import math
 import os
 import sqlite3
 import ne_green_fix as _green_fix
+import ne_pos_fix as _pos_fix
 import struct
 import threading
 import time
@@ -603,9 +604,10 @@ class Chunk:
         return self.pub_z
 
 
-def _load_chunk(kg: str, row: dict, hdr: dict) -> Chunk:
-    key = (kg, hdr['neo1_digest'], int(row['r10']), _green_fix.FIX_ID)
-    ch = _lru_get(_chunk_lru, key)
+def _load_chunk(kg: str, row: dict, hdr: dict, raw: bool = False) -> Chunk:
+    """``raw=True`` (ne_pos_fix measurement only): stored positions, not cached."""
+    key = (kg, hdr['neo1_digest'], int(row['r10']), _green_fix.FIX_ID + _pos_fix.tag(kg))
+    ch = None if raw else _lru_get(_chunk_lru, key)
     if ch is not None:
         return ch
     p = _file_path(kg)
@@ -627,6 +629,10 @@ def _load_chunk(kg: str, row: dict, hdr: dict) -> Chunk:
     # read-time overrides (tree rule: alpen/bau/gruen under a LiDAR canopy → wald;
     # green rule: bau/alpen on S2-green cells → gruen); the file is untouched — see ne_green_fix.py
     parts['obs'], _ = _green_fix.fix_rows(parts["obs"], ctx_rows)
+    if raw:
+        return Chunk(kg, row, parts)
+    # position override for KGs built on 5 m-shifted rasters (ne_pos_fix.py, measured per KG)
+    parts['trees'], parts['bld'] = _pos_fix.fix_words(kg, parts['trees'], parts['bld'])
     ch = Chunk(kg, row, parts)
     _lru_put(_chunk_lru, key, ch, CHUNK_LRU_N)
     return ch
@@ -1439,7 +1445,7 @@ def pub_file(kg: str) -> Path | None:
     h = header(kg)
     if h is None:
         return None
-    out = PUB_DIR / f'{kg}-{h["neo1_digest"]}-{_green_fix.FIX_ID}.h3b'
+    out = PUB_DIR / f'{kg}-{h["neo1_digest"]}-{_green_fix.FIX_ID}{_pos_fix.tag(kg).replace("|", "-")}.h3b'
     if out.exists():
         return out
     with _pub_lock:
@@ -1531,7 +1537,7 @@ def _format(allowed=FORMATS, default: str = 'json') -> str:
 
 
 def _etag(hdrs: dict, extra: str = '') -> str:
-    digs = sorted(str(h.get('neo1_digest')) for h in hdrs.values())
+    digs = sorted(str(h.get('neo1_digest')) + _pos_fix.tag(k) for k, h in hdrs.items())
     canon = request.method + ' ' + request.path + '?' + '&'.join(f'{k}={v}' for k, v in sorted(request.args.items(multi=True)))
     if request.method == 'POST':
         canon += '#' + hashlib.sha256(request.get_data() or b'').hexdigest()[:16]
@@ -2048,7 +2054,7 @@ def kg_cells(code):
         if bb is None:
             raise CellsError(404, f'unknown KG {code}')
         return _not_ready({'kgs': [], 'kgs_missing': [code]})
-    etag = '"c-' + hashlib.sha256(f'{code}|{h["neo1_digest"]}|{fmt}|{_green_fix.FIX_ID}'.encode()).hexdigest()[:16] + '"'
+    etag = '"c-' + hashlib.sha256(f'{code}|{h["neo1_digest"]}{_pos_fix.tag(code)}|{fmt}|{_green_fix.FIX_ID}'.encode()).hexdigest()[:16] + '"'
     if fmt == 'json':
         d = {'kg': code, 'ready': True, 'cells_n': h['cells_n'], 'epoch': h['epoch'], 'product_version': h['product_version'],
              'partial': bool(h.get('partial_cells')), 'neo1_digest': h['neo1_digest'], 'summary': h['summary'],

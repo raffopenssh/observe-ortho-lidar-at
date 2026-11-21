@@ -59,6 +59,7 @@ import numpy as np
 import cells_api as ca
 import ne_h3
 import ne_green_fix as _green_fix
+import ne_pos_fix as _pos_fix
 import mem_lru as _mem_lru
 
 log = logging.getLogger('cells_bins')
@@ -230,7 +231,7 @@ def bin_inputs(i: int, j: int) -> dict:
     files = ca._files()
     on_disk = [k for k in inter if k in files]
     missing = [k for k in inter if k not in files]
-    parts = [(k, str(files[k].get('neo1_digest')), int(files[k].get('partial') or 0)) for k in on_disk]
+    parts = [(k, str(files[k].get('neo1_digest')) + _pos_fix.tag(k), int(files[k].get('partial') or 0)) for k in on_disk]
     gen = _gen(i, j, parts, _store_stamps({k.split('-')[0] for k in inter}))
     epochs = sorted({str(files[k].get('epoch')) for k in on_disk if files[k].get('epoch')})
     return {'i': i, 'j': j, 'bbox': (w, s, e, n), 'kgs': inter, 'on_disk': on_disk, 'missing': missing,
@@ -807,7 +808,7 @@ def manifest() -> dict:
         for (i, j) in sorted(per_bin):
             on = sorted(per_bin[(i, j)]); miss = sorted(missing_in.get((i, j), []))
             inter = sorted(on + miss)
-            parts = [(k, str(files[k].get('neo1_digest')), int(files[k].get('partial') or 0)) for k in on]
+            parts = [(k, str(files[k].get('neo1_digest')) + _pos_fix.tag(k), int(files[k].get('partial') or 0)) for k in on]
             st = [(p_, stamp_of.get(p_, '')) for p_ in {k.split('-')[0] for k in inter}]
             eps = sorted({str(files[k].get('epoch')) for k in on if files[k].get('epoch')})
             I.append(i); J.append(j); G.append(_gen(i, j, parts, st)); EP.append(eps[-1] if eps else None)

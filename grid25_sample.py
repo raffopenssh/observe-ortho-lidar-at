@@ -158,6 +158,7 @@ def register(code, grid: dict) -> dict:
     if grid is None or grid.get('_reg') is not None:
         return grid
     _drop_zero_fill(grid)
+    _patch(code, grid)
     off = registration()['map'].get(str(code))
     if off and (off[0] or off[1]):
         grid['x0'] = float(grid['x0']) + float(off[0])
@@ -165,7 +166,46 @@ def register(code, grid: dict) -> dict:
         grid['_reg'] = (float(off[0]), float(off[1]))
     else:
         grid['_reg'] = (0.0, 0.0)
+    _clip_national(grid)
     return grid
+
+
+MASK_BUFFER_M = 100.0    # cells kept beyond the border: support for the cubic taps + gradient stencil only
+
+
+def _clip_national(grid):
+    """Products are rectangles and BEV served (partly still serves) terrain
+    beyond the border — cells farther than ``MASK_BUFFER_M`` outside the
+    national outline (``austria_mask``, the one the NE server clips with) become
+    nodata.  Tiles cut their alpha exactly on the outline afterwards."""
+    a = grid.get('elev')
+    if a is None:
+        return
+    try:
+        import austria_mask
+        m = austria_mask.grid_mask(float(grid['x0']), float(grid['y0']), a.shape[0], a.shape[1],
+                                   float(grid.get('cell_m') or 25.0), MASK_BUFFER_M)
+    except Exception:  # noqa: BLE001 — a broken mask must never take the tiles down
+        return
+    if m is None or m.all():
+        return
+    for k in ('elev', 'slope'):
+        v = grid.get(k)
+        if v is not None and getattr(v, 'shape', None) == m.shape:
+            v = np.array(v, np.float32, copy=True)
+            v[~m] = np.nan
+            grid[k] = v
+
+
+def _patch(code, grid):
+    """Cells re-derived from the BEV DTM for tiles whose stored terrain is
+    wrong (``grid25_patch.py``; applied in the product's own, unregistered
+    frame — a patched tile is by construction not shifted)."""
+    try:
+        import grid25_patch
+        grid25_patch.apply(code, grid)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # --------------------------------------------------------------------------

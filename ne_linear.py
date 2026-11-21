@@ -395,7 +395,14 @@ def load_kg(kg: str) -> dict | None:
         ids.append(ch.ids[ci].astype(np.uint64))
     cat = lambda a, t: np.concatenate(a).astype(t) if a else np.zeros(0, t)   # noqa: E731
     return {'x': cat(xs, np.int32), 'y': cat(ys, np.int32), 'h': cat(hs, np.float32), 'cr': cat(cs, np.float32),
-            'cell': cat(ids, np.uint64), 'digest': hdr.get('neo1_digest')}
+            'cell': cat(ids, np.uint64), 'digest': _dig(kg, hdr.get('neo1_digest'))}
+
+
+def _dig(kg, digest):
+    """File digest + position-fix tag: a KG whose apices were moved at read
+    time (ne_pos_fix) is recomputed like a re-ingested one."""
+    import ne_pos_fix
+    return (digest or '') + ne_pos_fix.tag(kg) if digest else digest
 
 
 def process_kg(kg: str, conn=None, force: bool = False, flags: bool = True) -> dict | None:
@@ -408,7 +415,7 @@ def process_kg(kg: str, conn=None, force: bool = False, flags: bool = True) -> d
     if not hdr:
         return None
     row = c.execute('SELECT digest, ver FROM kg WHERE kg=?', (kg,)).fetchone()
-    if row and not force and row[0] == hdr.get('neo1_digest') and row[1] == VERSION:
+    if row and not force and row[0] == _dig(kg, hdr.get('neo1_digest')) and row[1] == VERSION:
         return {'kg': kg, 'skipped': True}
     d = load_kg(kg)
     if d is None:
@@ -638,7 +645,7 @@ def backfill(budget_s: float = 3000.0, flags: bool = True, quiet: bool = False) 
     c = _conn(write=True)
     done = {k: (d, v) for k, d, v in c.execute('SELECT kg, digest, ver FROM kg')}
     files = ca._files()
-    todo = [k for k in sorted(files) if done.get(k) != (files[k].get('neo1_digest'), VERSION)]
+    todo = [k for k in sorted(files) if done.get(k) != (_dig(k, files[k].get('neo1_digest')), VERSION)]
     n = runs = hid = 0
     for kg in todo:
         if time.time() - t0 > budget_s:

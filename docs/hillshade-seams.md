@@ -65,6 +65,78 @@ changes when the offsets change, so a no-op rebuild does not invalidate
 client tile caches. A failed unit = seams found (`systemctl status
 grid25-registration`, list in `data/hillshade_seam_report.json`).
 
+## National mask (2026-11-21, tileset v5)
+
+Products are rectangles and BEV served — in places still serves — terrain
+beyond the border: 1 469 of 16 775 products have cells outside Austria
+(1 124 farther than 75 m, 1 445 km² in total). Alpha therefore did not
+follow the border wherever a product reached across.
+
+* `austria_mask.py` = **the outline the NE server clips with**
+  (`GET <NE server>/api/v1/ne/glyph/admin/outline?c=AT`, OSM relation 16239
+  ~5 m, viewBox → lon/lat with `proj` of `/api/v1/ne/glyph`). Stored as
+  `data/austria_outline.json` (gitignored — ODbL; `python3 austria_mask.py
+  --fetch`, refreshed by the weekly unit). Do NOT union the Statistik
+  Austria Land outlines instead (off by up to ~200 m).
+* `grid25_sample.register → _clip_national`: cells > 100 m outside → nodata
+  (the 100 m only support the cubic taps / gradient stencil) — applies to
+  tiles, `/heightfield`, landscape queries.
+* `hillshade_tiles.shade`: alpha cut exactly on the outline for tiles the
+  border crosses. Contract: **alpha 255 = inside Austria and terrain
+  available, else 0**. No mask file → no clip (never an outage).
+
+## Stale tiles / grid25 patches (`grid25_patch.py`)
+
+Finding (z12 2156/1436, Nofels 92116): a product is stitched from ~1.5 km
+processing tiles; some tiles hold terrain that does not match today's BEV
+DTM at all (92116 west tile column: 440–488 m stored vs 429 m on the Rhine
+plain; tile 9: a smooth 6 m-low plateau) — tiles restored from rasters of
+the time BEV served elevation abroad. Result: an opaque rectangle across
+the border and a cliff line along the *internal tile edge of one product*.
+
+Why the seam check missed it: it tests **product** boundaries for 1-px
+discontinuities. A wrong tile inside one product is (a) not a product
+boundary and (b) after the cubic resampling a smooth ramp over several
+pixels at any zoom — no pixel pair is an outlier. Hence a second rule in
+the DTM's own 25 m domain:
+
+* `--edge-scan` (local, all products): 3-cell step across every internal
+  tile edge vs the same step 3 and 6 cells further in on both sides
+  (> 3× median, floor 1 m, run ≥ 16 cells) → `index.json → edges`.
+* `--scan` (throttled on host RX, resumable): suspects = tiles with ≥ 40
+  cells > 300 m abroad + tiles on flagged edges → two 25 m strips of BEV
+  DTM per tile → median |stored − BEV| > 0.5 m (healthy: < 0.1 m) ⇒ tile
+  rebuilt from BEV exactly as the pipeline does (25 m block mean, ≥ 20 %
+  valid) → `data/grid25_patches/<code>.npz`, overlaid by
+  `grid25_sample.register → _patch` for every grid25 reader. One tile-set
+  version bump per scan that changed something. This also repairs the
+  5 m-shifted tiles of *mixed* products and corrupt tiles (90102).
+* `--tile CODE E N [--force]` for a spot reported by hand.
+* TileJSON `tile_edge_check` = `{edges_open, products_patched, tiles_patched, …}`;
+  remaining pixel-rule seams: `/tiles/hillshade/seams.json` (tile + row/col).
+
+Tile-set version = `<render>.<registration>.<patch generation>-<outline sha>`.
+Weekly unit order: outline fetch → registration → edge-scan → scan → seam check.
+Tests: `python3 tests/test_grid25_patch.py`.
+
+## Trees / structures of shifted KGs (`ne_pos_fix.py`)
+
+The v2 upgrade ran the whole pipeline on the shifted GPKG rasters, so apices
+and structures of those KGs are 5 m off as well (true = stored + (−5, +5)).
+Read-time fix like `ne_green_fix`: `cells_api._load_chunk` moves the dx/dy
+bits of every NET1/NEB1 word by the KG's offset; cache keys / ETags carry
+`ne_pos_fix.tag(kg)` (the `neo1_digest` itself is NOT altered). Position-keyed
+stores follow: `tree_ver` rows are migrated once, linear-noise runs recomputed
+(`ne_linear._dig`), legacy QA points shifted.
+
+Which KGs: measured, never taken from the registration table —
+`python3 ne_pos_fix.py --verify` reads 4 × 250 m BEV nDSM windows per
+candidate parent (one per processing tile for *mixed* parents): an apex of
+height h sits on nDSM ≈ h in the right frame (median |nDSM − h| ≈ 0.5 m vs
+≈ 4 m). Fixed only when ≥ 3 windows say shifted and none says zero;
+`mixed` / `unclear` KGs are left alone. State `data/ne_pos_fix.json`.
+NOT fixable this way: NE cell statistics (NEO1), segments — reprocess.
+
 ## Open: products that need a real regeneration (NOT done — decided 2026-11-21)
 Do not re-investigate; this is the state:
 
