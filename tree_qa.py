@@ -475,7 +475,13 @@ def _refresh(budget_s, limit, verbose, do_bins) -> dict:
     con.close()
     st.update(seconds=round(time.time() - t0, 1), finished_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
     try:
-        _db_path().with_suffix('.json').write_text(json.dumps(st))
+        last = _db_path().with_suffix('.json'); runs = _db_path().with_name('tree_qa_runs.jsonl')
+        with open(runs, 'a') as fh:                       # run history (one line per refresh that did work)
+            if fh.tell() == 0 and last.exists():
+                fh.write(last.read_text().strip() + '\n')
+            if st['kgs_evaluated'] or st['errors']:
+                fh.write(json.dumps(st) + '\n')
+        last.write_text(json.dumps(st))
     except OSError:
         pass
     return st
