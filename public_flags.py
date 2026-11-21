@@ -390,7 +390,7 @@ def _clean_note(s) -> str | None:
 _KNOWN = {'cell', 'lon', 'lat', 'kg', 'kg_code', 'layer', 'claim', 'observed', 'expected', 'note', 'source',
           'reporter', 'epoch', 'species', 'taxon', 'h_m', 'dbh_cm', 'tree_id', 'tree_id_v2', 'client_id', 'force',
           'retract', 'measured_at', 'dbh_method', 'h_method', 'vitality', 'status', 'reporter_key',
-          'state', 'date', 'state_date', 'logged_at', 'felled_at'}
+          'state', 'date', 'state_date', 'logged_at', 'felled_at', 'frame', 'as_of', '_fr', '_frame'}
 # what can have happened to a tree since our flight (stored index + 1 in 4 bits — append only, max 14)
 TREE_STATES = ('standing',    # still there, alive (also: contradicts somebody's report)
                'logged',      # cut down / harvested
@@ -519,6 +519,13 @@ def record(body: dict, client: str, org: str | None = None) -> dict:
     if names_tree or str(body.get('layer') or '').strip().lower() in TREE_LAYERS:
         import tree_user as tu
         tu.prefill(body)                # tree_id / client_id → lon, lat
+        # stale download after a tree position fix → today's frame (docs/tree-user.md → Position frames)
+        body.pop('_fr', None); body.pop('_frame', None)
+        if body.get('client_id') in (None, '') or body.get('tree_id') not in (None, ''):
+            rp_ = body.get('reporter')
+            fr = tu.reframe(body, _reporter_hash(str(rp_)[:120] if rp_ not in (None, '') else None, client, org))
+            if fr:
+                body['_frame'] = fr
     layer = str(body.get('layer') or ('trees' if names_tree else 'other')).strip().lower()
     if layer not in LAYERS:
         raise FlagError(400, f'layer must be one of {", ".join(LAYERS)}', layers=LAYERS)
@@ -527,6 +534,13 @@ def record(body: dict, client: str, org: str | None = None) -> dict:
         raise FlagError(400, f'claim must be one of {", ".join(CLAIMS)}', claims=CLAIMS)
     subj = _subject(body)
     has_point = body.get('lon') is not None and body.get('lat') is not None
+    if layer == 'trees' and has_point and subj.get('cell') is not None and not (body.get('kg') or body.get('kg_code')):
+        # KG rectangles overlap: file the report under the KG whose FILE serves the apex it names
+        # (the read side — ne_trees._flags — is per file), not under the KG of the cell
+        import tree_user as tu
+        k = tu.apex_kg(subj['lon'], subj['lat'])
+        if k:
+            subj['kg'] = k
     if claim == 'tree':
         claim = 'species'
     if claim in ('species', 'state'):
@@ -656,6 +670,8 @@ def record(body: dict, client: str, org: str | None = None) -> dict:
     out['tally'] = tally(_tkey(subj))
     if tree is not None:
         out['tree'] = tree
+    elif isinstance(body.get('_frame'), dict) and (body['_frame'].get('moved_m') or body['_frame'].get('ambiguous')):
+        out['frame'] = body['_frame']      # sent in a pre-fix frame: `subject` is where it was filed
     if unmerge is not None:
         import tree_crown as tc
         ux, uy = tc.skey_xy(unmerge[0])
@@ -745,6 +761,32 @@ def auto_sync(kg: str, source: str, layer: str, claim: str, items: list, gone: l
             raise
     _heat_cache.clear()
     return {'upserted': len(rows), 'stale': st}
+
+
+def auto_kg(kg: str, source: str, layer: str, claim: str, expected: str | None, observed: str | None = None) -> dict:
+    """One machine report about a whole KG (subject = the KG, never hides a cell) — the public record
+    of something we did to its product at read time (ne_pos_fix: ``auto-shift``).  Same rules as
+    :func:`auto_sync`: an identical re-run writes nothing, a human verdict is never overwritten."""
+    c = _conn()
+    now = int(time.time())
+    kg = str(kg).zfill(5)
+    lid, cid_, sid = _dict_id(c, 'layer', layer), _dict_id(c, 'claim', claim), _dict_id(c, 'source', source)
+    with _LOCK:
+        n = c.execute(
+            'INSERT INTO report(ts, ts_last, n, skey, cell, kg, layer, claim, source, reporter, epoch, observed, expected, status) '
+            'VALUES (?,?,1,?,NULL,?,?,?,?,?,?,?,?,0) '
+            'ON CONFLICT(skey, layer, claim, reporter) DO UPDATE SET ts_last = excluded.ts_last, expected = excluded.expected, '
+            'observed = excluded.observed, status = CASE WHEN status IN (3, 4) THEN 0 ELSE status END '
+            'WHERE status IN (3, 4) OR expected IS NOT excluded.expected OR observed IS NOT excluded.observed',
+            (now, now, -int(kg), kg, lid, cid_, sid, _reporter_hash(source, 'auto'), _epoch_now(kg), observed, expected)).rowcount
+    return {'written': n}
+
+
+def auto_kg_status(source: str) -> dict:
+    """{kg: status name} of the KG-level machine reports of ``source``."""
+    c = _conn()
+    return {r[0]: STATUS[r[1]] for r in c.execute('SELECT kg, status FROM report WHERE reporter=? AND cell IS NULL AND kg IS NOT NULL',
+                                                  (_reporter_hash(source, 'auto'),))}
 
 
 def auto_cells(kg, source: str, status: str = 'rejected') -> set:
@@ -865,8 +907,16 @@ def _where(a: dict) -> tuple[str, list]:
         if not (kg.isdigit() and len(kg) == 5):
             raise FlagError(400, 'kg must be a 5-digit code')
         w.append('kg = ?'); p.append(kg)
+    elif str(a.get('source') or '').startswith('auto-'):
+        pass        # a machine source is a selector of its own: the national record of one read-time fix
     else:
-        raise FlagError(400, 'selector required: bbox= | cell= | ids= | lon=&lat=[&k=] | kg=')
+        raise FlagError(400, 'selector required: bbox= | cell= | ids= | lon=&lat=[&k=] | kg= | source=auto-…')
+    if a.get('source'):
+        sid = _DICT.get(('source', str(a['source']).strip()[:MAX_SOURCE]))
+        if sid is None:
+            w.append('0')
+        else:
+            w.append('source = ?'); p.append(sid)
     for kind in ('layer', 'claim'):
         if a.get(kind):
             vals = [v.strip().lower() for v in a[kind].split(',') if v.strip()]

@@ -15799,7 +15799,7 @@ def _tree_v3_filter_rows(rows, eff):
 
 
 _PRODUCT_CARRY_FIELDS = ('stand_context', 'segment_type', 'segment_type_conf', 'dh_per_year_m',
-                         'als_year', 'product_code', 'product_version', 'tree_id_product')
+                         'als_year', 'product_code', 'product_version', 'tree_id_product', 'tree_id_prev')
 
 
 def _tree_v3_acquisition(codes, geom_3035, dataset):
@@ -16018,6 +16018,9 @@ def _tree_v3_crowns(rows, meta, eff, task_id):
         key = r.get('tree_id_product') or r['tree_id']
         g = crowns.get(key)
         if g is not None:
+            if r.get('_pos_off'):                   # ne_pos_fix: crown follows its apex
+                from shapely.affinity import translate
+                g = translate(g, r['_pos_off'][0], r['_pos_off'][1])
             out[r['tree_id']] = g
     return out
 

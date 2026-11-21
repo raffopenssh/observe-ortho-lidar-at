@@ -27,6 +27,7 @@ State: ``data/ne_pos_fix.json`` ``{kgs: {kg: {verdict, off, windows, ts}}}``
 from __future__ import annotations
 
 import json
+import re
 import os
 import sys
 import threading
@@ -45,9 +46,11 @@ MIN_TREES = 40                  # per window
 RATIO = 0.5                     # winning frame: median |nDSM − h| below this × the other frame's …
 ERR_OK = 1.5                    # … and below this many metres
 SUB_M = 125; SUB_MIN_TREES = 12 # per-sub-cell verdicts inside a window
+FLAG_APEX_M = 2.5               # = ne_trees.FLAG_APEX_M: a point flag names the apex within this
 MIXED_SUB_FRAC = 0.1            # minority sub-cells above this share → the KG is mixed
 _LOCK = threading.Lock()
-_ST = {'mtime': None, 'off': {}, 'n': 0}
+FRAME_STALE = 'p0'              # token of the stored (pre-fix) frame; anything else = today's positions
+_ST = {'mtime': None, 'off': {}, 'n': 0, 'past': {}}
 
 
 def _load() -> dict:
@@ -61,7 +64,14 @@ def _load() -> dict:
                 d = json.loads(PATH.read_text())
                 off = {k: (int(v['off'][0]), int(v['off'][1])) for k, v in (d.get('kgs') or {}).items()
                        if v.get('verdict') == 'shift' and v.get('off')}
-                _ST.update(mtime=mt, off=off, n=len(off))
+                # frame history (docs/tree-user.md → Position frames): a copy downloaded before the
+                # fix (or before a regeneration that retired it) is `delta` off today's positions
+                past = {}
+                for k, v in (d.get('kgs') or {}).items():
+                    f = _frames_of(v)
+                    if f:
+                        past[k] = f
+                _ST.update(mtime=mt, off=off, n=len(off), past=past)
             except Exception:  # noqa: BLE001 — a half-written file never breaks a read path
                 _ST['mtime'] = mt
     return _ST
@@ -75,6 +85,126 @@ def tag(kg) -> str:
     """Cache-key / ETag suffix: '' for an untouched KG (keys stay as they were)."""
     o = offset(kg)
     return f'|p{o[0]:+d}{o[1]:+d}' if o else ''
+
+
+def _tok(o) -> str:
+    return f'p{int(o[0]):+d}{int(o[1]):+d}' if o and (o[0] or o[1]) else FRAME_STALE
+
+
+def _frames_of(v: dict) -> dict | None:
+    """Frame history of one state entry.  ``shift``: served = stored + off since ``ts``; a copy made
+    before is frame p0, ``delta`` = off away.  ``retired`` (product regenerated on the true grid): the
+    same.  ``rejected`` (fix overruled, positions stored again): a copy made WHILE the fix was on
+    (``ts`` ≤ t < ``rejected_ts``) is ``-off`` away."""
+    vd = v.get('verdict')
+    o = v.get('off') if vd == 'shift' else v.get('was') if vd in ('retired', 'rejected') else None
+    if not o:
+        return None
+    o = (int(o[0]), int(o[1])); ts = int(v.get('ts') or 0)
+    if vd == 'rejected':
+        return {'frame': FRAME_STALE, 'stale': _tok(o), 'delta': (-o[0], -o[1]), 'from': ts, 'until': int(v.get('rejected_ts') or ts)}
+    return {'frame': _tok(o), 'stale': FRAME_STALE, 'delta': o, 'from': 0, 'until': ts}
+
+
+def frames(kg) -> dict | None:
+    """None for a KG whose tree positions never changed, else ``{frame, stale, delta, from, until}``:
+    ``frame`` = token of the positions served today; a copy made in [from, until) is frame ``stale``
+    and its coordinates need ``delta`` (dx, dy) m added."""
+    return _load()['past'].get(str(kg).zfill(5))
+
+
+def all_frames() -> dict:
+    return _load()['past']
+
+
+def _update(fn):
+    """Read-modify-write of the state file under a lock (verify, sync, unfix, retire may overlap)."""
+    import fcntl
+    PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(PATH) + '.lock', 'w') as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            doc = json.loads(PATH.read_text())
+        except Exception:  # noqa: BLE001
+            doc = {'kgs': {}}
+        doc.setdefault('kgs', {})
+        out = fn(doc)
+        doc['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        tmp = PATH.with_suffix('.tmp'); tmp.write_text(json.dumps(doc)); os.replace(tmp, PATH)
+        return out
+
+
+def retire(kg) -> bool:
+    """Call when a shifted KG's product is REGENERATED on the true grid: the read-time shift stops,
+    the frame history stays (stale copies still resolve), the KG is never re-measured."""
+    kg = str(kg).zfill(5)
+
+    def f(doc):
+        v = doc['kgs'].get(kg)
+        if not v or v.get('verdict') != 'shift':
+            return False
+        doc['kgs'][kg] = {'verdict': 'retired', 'was': v['off'], 'ts': v.get('ts'), 'retired_ts': int(time.time()), 'windows': []}
+        return True
+    return _update(f)
+
+
+def unfix(kg, db=None) -> bool:
+    """Overrule (the KG's ``auto-shift`` report was rejected): serve stored positions again and move
+    the user reports back.  Copies made while the fix was on stay resolvable (frame history)."""
+    kg = str(kg).zfill(5)
+    v = (json.loads(PATH.read_text()).get('kgs') or {}).get(kg) if PATH.exists() else None
+    if not v or v.get('verdict') != 'shift':
+        return False
+    o = v['off']
+    _migrate_stores(kg, (-int(o[0]), -int(o[1])), db=db, stored=False)
+
+    def f(doc):
+        doc['kgs'][kg] = {'verdict': 'rejected', 'was': o, 'ts': v.get('ts'), 'rejected_ts': int(time.time()), 'windows': v.get('windows') or []}
+        return True
+    return _update(f)
+
+
+# ── public record: one machine flag per KG (like ne_linear's auto-linear runs) ──
+
+SOURCE = 'auto-shift'
+
+
+def _flag(kg, v: dict) -> None:
+    """KG-level report, layer ``trees``, claim ``misplaced``, source ``auto-shift`` — what we did to
+    the 2.4 product of this KG (or know and did not do: ``applied: false``)."""
+    import public_flags as pf
+    vd = v.get('verdict')
+    if vd not in ('shift', 'mixed', 'retired', 'rejected'):
+        return
+    o = v.get('off') or v.get('was') or list(SHIFT)
+    w = [x for x in v.get('windows') or [] if x.get('v') in ('shift', 'zero', 'unclear')]
+    exp = {'hint': 'shift', 'applied': vd == 'shift', 'moved_m': [int(o[0]), int(o[1])], 'crs': 'EPSG:3035',
+           'layers': ['trees', 'structures'], 'frame': _tok(o) if vd in ('shift', 'retired') else FRAME_STALE, 'verdict': vd}
+    if vd in ('shift', 'retired', 'rejected'):
+        exp['since'] = int(v.get('ts') or 0)
+    if vd == 'rejected':
+        exp['until'] = int(v.get('rejected_ts') or 0)
+    obs = {'windows': len(w), 'shifted': sum(x['v'] == 'shift' for x in w),
+           'err_m': {'moved': round(float(np.median([x['shift'] for x in w])), 2), 'stored': round(float(np.median([x['zero'] for x in w])), 2)}} if w else None
+    pf.auto_kg(kg, SOURCE, 'trees', 'misplaced', json.dumps(exp, separators=(',', ':')),
+               json.dumps(obs, separators=(',', ':')) if obs else None)
+
+
+def sync(db=None) -> dict:
+    """State ↔ flags: every decided KG has its report; a report a human REJECTED turns the fix off."""
+    import public_flags as pf
+    try:
+        doc = json.loads(PATH.read_text())
+    except Exception:  # noqa: BLE001
+        return {'kgs': 0}
+    st = pf.auto_kg_status(SOURCE)
+    n = un = 0
+    for kg, v in sorted((doc.get('kgs') or {}).items()):
+        if v.get('verdict') == 'shift' and st.get(kg) == 'rejected':
+            un += bool(unfix(kg, db=db))
+            v = json.loads(PATH.read_text())['kgs'][kg]
+        _flag(kg, v); n += 1
+    return {'kgs': n, 'unfixed': un}
 
 
 def _shift5(v, d):
@@ -289,35 +419,106 @@ def verify_kg(kg) -> dict:
     return out
 
 
-def _migrate_stores(kg, off) -> dict:
-    """User tree reports are keyed on the apex position (stored frame) —
-    move them with the apices.  Idempotent per KG via the caller's state."""
+def _migrate_stores(kg, off, db=None, stored: bool = True) -> dict:
+    """Everything users told us about a tree is keyed on the apex position
+    (stored frame) — move it with the apices so nothing is dropped:
+    ``tree_ver`` (species / measures / state / notes; NOT trees a user added —
+    those are their own real-world points), tree-layer flags that name an apex
+    (spurious, wrong height …; NOT ``missing``) and "same tree" crown flags
+    (apex-keyed ``skey`` + ``expected.of``).  Idempotent per KG via the
+    caller's state.  Reports arriving later from copies made before the fix
+    are handled at write time (tree_user.reframe)."""
     import sqlite3
-    n = 0
-    if PATH.parent != DATA:      # test / dry-run state file → never touch the live store
+    out = {'tree_ver': 0, 'flags': 0, 'crown': 0}
+    if db is None and PATH.parent != DATA:      # test / dry-run state file → never touch the live store
         return {'tree_ver': 0, 'dry': True}
-    p = DATA / 'public_flags.sqlite'
-    if p.exists():
-        c = sqlite3.connect(str(p), timeout=30)
-        try:
+    p = Path(db) if db else DATA / 'public_flags.sqlite'
+    if not p.exists():
+        return out
+    dx, dy = int(off[0]), int(off[1])
+    c = sqlite3.connect(str(p), timeout=30, isolation_level=None)
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        tabs = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'tree_ver' in tabs:
             cols = {r[1] for r in c.execute('PRAGMA table_info(tree_ver)')}
-            if 'x' in cols:
-                extra = ', e_dm = e_dm + ?, n_dm = n_dm + ?' if {'e_dm', 'n_dm'} <= cols else ''
-                args = [off[0], off[1]] + ([off[0] * 10, off[1] * 10] if extra else []) + [int(kg)]
-                n = c.execute(f'UPDATE tree_ver SET x = x + ?, y = y + ?{extra} WHERE kg = ?', args).rowcount
-                c.commit()
-        finally:
-            c.close()
-    return {'tree_ver': n}
+            extra = ', e_dm = e_dm + ?, n_dm = n_dm + ?' if {'e_dm', 'n_dm'} <= cols else ''
+            args = [dx, dy] + ([dx * 10, dy * 10] if extra else []) + [int(kg)]
+            out['tree_ver'] = c.execute(
+                f'UPDATE tree_ver SET x = x + ?, y = y + ?{extra} WHERE kg = ? AND NOT EXISTS '
+                '(SELECT 1 FROM tree_ver a WHERE a.kg = tree_ver.kg AND a.x = tree_ver.x AND a.y = tree_ver.y '
+                'AND a.op = 1)', args).rowcount
+        if 'report' in tabs:
+            import cells_api as ca
+            import tree_crown as tc
+            fwd = ca._tf('EPSG:4326', 'EPSG:3035'); inv = ca._tf('EPSG:3035', 'EPSG:4326')
+
+            def mv(lo, la):
+                x, y = fwd.transform(lo, la)
+                lo2, la2 = inv.transform(x + dx, y + dy)
+                return float(lo2), float(la2)
+            did = {(k, v): i for i, k, v in c.execute("SELECT id, kind, val FROM dict WHERE kind IN ('layer', 'claim', 'source')")}
+            lay = [i for (k, v), i in did.items() if k == 'layer' and v == 'trees']
+            skip_claim = did.get(('claim', 'missing'), -1); auto = did.get(('source', 'auto-linear'), -1)
+            # a flag belongs to this KG's move when it names one of ITS stored apices — never by the row's
+            # `kg` (= KG of the cell; KG rectangles overlap, the apex may be served by the neighbour's file)
+            ap = _raw_apices(kg) if lay else None
+            rows = []
+            if ap is not None:
+                # stored=False (unfix): the rows sit on the SHIFTED apices
+                ax = np.round(ap[0]).astype(np.int64) - (0 if stored else dx)
+                ay = np.round(ap[1]).astype(np.int64) - (0 if stored else dy)
+                have = set(zip(ax.tolist(), ay.tolist()))
+                w, s_ = inv.transform(float(ax.min()) - 30, float(ay.min()) - 30); e_, n_ = inv.transform(float(ax.max()) + 30, float(ay.max()) + 30)
+                rows = c.execute('SELECT id, skey, lon_e6, lat_e6, expected, layer, claim FROM report WHERE lat_e6 BETWEEN ? AND ? '
+                                 'AND lon_e6 BETWEEN ? AND ? AND (source IS NULL OR source != ?)',
+                                 (int(s_ * 1e6) - 500, int(n_ * 1e6) + 500, int(w * 1e6) - 500, int(e_ * 1e6) + 500, auto)).fetchall()
+            for rid, skey, lo, la, exp, layer, claim in rows:
+                if layer not in lay or claim == skip_claim:
+                    continue
+                lo2, la2 = mv(lo / 1e6, la / 1e6)
+                if not tc.is_apex_skey(skey):
+                    px, py = fwd.transform(lo / 1e6, la / 1e6)
+                    if float(np.min(np.hypot(ax - px, ay - py))) > FLAG_APEX_M:
+                        continue
+                if tc.is_apex_skey(skey):
+                    x, y = tc.skey_xy(skey)
+                    if (x, y) not in have:
+                        continue
+                    try:
+                        e = json.loads(exp) if exp else None
+                        for o in (e.get('of'), (e.get('spurious') or {}).get('of')) if isinstance(e, dict) else ():
+                            if isinstance(o, dict) and 'x' in o and 'y' in o and (int(o['x']), int(o['y'])) in have:
+                                o['x'] = int(o['x']) + dx; o['y'] = int(o['y']) + dy
+                                if o.get('lon') is not None and o.get('lat') is not None:
+                                    a, b = mv(float(o['lon']), float(o['lat'])); o['lon'], o['lat'] = round(a, 7), round(b, 7)
+                                m = re.match(r'^t_(\d+)_(\d+)$', str(o.get('tree_id') or ''))
+                                if m:
+                                    o['tree_id'] = f't_{int(m.group(1)) + dx * 10}_{int(m.group(2)) + dy * 10}'
+                        exp = json.dumps(e, separators=(',', ':'), ensure_ascii=False) if e is not None else exp
+                    except Exception:  # noqa: BLE001 — unreadable hint: the key still follows
+                        pass
+                    c.execute('UPDATE OR IGNORE report SET skey = ?, lon_e6 = ?, lat_e6 = ?, expected = ? WHERE id = ?',
+                              (tc.apex_skey(x + dx, y + dy), int(round(lo2 * 1e6)), int(round(la2 * 1e6)), exp, rid))
+                    out['crown'] += 1
+                else:
+                    c.execute('UPDATE report SET lon_e6 = ?, lat_e6 = ? WHERE id = ?', (int(round(lo2 * 1e6)), int(round(la2 * 1e6)), rid))
+                    out['flags'] += 1
+        c.execute('COMMIT')
+    except Exception:
+        c.execute('ROLLBACK')
+        raise
+    finally:
+        c.close()
+    return out
 
 
 def verify(budget_mb_h: float = 150.0, max_kgs: int | None = None, only=None, quiet=False) -> dict:
     import psutil
     try:
-        doc = json.loads(PATH.read_text())
+        kgs = json.loads(PATH.read_text()).get('kgs') or {}
     except Exception:  # noqa: BLE001
-        doc = {'kgs': {}}
-    kgs = doc.setdefault('kgs', {})
+        kgs = {}
     todo = [k for k in (only or candidates()) if k not in kgs]
     if max_kgs:
         todo = todo[:max_kgs]
@@ -333,11 +534,18 @@ def verify(budget_mb_h: float = 150.0, max_kgs: int | None = None, only=None, qu
                 r['migrated'] = _migrate_stores(kg, r['off'])
             except Exception as e:  # noqa: BLE001 — do not serve a KG whose reports could not follow
                 r = dict(r, verdict='error', error='migrate: ' + repr(e)[:160]); r.pop('off', None)
-        if r['verdict'] != 'error':
-            kgs[kg] = r
-        doc['mb'] = float(doc.get('mb') or 0) + (psutil.net_io_counters().bytes_recv - b0) / 1e6
-        doc['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-        tmp = PATH.with_suffix('.tmp'); tmp.write_text(json.dumps(doc)); os.replace(tmp, PATH)
+        mb = (psutil.net_io_counters().bytes_recv - b0) / 1e6
+
+        def put(doc, kg=kg, r=r, mb=mb):
+            if r['verdict'] != 'error':
+                doc['kgs'][kg] = r
+            doc['mb'] = float(doc.get('mb') or 0) + mb
+        _update(put)
+        if PATH.parent == DATA:
+            try:
+                _flag(kg, r)
+            except Exception as e:  # noqa: BLE001
+                print('auto-shift flag', kg, e, file=sys.stderr)
         done += 1
         if not quiet:
             print(kg, r['verdict'], [w.get('v') for w in r['windows']], r.get('error', ''), flush=True)
@@ -352,11 +560,20 @@ def verify(budget_mb_h: float = 150.0, max_kgs: int | None = None, only=None, qu
         wait = used / budget_mb_h * 3600 - (time.time() - t0)
         if wait > 0:
             time.sleep(min(wait, 600))
-    return {'done': done, 'left': len(candidates()) - len(kgs), **status()}
+    return {'done': done, **status()}
 
 
 if __name__ == '__main__':
-    if '--verify' in sys.argv:
+    if '--sync' in sys.argv:
+        print(json.dumps(sync()))
+    elif '--unfix' in sys.argv or '--retire' in sys.argv:
+        f = unfix if '--unfix' in sys.argv else retire
+        kg = sys.argv[sys.argv.index('--unfix' if f is unfix else '--retire') + 1]
+        ok = f(kg)
+        if ok:
+            _flag(kg, json.loads(PATH.read_text())['kgs'][str(kg).zfill(5)])
+        print(json.dumps({'kg': kg, 'ok': ok}))
+    elif '--verify' in sys.argv:
         def _arg(n, d, t):
             return t(sys.argv[sys.argv.index(n) + 1]) if n in sys.argv else d
         only = _arg('--kgs', None, lambda s: s.split(','))

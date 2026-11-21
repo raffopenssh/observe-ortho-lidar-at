@@ -682,8 +682,15 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
             'limit': lim, 'pending_kgs': st['pending'], 'not_processed': st['not_processed'],
             'dropped_qa': dropped, 'dropped_linear': dropped_lin, 'realistic': bool(realistic), 'truncated': truncated,
             'chunks_scanned': scanned, 'chunks_in_bbox': len(rows), 'ms': round((time.time() - t0) * 1000, 1),
-            'ready': st['ready'], 'state': st, **_user_blocks(kind, out if n_out else None, st['kgs'], w, s, e, n, min_h, max_h, notes),
+            'ready': st['ready'], 'state': st, **_frames_block(st['kgs']), **_user_blocks(kind, out if n_out else None, st['kgs'], w, s, e, n, min_h, max_h, notes),
             **_merged_block(crown_tops, w, s, e, n, min_h, max_h, out if n_out else None)}
+
+
+def _frames_block(kgs) -> dict:
+    """``frames {kg: token}`` for KGs whose tree positions were corrected as a
+    block (ne_pos_fix) — absent everywhere else, so untouched bodies stay as they were."""
+    f = {k: v['frame'] for k in kgs for v in (_pos_fix.frames(k),) if v}
+    return {'frames': f} if f else {}
 
 
 def _merged_block(tops, w, s, e, n, min_h, max_h, cols) -> dict:

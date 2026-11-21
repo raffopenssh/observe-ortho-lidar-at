@@ -135,6 +135,9 @@ candidate parent (one per processing tile for *mixed* parents): an apex of
 height h sits on nDSM ≈ h in the right frame (median |nDSM − h| ≈ 0.5 m vs
 ≈ 4 m). Fixed only when ≥ 3 windows say shifted and none says zero;
 `mixed` / `unclear` KGs are left alone. State `data/ne_pos_fix.json`.
+Public record + overrule = one `auto-shift` flag per KG; stale client copies
+(mail sync, inventory ids) are re-framed on write:
+`docs/tree-user.md → Position frames`.
 NOT fixable this way: NE cell statistics (NEO1), segments — reprocess.
 
 ## Open: products that need a real regeneration (NOT done — decided 2026-11-21)
@@ -160,7 +163,7 @@ Do not re-investigate; this is the state:
   nDSM 8.2 vs 3.5 m at zero shift for 92124). So `true = stored + offset`,
   same table as grid25. Classes / heights are right (LiDAR and ortho moved
   together), only the position is off.
-  Read-time fix NOT implemented yet. Constraints found:
+  Read-time fix: implemented, section above. Constraints found:
   - tree identity is position-keyed everywhere: `tree_id` = stored E_N,
     `tree_user` (`tree_ver`, match ≤ 1.5 m), `ne_linear` runs, legacy flag
     points. Shift only at the I/O boundary (emitted lon/lat, bbox filter,

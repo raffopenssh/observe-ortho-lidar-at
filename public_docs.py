@@ -314,6 +314,8 @@ what you expect, and send `looks_right` too: a confirmation is as useful as a co
   GET  /api/v1/flags?cell=<h3>                     res 12 exact; res 6–11 = everything inside that hexagon
   GET  /api/v1/flags?ids=a,b,…                     ≤ 512 res-12 ids       GET /api/v1/flags?lon=&lat=[&k=0..3]
   GET  /api/v1/flags?kg=63349                      everything flagged in a KG (cells and the KG itself)
+  GET  /api/v1/flags?source=auto-shift|auto-linear   a machine source is a selector of its own: what we changed at
+                                                   read time, nationwide (auto-shift: one KG-level row per KG)
        filters layer=a,b  claim=a,b  status=open (default) | confirmed | rejected | fixed | stale | all
                since=<unix s | ISO>  limit≤2000  group=subject (default) | report (raw rows, newest first)
                notes=0 (drop notes)  format=json | columns ({{cells[], kg[], layer[], n[], open[], last[], top_claim[]}})
@@ -465,6 +467,22 @@ IDENTITY — say which tree you mean, in this order of preference:
        `reporter` ids are namespaced to the key and no longer depend on the network you post from, daily cap
        4 500 per key, as without one. Holders without "~" are organisations we verified (cap 20 000 —
        ask us). Wrong key → 401. The key works for every POST /api/v1/flags, not only trees.
+
+  Position frames (KGs whose tree positions we corrected after you downloaded them)        #position-frames
+       /trees/bbox carries top-level "frames": {{"<kg>": "p-5+5"}} ONLY for such KGs (absent = never moved). Keep it
+       with your copy and echo it on every report as "frame": "<token>" — or send "as_of": <time of your download,
+       ISO | epoch s>. Without either we decide from the coordinate / tree_id itself (it names an apex in one
+       frame only) and from your recent reports. A report from an older copy is filed on the SAME tree at today's
+       position: the answer carries frame{{frame, sent, by: frame|as_of|exact|history, moved_m:[dx,dy] (EPSG:3035),
+       tree_id?}} (inside tree{{}} for tree reports, top-level for flags) + subject / tree at the position filed —
+       re-fetch /trees/bbox for those KGs. frame.ambiguous = both frames fit, taken as today's (hint says how to
+       correct). Added trees, claim "missing" and points on no apex are real-world positions and never move.
+       Before a bulk import: POST /api/v1/trees/frame {{"points":[[lon,lat]…] (≤ 20000) | "tree_ids":[…]}} →
+       {{kgs:{{"<kg>":{{frame: which frame your file is in, current, stale_hits, current_hits, confident}}}}}};
+       GET /api/v1/trees/frame → every KG that moved {{frame, stale, moved_m, from, until}} + frames_rev.
+       /trees/taxa carries frames_rev: when it changes, positions of old rows moved without a new rev → re-read
+       from since=0 once. What we did per KG is public: GET /api/v1/flags?source=auto-shift&group=report
+       (claim misplaced, expected{{applied, moved_m, frame, since}}); a rejected one is switched off again.
 
   Read back — cheapest first:
   1. /api/v1/trees/bbox grows ONLY where something was reported (untouched KGs: byte-identical, 1-day cache;

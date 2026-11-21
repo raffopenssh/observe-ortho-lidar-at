@@ -34,7 +34,15 @@ $COMMON"
 [ -n "$DRY" ] || { active || exit 0; while active; do sleep 120; done; }
 send "srtm-lidar-at wake-up B: tree/structure position verify finished — report only.
 $U ended: $(systemctl show -p Result --value $U). Last step 'ne_pos_fix.py --verify' measured ~483 candidate parent KGs against BEV nDSM and switched on the read-time (-5,+5) m correction of tree apices / structures per confirmed KG (verdicts: shift = corrected, zero / mixed / unclear = left alone).
-Collect: python3 ne_pos_fix.py --status; the step log below; curl -s localhost:8100/api/v1/health.
-Pre-run test: 10 parents -> 7 shift, 3 zero controls untouched, 1 mixed left alone. Expect mostly shift among the 416 shifted products' parents; mixed (166 products) mostly left alone.
-Reply with: owner report <= 10 lines — verdict histogram, MB used, failures, KGs left uncorrected (mixed/unclear count; these need the reprocess noted under 'Open: products that need a real regeneration') — and one line for umfeld-at only if tree positions changed (trees moved 7 m NW in N KGs; etags changed, re-fetch).
+Since the job started the fix gained a public record and stale-copy handling (docs/tree-user.md -> Position frames; read only that section): one KG-level machine flag per decided KG (source auto-shift, claim misplaced, expected.applied/moved_m), user reports + tree flags migrated with each KG, clients on an older download re-framed on write.
+Collect (cheap, in this order):
+1. python3 ne_pos_fix.py --status
+2. python3 ne_pos_fix.py --sync      (idempotent; flags must equal decided KGs)
+3. curl -s 'localhost:8100/api/v1/flags?source=auto-shift&group=report&status=all&limit=1000' | python3 -c 'import sys,json,collections as c; r=json.load(sys.stdin)[\"reports\"]; print(len(r), c.Counter((x[\"expected\"][\"verdict\"], x[\"status\"]) for x in r))'
+4. curl -s localhost:8100/api/v1/trees/frame | head -c 400 ; curl -s localhost:8100/api/v1/health
+5. sqlite3 data/public_flags.sqlite 'SELECT fr, COUNT(*) FROM tree_ver GROUP BY fr'   (1 = reports that arrived in the old frame and were moved)
+6. python3 tests/test_tree_frame.py | tail -1 ; the step log below
+Pre-run test: 10 parents -> 7 shift, 3 zero controls untouched, 1 mixed left alone. Expect mostly shift among the 416 shifted products' parents; mixed (166 products) mostly left alone. KGs with user rows among the candidates: 92001, 92124 - check 'migrated' in data/ne_pos_fix.json for them.
+Judge: verdict histogram, MB used, errors (verdict error = not stored, retried next weekly run), flags == decided KGs, any migrate failure.
+Reply with: (1) owner report <= 10 lines - numbers first; KGs left uncorrected (mixed/unclear; these need the reprocess under 'Open: products that need a real regeneration'); (2) only if any KG got verdict shift, a paste-ready note for the NE server AND inventory clients, <= 6 lines: N KGs, trees/structures moved 7 m NW ((-5,+5) m EPSG:3035), list = GET /api/v1/flags?source=auto-shift, re-fetch /trees/bbox for KGs in its 'frames' block, echo 'frame' on reports, /trees/taxa readers re-read from since=0 when frames_rev changes, v3 ids: tree_id_prev maps old exports.
 $COMMON"

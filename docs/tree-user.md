@@ -150,3 +150,57 @@ Several apices on one broad crown. A reader flags the extra (lower) top: layer `
   tree of the result has one), `/trees/taxa` last column; `notes=0` everywhere. Moderation = the version's
   `/trees/taxa/<rev>/moderate`.
 * `/trees/bbox` json / geojson now also passes `reported` through (`landscape_query.trees_bbox` dropped it).
+
+## Position frames (`ne_pos_fix.py`, 2026-11-21)
+
+Tree / structure positions of a KG can change after a client downloaded them
+(read-time (−5,+5) m fix of the shifted v2 products, `docs/hillshade-seams.md`).
+Rule: **a report made with any copy lands on the same tree; nothing is dropped;
+a refresh returns today's positions.**
+
+* **Record = flag.** One KG-level machine report per decided KG: layer
+  `trees`, claim `misplaced`, source `auto-shift`, `expected {hint:"shift",
+  applied, moved_m:[dx,dy], crs, frame, since[, until], verdict}`, `observed
+  {windows, shifted, err_m{moved, stored}}`. `GET /api/v1/flags?source=auto-shift`
+  (machine source = selector, no bbox needed) lists what was done to the 2.4
+  product; `mixed` KGs are listed with `applied:false`. KG-level rows never
+  hide a cell. **Overrule**: set the report `rejected` → the hourly
+  `ne_pos_fix.py --sync` (`ne-linear.service` ExecStartPost) calls `unfix`:
+  shift off, every user row moved back, copies made while it was on resolve
+  (`frame p0`, `stale p-5+5`).
+* **Frame token**: `p0` = positions as stored, `p-5+5` = moved. `/trees/bbox`
+  carries sparse top-level `frames {kg: token}` only for KGs that ever moved
+  (zero bytes elsewhere). Clients store it with a download and echo it as
+  `"frame"` (or `"as_of"` = download time) on every report.
+* **`tree_user.reframe`** (called from `public_flags.record` for tree-layer
+  bodies, before subject / matching): `frame` echo → `as_of` → exact evidence
+  (the coordinate sits ≤ 0.75 m on an apex in one frame only, or the
+  `tree_id` is bound in one) → the reporter's unambiguous reports of the last
+  days in that KG (`tree_ver.fr`: 1 stale-moved, 2 current, 3 ambiguous) →
+  today's frame + `ambiguous` hint. Moves `lon/lat/tree_id/expected.of` in
+  place; the answer carries `frame {frame, sent, by, moved_m, tree_id?}`
+  (`tree.frame` on tree reports, top-level on plain flags) + a "refresh"
+  warning. Free points (no apex in either frame), added trees and `missing`
+  flags are real-world positions and never move.
+* **Bulk check before an import**: `POST /api/v1/trees/frame {points:[[lon,lat]…]
+  | tree_ids:[…]}` → per KG `{frame, current, stale_hits, current_hits,
+  confident}`; `GET` lists all frames + `frames_rev`.
+* **Migration** (`ne_pos_fix._migrate_stores`, one transaction per KG): `tree_ver`
+  rows (not added trees), tree-layer point flags that name one of the KG's
+  apices within 2.5 m (selected spatially — the row's `kg` is not trusted),
+  crown flags (`skey` + `expected.of`). Rows move WITHOUT a new rev →
+  `/trees/taxa` carries `frames_rev`; when it changes, delta readers re-read
+  from `since=0`. `tree_user.state` is also keyed on `ne_pos_fix.tag(kg)`.
+* **v3 inventory** (`trees_v3.read_apices`, forestry): serves moved e/n, the
+  new `tree_id`, plus `tree_id_prev` (the id of older exports) and
+  `tree_id_product`; a stale id posted to `/flags` resolves by evidence.
+* **Regeneration**: when a shifted KG's product is rebuilt on the true grid,
+  call `ne_pos_fix.retire(kg)` (`--retire`) — shift off, token and frame
+  history kept. Not wired into any pipeline yet.
+* Not migrated: cell-keyed flags on the `structures` / cells layers (cell ids
+  do not move; 7 m vs 16 m cells).
+* Tree-layer point flags are filed under the KG whose **file** serves the
+  apex (`tree_user.apex_kg`), not the cell's KG — KG rectangles overlap.
+  `tree_user.rekey_tree_flags()` repaired older rows once.
+
+Test: `python3 tests/test_tree_frame.py`.

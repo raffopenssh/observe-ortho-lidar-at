@@ -86,6 +86,7 @@ _ADD_COLS = (('uh_dm', 'INTEGER'),      # reporter's own height measurement / es
              ('meta', 'INTEGER'),       # packed training metadata, 4 bits each (META_FIELDS order; 0 = not given)
              ('org', 'INTEGER'),        # dict id (kind 'org'): holder of the reporter key the version came with
              ('sdate', 'INTEGER'),      # date of the state, packed (pack_date: 2 bytes; NULL = not given)
+             ('fr', 'INTEGER'),         # position frame the report arrived in: 1 stale (moved), 2 today's, 3 ambiguous
              ('note', 'TEXT'))          # reporter's comment ≤ pf.MAX_NOTE chars (NULL = none given, '' = taken back)
 # training metadata vocabulary (standard English terms; value index + 1 is stored).  German field terms
 # and common synonyms are accepted and normalised.
@@ -407,6 +408,11 @@ def state(kg, grev: int | None = None) -> dict:
     if not grev:
         return _EMPTY
     st = _state.get(kg)
+    # a position fix moves the KG's rows without a new rev → the cached state must not outlive it
+    import ne_pos_fix
+    ptag = ne_pos_fix.tag(kg)
+    if st is not None and st.get('ptag', '') != ptag:
+        st = None
     if st is not None and st.get('grev') == grev and st.get('path') == str(pf.DB_PATH):
         return st
     try:
@@ -420,7 +426,7 @@ def state(kg, grev: int | None = None) -> dict:
     except Exception as e:  # noqa: BLE001
         log.warning('tree_user state %s: %s', kg, e)
         return _EMPTY
-    st['grev'] = grev
+    st['grev'] = grev; st['ptag'] = ptag
     with _state_lock:
         if len(_state) > 8000:
             _state.clear()
@@ -964,10 +970,10 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
                               (now, x, y, kg, OP_MODERATE, rep, source_id, undone['rev'], org_id))
                 else:
                     c.execute('INSERT INTO tree_ver(ts, x, y, kg, op, sp, h_dm, reporter, source, epoch, uh_dm, dbh_mm, '
-                              'e_dm, n_dm, cid, mts, meta, org, sdate, note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                              'e_dm, n_dm, cid, mts, meta, org, sdate, note, fr) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                               (now, x, y, kg, op, sp, h_dm, rep, source_id, ep, uh_dm, dbh_mm, e_dm, n_dm,
                                cid if op == OP_ADD else None, mts, meta, org_id, sdate,
-                               None if op == OP_RETRACT else note_v))
+                               None if op == OP_RETRACT else note_v, body.get('_fr')))
                 written = True
             c.execute('COMMIT')
         except Exception:
@@ -994,6 +1000,11 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
         out['matched_by'] = 'client_id'
     if apex_h is not None:
         out['height_m'] = round(apex_h, 2)
+    if body.get('_frame'):
+        out['frame'] = body['_frame']
+        if body['_frame'].get('moved_m'):
+            warnings.append('coordinates / tree_id were from a copy made before the position fix of this KG — matched '
+                            'after moving them; refresh your copy (tree.frame, docs #position-frames)')
     if latin is not None and not known:
         warnings.append('species not in our dictionary — stored as written; check /api/v1/trees/taxa/dict')
     if warnings:
@@ -1149,6 +1160,11 @@ def history(lon: float | None = None, lat: float | None = None, tree_id=None, cl
     if not g:
         return None
     best = None
+    if client_id in (None, '') and (tree_id not in (None, '') or (lon is not None and lat is not None)):
+        b = {'tree_id': tree_id, 'lon': lon, 'lat': lat}         # an id / coordinate of a stale copy (Position frames)
+        prefill(b)
+        if (reframe(b) or {}).get('moved_m'):
+            tree_id, lon, lat = b['tree_id'], b['lon'], b['lat']
     tid = parse_tree_id(tree_id)
     if tid is not None:
         lon, lat = _tf('EPSG:3035', 'EPSG:4326').transform(tid[0] / 10.0, tid[1] / 10.0)
@@ -1416,6 +1432,9 @@ def taxa_get():
     out = listing(bbox, kg, since, limit, only=None if not sf else 0 if sf in ('1', 'any') else state_id(sf),
                   notes=_notes_arg(a))
     out['meta'] = _meta()
+    fr = frames_rev()
+    if fr:      # changes when tree positions of a KG were corrected: rows moved WITHOUT a new rev → re-read from since=0
+        out['frames_rev'] = fr
     return pf._resp(out, max_age=TAXA_MAX_AGE)
 
 
@@ -1475,3 +1494,243 @@ def taxa_moderate(rev: int):
     if d is None and not _conn().execute('SELECT 1 FROM tree_ver WHERE rev=? AND op != 3', (rev,)).fetchone():
         raise pf.FlagError(404, 'no such version')
     return pf._resp({'rev': rev, 'hidden': True, 'tree': d, 'meta': _meta()})
+
+
+# === SECTION: position frames (stale downloads after a tree position fix) ===
+# docs/tree-user.md → Position frames.  A KG's apices can move as a block (ne_pos_fix: the measured
+# (−5, +5) m correction; later a regeneration).  A client that downloaded trees BEFORE that and reports
+# afterwards (offline edits, mail sync) names them by coordinates / tree_ids of the old frame.
+
+FRAME_EXACT_M = 0.75         # a coordinate copied from a download sits on its apex (metre-snapped corpus)
+FRAME_HIST_S = 30 * 86400    # a reporter's own unambiguous reports in the KG decide an ambiguous one
+FRAME_VOTE_MAX = 20000       # points per POST /api/v1/trees/frame
+FRAME_VOTE_SAMPLE = 300      # evaluated per KG (evenly sampled)
+FR_STALE, FR_CURRENT = 1, 2  # tree_ver.fr: frame the report arrived in (NULL = no evidence either way)
+
+
+def _as_of(v) -> int:
+    try:
+        if isinstance(v, (int, float)) or str(v).strip().replace('.', '', 1).isdigit():
+            t = float(v)
+            return int(t / 1000 if t > 1e11 else t)
+        import datetime as _dt
+        d = _dt.datetime.fromisoformat(str(v).strip().replace('Z', '+00:00'))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=_dt.timezone.utc)
+        return int(d.timestamp())
+    except Exception:  # noqa: BLE001
+        raise pf.FlagError(400, 'as_of must be the time of your download: ISO date / datetime or epoch seconds')
+
+
+def _frame_kgs(lon, lat) -> dict:
+    """{(dx, dy): {kgs, until, frame}} of the fixed KGs around a point (empty almost everywhere)."""
+    import ne_pos_fix
+    if not ne_pos_fix.all_frames():
+        return {}
+    out = {}
+    for k in _near_kgs(lon, lat, SEARCH_M + 8.0):
+        f = ne_pos_fix.frames(k)
+        if f and f['delta'] != (0, 0):
+            g = out.setdefault(f['delta'], {'kgs': set(), 'until': 0, 'from': f['from'], 'frame': f['frame'], 'stale': f['stale']})
+            g['kgs'].add(int(k)); g['until'] = max(g['until'], f['until']); g['from'] = min(g['from'], f['from'])
+    return out
+
+
+def _on_apex(px, py, kgs=None, tol=FRAME_EXACT_M) -> bool:
+    lon, lat = _tf('EPSG:3035', 'EPSG:4326').transform(px, py)
+    ap = _apices_near(float(lon), float(lat), 3.0)
+    if ap is None:
+        return False
+    ok = (np.abs(ap['x'] - px) <= tol + 1e-6) & (np.abs(ap['y'] - py) <= tol + 1e-6)
+    if kgs is not None:
+        ok &= np.isin(ap['kg'].astype(np.int64), list(kgs))
+    return bool(ok.any())
+
+
+def apex_kg(lon, lat, r_m: float = 2.5) -> str | None:
+    """KG file serving the apex a point names (nearest within r_m = ne_trees.FLAG_APEX_M), else None."""
+    ap = _apices_near(float(lon), float(lat), r_m + 1.0)
+    if ap is None:
+        return None
+    px, py = _to_3035(float(lon), float(lat))
+    d = np.hypot(ap['x'] - px, ap['y'] - py)
+    j = int(np.argmin(d))
+    return str(ap['kg'][j]).zfill(5) if d[j] <= r_m else None
+
+
+def rekey_tree_flags(dry: bool = False) -> dict:
+    """One-off repair: tree-layer point flags written before 2026-11-21 were filed under the KG
+    of their cell; where another KG's file serves the apex they never took effect."""
+    c = _conn(); pf._load_dict(c)
+    lay = pf._DICT.get(('layer', 'trees')); auto = pf._DICT.get(('source', 'auto-linear'))
+    n = moved = 0
+    for r in c.execute('SELECT id, kg, lon_e6, lat_e6 FROM report WHERE layer=? AND lon_e6 IS NOT NULL AND cell IS NOT NULL '
+                       'AND skey > ? AND (source IS NULL OR source != ?)', (lay, -(1 << 32), -1 if auto is None else auto)).fetchall():
+        n += 1
+        k = apex_kg(r['lon_e6'] / 1e6, r['lat_e6'] / 1e6)
+        if k and k != r['kg']:
+            moved += 1
+            if not dry:
+                c.execute('UPDATE report SET kg=? WHERE id=?', (k, r['id']))
+    return {'point_flags': n, 'rekeyed': moved, 'dry': dry}
+
+
+def _id_bound(c, tid, kgs) -> bool:
+    fx, fy = tid[0] // 10, tid[1] // 10
+    q = ','.join(str(int(k)) for k in kgs)
+    return bool(q) and c.execute(f'SELECT 1 FROM tree_ver WHERE kg IN ({q}) AND x BETWEEN ? AND ? AND y BETWEEN ? AND ? '
+                                 'AND e_dm=? AND n_dm=? AND op IN (0, 2) LIMIT 1',
+                                 (fx - 3, fx + 4, fy - 3, fy + 4, tid[0], tid[1])).fetchone() is not None
+
+
+def reframe(body: dict, rep: bytes | None = None) -> dict | None:
+    """Decide which position frame a tree report was made in and, when it is a
+    stale one, move ``lon / lat / tree_id`` (and ``expected.of``) to today's
+    frame IN PLACE — before the subject / matching code sees them.  Order:
+    ``frame`` echo → ``as_of`` (download time) → evidence (the coordinate sits
+    exactly on an apex in one frame only) → the reporter's recent unambiguous
+    reports in that KG → today's frame + ``ambiguous``.  A free point (on no
+    apex in either frame) is a real-world position = today's frame.
+    Returns the public ``frame`` block (None outside fixed KGs)."""
+    if not isinstance(body, dict) or body.get('lon') is None or body.get('lat') is None:
+        return None
+    try:
+        lon, lat = float(body['lon']), float(body['lat'])
+    except (TypeError, ValueError):
+        return None
+    groups = _frame_kgs(lon, lat)
+    if not groups:
+        return None
+    (dx, dy), g = max(groups.items(), key=lambda kv: len(kv[1]['kgs']))
+    tid = parse_tree_id(body.get('tree_id'))
+    px, py = (tid[0] / 10.0, tid[1] / 10.0) if tid else _to_3035(lon, lat)
+    tok = body.get('frame')
+    by = None; stale = False
+    if tok not in (None, ''):
+        stale, by = str(tok).strip().lower() == g['stale'], 'frame'
+    elif body.get('as_of') not in (None, ''):
+        stale, by = g['from'] <= _as_of(body['as_of']) < g['until'], 'as_of'
+    here = there = None
+    if by is None:
+        c = _conn()
+        tid_b = (tid[0] + dx * 10, tid[1] + dy * 10) if tid else None
+        here = (tid is not None and _id_bound(c, tid, _near_kgs(lon, lat, 3.0))) or _on_apex(px, py)
+        there = (tid is not None and _id_bound(c, tid_b, g['kgs'])) or _on_apex(px + dx, py + dy, g['kgs'])
+        if here != there:
+            stale, by = there, 'exact'
+        elif here and rep is not None:
+            q = ','.join(str(k) for k in g['kgs'])
+            n = dict(c.execute(f'SELECT fr, COUNT(*) FROM tree_ver WHERE reporter=? AND kg IN ({q}) AND ts>? AND fr IN (1, 2) '
+                               'GROUP BY fr', (rep, int(time.time()) - FRAME_HIST_S)).fetchall())
+            if n and len(n) == 1 and sum(n.values()) >= 2:
+                stale, by = FR_STALE in n, 'history'
+    out = {'frame': g['frame'], 'sent': g['stale'] if stale else g['frame'], 'by': by}
+    if by is None:
+        if here:                                    # an apex under the coordinate in BOTH frames, nothing to tell them apart
+            out.update(ambiguous=True, hint='this coordinate names one tree in today\'s positions and another in a '
+                                            'copy downloaded before the position fix — taken as today\'s; re-send with '
+                                            f'"frame": "{g["stale"]}" (after "retract": "last") if it came from an older download')
+        else:
+            out.pop('by')
+        body['_fr'] = 3 if here else None
+        return out
+    body['_fr'] = FR_STALE if stale else FR_CURRENT
+    if not stale:
+        return out
+    inv = _tf('EPSG:3035', 'EPSG:4326')
+
+    def move(d):
+        t = parse_tree_id(d.get('tree_id'))
+        if t is not None:
+            d['tree_id'] = tree_id_str((t[0] + dx * 10, t[1] + dy * 10))
+        if d.get('lon') is not None and d.get('lat') is not None:
+            x, y = _to_3035(float(d['lon']), float(d['lat']))
+            lo, la = inv.transform(x + dx, y + dy)
+            d['lon'], d['lat'] = float(lo), float(la)
+    move(body)
+    exp = body.get('expected')
+    if isinstance(exp, dict) and isinstance(exp.get('of'), dict):
+        body['expected'] = {**exp, 'of': dict(exp['of'])}
+        move(body['expected']['of'])
+    out.update(moved_m=[dx, dy], lon=round(body['lon'], 7), lat=round(body['lat'], 7))
+    if tid is not None:
+        out['tree_id'] = body['tree_id']
+    return out
+
+
+def frames_rev() -> str | None:
+    import ne_pos_fix
+    f = ne_pos_fix.all_frames()
+    return f'{len(f)}.{max(v["until"] for v in f.values())}' if f else None
+
+
+def frame_vote(points=None, tree_ids=None) -> dict:
+    """Which frame is a whole downloaded file in?  Per fixed KG: how many of its
+    coordinates sit exactly on an apex in the stale frame / in today's."""
+    inv = _tf('EPSG:3035', 'EPSG:4326')
+    xy = []
+    for t in tree_ids or ():
+        t = parse_tree_id(t)
+        if t is not None:
+            xy.append((t[0] / 10.0, t[1] / 10.0))
+    if points:
+        a = np.asarray(points, np.float64).reshape(-1, 2)
+        x, y = _tf('EPSG:4326', 'EPSG:3035').transform(a[:, 0], a[:, 1])
+        xy += list(zip(np.asarray(x).tolist(), np.asarray(y).tolist()))
+    import ne_pos_fix
+    res = {}
+    if xy and ne_pos_fix.all_frames():
+        a = np.asarray(xy); lo, la = inv.transform(a[:, 0], a[:, 1])
+        by_kg = {}
+        # coarse: one KG lookup per 200 m bucket, then per point only inside fixed KGs
+        bucket = {}
+        for i, (x, y) in enumerate(xy):
+            b = (int(x // 200), int(y // 200))
+            if b not in bucket:
+                bucket[b] = [k for k in _near_kgs(float(lo[i]), float(la[i]), 300.0) if ne_pos_fix.frames(k)]
+            if bucket[b]:
+                for k in _near_kgs(float(lo[i]), float(la[i]), 1.0):
+                    if ne_pos_fix.frames(k):
+                        by_kg.setdefault(str(k).zfill(5), []).append(i)
+                        break
+        for kg, idx in by_kg.items():
+            f = ne_pos_fix.frames(kg); dx, dy = f['delta']
+            step = max(1, len(idx) // FRAME_VOTE_SAMPLE)
+            ns = nc = nb = 0
+            for i in idx[::step][:FRAME_VOTE_SAMPLE]:
+                x, y = xy[i]
+                h = _on_apex(x, y); t = _on_apex(x + dx, y + dy, {int(kg)})
+                ns += t and not h; nc += h and not t; nb += h and t
+            win = f['stale'] if ns > nc else f['frame']
+            hi, lo_ = max(ns, nc), min(ns, nc)
+            res[kg] = {'frame': win if hi else None, 'current': f['frame'], 'points': len(idx), 'stale_hits': int(ns),
+                       'current_hits': int(nc), 'both': int(nb), 'confident': bool(hi >= 5 and hi >= 4 * max(lo_, 1)),
+                       'stale': f['stale'], 'moved_m': list(f['delta']), 'from': f['from'], 'until': f['until']}
+    return {'points': len(xy), 'kgs': res, 'default': 'current',
+            'note': 'send "frame" of the KG with every report from this file; KGs not listed never moved'}
+
+
+@pf.flags_bp.route('/api/v1/trees/frame', methods=['GET', 'POST'])
+def frame_route():
+    from flask import request
+    import ne_pos_fix
+    if request.method == 'GET':
+        r = pf._resp({'kgs': {k: {'frame': v['frame'], 'stale': v['stale'], 'moved_m': list(v['delta']), 'from': v['from'], 'until': v['until']}
+                              for k, v in sorted(ne_pos_fix.all_frames().items())},
+                      'frames_rev': frames_rev(), 'default': 'KGs not listed never moved', 'record': '/api/v1/flags?source=auto-shift',
+                      'meta': _meta()})
+        r.headers['Cache-Control'] = 'public, max-age=300'
+        return r
+    body = request.get_json(silent=True) or {}
+    pts = body.get('points') or []; ids = body.get('tree_ids') or []
+    if not isinstance(pts, list) or not isinstance(ids, list) or not (pts or ids):
+        raise pf.FlagError(400, 'send {"points": [[lon, lat], …]} and / or {"tree_ids": ["t_…", …]} — every point of the file, edited or not')
+    if len(pts) + len(ids) > FRAME_VOTE_MAX:
+        raise pf.FlagError(413, f'more than {FRAME_VOTE_MAX} points')
+    lim = pf._limited(pf._post_limit, cost=float(len(pts) + len(ids)) ** 0.5)
+    if lim is not None:
+        return lim
+    try:
+        return pf._resp(frame_vote(pts, ids))
+    except (TypeError, ValueError):
+        raise pf.FlagError(400, 'points must be [[lon, lat], …]')

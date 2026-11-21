@@ -613,19 +613,19 @@ def _load_chunk(kg: str, row: dict, hdr: dict, raw: bool = False) -> Chunk:
     p = _file_path(kg)
     with open(p, 'rb') as fh:
         fh.seek(int(hdr['body_offset']) + int(row['off']))
-        raw = zlib.decompress(fh.read(int(row['len'])))
+        buf = zlib.decompress(fh.read(int(row['len'])))
     n, t, b = int(row['cells']), int(row['trees']), int(row['bld'])
     rb = hdr.get('record_bytes') or {}
     r0, r1, r2, r3 = int(rb.get('nec1', 30)), int(rb.get('neo1', REC)), int(rb.get('net1', 4)), int(rb.get('neb1', 8))
     o1 = n * r0; o2 = o1 + n * r1; o3 = o2 + t * r2
     shuffled = 'shuffle' in str(hdr.get('chunk_layout') or '')
     if shuffled:
-        parts = {'obs': ne_h3._unshuffle(raw[o1:o2], r1, n), 'trees': ne_h3._unshuffle(raw[o2:o3], r2, t),
-                 'bld': ne_h3._unshuffle(raw[o3:o3 + b * r3], r3, b)}
-        ctx_rows = ne_h3._unshuffle(raw[:o1], r0, n)
+        parts = {'obs': ne_h3._unshuffle(buf[o1:o2], r1, n), 'trees': ne_h3._unshuffle(buf[o2:o3], r2, t),
+                 'bld': ne_h3._unshuffle(buf[o3:o3 + b * r3], r3, b)}
+        ctx_rows = ne_h3._unshuffle(buf[:o1], r0, n)
     else:
-        parts = {'obs': raw[o1:o2], 'trees': raw[o2:o3], 'bld': raw[o3:o3 + b * r3]}
-        ctx_rows = raw[:o1]
+        parts = {'obs': buf[o1:o2], 'trees': buf[o2:o3], 'bld': buf[o3:o3 + b * r3]}
+        ctx_rows = buf[:o1]
     # read-time overrides (tree rule: alpen/bau/gruen under a LiDAR canopy → wald;
     # green rule: bau/alpen on S2-green cells → gruen); the file is untouched — see ne_green_fix.py
     parts['obs'], _ = _green_fix.fix_rows(parts["obs"], ctx_rows)

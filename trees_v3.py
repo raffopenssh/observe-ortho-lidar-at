@@ -297,6 +297,17 @@ def read_apices(path: str, geom_3035, code: str, version: str | None = None) -> 
     import fiona
     import v21_products
     out = []
+    # KGs built on 5 m-shifted rasters (ne_pos_fix, measured per parent): the product stores every apex
+    # `off` away from its true place → select in the stored frame, serve in the true one
+    off = None
+    try:
+        import ne_pos_fix
+        off = ne_pos_fix.offset(str(code).split('-')[0])
+    except Exception:  # noqa: BLE001
+        pass
+    if off:
+        from shapely.affinity import translate
+        geom_3035 = translate(geom_3035, -off[0], -off[1])
     pg = prep(geom_3035)
     with fiona.open(path, layer=v21_products.TREE_APICES_LAYER) as src:
         for f in src.filter(bbox=geom_3035.bounds):
@@ -309,6 +320,16 @@ def read_apices(path: str, geom_3035, code: str, version: str | None = None) -> 
             r["product_version"] = version
             out.append(r)
     canonicalize_rows(out)
+    if off:
+        import tree_inventory as tv
+        for r in out:
+            # tree_id_prev = the id (and position) every client copy made before the fix holds;
+            # reports sent with it are re-bound by tree_user.reframe
+            r["tree_id_prev"] = r.get("tree_id")
+            r.setdefault("tree_id_product", r.get("tree_id"))
+            r["e"] += off[0]; r["n"] += off[1]
+            r["tree_id"] = tv._stable_tree_id(r["e"], r["n"])
+            r["_pos_off"] = off
     return out
 
 
@@ -687,6 +708,8 @@ def product_row_to_feature(r: dict, crown=None) -> dict:
     }
     if r.get("tree_id_product"):
         props["tree_id_product"] = r["tree_id_product"]
+    if r.get("tree_id_prev"):                       # id before the KG's position fix (ne_pos_fix)
+        props["tree_id_prev"] = r["tree_id_prev"]
     if r.get("tree_id_twin"):
         props["tree_id_twin"] = r["tree_id_twin"]
     if r.get("tree_id_v2"):
