@@ -16,7 +16,7 @@ COMMON="Rules: fresh, self-contained wake-up — do NOT continue or read convers
 Step log (summaries + errors only): journalctl -u $U --since '$SINCE' --no-pager -o cat | grep -E '^\\{|Traceback|Error|rror:|exited|Failed|Finished|Deactivated|Consumed' | cut -c1-400 | tail -40"
 
 if [ -z "$DRY" ]; then while active && ! pgrep -f 'ne_pos_fix.py --verify' >/dev/null; do sleep 60; done; fi
-STILL=$(active && echo "The unit is STILL RUNNING its last step (ne_pos_fix --verify, >1 day, 120 MB/h): do not restart or stop it; a second wake-up reports it." || echo "The unit has ended: $(systemctl show -p Result --value $U) — ne_pos_fix did not run or is already done; check the step log.")
+STILL=$(active && echo "The unit is STILL RUNNING its last step (ne_pos_fix --verify, 5 GB/h budget): do not restart or stop it; a second wake-up reports it." || echo "The unit has ended: $(systemctl show -p Result --value $U) — ne_pos_fix did not run or is already done; check the step log.")
 send "srtm-lidar-at wake-up A: hillshade repair run finished — verify and report (no code changes unless a step failed for a trivial, safe-to-fix reason).
 $STILL
 Job = $U, steps: outline fetch -> grid25 registration -> grid25_patch --edge-scan (cliff-like internal tile edges, all products) -> grid25_patch --scan (verify suspects against BEV DTM, rebuild bad tiles, one tile-set version bump if anything changed) -> z15 country seam check on the new tile set.
