@@ -749,14 +749,15 @@ class Table:
         return _gather_rows(self, 'bld_off', 'bld')
 
 
-def _gather_rows(t: Table, off_attr: str, arr_attr: str):
+def _gather_rows(t: Table, off_attr: str, arr_attr: str, arrs: list | None = None):
+    """``arrs`` = one array per chunk parallel to its rows (e.g. a keep-mask) gathered instead of the rows."""
     n = len(t)
     if n == 0:
         return np.zeros(0, np.int64), np.zeros(0, np.uint64)
     base = np.zeros(len(t.chunks) + 1, np.int64)
     for i, ch in enumerate(t.chunks):
         base[i + 1] = base[i] + len(getattr(ch, arr_attr))
-    allw = np.concatenate([getattr(ch, arr_attr) for ch in t.chunks]) if t.chunks else np.zeros(0)
+    allw = np.concatenate(arrs if arrs is not None else [getattr(ch, arr_attr) for ch in t.chunks]) if t.chunks else np.zeros(0)
     starts = np.empty(n, np.int64); cnt = np.empty(n, np.int64)
     for i, ch in enumerate(t.chunks):
         m = t.src_chunk == i

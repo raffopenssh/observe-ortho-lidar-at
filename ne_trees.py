@@ -58,6 +58,7 @@ FLAG_LAYERS = {'trees': ('trees', 'cells.trees'), 'structures': ('structures', '
 LEGACY_FLAG_KIND = {'trees': 'top_tree', 'structures': 'top_by_type'}
 MAX_LIMIT = 20000              # hard cap; default 2000 (a 5 km² alpine tile holds >2000 apices ≥ 35 m)
 DEFAULT_LIMIT = 2000
+DEFAULT_MIN_H = 3.0            # the cell products' apex population (NET1 min_h_m)
 MAX_AREA_DEG2 = 0.25
 CHUNK_BUDGET = 6000             # hard cap on chunk inflations per request (~1.5 s cold)
 EDGE_PAD_DEG = 0.0015           # ~110 m: r10 cells whose centre is just outside still hold bbox objects
@@ -496,6 +497,85 @@ def _chunk_ext(d: dict) -> dict:
     return ext
 
 
+def _qa_state(kgs, kind: str = 'trees') -> dict:
+    """Per-request state of the realistic filter (:func:`_qa_mask`)."""
+    q = {'kind': kind, 'lin': np.zeros(0, np.uint64), 'lin_grid': frozenset(), 'fcs': {}, 'legacy': {},
+         'crown_add': [], 'crown_tops': [], 'dropped': 0, 'dropped_lin': 0}
+    if kind == 'trees':
+        try:                                # apices of detected linear-noise runs (ne_linear.py)
+            import ne_linear
+            q['lin'], q['lin_grid'] = ne_linear.hidden(kgs)
+        except Exception as ex:  # noqa: BLE001
+            log.debug('ne_trees linear keys: %s', ex)
+    return q
+
+
+def _qa_mask(d: dict, x_: dict, kg: str, m, q: dict):
+    """THE realistic=1 predicate for one decoded chunk: ``m`` (bool mask | None = all) minus
+    height rule, linear-noise apices, reader flags and legacy QA flags.  Used by ``collect``
+    (/trees/bbox) and by :func:`chunk_keep` (cell products, ``cells_bins``) — one implementation."""
+    kind = q['kind']
+    if not x_['all_ok']:
+        m = d['ok'] if m is None else m & d['ok']
+    if q['lin_grid'] and not q['lin_grid'].isdisjoint(x_['grid']):
+        import ne_linear
+        hit = ne_linear.is_hidden(d['x'], d['y'], q['lin'], m)
+        if hit.any():
+            m = ~hit if m is None else m & ~hit; q['dropped_lin'] += int(hit.sum())
+    if kg not in q['fcs']:
+        fc, fp, fm, ft = _flags(kg, kind)
+        q['crown_tops'].extend(ft)
+        q['fcs'][kg] = (np.sort(np.fromiter(fc, np.uint64, len(fc))) if fc else None, fp if len(fp) else None)
+        if fm is not None:
+            q['crown_add'].append(fm)
+    fc, fp = q['fcs'][kg]
+    if fc is not None:
+        i0 = int(np.searchsorted(fc, x_['c0'])); i1 = int(np.searchsorted(fc, x_['c1'], side='right'))
+        if i1 > i0:
+            mb = ~np.isin(d['cell'], fc[i0:i1])
+            m = mb if m is None else m & mb
+    if fp is not None:                           # reports about single trees: hide just that apex
+        pn = fp[(fp[:, 0] >= x_['x0'] - FLAG_APEX_M) & (fp[:, 0] <= x_['x1'] + FLAG_APEX_M)
+                & (fp[:, 1] >= x_['y0'] - FLAG_APEX_M) & (fp[:, 1] <= x_['y1'] + FLAG_APEX_M)]
+        if len(pn):
+            bad = _flag_hits(d, pn)
+            if bad:
+                if m is None:
+                    m = np.ones(d['n'], bool)
+                q['dropped'] += int(m[bad].sum()); m[bad] = False
+    if kg not in q['legacy']:
+        fs = legacy_flagged_points(kg, kind)
+        q['legacy'][kg] = (fs, np.array([p[0] for p in fs]), np.array([p[1] for p in fs])) if fs else None
+    lg = q['legacy'][kg]
+    if lg is not None and ((lg[1] >= x_['w'] - 2e-5) & (lg[1] <= x_['e'] + 2e-5)
+                           & (lg[2] >= x_['s'] - 2e-5) & (lg[2] <= x_['n'] + 2e-5)).any():
+        fs = lg[0]
+        idx = np.arange(d['n']) if m is None else np.nonzero(m)[0]
+        bad = [i for i in idx.tolist() if (round(float(d['lon'][i]), 5), round(float(d['lat'][i]), 5)) in fs]
+        if bad:
+            if m is None:
+                m = np.ones(d['n'], bool)
+            m[bad] = False; q['dropped'] += len(bad)
+    return m
+
+
+def chunk_keep(ch, q: dict):
+    """Keep-mask over the NET1 rows of a loaded ``cells_api.Chunk`` = exactly the apices
+    /trees/bbox returns by default (realistic=1, min_height=3).  None = every apex."""
+    if not ch.trees.size:
+        return None
+    hdr = ca.header(ch.kg)
+    d = _decoded_chunk(ch.kg, ch.row, hdr, 'trees')
+    if not d or not d['n']:
+        return None
+    x_ = d.get('ext')
+    if x_ is None:
+        x_ = d['ext'] = _chunk_ext(d)
+    m = (d['h'] >= DEFAULT_MIN_H) if x_['hmin'] < DEFAULT_MIN_H else None
+    m = _qa_mask(d, x_, ch.kg, m, q)
+    return None if m is None or m.all() else m
+
+
 def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int = DEFAULT_LIMIT,
             realistic: bool = True, types: set | None = None, max_height: float | None = None,
             max_limit: int = MAX_LIMIT, notes: bool = True) -> dict:
@@ -525,19 +605,10 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
     hdrs: dict = {}
     scanned = 0; exhausted = True; kth = -1.0; n_at_kth = 0
     parts: list[tuple[dict, np.ndarray, int]] = []     # (decoded chunk, selected idx | None = all, kg index)
-    n_acc = 0; dropped = 0; dropped_lin = 0
+    n_acc = 0
     kg_ix: dict = {}                                   # kg -> index into kg_names
     kg_names: list = []
-    fcs: dict = {}                                     # kg -> sorted flagged res-12 ids (or None)
-    legacy: dict = {}                                  # kg -> (set, lon array, lat array) | None
-    lin = np.zeros(0, np.uint64); lin_grid = frozenset()
-    crown_add: list = []; crown_tops: list = []                               # per KG [[parent key, m²]] of "same tree" flags (tree_crown.py)
-    if realistic and kind == 'trees':
-        try:                                # apices of detected linear-noise runs (ne_linear.py)
-            import ne_linear
-            lin, lin_grid = ne_linear.hidden(st['kgs'])
-        except Exception as ex:  # noqa: BLE001
-            log.debug('ne_trees linear keys: %s', ex)
+    q = _qa_state(st['kgs'] if realistic else (), kind)
 
     def kth_now() -> float:
         hs = np.concatenate([p[0]['h'] if p[1] is None else p[0]['h'][p[1]] for p in parts])
@@ -591,46 +662,7 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
             mb = hs < max_h
             m = mb if m is None else m & mb
         if realistic:
-            if not x_['all_ok']:
-                m = d['ok'] if m is None else m & d['ok']
-            if lin_grid and not lin_grid.isdisjoint(x_['grid']):
-                hit = ne_linear.is_hidden(d['x'], d['y'], lin, m)
-                if hit.any():
-                    m = ~hit if m is None else m & ~hit; dropped_lin += int(hit.sum())
-            if kg not in fcs:
-                fc, fp, fm, ft = _flags(kg, kind)
-                crown_tops.extend(ft)
-                fcs[kg] = (np.sort(np.fromiter(fc, np.uint64, len(fc))) if fc else None, fp if len(fp) else None)
-                if fm is not None:
-                    crown_add.append(fm)
-            fc, fp = fcs[kg]
-            if fc is not None:
-                i0 = int(np.searchsorted(fc, x_['c0'])); i1 = int(np.searchsorted(fc, x_['c1'], side='right'))
-                if i1 > i0:
-                    mb = ~np.isin(d['cell'], fc[i0:i1])
-                    m = mb if m is None else m & mb
-            if fp is not None:                           # reports about single trees: hide just that apex
-                pn = fp[(fp[:, 0] >= x_['x0'] - FLAG_APEX_M) & (fp[:, 0] <= x_['x1'] + FLAG_APEX_M)
-                        & (fp[:, 1] >= x_['y0'] - FLAG_APEX_M) & (fp[:, 1] <= x_['y1'] + FLAG_APEX_M)]
-                if len(pn):
-                    bad = _flag_hits(d, pn)
-                    if bad:
-                        if m is None:
-                            m = np.ones(d['n'], bool)
-                        dropped += int(m[bad].sum()); m[bad] = False
-            if kg not in legacy:
-                fs = legacy_flagged_points(kg, kind)
-                legacy[kg] = (fs, np.array([p[0] for p in fs]), np.array([p[1] for p in fs])) if fs else None
-            lg = legacy[kg]
-            if lg is not None and ((lg[1] >= x_['w'] - 2e-5) & (lg[1] <= x_['e'] + 2e-5)
-                                   & (lg[2] >= x_['s'] - 2e-5) & (lg[2] <= x_['n'] + 2e-5)).any():
-                fs = lg[0]
-                idx = np.arange(d['n']) if m is None else np.nonzero(m)[0]
-                bad = [i for i in idx.tolist() if (round(float(d['lon'][i]), 5), round(float(d['lat'][i]), 5)) in fs]
-                if bad:
-                    if m is None:
-                        m = np.ones(d['n'], bool)
-                    m[bad] = False; dropped += len(bad)
+            m = _qa_mask(d, x_, kg, m, q)
         if type_codes is not None:
             mb = np.isin(d['type'], type_codes)
             m = mb if m is None else m & mb
@@ -669,9 +701,9 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
                 out[k] = np.concatenate([p[0][k] if p[1] is None else p[0][k][p[1]] for p in parts])[order]
         kidx = np.repeat(np.array([p[2] for p in parts], np.int32), [p[3] for p in parts])[order]
         out['kg'] = np.array(kg_names, dtype=object)[kidx]
-        if crown_add:
+        if q['crown_add']:
             import tree_crown
-            tree_crown.apply(out, crown_add)
+            tree_crown.apply(out, q['crown_add'])
     n_out = int(out['h'].size) if n_acc else 0
     truncated = n_out > lim or not exhausted
     if n_out > lim:
@@ -680,10 +712,10 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
         n_out = lim
     return {'kind': kind, 'cols': out, 'n': n_out, 'kgs': st['kgs'], 'min_height': min_h, 'max_height': max_h,
             'limit': lim, 'pending_kgs': st['pending'], 'not_processed': st['not_processed'],
-            'dropped_qa': dropped, 'dropped_linear': dropped_lin, 'realistic': bool(realistic), 'truncated': truncated,
+            'dropped_qa': q['dropped'], 'dropped_linear': q['dropped_lin'], 'realistic': bool(realistic), 'truncated': truncated,
             'chunks_scanned': scanned, 'chunks_in_bbox': len(rows), 'ms': round((time.time() - t0) * 1000, 1),
             'ready': st['ready'], 'state': st, **_frames_block(st['kgs']), **_user_blocks(kind, out if n_out else None, st['kgs'], w, s, e, n, min_h, max_h, notes),
-            **_merged_block(crown_tops, w, s, e, n, min_h, max_h, out if n_out else None)}
+            **_merged_block(q['crown_tops'], w, s, e, n, min_h, max_h, out if n_out else None)}
 
 
 def _frames_block(kgs) -> dict:
