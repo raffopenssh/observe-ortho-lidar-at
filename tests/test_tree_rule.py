@@ -18,6 +18,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ne_h3                  # noqa: E402
+import json                    # noqa: E402
 import tree_rule              # noqa: E402
 
 
@@ -34,12 +35,23 @@ def test_one_function():
     assert tree_rule.keep_mask(np.array([63.75]))[0] == False and tree_rule.keep_mask(np.array([50.0]))[0]  # noqa: E712
     assert tree_rule.keep_mask(np.zeros(0), np.zeros(0, np.uint64)).size == 0
     import ne_trees, tree_qa
-    assert 'tree_rule.keep_mask(' in inspect.getsource(ne_trees._decode_chunk_uncached)
-    assert '.keep_mask(' in inspect.getsource(ne_h3.build_observed)
+    assert 'tree_rule.chunk_keep(' in inspect.getsource(ne_trees._decode_chunk_uncached)
+    import tree_qa
     assert tree_qa.RULE_ID == tree_rule.RULE_ID and tree_qa.quant_h is tree_rule.quant_h
-    assert tree_rule.built_with({'net1': {'tree_rule': tree_rule.marker(3)}})
-    assert not tree_rule.built_with({'net1': {'rows_n': 1}}) and not tree_rule.built_with(None)
-    assert not tree_rule.built_with({'net1': {'tree_rule': {'id': 'older', 'dropped': 0}}})
+    mk = tree_rule.marker({'8a1f8e333717fff': [2, 5]})
+    assert json.loads(json.dumps(mk)) == mk and mk['hidden'] == 2
+    h = {'net1': {'digest': 'd1', 'tree_rule': mk}}
+    assert tree_rule.built_with(h) and tree_rule.marked_chunks(h) == {0x8a1f8e333717fff}
+    assert tree_rule.hidden_rows(h, 0x8a1f8e333717fff).tolist() == [2, 5] and tree_rule.hidden_rows(h, 7).size == 0
+    # header verdict wins over a re-evaluation (63.75 m at row 0 is NOT listed → kept; rows 2, 5 hidden)
+    assert tree_rule.chunk_keep(h, 0x8a1f8e333717fff, np.array([63.75, 5, 5, 5, 5, 5.])).tolist() == [True, True, False, True, True, False]
+    assert json.loads(json.dumps(h)) == h                       # parsing left the header plain JSON
+    for hh in ({'net1': {'rows_n': 1}}, None, {'net1': {'tree_rule': dict(mk, id='older')}}):
+        assert not tree_rule.built_with(hh) and tree_rule.hidden_rows(hh, 1) is None and tree_rule.marked_chunks(hh) is None
+        assert tree_rule.chunk_keep(hh, 1, np.array([63.75, 5.0])).tolist() == [False, True]
+    # the drop-at-build marker of fdff4ff (no rows): nothing left to hide, not evaluated again
+    lg = {'net1': {'digest': 'd2', 'tree_rule': {'id': tree_rule.RULE_ID, 'dropped': 3}}}
+    assert tree_rule.chunk_keep(lg, 1, np.array([63.75, 5.0])).all()
 
 
 def _build(declared, apex, tf, n=400):
@@ -47,7 +59,7 @@ def _build(declared, apex, tf, n=400):
     return ne_h3.build_observed(declared, seg, nd, lab, [], tf, {}, apex_rows=apex, kg=declared.header.get('kg', ''))
 
 
-def test_builder_equals_old_file_plus_tree_qa():
+def test_writer_marks_rows_file_stays_raw():
     files = sorted(ne_h3.NE_DIR.glob('*.h3b'), key=lambda p: p.stat().st_size)
     if not files:
         print('  (no data/ne/*.h3b — builder part skipped)'); return
@@ -63,44 +75,39 @@ def test_builder_equals_old_file_plus_tree_qa():
             for x, y, h in zip(rng.uniform(5, 395, 900), rng.uniform(5, 395, 900), rng.uniform(3, 32, 900))]
     for k, h in enumerate([62.0, 70.0, 51.3, 47.0, 58.9, 45.2, 49.0, 64.1]):      # masts / spikes
         apex.append({'e': x0 + 30 + 45 * k, 'n': y1 - 40 - 40 * k, 'h_m': h, 'crown_area_m2': 5.0})
-    new = _build(declared, apex, tf)
-    real = tree_rule.keep_mask
-    tree_rule.keep_mask = lambda h, chunk=None: np.ones(np.asarray(h).size, bool)
-    try:
-        old = _build(declared, apex, tf)
-    finally:
-        tree_rule.keep_mask = real
-    assert old['tree_rule']['dropped'] == 0 and new['tree_rule']['dropped'] > 0, new['tree_rule']
-    assert new['tree_rule']['id'] == tree_rule.RULE_ID
-    # old file → what the primary serves: per res-10 chunk, hide what the rule hides (tree_qa.patch)
+    obs = _build(declared, apex, tf)
+    # the builder is non-destructive: every apex is in NET1 (realistic=0 = the raw inventory)
+    w_all = np.frombuffer(obs['net1_raw'], '<u4')
+    assert 0 < w_all.size <= len(apex) and w_all.size == int(obs['tree_n'].sum()) == obs['summary']['observed']['trees_n']
+    assert ((w_all >> 10) & 255).max() == 255 and 'tree_rule' not in obs
+    d = tempfile.mkdtemp(); p = os.path.join(d, 'x.h3b')
+    hdr = ne_h3.write_h3b(p, declared, obs, declared.header.get('kg', '0'), '2.4')
+    assert ne_h3.verify_h3b(p, expected_declared_digest=declared.digest)['ok']
+    hdr = ne_h3.read_h3b_header(p)
+    mk = hdr['net1']['tree_rule']
+    assert tree_rule.built_with(hdr) and mk['mode'] == 'mark' and hdr['net1']['rows_n'] == w_all.size
+    # header verdict == the rule evaluated on each stored chunk (what the primary did for old files),
+    # and tree_qa.patch with the header rows == patch with the read-time rule
     rec = ne_h3.OBS_REC.size
-    par = ne_h3.h3_parent_vec(old['cell_ids'], ne_h3.CHUNK_RES)
+    par = ne_h3.h3_parent_vec(obs['cell_ids'], ne_h3.CHUNK_RES)
     cut = np.flatnonzero(np.concatenate([[True], par[1:] != par[:-1], [True]]))
-    toff = np.concatenate([[0], np.cumsum(old['tree_n'].astype(np.int64))])
-    exp_o = bytearray(); exp_t = bytearray(); hidden = 0
-    for a, b in zip(cut[:-1].tolist(), cut[1:].tolist()):
-        o = old['neo1_raw'][a * rec:b * rec]; t = old['net1_raw'][toff[a] * 4:toff[b] * 4]
-        w = np.frombuffer(t, '<u4')
-        keep = tree_rule.keep_mask(((w >> 10) & 255).astype(np.float64) / 4.0) if w.size else np.ones(0, bool)
+    toff = np.concatenate([[0], np.cumsum(obs['tree_n'].astype(np.int64))])
+    hidden = 0
+    assert len(hdr['chunks']) == len(cut) - 1
+    for c, a, b in zip(hdr['chunks'], cut[:-1].tolist(), cut[1:].tolist()):
+        o = obs['neo1_raw'][a * rec:b * rec]; t = obs['net1_raw'][toff[a] * 4:toff[b] * 4]
+        w = np.frombuffer(t, '<u4'); r10 = int(c['r10'], 16)
+        h = ((w >> 10) & 255).astype(np.float64) / 4.0
+        keep = tree_rule.keep_mask(h) if w.size else np.ones(0, bool)
+        assert np.array_equal(tree_rule.chunk_keep(hdr, r10, h), keep), c['r10']
+        assert (r10 in tree_rule.marked_chunks(hdr)) == (not keep.all())
         if not keep.all():
             hidden += int((~keep).sum())
-            o, t = tree_qa.patch(o, t, np.flatnonzero(~keep).astype('<u2').tobytes())
-        exp_o += o; exp_t += t
-    assert hidden == new['tree_rule']['dropped'], (hidden, new['tree_rule'])
-    assert bytes(exp_t) == new['net1_raw'], 'NET1 rows differ'
-    assert bytes(exp_o) == new['neo1_raw'], 'NEO1 rows differ'
-    assert new['summary']['observed']['trees_n'] == len(new['net1_raw']) // 4 == int(new['tree_n'].sum())
-    # raw surface stats untouched: every NEO1 byte outside tree_n / tree_h_max equals the unfiltered build
-    import cells_api as ca
-    A = np.frombuffer(old['neo1_raw'], ca.OBS_DT); B = np.frombuffer(new['neo1_raw'], ca.OBS_DT)
-    assert all(np.array_equal(A[f], B[f]) for f in ca.OBS_DT.names if f not in ('tn', 'thx'))
-    d = tempfile.mkdtemp()
-    for tag, obs in (('new', new), ('old', dict(old, tree_rule=None))):
-        p = os.path.join(d, tag + '.h3b')
-        hdr = ne_h3.write_h3b(p, declared, obs, declared.header.get('kg', '0'), '2.4')
-        assert ne_h3.verify_h3b(p, expected_declared_digest=declared.digest)['ok']
-        assert tree_rule.built_with(ne_h3.read_h3b_header(p)) == (tag == 'new'), hdr['net1']
-    print(f'  ({hidden} apices dropped by the builder; bytes == unfiltered build + tree_qa.patch)')
+            hr = tree_rule.hidden_rows(hdr, r10)
+            assert tree_qa.patch(o, t, hr.astype('<u2').tobytes()) == tree_qa.patch(o, t, np.flatnonzero(~keep).astype('<u2').tobytes())
+            assert len(tree_qa.patch(o, t, hr.astype('<u2').tobytes())[1]) // 4 == int(keep.sum())
+    assert hidden == mk['hidden'] > 0, (hidden, mk)
+    print(f'  ({hidden} of {w_all.size} apices marked in the header; NET1 keeps all of them)')
 
 
 if __name__ == '__main__':

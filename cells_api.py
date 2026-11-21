@@ -1399,7 +1399,8 @@ def _pub_header_base(h: dict, kg: str) -> dict:
         'neo1': {'algo': ne_h3.ALGO_OBS, 'digest': h.get('neo1_digest'), 'record': ne_h3.OBS_REC.format,
                  'epoch': h.get('epoch'), 'source': ne_h3.OBS_SOURCE_FIXED, 'fields': _NEO1_REC_FIELDS,
                  'units': UNITS},
-        'net1': dict(h.get('net1') or {}, record='u32: dx:5 dy:5 h:8(0.25m) crown:6(log2*5) species:4 vitality:3 flag:1',
+        # tree_rule (raw-file row indices, ne_h3.write_h3b) is not carried: these rows are already QA'd
+        'net1': dict({k: v for k, v in (h.get('net1') or {}).items() if k != 'tree_rule'}, record='u32: dx:5 dy:5 h:8(0.25m) crown:6(log2*5) species:4 vitality:3 flag:1',
                      species=list(SPECIES), vitality=list(VITALITY)),
         'neb1': dict(h.get('neb1') or {}, record='u64: dx:5 dy:5 h_max:8(0.25m) h_robust:8(0.25m) area:16(m2) type:4 conf:4 dh:8(i8 0.25m)',
                      types=list(STRUCTURE_TYPES)),

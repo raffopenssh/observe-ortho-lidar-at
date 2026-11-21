@@ -45,8 +45,8 @@ KINDS = ('trees', 'structures')
 # A "spike" (tallest apex of its res-10 chunk with h/p90 > 1.6, or > 15 m above
 # the second tallest) occurs in 0.2-0.4 % of ordinary trees but in 27 / 48 / 69 %
 # of the 50-55 / 55-60 / >= 60 m bands.  Below 45 m spikes are real trees.
-# The rule itself lives in tree_rule.py (shared with the ne_h3 builder); files whose header
-# says it was applied at build time (net1.tree_rule) are not filtered again here.
+# The rule itself lives in tree_rule.py (shared with ne_h3.write_h3b); files whose header lists
+# the hidden rows (net1.tree_rule) are read from it, never evaluated twice.  Files keep every apex.
 TREE_H_SATURATED = tree_rule.H_SATURATED
 TREE_SPIKE_H = tree_rule.SPIKE_H
 TREE_SPIKE_RATIO = tree_rule.SPIKE_RATIO
@@ -432,7 +432,7 @@ def _decode_chunk_uncached(key, kg: str, r: dict, hdr: dict, kind: str) -> dict:
          'x': x.astype(np.int32), 'y': y.astype(np.int32), 'h': hs.astype(np.float32),
          'cell': ch.ids[cell_idx].astype(np.uint64)}
     if kind == 'trees':
-        ok = np.ones(hs.size, bool) if tree_rule.built_with(hdr) else tree_rule.keep_mask(hs)
+        ok = tree_rule.chunk_keep(hdr, int(r['r10']), hs)   # header verdict, else tree_rule.keep_mask(
         d.update(crown_m2=dec['crown_m2'].astype(np.float32), species=dec['species'].astype(np.uint8),
                  vitality=dec['vitality'].astype(np.uint8), ndsm_only=dec['ndsm_only'].astype(bool))
     else:

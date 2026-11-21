@@ -5,14 +5,16 @@ masts / turbines / cranes) or a spike: >= ``SPIKE_H`` m and either h / p90 > ``S
 more than ``SPIKE_GAP`` m above the second tallest apex of its res-10 chunk (derivation: see
 ``ne_trees``).  Heights are the stored NET1 heights (0.25 m steps, as ``cells_api.decode_trees``).
 
-Callers: ``ne_trees._decode_chunk_uncached`` (/trees/bbox, and through ``chunk_keep`` the
-``tree_qa`` store) for files built without the rule; ``ne_h3.build_observed`` (the builder, on
-peers) which drops those apices before NET1 is written and records ``RULE_ID`` in the h3b header
-(``net1.tree_rule``).  Pure numpy — no primary-only imports.
+Callers: ``ne_h3.write_h3b`` (every writer: builder on peers, 2.4 fast path, block merge)
+evaluates it per chunk and records the hidden NET1 row indices in the h3b header
+(``net1.tree_rule`` = :func:`marker`) — the file keeps EVERY apex, so ``realistic=0`` stays the
+raw inventory; ``ne_trees._decode_chunk_uncached`` (/trees/bbox realistic=1, and through
+``ne_trees.chunk_keep`` the ``tree_qa`` store → cell products) takes :func:`chunk_keep`: the
+header's verdict, or the rule itself for files written without a marker.  Pure numpy.
 
 ``RULE_ID`` is THE id to bump when a constant below changes: ``tree_qa.RULE_ID`` is this value
-(every KG is re-evaluated) and a file whose header carries another id is treated as built
-without the current rule (:func:`built_with`).
+(every KG is re-evaluated) and a file whose header carries another id is evaluated at read
+time like a file without a marker (:func:`built_with`).
 """
 from __future__ import annotations
 
@@ -57,12 +59,57 @@ def quant_h(h_m: np.ndarray) -> np.ndarray:
     return np.clip(np.round(h_m * 2.0), 1, 254).astype(np.uint8)
 
 
-def marker(dropped: int, **extra) -> dict:
-    """The h3b header record (``net1.tree_rule``) of a file whose NET1 rows already passed the rule."""
-    return dict(id=RULE_ID, dropped=int(dropped), **extra)
+def marker(rows: dict) -> dict:
+    """The h3b header record (``net1.tree_rule``): *rows* = {r10 hex: [NET1 row index within that
+    chunk, ...]} of the apices the rule hides.  The file itself keeps every apex."""
+    return {'id': RULE_ID, 'mode': 'mark', 'hidden': int(sum(len(v) for v in rows.values())),
+            'rows': {k: [int(i) for i in v] for k, v in sorted(rows.items())}}
+
+
+def _marker(hdr: dict | None):
+    m = ((hdr or {}).get('net1') or {}).get('tree_rule')
+    return m if isinstance(m, dict) and m.get('id') == RULE_ID else None
 
 
 def built_with(hdr: dict | None) -> bool:
-    """True when the file's NET1 rows already passed the CURRENT rule (header marker)."""
-    m = ((hdr or {}).get('net1') or {}).get('tree_rule')
-    return isinstance(m, dict) and m.get('id') == RULE_ID
+    """True when the file's header carries the verdict of the CURRENT rule."""
+    return _marker(hdr) is not None
+
+
+_P: dict = {}           # NET1 digest → {r10 int: row idx}   (header dicts stay plain JSON)
+
+
+def _parsed(m: dict, hdr: dict) -> dict:
+    key = (hdr.get('net1') or {}).get('digest') or id(m)
+    p = _P.get(key)
+    if p is None:       # a marker without ``rows`` (the short-lived drop-at-build format of
+        if len(_P) > 4096:      # fdff4ff) = nothing left to hide
+            _P.clear()
+        p = _P[key] = {int(k, 16): np.asarray(v, np.int64) for k, v in (m.get('rows') or {}).items()}
+    return p
+
+
+_NONE = np.zeros(0, np.int64)
+
+
+def hidden_rows(hdr: dict | None, r10: int):
+    """NET1 row indices of chunk *r10* the rule hides, read from the header → array (often
+    empty); None = file without a current marker (caller evaluates :func:`keep_mask`)."""
+    m = _marker(hdr)
+    return None if m is None else _parsed(m, hdr).get(int(r10), _NONE)
+
+
+def marked_chunks(hdr: dict | None):
+    """r10 ids of the chunks with a hidden apex per the header; None = no current marker."""
+    m = _marker(hdr)
+    return None if m is None else set(_parsed(m, hdr))
+
+
+def chunk_keep(hdr: dict | None, r10: int, h_m) -> np.ndarray:
+    """Keep-mask of one stored chunk: the header's verdict when the file has one, else the rule."""
+    hr = hidden_rows(hdr, r10)
+    if hr is None:
+        return keep_mask(h_m)
+    ok = np.ones(np.asarray(h_m).size, bool)
+    ok[hr[hr < ok.size]] = False
+    return ok

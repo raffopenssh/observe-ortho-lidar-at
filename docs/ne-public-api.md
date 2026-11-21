@@ -474,18 +474,21 @@ apices `/api/v1/trees/bbox` returns by default (`realistic=1`, `min_height=3`). 
   only the apex columns of the affected cells; same `tree_cols_for` as `build_bin`) and their blocks
   re-stored, so public workers never build on demand.
 * **Height rule = `tree_rule.keep_mask`** (pure numpy; constants + `RULE_ID` in `tree_rule.py`, the one
-  place to bump — `tree_qa.RULE_ID` is the same value). Two callers: `ne_trees._decode_chunk_uncached`
-  (read time) and `ne_h3.build_observed` (build time, on peers — height rule only, peers have no flags /
-  linear-noise data): the builder drops those apices before NET1 is written, `tree_n` / `tree_h_max`
-  come from the kept set (`quant_h`), `h_max` / `h_p90` / `crown_frac` stay raw, and the h3b header
-  records `net1.tree_rule = {id, dropped}`.
-* **Two file generations** (`tree_rule.built_with(hdr)`): no marker (every file built before
-  2026-11-21, never rebuilt) or another rule id → height rule at read time through `tree_qa`, as
-  before; marker with the current id → `ne_trees` skips the height rule and `tree_qa` drops the
-  height candidates (no double application); linear-noise / flag hides go through `tree_qa` for both.
-  `ne_ingest.merge_blocks` keeps the marker only when every source carries the same id (`merged: true`);
-  a merge with an old file is an old file. `tests/test_tree_rule.py`: built-with-rule bytes ==
-  unfiltered build + `tree_qa.patch`.
+  place to bump — `tree_qa.RULE_ID` is the same value). **Files are never filtered**: NET1 / NEO1 keep
+  every apex, so `/trees/bbox?realistic=0` is the raw inventory for every file generation (compare
+  with `realistic=1` at will). `ne_h3.write_h3b` — the one writer behind the peer builder, the 2.4 fast
+  path and `ne_ingest.merge_blocks` — evaluates the rule per final res-10 chunk and records the verdict
+  in the header: `net1.tree_rule = {id, mode: "mark", hidden: N, rows: {r10hex: [NET1 row idx in chunk]}}`
+  (sparse, ~0.03 % of the file; `h_max` / `h_p90` / `crown_frac` are raw surface stats, untouched).
+* **Reading it** (`tree_rule.chunk_keep(hdr, r10, h)`): marker with the current id → the listed rows
+  are the rule's verdict (`ne_trees` does not re-evaluate, `tree_qa.evaluate_kg` takes
+  `marked_chunks(hdr)` as its height candidates instead of the index scan); no marker (files written
+  before 2026-11-21) or another rule id → `keep_mask` at read time, as before. Same result either way
+  (`tests/test_tree_rule.py`; one-file `merge_blocks` of 92001: 246 rows, 0 mismatches). Linear-noise /
+  flag / legacy hides are primary-only and go through `tree_qa` for both; all hides are row-index
+  based, so position fixes / frames (`ne_pos_fix`, `tree_user` frames) do not interact. The public KG
+  container (`_pub_header_base`) drops the marker — its rows are already QA'd. A marker without `rows`
+  (drop-at-build format of commit fdff4ff, live for minutes) reads as "nothing left to hide".
 * **Snapshot race guard** (`tree_qa.sync()`): the per-process snapshot is ≤ 30 s old; before a reader
   builds or replaces a stored product on a generation mismatch (`cells_bins.load_bin`,
   `cells_blocks.serve_block`, and `store_block` always) it stats the store (`version()`), reloads when

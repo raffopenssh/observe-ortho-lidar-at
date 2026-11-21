@@ -276,9 +276,10 @@ def evaluate_kg(kg: str, ctx: _Ctx) -> tuple[dict, dict]:
     if hdr is None:
         return {}, {}
     rows = {int(c['r10'], 16): c for c in hdr['chunks'] if int(c.get('trees') or 0) > 0}
-    # height rule: only files built without it (new files carry net1.tree_rule — the builder
-    # already dropped those apices; linear-noise / flag candidates below apply to both)
-    cand = set() if tree_rule.built_with(hdr) else set(ctx.static.get(kg, ()))
+    # height rule: the chunks the file's header marks (net1.tree_rule, written by ne_h3.write_h3b),
+    # else — files without a current marker — the index scan for chunks that can trip it
+    cand = tree_rule.marked_chunks(hdr)
+    cand = set(ctx.static.get(kg, ())) if cand is None else set(cand)
     tf = ca._tf('EPSG:3035', 'EPSG:4326')
     for k in ctx.lin_kgs(kg):
         keys = ctx.sn['keys'][k]
