@@ -79,19 +79,27 @@ Do not re-investigate; this is the state:
 * The 416 offset-corrected products are fine in every reader here, but
   their **Zenodo `_full_gpkg` rasters stay 5 m shifted**.
 
-* **Trees / NE cells / segments of the same products (inferred, not yet
-  measured)**: the v2 upgrade re-ran the whole pipeline on the GPKG rasters
-  (`v2_source.install` patches `read_dtm_dsm` + `read_ortho_for_als`), so
-  everything derived there — `tree_apices`, crowns, segments, `.h3b` NE
-  cells — should carry the same shift: stored position = true position
-  + (5 m E, −5 m N). Internally consistent (LiDAR and ortho moved
-  together), so classes/heights are right, only the position is off; an H3
-  res-12 cell (~9 m edge) can be the neighbour of the right one. Nothing
-  is corrected at read time yet. Verify first (apices of a shifted product
-  vs. a fresh overlapping one), then either add the registration offset in
-  `ne_trees` or leave it to the reprocess. User tree reports / flags are
-  keyed to the served positions — moving apices needs their match
-  tolerance checked (`docs/tree-user.md`).
+* **Trees / structures / NE cells / segments of the same products —
+  measured 2026-11-21**: the v2 upgrade re-ran the whole pipeline on the
+  GPKG rasters (`v2_source.install`), so everything derived there carries
+  the shift. Test: apices from `ne_trees.points_bbox` vs. a 500 m BEV 1 m
+  nDSM window, mean nDSM under the apex for every shift −8…8 m → best
+  shift (−5,+5) for 92124, (−5,+4) for 92105, (−5,+6) for 92109 (mean
+  nDSM 8.2 vs 3.5 m at zero shift for 92124). So `true = stored + offset`,
+  same table as grid25. Classes / heights are right (LiDAR and ortho moved
+  together), only the position is off.
+  Read-time fix NOT implemented yet. Constraints found:
+  - tree identity is position-keyed everywhere: `tree_id` = stored E_N,
+    `tree_user` (`tree_ver`, match ≤ 1.5 m), `ne_linear` runs, legacy flag
+    points. Shift only at the I/O boundary (emitted lon/lat, bbox filter,
+    incoming report points) and keep x / y / cell / tree_id raw, or every
+    store has to be migrated.
+  - safe scope = whole-parent, non-mixed codes (312 KGs). Block codes (30)
+    are merged into the parent `.h3b` without block attribution; mixed
+    (166) need a per-tile verdict.
+  - NE cells cannot be fixed like `green_fix`: that rewrites values inside
+    a cell, this moves content across cells (7 m vs ~16 m cell spacing).
+    Needs the reprocess.
 
 Paths considered:
 1. *Re-upgrade from the v1 GPKG* (`v2_regen`-style): useless — the GPKG
