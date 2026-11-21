@@ -191,6 +191,12 @@ Paths considered:
    commit ≥ eead178 first, clear the tile checkpoints of the affected KGs
    (old pickles would be restored), then `grid25_registration.py --build`
    and the seam check once they are ingested.
+   **Per regenerated KG that has verdict `shift`: `python3 ne_pos_fix.py
+   --retire <kg>`** as soon as its new `.h3b` is ingested — otherwise the
+   read-time shift is applied on top of correct positions (7 m off the
+   other way). Not automatic on purpose: a reprocess is a clean cut, user
+   feedback is reviewed and remapped by hand (`docs/tree-user.md →
+   Position frames`). Check: `python3 ne_pos_fix.py --status`.
 
 ## Contract (unchanged)
 Grey PNG, flat = 180, lit > 180, shaded < 180; alpha 0|255 only.
