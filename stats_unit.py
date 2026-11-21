@@ -582,7 +582,7 @@ def _rows_wanted(kg: str, hdr: dict, fh, rows: list[dict], want_by_r10: dict) ->
     rb = hdr.get('record_bytes') or {}
     r0, r1 = int(rb.get('nec1', 30)), int(rb.get('neo1', ca.REC))
     shuffled = 'shuffle' in str(hdr.get('chunk_layout') or '')
-    base = int(hdr['body_offset'])
+    base = ca.body_base(fh, kg, hdr)        # survives a header-only rewrite of the file mid-request
     out = []
     for row in rows:
         n = int(row['cells'])

@@ -489,6 +489,20 @@ apices `/api/v1/trees/bbox` returns by default (`realistic=1`, `min_height=3`). 
   based, so position fixes / frames (`ne_pos_fix`, `tree_user` frames) do not interact. The public KG
   container (`_pub_header_base`) drops the marker — its rows are already QA'd. A marker without `rows`
   (drop-at-build format of commit fdff4ff, live for minutes) reads as "nothing left to hide".
+* **Header marker for existing files** (`tree_qa.mark_files`, phase 0b of the hourly
+  `cells-bins.service`, ≤ 5 min per run, resumable; by hand `python3 tree_qa.py --mark [--budget-s N]`):
+  files written before the writer set the marker get it by a **header-only rewrite** — chunk bytes
+  copied as they are, all digests and the file **mtime** kept (no `cells_generation` / bin gen / ETag /
+  `published_at` change, no re-ingest, no upload; the Zenodo `_ne_h3b` copies stay unmarked and read
+  the same through the fallback). Only chunks whose index `hmax` ≥ 45 m are inflated. Only
+  `body_offset` moves, so: `cells_api.header` validates its cache by mtime **and size**,
+  `cells_api.body_base(fh, kg, hdr)` re-reads the offset for a request that still holds the old header
+  (`_load_chunk`, `stats_unit._rows_wanted`) — any new reader that seeks into a corpus file must use it.
+  State `data/ne/tree_marker.json` (kg → [mtime_ns, size]), last run `tree_marker.last.json`,
+  `header_marker` in `tree_qa.py --status` and the `tree_qa:` line. `tests/test_tree_marker.py`
+  (marker == `write_h3b`'s, body sha equal, old-header reads). Trap: never run `ne_ingest.merge_blocks`
+  on a corpus file "to look" — it calls `index_file` on its output and overwrites that KG's index row
+  (repair: `cells_api.index_file(data/ne/<kg>.h3b)`).
 * **Snapshot race guard** (`tree_qa.sync()`): the per-process snapshot is ≤ 30 s old; before a reader
   builds or replaces a stored product on a generation mismatch (`cells_bins.load_bin`,
   `cells_blocks.serve_block`, and `store_block` always) it stats the store (`version()`), reloads when

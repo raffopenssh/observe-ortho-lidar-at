@@ -1091,6 +1091,12 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
         tq = _tree_qa.refresh(None if budget_s is None else budget_s * 0.5, None, verbose=verbose)
     except Exception as e:  # noqa: BLE001
         log.warning('cells_bins: tree_qa refresh: %s', e); tq = {'error': str(e)}
+    # phase 0b: header marker (net1.tree_rule) for corpus files written before the writer set it —
+    # header-only rewrite, no generation change (tree_qa.mark_files; ≤ 5 min per run, resumable)
+    try:
+        tq = dict(tq or {}, header_marker=_tree_qa.mark_files(None if budget_s is None else min(300.0, budget_s * 0.1)))
+    except Exception as e:  # noqa: BLE001
+        log.warning('cells_bins: tree_qa mark_files: %s', e)
     if budget_s is not None:
         budget_s = max(30.0, budget_s - (time.time() - t00))
     from concurrent.futures import ThreadPoolExecutor

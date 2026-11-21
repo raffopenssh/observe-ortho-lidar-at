@@ -21,7 +21,7 @@ inputs changed (file digest, position tag, linear-noise token, flag revisions), 
 the tree columns of the affected cells inside the stored bins (no bin rebuild) and re-stores
 their blocks, so the public workers do not build on demand.
 
-    python3 tree_qa.py --status | --refresh [--budget-s N] [--limit N] | --kg 92001
+    python3 tree_qa.py --status | --refresh [--budget-s N] [--limit N] | --kg 92001 | --mark [--budget-s N]
 """
 from __future__ import annotations
 
@@ -503,6 +503,163 @@ def _refresh(budget_s, limit, verbose, do_bins) -> dict:
     return st
 
 
+# === SECTION: header marker for existing files (tree_rule verdict, header-only rewrite) ===
+
+MARK_STATE = ne_h3.NE_DIR / 'tree_marker.json'      # {kg: [mtime_ns, size]} of files known to carry the marker
+
+
+def _mark_state() -> dict:
+    try:
+        return json.loads(MARK_STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def mark_file(kg: str, hmax: dict | None = None) -> dict:
+    """Give ``data/ne/<kg>.h3b`` the header record ``ne_h3.write_h3b`` writes for new files
+    (``net1.tree_rule`` = rows the height rule hides).  Header-only: the chunk bytes are copied
+    as they are, digests / mtime stay, only ``body_offset`` moves (readers:
+    ``cells_api.header`` validates by size too, ``cells_api.body_base`` covers open requests).
+    *hmax* = {r10: tallest apex ×4 | None} from the index — chunks below the spike floor are
+    not inflated.  No upload, no re-ingest, no generation change."""
+    import shutil
+    import struct
+    import cells_api as ca
+    kg = str(kg).zfill(5)
+    p = ca._file_path(kg)
+    st0 = p.stat()
+    if time.time() - st0.st_mtime < 300:
+        return {'kg': kg, 'skipped': 'fresh file (ingest may still be indexing it)'}
+    with open(p, 'rb') as src:
+        head = src.read(9)
+        if head[:4] != ne_h3.H3B_MAGIC or head[4] != ne_h3.FMT_VER:
+            raise ValueError('not an H3B1 file')
+        hdr = json.loads(src.read(struct.unpack_from('<I', head, 5)[0]).decode('utf-8'))
+        if tree_rule.built_with(hdr) and (hdr['net1']['tree_rule'].get('mode') == 'mark'):
+            return {'kg': kg, 'marked': False, 'stat': [st0.st_mtime_ns, st0.st_size]}
+        old_base = int(hdr['body_offset'])
+        floor = int(tree_rule.SPIKE_H * 4)
+        rows = {}
+        for c in hdr.get('chunks') or []:
+            if not int(c.get('trees') or 0):
+                continue
+            hm = (hmax or {}).get(int(c['r10'], 16))
+            if hm is not None and hm < floor:
+                continue
+            w = np.frombuffer(ne_h3.read_h3b_chunk(p, hdr, c)['trees'], '<u4')
+            bad = np.flatnonzero(~tree_rule.keep_mask(((w >> 10) & 0xFF).astype(np.float64) / 4.0))
+            if bad.size:
+                rows[c['r10']] = bad.tolist()
+        hdr.setdefault('net1', {})['tree_rule'] = tree_rule.marker(rows)
+        for _ in range(6):          # same fixed point as ne_h3.write_h3b
+            hj = ne_h3.canonical_json(hdr)
+            hb = ne_h3.H3B_MAGIC + bytes([ne_h3.FMT_VER]) + struct.pack('<I', len(hj)) + hj
+            if len(hb) == hdr['body_offset']:
+                break
+            hdr['body_offset'] = len(hb)
+        assert len(hb) == hdr['body_offset']
+        tmp = p.with_suffix(p.suffix + '.mark.tmp')
+        try:
+            with open(tmp, 'wb') as dst:
+                dst.write(hb)
+                src.seek(old_base)
+                shutil.copyfileobj(src, dst, 1 << 20)
+                dst.flush(); os.fsync(dst.fileno())
+            if tmp.stat().st_size != st0.st_size - old_base + len(hb):
+                raise RuntimeError('body copy short')
+            os.utime(tmp, ns=(st0.st_atime_ns, st0.st_mtime_ns))
+            st1 = p.stat()          # replaced by an ingest meanwhile → leave the new file alone
+            if (st1.st_ino, st1.st_mtime_ns, st1.st_size) != (st0.st_ino, st0.st_mtime_ns, st0.st_size):
+                return {'kg': kg, 'skipped': 'file changed'}
+            os.replace(tmp, p)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+    try:
+        c = ca._idx_conn(write=True)
+        with ca._idx_write_lock:
+            c.execute('UPDATE file SET body_offset=? WHERE kg=?', (int(hdr['body_offset']), kg)); c.commit()
+    except Exception as e:  # noqa: BLE001  (informational column; readers take the header's)
+        log.warning('tree_qa mark %s: index body_offset: %s', kg, e)
+    ca._header_cache_drop(kg)
+    return {'kg': kg, 'marked': True, 'hidden': hdr['net1']['tree_rule']['hidden'],
+            'stat': [st0.st_mtime_ns, st0.st_size - old_base + len(hb)]}
+
+
+def mark_files(budget_s: float | None = 300.0, limit: int | None = None, verbose: bool = False) -> dict:
+    """Header marker for every corpus file that lacks it (resumable; phase 0b of the hourly
+    ``cells-bins.service``, niced / idle IO).  A file whose (mtime, size) is in ``tree_marker.json``
+    is not opened again; new / re-ingested files are written with the marker and only recorded."""
+    import cells_api as ca
+    t0 = time.time()
+    state = _mark_state()
+    out = {'files': 0, 'known': 0, 'marked': 0, 'already': 0, 'skipped': 0, 'errors': 0, 'hidden': 0,
+           'stopped_on_budget': False}
+    todo = []
+    for kg in sorted(ca._files()):
+        try:
+            st = ca._file_path(kg).stat()
+        except OSError:
+            continue
+        out['files'] += 1
+        if state.get(kg) == [st.st_mtime_ns, st.st_size]:
+            out['known'] += 1
+        else:
+            todo.append(kg)
+    if todo:
+        hm: dict = {}
+        c = ca._idx_conn()
+        if c is not None:
+            try:
+                for kg, r10, h in c.execute('SELECT kg, r10, hmax FROM chunk WHERE trees > 0 AND (hmax IS NULL OR hmax >= ?)',
+                                            (int(tree_rule.SPIKE_H * 4),)):
+                    hm.setdefault(kg, {})[int(r10)] = h
+                known_all = c.execute('SELECT 1 FROM chunk WHERE hmax IS NULL AND trees > 0 LIMIT 1').fetchone() is None
+            except sqlite3.Error:
+                hm = {}; known_all = False
+        else:
+            known_all = False
+
+        class _Below(dict):         # chunk not in the candidate list = below the spike floor
+            def get(self, k, d=None):
+                return dict.get(self, k, 0)
+    n_since = 0
+    for kg in todo:
+        if (budget_s is not None and time.time() - t0 > budget_s) or (limit and out['marked'] + out['already'] >= limit):
+            out['stopped_on_budget'] = True
+            break
+        try:
+            r = mark_file(kg, _Below(hm.get(kg, {})) if known_all else None)
+        except Exception as e:  # noqa: BLE001
+            out['errors'] += 1; log.warning('tree_qa mark %s: %s', kg, e)
+            continue
+        if 'skipped' in r:
+            out['skipped'] += 1
+            continue
+        state[kg] = r['stat']
+        out['marked' if r['marked'] else 'already'] += 1; out['hidden'] += int(r.get('hidden') or 0)
+        n_since += 1
+        if n_since >= 200:
+            _write_json(MARK_STATE, state); n_since = 0
+        if verbose and r['marked']:
+            print(f"  marked {kg}: {r['hidden']} rows", flush=True)
+    if n_since or (todo and not MARK_STATE.exists()):
+        _write_json(MARK_STATE, state)
+    out['todo_left'] = len(todo) - out['marked'] - out['already']
+    out['seconds'] = round(time.time() - t0, 1); out['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    try:
+        _write_json(MARK_STATE.with_suffix('.last.json'), out)
+    except OSError:
+        pass
+    return out
+
+
+def _write_json(path, obj) -> None:
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    tmp.write_text(json.dumps(obj, separators=(',', ':')))
+    os.replace(tmp, path)
+
+
 def status() -> dict:
     out = {'db': str(_db_path()), 'exists': _db_path().exists(), 'rule': RULE_ID}
     if out['exists']:
@@ -517,6 +674,10 @@ def status() -> dict:
         out['last_run'] = json.loads(_db_path().with_suffix('.json').read_text())
     except (OSError, ValueError):
         pass
+    try:
+        out['header_marker'] = dict(json.loads(MARK_STATE.with_suffix('.last.json').read_text()), files_marked=len(_mark_state()))
+    except (OSError, ValueError):
+        pass
     return out
 
 
@@ -526,7 +687,8 @@ def text_line() -> str:
     return (f"tree_qa: {s.get('kgs_filtered', 0)} KGs / {s.get('bins', 0)} bins / {s.get('cells_touched', 0)} cells / "
             f"{s.get('apices_hidden', 0)} apices hidden from cell products (= /trees/bbox default); last refresh "
             f"{lr.get('finished_at', '-')}: {lr.get('kgs_evaluated', 0)}/{lr.get('todo', 0)} KGs, {lr.get('bins_patched', 0)} bins patched, "
-            f"{lr.get('errors', 0)} errors{' (budget stop)' if lr.get('stopped_on_budget') else ''}")
+            f"{lr.get('errors', 0)} errors{' (budget stop)' if lr.get('stopped_on_budget') else ''}"
+            + (f"; header marker {hm_.get('files_marked', 0)}/{hm_.get('files', 0)} files" if (hm_ := s.get('header_marker')) else ''))
 
 
 if __name__ == '__main__':
@@ -535,9 +697,12 @@ if __name__ == '__main__':
     ap.add_argument('--status', action='store_true'); ap.add_argument('--refresh', action='store_true')
     ap.add_argument('--no-bins', action='store_true'); ap.add_argument('--kg')
     ap.add_argument('--budget-s', type=float); ap.add_argument('--limit', type=int)
+    ap.add_argument('--mark', action='store_true', help='header marker pass (mark_files)')
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
-    if a.refresh:
+    if a.mark:
+        print(json.dumps(mark_files(a.budget_s, a.limit, verbose=True)))
+    elif a.refresh:
         print(json.dumps(refresh(a.budget_s, a.limit, bins=not a.no_bins)))
     elif a.kg:
         print(json.dumps(refresh_kg(a.kg)))

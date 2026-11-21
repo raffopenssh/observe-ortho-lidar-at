@@ -513,17 +513,35 @@ def _file_path(kg: str) -> Path:
     return NE_DIR / f'{kg}.h3b'
 
 
+def h_ok(h, mt, size) -> bool:
+    return h is not None and h['_mtime'] == mt and h.get('_size') == size
+
+
+def body_base(fh, kg: str, hdr: dict) -> int:
+    """Body offset for reads on the OPEN file *fh*.  A request holds its header for its whole
+    life; when the file was replaced meanwhile by a header-only rewrite (same NEO1 digest, body
+    bytes identical, header longer — ``tree_qa.mark_files``) the chunk offsets are still right
+    but the body starts elsewhere: one fstat per open, a header re-read only on a size change."""
+    sz = hdr.get('_size')
+    if sz is not None and os.fstat(fh.fileno()).st_size != sz:
+        h2 = header(kg)
+        if h2 is not None and h2.get('neo1_digest') == hdr.get('neo1_digest'):
+            return int(h2['body_offset'])
+    return int(hdr['body_offset'])
+
+
 def header(kg: str, with_chunks: bool = False) -> dict | None:
     """Slim header of a product file (no ``chunks`` unless asked), validated
     against the file mtime."""
     kg = str(kg).zfill(5)
     p = _file_path(kg)
     try:
-        mt = p.stat().st_mtime
+        st = p.stat(); mt = st.st_mtime
     except FileNotFoundError:
         return None
     h = _lru_get(_header_lru, kg)
-    if h is not None and h['_mtime'] == mt and (not with_chunks or 'chunks' in h):
+    # size too: a header-only rewrite (tree_qa.mark_files) keeps the mtime but moves body_offset
+    if h_ok(h, mt, st.st_size) and (not with_chunks or 'chunks' in h):
         return h
     full = ne_h3.read_h3b_header(p)
     h = {k: full.get(k) for k in ('kg', 'body_offset', 'cells_n', 'product_version', 'partial_cells',
@@ -533,7 +551,7 @@ def header(kg: str, with_chunks: bool = False) -> dict | None:
     h['epoch'] = NE_EPOCH
     h['neo1_digest'] = (full.get('neo1') or {}).get('digest')
     h['summary'] = public_summary(full.get('summary') or {})
-    h['_mtime'] = mt
+    h['_mtime'] = mt; h['_size'] = st.st_size
     if with_chunks:
         h['chunks'] = full.get('chunks') or []
     _lru_put(_header_lru, kg, h, HEADER_LRU_N)
@@ -618,7 +636,7 @@ def _load_chunk(kg: str, row: dict, hdr: dict, raw: bool = False, qa: bool = Tru
         return ch
     p = _file_path(kg)
     with open(p, 'rb') as fh:
-        fh.seek(int(hdr['body_offset']) + int(row['off']))
+        fh.seek(body_base(fh, kg, hdr) + int(row['off']))
         buf = zlib.decompress(fh.read(int(row['len'])))
     n, t, b = int(row['cells']), int(row['trees']), int(row['bld'])
     rb = hdr.get('record_bytes') or {}
