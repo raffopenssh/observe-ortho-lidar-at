@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 from typing import Optional
 
 import numpy as np
@@ -286,6 +288,115 @@ def read_masked(
     return data, valid, transform, crs
 
 
+# === SECTION: provenance + national clip (docs/qc-lessons.md → guards) ===
+#
+# OUTLINE_CLIP_M: when set (the KG processor sets it, the interactive tier and
+# the read-time detectors do not), ``read_dtm_dsm`` blanks every pixel farther
+# than this many metres outside the national outline (``austria_mask``).  BEV
+# served elevation beyond the border during the 2026 run and withdrew it
+# later — those pixels froze into products (``grid25_stale``).
+OUTLINE_CLIP_M: float | None = None
+RECORD_SOURCES = False          # processor: attach ``sources`` (BEV file identity) to every read
+SOURCE_IDENTITY = True          # one HEAD per BEV file per process (memoised)
+_SRC_ID: dict = {}
+_SRC_LOCK = threading.Lock()
+
+
+def clip_national(d: dict, buffer_m: float | None = None) -> int:
+    """Blank (NaN / mask False) the pixels of a ``read_dtm_dsm``-shaped dict
+    that lie farther than *buffer_m* outside Austria.  In place (arrays are
+    replaced, never written through — sidecars are mmap'd read-only).  Returns
+    the number of pixels that held data and lost it; 0 when the mask file is
+    missing, the transform is unknown or the tile is inland.  Never raises."""
+    try:
+        buffer_m = OUTLINE_CLIP_M if buffer_m is None else buffer_m
+        tf = d.get("transform")
+        if buffer_m is None or tf is None or abs(tf.b) > 1e-9 or abs(tf.d) > 1e-9:
+            return 0
+        import austria_mask
+        rows, cols = d["dtm"].shape[:2]
+        keep = austria_mask.grid_mask(float(tf.c), float(tf.f), rows, cols, float(tf.a), float(buffer_m))
+        if keep is None or keep.all():
+            return 0
+        out = ~keep
+        had = out & np.isfinite(d["dtm"])
+        for k in ("dtm", "dsm", "ndsm"):
+            a = d.get(k)
+            if a is not None and a.shape[:2] == out.shape:
+                a = np.array(a, np.float32, copy=True)
+                a[out] = np.nan
+                d[k] = a
+        m = d.get("mask")
+        if m is not None and m.shape == out.shape:
+            d["mask"] = np.asarray(m, bool) & keep
+        n = int(had.sum())
+        d["outline_clip_px"] = int(d.get("outline_clip_px") or 0) + n
+        return n
+    except Exception as e:  # noqa: BLE001 — a broken mask must never fail a read
+        log.warning("clip_national failed (%s) — raster left as read", e)
+        return 0
+
+
+def source_identity(layer: str, tile: tuple, dataset: str = ti.DEFAULT_DATASET) -> dict:
+    """``{layer, dataset, file, etag, last_modified, size}`` of the BEV file a
+    window comes from.  One HEAD per file per process; a failed HEAD yields the
+    file name only (and is retried after 10 min).  "Upstream changed" is then a
+    metadata comparison instead of a re-read."""
+    key = (layer, tile, dataset)
+    now = time.time()
+    hit = _SRC_ID.get(key)
+    if hit and (hit[1].get("etag") or now - hit[0] < 600):
+        return dict(hit[1])
+    url = ti.get_tile_url(layer, tile[0], tile[1], dataset).replace("/vsicurl/", "")
+    ident = {"layer": layer, "dataset": dataset, "file": url.rsplit("/", 1)[-1]}
+    if SOURCE_IDENTITY:
+        try:
+            import requests
+            r = requests.head(url, timeout=10, allow_redirects=True)
+            if r.status_code == 200:
+                if r.headers.get("ETag"):
+                    ident["etag"] = r.headers["ETag"].strip('"')
+                if r.headers.get("Last-Modified"):
+                    ident["last_modified"] = r.headers["Last-Modified"]
+                if r.headers.get("Content-Length"):
+                    ident["size"] = int(r.headers["Content-Length"])
+            else:
+                ident["http"] = r.status_code
+        except Exception as e:  # noqa: BLE001
+            log.info("source identity HEAD %s failed: %s", ident["file"], str(e)[:80])
+    with _SRC_LOCK:
+        _SRC_ID[key] = (now, ident)
+    return dict(ident)
+
+
+def sources_for_bounds(bounds, dataset: str = ti.DEFAULT_DATASET, pad: float = 5.0) -> list:
+    """Source identities (DTM + DSM) of every BEV file a bbox read touches."""
+    try:
+        b = snap_bbox(bounds[0] - pad, bounds[1] - pad, bounds[2] + pad, bounds[3] + pad)
+        return [source_identity(lay, t, dataset)
+                for t in ti.find_tiles_for_bbox(*b) for lay in ("DTM", "DSM")]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def sources_changed(then: list, now: list) -> list:
+    """File names whose identity differs between two ``sources`` lists (only
+    files with an ETag / Last-Modified on both sides can differ)."""
+    cur = {s.get("file"): s for s in (now or []) if isinstance(s, dict)}    # file names carry layer + date
+    out = []
+    for s in then or []:
+        if not isinstance(s, dict):
+            continue
+        c = cur.get(s.get("file"))
+        if not c:
+            continue
+        for k in ("etag", "last_modified", "size"):
+            if s.get(k) and c.get(k) and s[k] != c[k]:
+                out.append(s.get("file"))
+                break
+    return sorted(set(out))
+
+
 def read_dtm_dsm(
     geom_3035: shapely.geometry.base.BaseGeometry,
     dataset: str = ti.DEFAULT_DATASET,
@@ -320,11 +431,16 @@ def read_dtm_dsm(
     # Clamp small negative values to 0 (noise)
     ndsm = np.where((ndsm < 0) & valid, 0.0, ndsm)
 
-    return {
+    out = {
         "dtm": dtm, "dsm": dsm, "ndsm": ndsm,
         "mask": valid, "transform": tf, "crs": crs,
         "shape": (min_h, min_w),
     }
+    if OUTLINE_CLIP_M is not None:
+        clip_national(out)
+    if RECORD_SOURCES:
+        out["sources"] = sources_for_bounds(bounds, dataset, pad)
+    return out
 
 
 def read_multi_date_ndsm(

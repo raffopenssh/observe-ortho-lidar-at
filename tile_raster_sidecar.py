@@ -130,10 +130,18 @@ def persist_dtm_dsm(ckpt_root: Path, kg_code: str, tile_idx: int,
             _atomic_save_npy(d / "ndsm.npy", np.asarray(tdata["ndsm"], dtype=np.float32))
             tf = tdata["transform"]
             shape = tdata["shape"]
+            extra = {}
+            src = tdata.get("sources")
+            if src:
+                # identity of the BEV files this raster was read from; the
+                # FIRST read's identity is kept (the one the tile was
+                # segmented from), a later re-read lands in bev_source_reread
+                first = (read_meta(ckpt_root, kg_code, tile_idx) or {}).get("bev_source")
+                extra["bev_source_reread" if first else "bev_source"] = list(src)
             _write_meta(d,
                         transform=[tf.a, tf.b, tf.c, tf.d, tf.e, tf.f],
                         shape=list(shape),
-                        layers={"default": True})
+                        layers={"default": True}, **extra)
         else:
             _atomic_save_npy(d / f"dtm_{dataset}.npy",
                              np.asarray(tdata["dtm"], dtype=np.float32))
@@ -165,6 +173,14 @@ def persist_ortho(ckpt_root: Path, kg_code: str, tile_idx: int,
     except Exception as e:
         _log.warning("persist_ortho(%s,%s,%s) failed: %s",
                      kg_code, tile_idx, year, e)
+
+
+def read_meta(ckpt_root: Path, kg_code: str, tile_idx: int) -> Optional[dict]:
+    """meta.json of a tile's raster dir, or None."""
+    try:
+        return json.loads((_tile_raster_dir(ckpt_root, kg_code, tile_idx) / "meta.json").read_text())
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------------------------

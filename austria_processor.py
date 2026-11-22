@@ -3354,6 +3354,37 @@ _SIDECAR_STATS: dict = {
 }
 
 
+# Tiles the stitch re-read whose BEV source identity (file ETag /
+# Last-Modified, raster_io.source_identity) differs from the identity recorded
+# when the tile was segmented: {tile_no: [file, …]}.  The raster pasted into the
+# product is then not the one the segments were cut from — the checkable form
+# of the 2026 ``grid25_stale`` fault.
+_STITCH_SOURCE_CHANGED: dict = {}
+_STITCH_REREAD_SOURCES: dict = {}     # {tile_no: sources of the re-read}
+
+# National clip of every DTM/DSM read in the KG pipeline (raster_io.
+# clip_national): metres kept beyond the outline, same buffer as the read-time
+# mask of the 25 m terrain (grid25_sample.MASK_BUFFER_M).  ``off`` disables.
+try:
+    _OUTLINE_CLIP_M = (None if os.environ.get("OUTLINE_CLIP_M", "").lower() in ("off", "none", "-1")
+                       else float(os.environ.get("OUTLINE_CLIP_M") or 100.0))
+except Exception:  # noqa: BLE001
+    _OUTLINE_CLIP_M = 100.0
+
+
+def _compact_sources(sources) -> list:
+    """``raster_io`` source identities → the short form kept per tile."""
+    out = []
+    for s_ in sources or []:
+        if isinstance(s_, dict) and s_.get("file"):
+            e = {"file": s_["file"]}
+            for k in ("etag", "last_modified"):
+                if s_.get(k):
+                    e[k] = s_[k]
+            out.append(e)
+    return out
+
+
 # Tiles whose default DTM/DSM raster the gpkg_full stitch had to re-read from
 # BEV (no local sidecar).  Listed on the sidecar summary line so the QC ledger
 # (qc_ledger.py, docs/qc-lessons.md) knows WHICH tiles of a product came from a
@@ -3502,6 +3533,22 @@ def _read_dtm_for_tile(tr, kg_code: str | None = None, tile_idx: int | None = No
     tdata = _align_tdata_to_tile(
         _rio.read_dtm_dsm(box(*tr["bounds_3035"]), _ti.DEFAULT_DATASET, pad=0.0), tr)
     if kg_code is not None and tile_idx is not None:
+        try:
+            # second read of a tile: is BEV still serving the file the tile
+            # was segmented from?  (identity travels in the tile's sidecar
+            # meta.json — shipped with the checkpoint tar — or in ``tr``)
+            import tile_raster_sidecar as _trs
+            _then = tr.get("bev_source") or (_trs.read_meta(
+                DATA_DIR / "tile_checkpoints", kg_code, tile_idx) or {}).get("bev_source")
+            _STITCH_REREAD_SOURCES[int(tile_idx) + 1] = _compact_sources(tdata.get("sources"))
+            _chg = _rio.sources_changed(_then, tdata.get("sources"))
+            if _chg:
+                _STITCH_SOURCE_CHANGED[int(tile_idx) + 1] = _chg
+                log.warning("KG %s tile %d: BEV source changed since the tile was segmented (%s) — "
+                            "stitched raster differs from the segmentation input",
+                            kg_code, int(tile_idx) + 1, ", ".join(_chg)[:200])
+        except Exception:  # noqa: BLE001
+            pass
         try:
             import tile_raster_sidecar as _trs
             ckpt_root = DATA_DIR / "tile_checkpoints"
@@ -4255,6 +4302,8 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
     for _k in list(_SIDECAR_STATS.keys()):
         _SIDECAR_STATS[_k] = 0
     del _STITCH_REREAD_TILES[:]
+    _STITCH_SOURCE_CHANGED.clear()
+    _STITCH_REREAD_SOURCES.clear()
     out_path = str(GPKG_DIR / f"{kg_code}_full.gpkg")
     _purge_stale_gpkg(out_path)
     if not tile_seg_results:
@@ -5081,6 +5130,9 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
             if _STITCH_REREAD_TILES:
                 _summary += " reread_dtm_tiles=" + ",".join(
                     str(_t) for _t in sorted(_STITCH_REREAD_TILES)[:80])
+            if _STITCH_SOURCE_CHANGED:
+                _summary += " source_changed_tiles=" + ",".join(
+                    str(_t) for _t in sorted(_STITCH_SOURCE_CHANGED)[:80])
             log.info(_summary)
             try:
                 import json as _j_sc
@@ -6965,6 +7017,10 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
 
     kg_code = kg["kg_code"]
     result = {"kg_code": kg_code, "success": False, "step": "init", "files": {}}
+    # Guards of the 2026 run (docs/qc-lessons.md): every DTM/DSM read of this
+    # KG is clipped to the national outline and carries its BEV file identity.
+    raster_io.OUTLINE_CLIP_M = _OUTLINE_CLIP_M
+    raster_io.RECORD_SOURCES = True
 
     # --- Tile checkpoint cache for resume-on-restart ---
     _tile_ckpt_dir = DATA_DIR / "tile_checkpoints" / kg_code
@@ -6983,7 +7039,10 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
         if _restored.get("n"):
             mb = _restored.get("bytes", 0) / 1e6
             _msg = (f"chkpt: restored {_restored['n']} tile pickle(s) "
-                    f"({mb:.1f} MB) for {kg_code} from Zenodo")
+                    f"({mb:.1f} MB) for {kg_code} from Zenodo"
+                    + (f", {_restored.get('rasters', 0)} with raster sidecar, "
+                       f"{_restored.get('identity', 0)} identity-only"
+                       if (_restored.get('rasters') or _restored.get('identity')) else ""))
             log.info("KG %s: %s", kg_code, _msg)
             try:
                 import json as _j_chk
@@ -7675,6 +7734,14 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
             tile_avail["dtm"] = True
             tile_avail["dsm"] = True
             tile_avail["valid_pixels"] = tvalid
+            # per-tile provenance: BEV file identity + pixels the national clip removed
+            _bsrc = _compact_sources(tdata.get("sources"))
+            if _bsrc:
+                tile_avail["bev_source"] = _bsrc
+            if tdata.get("outline_clip_px"):
+                tile_avail["outline_clip_px"] = int(tdata["outline_clip_px"])
+                log.info("KG %s %s: national clip removed %d px of LiDAR beyond the outline (+%.0f m)",
+                         kg_code, tile_label, tile_avail["outline_clip_px"], _OUTLINE_CLIP_M or 0)
 
             # Phase 1: persist default-date DTM/DSM/ndsm as a per-tile
             # raster sidecar. Lets gpkg_full skip the BEV re-read entirely.
@@ -8695,6 +8762,29 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 if not _reuse_full and not _full_already_on_zenodo:
                     full_gpkg, _boundary_remap = build_full_gpkg_tiled(
                         kg_code, tile_seg_results, all_objects, obs_year, mark_uncertain=mark_uncertain)
+                    # per-tile provenance of the stitch for data_quality.tiles[]:
+                    # which tiles were read a second time, and whether BEV
+                    # served a different file than the one they were segmented from
+                    try:
+                        for _ta in tile_data_availability:
+                            if not isinstance(_ta, dict):
+                                continue
+                            _tno = _ta.get("tile_index")
+                            if _tno in _STITCH_REREAD_TILES:
+                                _ta["stitch_reread"] = True
+                                _now = _STITCH_REREAD_SOURCES.get(_tno)
+                                if _tno not in _STITCH_SOURCE_CHANGED and _ta.get("bev_source") and _now:
+                                    _chg = raster_io.sources_changed(_ta["bev_source"], _now)
+                                    if _chg:
+                                        _STITCH_SOURCE_CHANGED[_tno] = _chg
+                            if _tno in _STITCH_SOURCE_CHANGED:
+                                _ta["source_changed"] = list(_STITCH_SOURCE_CHANGED[_tno])[:8]
+                        if _STITCH_SOURCE_CHANGED:
+                            _relay_subprocess_info(
+                                f"KG {kg_code}: BEV source changed between segmentation and stitch for tile(s) "
+                                + ",".join(str(_t) for _t in sorted(_STITCH_SOURCE_CHANGED)[:40]), "gpkg_full")
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception as _bge:
                 from tile_cache import CacheMissError as _CacheMissError
                 if isinstance(_bge, _CacheMissError) or isinstance(getattr(_bge, '__cause__', None), _CacheMissError):
@@ -9079,8 +9169,10 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                 v1_doc,
                 union_geom_3035=_v2_union_3035,
                 h3b_path=result["files"].get(NE_PRODUCT_KEY),
-                ne_declared_digest=(_ne_declared.digest if _ne_declared is not None else None))
+                ne_declared_digest=(_ne_declared.digest if _ne_declared is not None else None),
+                neighbour_check=not _is_sweep)
             result["v2_verify"] = {"ok": bool(_rep["ok"]), "summary": _rep.summary(),
+                                   "neighbour_registration": _rep.get("neighbour_registration"),
                                    "errors": list(_rep.get("errors", []))[:10],
                                    "warnings": list(_rep.get("warnings", []))[:10]}
             _vmsg = f"v2verify: {kg_code} {_rep.summary()}"

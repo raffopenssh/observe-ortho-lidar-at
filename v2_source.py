@@ -226,9 +226,16 @@ def _gpkg_read_dtm_dsm(geom_3035, dataset=None, pad=5.0):
     valid = gmask & np.isfinite(dtm) & np.isfinite(dsm)
     ndsm = np.where(valid, dsm - dtm, np.nan).astype(np.float32)
     ndsm = np.where((ndsm < 0) & valid, 0.0, ndsm).astype(np.float32)
-    return {"dtm": dtm, "dsm": dsm, "ndsm": ndsm, "mask": valid,
-            "transform": tf, "crs": g.crs, "shape": shape, "dataset": dataset,
-            "source": "gpkg"}
+    out = {"dtm": dtm, "dsm": dsm, "ndsm": ndsm, "mask": valid,
+           "transform": tf, "crs": g.crs, "shape": shape, "dataset": dataset,
+           "source": "gpkg"}
+    try:        # rasters inherited from the v1 GPKG get the same national clip as a BEV read
+        import raster_io as _rio
+        if _rio.OUTLINE_CLIP_M is not None:
+            _rio.clip_national(out)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 # --------------------------------------------------------------------------

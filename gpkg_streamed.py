@@ -480,10 +480,12 @@ def build_full_gpkg_streamed(
     for date_key in other_dates:
         year = _ti.dataset_to_year(date_key)
 
+        from austria_processor import _align_tdata_to_tile as _align
+
         def _make_fetch_dtm_date(dk):
             def _fetch(tr, th_eff, tw_eff):
                 try:
-                    d2 = _rio.read_dtm_dsm(box(*tr["bounds_3035"]), dk)
+                    d2 = _align(_rio.read_dtm_dsm(box(*tr["bounds_3035"]), dk, pad=0.0), tr)
                     return [d2["dtm"][:th_eff, :tw_eff].astype(np.float32)]
                 except Exception:
                     return None
@@ -492,7 +494,7 @@ def build_full_gpkg_streamed(
         def _make_fetch_dsm_date(dk):
             def _fetch(tr, th_eff, tw_eff):
                 try:
-                    d2 = _rio.read_dtm_dsm(box(*tr["bounds_3035"]), dk)
+                    d2 = _align(_rio.read_dtm_dsm(box(*tr["bounds_3035"]), dk, pad=0.0), tr)
                     return [d2["dsm"][:th_eff, :tw_eff].astype(np.float32)]
                 except Exception:
                     return None
@@ -828,7 +830,8 @@ def build_full_gpkg_streamed(
 
 # Re-read helper — same as austria_processor._read_dtm_for_tile
 def _read_dtm_for_tile(tr):
-    import raster_io as _rio
-    import tile_index as _ti
-    from shapely.geometry import box
-    return _rio.read_dtm_dsm(box(*tr["bounds_3035"]), _ti.DEFAULT_DATASET)
+    # pad=0 + placed by transform (was the default 5 m pad pasted at the
+    # tile's own offset: the 2026 pos_shift fault, fixed for the tiled builder
+    # in eead178 but not here)
+    from austria_processor import _read_dtm_for_tile as _ap_read
+    return _ap_read(tr)

@@ -32,6 +32,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import sqlite3
 from pathlib import Path
 
@@ -1028,9 +1029,30 @@ def check_light_gpkg(path: str, v2: dict, rep: Report, union_geom_3035=None) -> 
 # gates
 # --------------------------------------------------------------------------
 
+def check_neighbour_registration(code: str, v2: dict, rep: Report, **kw) -> dict:
+    """Warn (never reject) when the product's 25 m terrain is displaced against
+    already uploaded neighbours, as a whole or tile by tile, or holds other
+    terrain than they do (``neighbour_registration``, docs/qc-lessons.md →
+    pos_shift).  Neighbour documents come from Zenodo (≤ 6 small GETs, ≤ 90 s);
+    no network / manifest → ``unchecked``, which is not a finding."""
+    try:
+        import neighbour_registration as nr
+        res = nr.check_before_upload(code, v2, **kw)
+        txt = nr.line(res)
+    except Exception as e:  # noqa: BLE001
+        res, txt = {"verdict": "unchecked"}, f"unchecked ({str(e)[:100]})"
+    rep["neighbour_registration"] = {k: res.get(k) for k in
+                                     ("verdict", "neighbours", "aligned", "shifted", "offset", "tiles",
+                                      "mismatch", "fetched", "s") if res.get(k) is not None}
+    bad = res.get("verdict") in ("shifted", "tiles-shifted") or bool(res.get("mismatch"))
+    rep.check("neighbour_registration", not bad, txt, fatal=False)
+    return res
+
+
 def verify_before_upload(code: str, json_v2_path: str, light_gpkg_path: str | None,
                          v1_doc: dict | None, *, union_geom_3035=None, h3b_path: str | None = None,
-                         ne_declared_digest: str | None = None) -> Report:
+                         ne_declared_digest: str | None = None,
+                         neighbour_check: bool = False) -> Report:
     rep = Report()
     p = Path(json_v2_path)
     if not rep.check("json_v2_exists", p.exists() and p.stat().st_size > 0, str(p)):
@@ -1050,6 +1072,8 @@ def verify_before_upload(code: str, json_v2_path: str, light_gpkg_path: str | No
     if light_gpkg_path is not None:
         check_light_gpkg(light_gpkg_path, v2, rep, union_geom_3035)
     check_ne(v2, rep, h3b_path, ne_declared_digest)
+    if neighbour_check and os.environ.get("NEIGHBOUR_REG_CHECK", "1") != "0":
+        check_neighbour_registration(code, v2, rep)
     if v1_doc is not None:
         try:
             v1_bytes = len(json.dumps(v1_doc, indent=2).encode())

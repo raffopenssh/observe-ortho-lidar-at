@@ -14,9 +14,11 @@ in the shared Zenodo cache deposit, and exposes minimal upload /
 download / delete operations. The same deposit already serves
 ``zenodo_cache`` tile bundles — we just live under a different prefix.
 
-Raster sidecars (Phase 1) are intentionally NOT included — they would
-blow the upload budget and the GPKG build step has its own re-read
-fallback. This is the "metadata tier" only.
+Raster sidecars: the default DTM/DSM (+nDSM) of each tile ride along,
+losslessly packed, as far as ``MAX_BUNDLE_BYTES`` allows after the pickles
+(``SHIP_RASTERS``); every tile ships at least its ``meta.json`` with the BEV
+source identity so a re-read by the next peer is checked against it.
+Multi-date and ortho sidecars do not travel.
 
 Local manifest at ``data/austria_processor/checkpoint_registry.json``
 tracks ``{kg_code: {ts, n_tiles, bytes, name}}``. The manifest is added
@@ -167,10 +169,105 @@ def _bundle_name(kg_code: str) -> str:
 # Bundling
 # ----------------------------------------------------------------------
 
-def _bundle_tile_pickles(kg_code: str) -> Optional[bytes]:
-    """Tar+gzip all tile_*.pkl files for kg_code into an in-memory blob.
+# Raster sidecars in the bundle (docs/qc-lessons.md → pos_shift): the default
+# DTM/DSM of a tile ride along so the peer that picks the KG up stitches the
+# SAME rasters the tiles were segmented from instead of re-reading BEV (a
+# second read is where the 5 m shift lived, and BEV may serve other data by
+# then).  Lossless (uint32 row delta + byte shuffle + zlib, ~3-4x on terrain).
+# Pickles have priority: rasters only fill what the pickles leave of
+# MAX_BUNDLE_BYTES, tile by tile; a tile that does not fit still ships its
+# ``meta.json`` (transform + BEV source identity) so the re-read is checked.
+# Multi-date and ortho sidecars never travel (re-read on the tile grid).
+SHIP_RASTERS = os.environ.get("CHKPT_SHIP_RASTERS", "1") != "0"
+RASTER_MARGIN_BYTES = 4 * 1024 * 1024
+_F32Z = b"F32Z1"
 
-    Returns None if there are no pickles to bundle or the bundle would
+
+def _f32z_encode(a) -> bytes:
+    import zlib
+    import numpy as np
+    u = np.ascontiguousarray(a, dtype="<f4").view("<u4")
+    d = u.copy()
+    d[:, 1:] -= u[:, :-1]
+    body = np.ascontiguousarray(d.view(np.uint8).reshape(-1, 4).T).tobytes()
+    return _F32Z + np.array(u.shape, "<u4").tobytes() + zlib.compress(body, 6)
+
+
+def _f32z_decode(blob: bytes):
+    import zlib
+    import numpy as np
+    if blob[:5] != _F32Z:
+        raise ValueError("not an F32Z1 raster")
+    rows, cols = (int(x) for x in np.frombuffer(blob[5:13], "<u4"))
+    b = np.frombuffer(zlib.decompress(blob[13:]), np.uint8).reshape(4, rows * cols)
+    d = np.ascontiguousarray(b.T).view("<u4").reshape(rows, cols)
+    return np.cumsum(d, axis=1, dtype=np.uint32).view("<f4")
+
+
+def _derive_ndsm(dtm, dsm, nd_valid):
+    import numpy as np
+    with np.errstate(invalid="ignore"):
+        nd = np.where(nd_valid, dsm - dtm, np.nan).astype(np.float32)
+        return np.where((nd < 0) & nd_valid, np.float32(0.0), nd).astype(np.float32)
+
+
+def _raster_members(kg_dir: Path, tile_no: str, with_rasters: bool) -> Optional[Dict[str, bytes]]:
+    """Bundle members of one tile's raster sidecar: always ``meta.json``;
+    with *with_rasters* also dtm / dsm (+ the nDSM validity bits, or the nDSM
+    itself when it is not exactly max(dsm - dtm, 0))."""
+    import zlib
+    import numpy as np
+    rdir = kg_dir / f"tile_{tile_no}" / "raster"
+    try:
+        meta = json.loads((rdir / "meta.json").read_text())
+    except Exception:
+        return None
+    out_meta = {k: meta[k] for k in ("transform", "shape", "bev_source") if meta.get(k)}
+    out_meta["layers"] = {}
+    pre = f"tile_{tile_no}/raster/"
+    out: Dict[str, bytes] = {}
+    if with_rasters and (meta.get("layers") or {}).get("default"):
+        try:
+            dtm = np.load(str(rdir / "dtm.npy"), mmap_mode="r")
+            dsm = np.load(str(rdir / "dsm.npy"), mmap_mode="r")
+            ndsm = np.load(str(rdir / "ndsm.npy"), mmap_mode="r")
+            if dtm.ndim == 2 and dtm.shape == dsm.shape == ndsm.shape:
+                ndv = np.isfinite(ndsm)
+                out[pre + "dtm.f32z"] = _f32z_encode(dtm)
+                out[pre + "dsm.f32z"] = _f32z_encode(dsm)
+                if np.array_equal(_derive_ndsm(np.asarray(dtm), np.asarray(dsm), ndv), ndsm, equal_nan=True):
+                    out[pre + "ndsm_valid.bitz"] = zlib.compress(np.packbits(ndv).tobytes(), 6)
+                else:
+                    out[pre + "ndsm.f32z"] = _f32z_encode(ndsm)
+                out_meta["layers"] = {"default": True}
+        except Exception as e:  # noqa: BLE001
+            _log.info("chkpt raster pack tile_%s failed: %s", tile_no, e)
+            out = {}
+            out_meta["layers"] = {}
+    out[pre + "meta.json"] = json.dumps(out_meta).encode()
+    return out
+
+
+def _tar_gz(members) -> bytes:
+    """members: iterable of (arcname, Path | bytes)."""
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
+        with tarfile.open(fileobj=gz, mode="w") as tar:
+            for name, src in members:
+                if isinstance(src, (bytes, bytearray)):
+                    ti_ = tarfile.TarInfo(name)
+                    ti_.size = len(src)
+                    tar.addfile(ti_, io.BytesIO(src))
+                else:
+                    tar.add(str(src), arcname=name)
+    return buf.getvalue()
+
+
+def _bundle_tile_pickles(kg_code: str) -> Optional[bytes]:
+    """Tar+gzip all tile_*.pkl files for kg_code into an in-memory blob,
+    plus the tiles' default raster sidecars as far as the size cap allows.
+
+    Returns None if there are no pickles to bundle or the pickles alone
     exceed ``MAX_BUNDLE_BYTES``.
     """
     kg_dir = CKPT_ROOT / kg_code
@@ -181,12 +278,8 @@ def _bundle_tile_pickles(kg_code: str) -> Optional[bytes]:
                   and p.name.endswith(".pkl"))
     if not pkls:
         return None
-    buf = io.BytesIO()
-    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
-        with tarfile.open(fileobj=gz, mode="w") as tar:
-            for p in pkls:
-                tar.add(str(p), arcname=p.name)
-    data = buf.getvalue()
+    base = [(p.name, p) for p in pkls]
+    data = _tar_gz(base)
     if len(data) > MAX_BUNDLE_BYTES:
         # Routine on big v2.x parents (a third of the fleet's KGs, Oct 2026):
         # the metadata pickles of a 20-tile KG gzip to 200–450 MB.  Info,
@@ -195,25 +288,118 @@ def _bundle_tile_pickles(kg_code: str) -> Optional[bytes]:
         _log.info("chkpt bundle for %s exceeds %d MB (%d MB) — skipping upload (local checkpoints still serve same-peer retries)",
                      kg_code, MAX_BUNDLE_BYTES // (1024*1024), len(data) // (1024*1024))
         return None
-    return data
+    if not SHIP_RASTERS:
+        return data
+    try:
+        budget = MAX_BUNDLE_BYTES - len(data) - RASTER_MARGIN_BYTES
+        extra, n_ras, n_meta = [], 0, 0
+        for p in pkls:
+            tno = p.name[len("tile_"):-len(".pkl")]
+            mem = _raster_members(kg_dir, tno, with_rasters=budget > 0)
+            if mem is None:
+                continue
+            size = sum(len(v) for v in mem.values())
+            if size > budget and len(mem) > 1:
+                mem = _raster_members(kg_dir, tno, with_rasters=False) or {}
+                size = sum(len(v) for v in mem.values())
+            if len(mem) > 1:
+                n_ras += 1
+            else:
+                n_meta += 1
+            budget -= size
+            extra.extend(sorted(mem.items()))
+        if not extra:
+            return data
+        full = _tar_gz(base + extra)
+        if len(full) > MAX_BUNDLE_BYTES:
+            return data
+        _log.info("chkpt bundle for %s: %d tile raster sidecar(s) shipped, %d identity-only (%.1f MB pickles → %.1f MB)",
+                  kg_code, n_ras, n_meta, len(data) / 1e6, len(full) / 1e6)
+        return full
+    except Exception as e:  # noqa: BLE001 — rasters are an add-on, never lose the pickles
+        _log.warning("chkpt bundle for %s: raster sidecars skipped (%s)", kg_code, e)
+        return data
+
+
+def _install_raster(kg_dir: Path, tile_no: str, files: Dict[str, bytes]) -> bool:
+    """Write one tile's shipped sidecar into ``tile_<N>/raster/`` (never over
+    an existing local one).  True when dtm/dsm/ndsm were installed."""
+    import zlib
+    import numpy as np
+    import tile_raster_sidecar as trs
+    rdir = kg_dir / f"tile_{tile_no}" / "raster"
+    if (rdir / "meta.json").exists() or "meta.json" not in files:
+        return False
+    meta = json.loads(files["meta.json"])
+    has = bool((meta.get("layers") or {}).get("default")) and "dtm.f32z" in files and "dsm.f32z" in files
+    if has and not trs._enough_disk():
+        has = False
+    rdir.mkdir(parents=True, exist_ok=True)
+    if has:
+        dtm = _f32z_decode(files["dtm.f32z"]); dsm = _f32z_decode(files["dsm.f32z"])
+        if "ndsm.f32z" in files:
+            ndsm = _f32z_decode(files["ndsm.f32z"])
+        else:
+            ndv = np.unpackbits(np.frombuffer(zlib.decompress(files["ndsm_valid.bitz"]), np.uint8),
+                                count=dtm.size).reshape(dtm.shape).astype(bool)
+            ndsm = _derive_ndsm(dtm, dsm, ndv)
+        trs._atomic_save_npy(rdir / "dtm.npy", dtm)
+        trs._atomic_save_npy(rdir / "dsm.npy", dsm)
+        trs._atomic_save_npy(rdir / "ndsm.npy", ndsm)
+    meta["layers"] = {"default": True} if has else {}
+    meta["shipped"] = True
+    tmp = rdir / "meta.json.tmp"
+    tmp.write_text(json.dumps(meta))
+    tmp.rename(rdir / "meta.json")
+    return has
+
+
+LAST_UNPACK: Dict = {}       # {"rasters": n, "identity": n} of the last _unpack_bundle
 
 
 def _unpack_bundle(blob: bytes, kg_code: str) -> int:
-    """Extract tile_*.pkl entries into tile_checkpoints/<kg>/.
+    """Extract tile_*.pkl entries (and shipped raster sidecars) into
+    tile_checkpoints/<kg>/.
 
     Skips any tile pickle already present locally (don't clobber a
-    freshly-written checkpoint). Returns count of files installed.
+    freshly-written checkpoint). Returns count of pickles installed.
     """
     kg_dir = CKPT_ROOT / kg_code
     kg_dir.mkdir(parents=True, exist_ok=True)
     installed = 0
+    LAST_UNPACK.clear(); LAST_UNPACK.update(rasters=0, identity=0)
     try:
         buf = io.BytesIO(blob)
+        new_tiles = set()
         with gzip.GzipFile(fileobj=buf, mode="rb") as gz:
             with tarfile.open(fileobj=gz, mode="r") as tar:
-                for member in tar.getmembers():
-                    name = os.path.basename(member.name)
-                    if not (name.startswith("tile_") and name.endswith(".pkl")):
+                cur_no, cur = None, {}
+
+                def _flush():
+                    if cur_no is not None and cur and cur_no in new_tiles:
+                        try:
+                            if _install_raster(kg_dir, cur_no, cur):
+                                LAST_UNPACK["rasters"] += 1
+                            else:
+                                LAST_UNPACK["identity"] += 1
+                        except Exception as e:  # noqa: BLE001
+                            _log.info("chkpt raster install tile_%s failed: %s", cur_no, e)
+
+                for member in tar:
+                    parts = member.name.split("/")
+                    name = parts[-1]
+                    if len(parts) == 3 and parts[1] == "raster" and parts[0].startswith("tile_") \
+                            and parts[0][5:].isdigit():
+                        # members of one tile are contiguous and follow all pickles
+                        if parts[0][5:] != cur_no:
+                            _flush()
+                            cur_no, cur = parts[0][5:], {}
+                        fobj = tar.extractfile(member)
+                        if fobj is not None and name in ("meta.json", "dtm.f32z", "dsm.f32z",
+                                                         "ndsm.f32z", "ndsm_valid.bitz"):
+                            cur[name] = fobj.read()
+                        continue
+                    if len(parts) != 1 or not (name.startswith("tile_") and name.endswith(".pkl")):
                         continue
                     dst = kg_dir / name
                     if dst.exists():
@@ -226,6 +412,8 @@ def _unpack_bundle(blob: bytes, kg_code: str) -> int:
                         f.write(fobj.read())
                     tmp.rename(dst)
                     installed += 1
+                    new_tiles.add(name[5:-4])
+                _flush()
     except Exception as e:
         _log.warning("unpack chkpt bundle for %s failed: %s", kg_code, e)
     return installed
@@ -447,7 +635,8 @@ def download_kg(kg_code: str) -> Dict:
     if n:
         _log.info("chkpt_registry: restored %d tile pickles for %s from Zenodo",
                   n, kg_code)
-    return {"n": n, "bytes": len(blob)}
+    return {"n": n, "bytes": len(blob), "rasters": LAST_UNPACK.get("rasters", 0),
+            "identity": LAST_UNPACK.get("identity", 0)}
 
 
 def delete_kg(kg_code: str) -> bool:
