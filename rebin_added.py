@@ -578,6 +578,12 @@ def status() -> dict:
         return {'rule': RULE, 'kgs': 0}
     s = totals(con)
     m = dict(con.execute('SELECT k, v FROM meta').fetchall())
+    try:                                             # denominator = KG files of the corpus, not rows scanned so far
+        import cells_api as ca
+        s['files'] = sum(1 for k in ca._files() if len(k) == 5 and k.isdigit())
+    except Exception:  # noqa: BLE001
+        s['files'] = s['kgs']
+    s['complete'] = s['scanned'] >= s['files'] and not s['errors']
     s.update(resolved=m.get('resolved') == RULE, synced_ts=int(m.get('synced_ts') or 0),
              unsynced=con.execute("SELECT COUNT(*) FROM kgs WHERE token IS NOT NULL AND synced IS NULL").fetchone()[0])
     return s
@@ -588,7 +594,7 @@ def text_line() -> str:
     if not s.get('kgs'):
         return f'rebin: {RULE} — no scan yet (python3 rebin_added.py --scan)'
     ts = time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(s['synced_ts'])) if s.get('synced_ts') else '-'
-    return (f"rebin: {RULE} scanned {s['scanned']}/{s['kgs']} KGs ({s['errors']} errors) · off_file {s['off_file']} of {s['stored']} stored = "
+    return (f"rebin: {RULE} scanned {s['scanned']}/{s['files']} KGs ({s['errors']} errors) · off_file {s['off_file']} of {s['stored']} stored = "
             f"added {s['added']} (no_row {s['no_row']} / other_file {s['other_file']}) + dup {s['dup'] + s['dup_frame'] + s['dup_added']} "
             f"(twin {s['dup']} / frame {s['dup_frame']} / added-twin {s['dup_added']}) + qa {s['qa']}"
             + (f" + undecided {s['pending']}" if s['pending'] else '')
