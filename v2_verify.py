@@ -480,6 +480,33 @@ def _lidar_extent_3035(v2: dict):
         return None
 
 
+def check_grid25_tile_edges(v2: dict, d: dict, rep: Report) -> None:
+    """Warn (never reject) when the 25 m terrain has a cliff along an
+    *internal processing-tile edge*: one tile's raster disagrees with its
+    neighbours — a stale / foreign / misregistered tile raster in the stitch
+    (docs/qc-lessons.md → grid25_stale).  Same rule as the read-time detector
+    (``grid25_patch.edges``: 3-cell step > 3× the step further in, ≥ 400 m
+    run).  Real terrain fires it too (553 of 16 775 products in the 2026 corpus,
+    19 of them with a tile that failed the BEV check), hence a warning:
+    the line lands in the processor log next to the upload, which is what the
+    2026 run lacked.  Pure numpy on the document, no I/O."""
+    try:
+        import grid25_patch as _gp
+        g = {"elev": d["elev"], "x0": d["x0"], "y0": d["y0"]}
+        ed = _gp.edges(str(v2.get("kg_code") or ""), g, tiles=_gp.tiles_of_doc(v2, g))
+    except Exception as e:  # noqa: BLE001
+        rep.check("grid25_tile_edges", False, f"edge check failed: {str(e)[:120]}", fatal=False)
+        return
+    if ed:
+        worst = max(ed, key=lambda x: x["step"])
+        rep.check("grid25_tile_edges", False,
+                  f"{len(ed)} internal tile edge(s) with a terrain step, tiles "
+                  f"{sorted({x['tile'] for x in ed})[:12]}, worst {worst['step']} m over "
+                  f"{worst['run'] * 25} m at tile {worst['tile']}", fatal=False)
+    else:
+        rep.check("grid25_tile_edges", True)
+
+
 def check_v21_document(v2: dict, rep: Report) -> None:
     """Product-2.1 JSON checks (JSON subset — also run on the primary)."""
     pv = str(v2.get("product_version") or "")
@@ -566,6 +593,7 @@ def check_v21_document(v2: dict, rep: Report) -> None:
         if not ok5:
             rep.check("grid25_range_drift", False,
                       f"grid {gmin:.0f}..{gmax:.0f} m outside terrain ±5 m", fatal=False)
+    check_grid25_tile_edges(v2, d, rep)
     lc = _g(v2, "landcover", "grid25")
     if isinstance(lc, dict):
         rep.check("landcover_grid25_dims", int(lc.get("cols", 0)) == cols and int(lc.get("rows", 0)) == rows,

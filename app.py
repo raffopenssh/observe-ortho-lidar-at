@@ -18853,7 +18853,7 @@ _PTXT_GROUPS = (
                   'throttle:', 'versions:', 'rollout:', 'frontier plan',
                   'primary_net:')),
     ('progress', ('progress:', 'products:', 'zenodo:', 'zen_stall:', 'v2:',
-                  'v2_verify_fails', 'v2_regen:', 'label_mix:', 'stale_blocks:', 'json_heal:', 'repair:',
+                  'v2_verify_fails', 'v2_regen:', 'qc:', 'qc worst', 'qc key', 'label_mix:', 'stale_blocks:', 'json_heal:', 'repair:',
                   'chkpt_registry:', 'zen_cache:', 'hansen_cover:', 'cache_reconcile:',
                   'priority queue', 'recent failures')),
     ('upstreams', ('warn_top', 'zenodo_circuit:', 'zenodo_uploads:',
@@ -19331,6 +19331,11 @@ def process_txt():
             'sweep=N    sliver-sweep drill-down: one row per swept parent '
             '(done -> confirmed/posted/queued, unswept/held units + '
             'the openEO cells they wait for); implies roster=0&log=0\n'
+            'qc=N       QC ledger drill-down: the N worst products (fault '
+            'classes, open rows, WHEN: upload / v1 build / peer / sidecar '
+            're-reads) with their manifest keys; qc=<manifest key or product '
+            'code> = every ledger row behind that key; implies roster=0&log=0 '
+            '(qc_ledger.py, docs/qc-lessons.md)\n'
             'greenfix=N green-fix override drill-down: fixed/confirmed/queued '
             'parents, budget, oldest unconfirmed rows; implies roster=0&log=0\n'
             '\n'
@@ -19404,7 +19409,11 @@ def process_txt():
             return 30
     sweep_n = _focus_n('sweep')
     greenfix_n = _focus_n('greenfix')
-    if sweep_n or greenfix_n:
+    # qc=N → worst products of the QC ledger; qc=<manifest key | code> → its rows
+    qc_arg = (request.args.get('qc') or '').strip()[:60]
+    if qc_arg in ('0', 'false', 'no'):
+        qc_arg = ''
+    if sweep_n or greenfix_n or qc_arg:
         if 'roster' not in request.args:
             show_roster = False
         if 'log' not in request.args:
@@ -19416,7 +19425,7 @@ def process_txt():
     # work avoided here is pure Python text formatting + log scanning.
     _cache_key = (nlog, warn_only, show_hidden, peer_q, msg_q, hours_back,
                   attn_only, show_roster, creds_full, show_bw,
-                  uploads_full, verbose, sweep_n, greenfix_n,
+                  uploads_full, verbose, sweep_n, greenfix_n, qc_arg,
                   request.args.get('stall', '10'))
     _now_t = _t.time()
     cache = getattr(process_txt, '_render_cache', None)
@@ -20561,6 +20570,17 @@ def process_txt():
             out.append(_ra.text_line())
         except Exception as _e:
             out.append(f'rebin: unavailable ({_e})')
+        # qc: ONE ledger over the read-time fault detectors (qc_ledger.py) —
+        # reads a ~6 KB summary JSON (mtime-cached); the drill-down opens the
+        # ledger SQLite read-only.  Never builds on the request path.
+        try:
+            import qc_ledger as _qc
+            out.append(_qc.text_line())
+            if qc_arg:
+                out.extend(_qc.detail_lines(limit=max(1, min(100, int(qc_arg))))
+                           if qc_arg.isdigit() else _qc.key_lines(qc_arg))
+        except Exception as _e:
+            out.append(f'qc: unavailable ({_e})')
         # label_mix: products stitched with colliding label ids (restored
         # tile checkpoints, Oct 2026) — detected from the NE cells, auto-
         # requeued for a full rerun (label_mix.py); grep `?q=label_mix`.
@@ -21810,7 +21830,7 @@ def process_txt():
 
     out.append('')
     out.append(
-        '# params: log=N|0 warn=1 hidden=1 attn=1 roster=0 creds=1 bw=1 sweep=N greenfix=N '
+        '# params: log=N|0 warn=1 hidden=1 attn=1 roster=0 creds=1 bw=1 sweep=N greenfix=N qc=N|key '
         'uploads=1 stall=N peer=<substr> q=<substr> hours=H verbose=1 help=1'
     )
     # --- Distil health banner (inserted just under the title) ----

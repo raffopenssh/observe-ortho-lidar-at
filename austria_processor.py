@@ -3354,6 +3354,13 @@ _SIDECAR_STATS: dict = {
 }
 
 
+# Tiles whose default DTM/DSM raster the gpkg_full stitch had to re-read from
+# BEV (no local sidecar).  Listed on the sidecar summary line so the QC ledger
+# (qc_ledger.py, docs/qc-lessons.md) knows WHICH tiles of a product came from a
+# second read — the 5 m tile shift lived exactly in those.
+_STITCH_REREAD_TILES: list = []
+
+
 def _sidecar_stat(key: str, n: int = 1) -> None:
     try:
         _SIDECAR_STATS[key] = _SIDECAR_STATS.get(key, 0) + n
@@ -3482,6 +3489,11 @@ def _read_dtm_for_tile(tr, kg_code: str | None = None, tile_idx: int | None = No
             pass
     if kg_code is not None and tile_idx is not None:
         _sidecar_stat("dtm_miss")
+        try:
+            if (tile_idx + 1) not in _STITCH_REREAD_TILES:
+                _STITCH_REREAD_TILES.append(int(tile_idx) + 1)
+        except Exception:  # noqa: BLE001
+            pass
     # pad=0: ``bounds_3035`` IS the tile's (already padded) pixel grid.  The
     # default 5 m pad returned an array starting 5 m further NW which every
     # caller then pasted at the tile's own offset (``[:th, :tw]``) — full-GPKG
@@ -4242,6 +4254,7 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
     # 24h log so we can audit sidecar hit ratios fleet-wide).
     for _k in list(_SIDECAR_STATS.keys()):
         _SIDECAR_STATS[_k] = 0
+    del _STITCH_REREAD_TILES[:]
     out_path = str(GPKG_DIR / f"{kg_code}_full.gpkg")
     _purge_stale_gpkg(out_path)
     if not tile_seg_results:
@@ -5065,6 +5078,9 @@ def build_full_gpkg_tiled(kg_code, tile_seg_results, all_objects, obs_year, mark
                 f"ortho={s['ortho_hit']}/{s['ortho_hit']+s['ortho_miss']} "
                 f"hit_pct={pct:.0f}% (BEV reads saved: {hit}/{tot})"
             )
+            if _STITCH_REREAD_TILES:
+                _summary += " reread_dtm_tiles=" + ",".join(
+                    str(_t) for _t in sorted(_STITCH_REREAD_TILES)[:80])
             log.info(_summary)
             try:
                 import json as _j_sc
@@ -7486,7 +7502,12 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                     cached_tile, next_obj_id, kg_code, tile_label)
                 all_new_buildings.extend(cached_tile.get("new_buildings", []))
                 all_infrastructure.extend(cached_tile.get("infrastructure", []))
-                tile_data_availability.append(cached_tile["tile_avail"])
+                # provenance for the QC ledger: this tile's result was not
+                # computed in the session that stitched the product
+                _ta_restored = cached_tile["tile_avail"]
+                if isinstance(_ta_restored, dict):
+                    _ta_restored = dict(_ta_restored, restored=True)
+                tile_data_availability.append(_ta_restored)
                 t_terrain_entry = cached_tile.get("terrain")
                 if t_terrain_entry is not None:
                     terrain_stats_list.append(t_terrain_entry)

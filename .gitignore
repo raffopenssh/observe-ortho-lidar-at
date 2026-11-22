@@ -63,3 +63,6 @@ data/hillshade_seam_report.json*
 data/grid25_patches/
 data/austria_outline.json
 data/ne_pos_fix.json
+data/qc_ledger.sqlite*
+data/qc_ledger.json
+data/qc_ledger_archive.json

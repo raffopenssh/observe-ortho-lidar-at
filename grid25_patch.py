@@ -130,9 +130,14 @@ def _raw_grid(code):
 def _tiles(code, g):
     """[(tile_index, r0, c0, r1, c1)] — processing tiles as cell ranges of the grid."""
     import kg_v2_store as kvs
+    return tiles_of_doc(kvs.get(code) or {}, g)
+
+
+def tiles_of_doc(d, g):
+    """``_tiles`` for a product document in hand (no store) — also used by the
+    pre-upload check ``v2_verify.check_grid25_tile_edges``."""
     from pyproj import Transformer
     tf = Transformer.from_crs('EPSG:4326', 'EPSG:3035', always_xy=True)
-    d = kvs.get(code) or {}
     rows, cols = g['elev'].shape
     out = []
     for t in (d.get('data_quality') or {}).get('tiles') or []:

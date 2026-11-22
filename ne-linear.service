@@ -9,6 +9,8 @@ WorkingDirectory=/home/exedev/srtm-lidar
 ExecStart=/usr/bin/python3 ne_linear.py --backfill --budget-s 3000 --quiet
 # tree position fix: state ↔ auto-shift flags, a rejected flag switches the fix off (docs/tree-user.md → Position frames)
 ExecStartPost=-/usr/bin/python3 ne_pos_fix.py --sync
+# QC ledger: join of all detector stores (local files only, skipped when no input changed; docs/qc-lessons.md)
+ExecStartPost=-/usr/bin/python3 qc_ledger.py --build
 Slice=batch.slice
 Nice=19
 CPUWeight=10
