@@ -90,6 +90,8 @@ def test_tree_qa_fold():
         ca._tree_qa.corpus_sig = lambda: dict(sig)
         g0 = cn.current_gen()
         files = ca._files()
+        if not files:
+            return                                                 # no corpus on this host (public fork)
         meta = {'algo': cn.ALGO, 'green_fix': cn._green_fix.FIX_ID, 'kgs': len(files), 'corpus': cn._corpus_sig(files),
                 'built_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'build_started': time.time(),
                 'tree_qa': {'id': 'x+thx1', 'kgs': 3700, 'hidden': 300000}}
