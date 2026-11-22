@@ -190,6 +190,9 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
     503 + Retry-After: 120 ({{"building": true}}), answered in milliseconds. Either answer queues the block; the
     builder takes queued blocks first (≈ 1–2 min). The glyph set and glyph + tree_h are prebuilt for every block;
     a subset of a prebuilt set is sliced from it (same bytes and ETag as its own build). rebuild=1 is ignored.
+    Manifest state: served_gen = the generation a request gets right now (== gen when current=1, the previous one
+    while rebuilding, null → 503); one stale generation per block for the glyph set and glyph + tree_h. The manifest
+    ETag hashes every served_gen, so it changes whenever a block becomes current.
     Manifest: GET /api/v1/cells/blocks?fields=… → columns {{bi, bj, gen, etag, bytes, stored, current, n, bins_n,
     complete}} (bytes null until prebuilt for that field set); epoch= must equal X-Cells-Epoch (else 409).
   /api/v1/cells/sample?res=10&format=bin[&fields=glyph|default|*|a,b,…]  → the NATIONAL SAMPLE for the glyph

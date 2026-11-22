@@ -152,6 +152,39 @@ def test_request_never_builds(monkeypatch, tmp_path):
         cbl._manifest_cache.clear()
 
 
+def test_one_stale_gen_and_manifest(monkeypatch, tmp_path):
+    """Stale case: base is cut from the stored tree_h body (same X-Cells-Gen) even when an own,
+    different previous build exists; manifest served_gen == that gen and its ETag moves on a flip."""
+    import shutil, public_api
+    bi, bj = _stored_block()
+    T = cb.with_ragged_counts(list(cbl.GLYPH_TREE_FIELDS)); G = list(cbl.GLYPH_FIELDS)
+    hdr, raw, _ = cbl.build_block(bi, bj, T)
+    monkeypatch.setattr(cbl, 'BLOCK_DIR', tmp_path); monkeypatch.setattr(cbl, 'FIELDSETS_PATH', tmp_path / 'fieldsets.json')
+    monkeypatch.setattr(cb, 'WANT_DIR', tmp_path / 'want')
+    import time as _t
+    import json as _j, struct as _s
+    def regen(blob, g):                                   # same body under another generation
+        n = _s.unpack('<I', blob[4:8])[0]; h = _j.loads(blob[8:8 + n]); h['gen'] = g
+        hb = _j.dumps(h, separators=(',', ':')).encode()
+        return h, blob[:4] + _s.pack('<I', len(hb)) + hb + blob[8 + n:]
+    cbl._write_block(bi, bj, T, *regen(raw, 'old-tree'), _t.time())
+    h2, r2 = regen(cbl.slice_block(raw, G)[1], 'old-base')
+    cbl._write_block(bi, bj, G, h2, r2, _t.time())
+    monkeypatch.setattr(cbl, '_bins_ready', lambda inps: False)
+    gen = cbl.current_gen(bi, bj)[0]
+    assert cbl.served_state(bi, bj, G, gen) == ('old-tree', False) and cbl.served_state(bi, bj, T, gen) == ('old-tree', False)
+    _, hx, _, m = cbl.serve_block(bi, bj, G, build=False)
+    _, hxt, _, _ = cbl.serve_block(bi, bj, T, build=False)
+    assert hx['X-Cells-Gen'] == hxt['X-Cells-Gen'] == 'old-tree' and hx['X-Cells-Stale'] == '1' and m['stale']
+    cbl._manifest_cache.clear()
+    m0 = cbl.manifest(G); k = list(zip(m0['blocks']['bi'], m0['blocks']['bj'])).index((bi, bj))
+    assert m0['blocks']['served_gen'][k] == 'old-tree' and m0['blocks']['current'][k] == 0 and m0['blocks']['gen'][k] == gen
+    cbl._write_block(bi, bj, T, *regen(raw, gen), _t.time()); cbl._manifest_cache.clear()      # the builder stores the superset
+    m1 = cbl.manifest(G)
+    assert m1['blocks']['served_gen'][k] == gen and m1['blocks']['current'][k] == 1 and m1['generation'] != m0['generation']
+    cbl._manifest_cache.clear()
+
+
 if __name__ == '__main__':
     for n, f in list(globals().items()):
         if n.startswith('test_'):

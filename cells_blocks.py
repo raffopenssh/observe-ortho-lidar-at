@@ -244,22 +244,48 @@ def _read_stored(bi: int, bj: int, fields, meta) -> bytes | None:
     return body if len(body) == meta.get('bytes') else None
 
 
-def _superset(bi: int, bj: int, fields, gen: str | None):
-    """A stored block of the same (bi, bj) whose columns include ``fields`` → (meta, zstd body)
-    or None.  ``gen`` given → only that generation; None → any (newest build first)."""
-    want = set(fields); cands = []
-    for fs in prewarm_fieldsets():
+def _supersets(bi: int, bj: int, fields, pf=None) -> list[tuple[list, dict]]:
+    """Stored valid blocks of (bi, bj) whose columns strictly include ``fields``, in
+    ``prewarm_fieldsets()`` order (glyph + tree_h first) → [(fieldset, meta)]."""
+    want = set(fields); out = []
+    for fs in (pf if pf is not None else prewarm_fieldsets()):
         fs = cb.with_ragged_counts(fs)
         if fs == list(fields) or not want <= set(fs):
             continue
         m = stored_meta(bi, bj, fs)
-        if _meta_ok(m) and (gen is None or m.get('gen') == gen):
-            cands.append((m.get('built_at') or '', -len(fs), fs, m))
-    for _, _, fs, m in sorted(cands, key=lambda x: x[:2], reverse=True):
+        if _meta_ok(m):
+            out.append((fs, m))
+    return out
+
+
+def _superset(bi: int, bj: int, fields, gen: str | None):
+    """A stored block of the same (bi, bj) whose columns include ``fields`` → (meta, zstd body)
+    or None.  ``gen`` given → only that generation; None → the first in prewarm order: ONE
+    stale generation per block (the base set is cut from the stored tree_h body, never from
+    its own, possibly newer or older, previous build)."""
+    for fs, m in _supersets(bi, bj, fields):
+        if gen is not None and m.get('gen') != gen:
+            continue
         z = _read_stored(bi, bj, fs, m)
         if z is not None:
             return m, z
     return None
+
+
+def served_state(bi: int, bj: int, fields, gen: str, pf=None) -> tuple[str | None, bool]:
+    """(generation a request for this block + field set is answered with right now, current?)
+    without reading a body — the manifest's ``served_gen`` / ``current``.  Mirrors
+    ``serve_block(build=False)``: own or superset at ``gen`` → current; else the first stored
+    superset in prewarm order, else the own previous build, else None (503)."""
+    own = stored_meta(bi, bj, fields)
+    if _meta_ok(own) and own.get('gen') == gen:
+        return gen, True
+    sups = _supersets(bi, bj, fields, pf)
+    if any(m.get('gen') == gen for _, m in sups):
+        return gen, True
+    if sups:
+        return sups[0][1].get('gen'), False
+    return (own.get('gen') if _meta_ok(own) else None), False
 
 
 def store_block(bi: int, bj: int, fields, *, rebuild: bool = False, build: bool = True) -> dict:
@@ -324,17 +350,15 @@ def serve_block(bi: int, bj: int, fields, *, rebuild: bool = False, build: bool 
                     meta = store_block(bi, bj, fields, build=False)
                 else:
                     cb.want_block(bi, bj); stale = True
+                    sup = _superset(bi, bj, fields, None)
+                    if sup is not None and not (_meta_ok(meta) and meta.get('gen') == sup[0].get('gen')):
+                        hdr, raw = slice_block(zdecompress(sup[1]), fields)      # one stale gen per block
+                        meta = _write_block(bi, bj, fields, hdr, raw, t0, sliced_from=sup[0].get('fh'))
                     if _meta_ok(meta):
                         body = _read_stored(bi, bj, fields, meta)
                     if body is None:
-                        sup = _superset(bi, bj, fields, None)
-                        if sup is None:
-                            remember_fieldset(fields)
-                            raise cb.building_error(bi, bj)
-                        hdr, raw = slice_block(zdecompress(sup[1]), fields)
-                        if hdr['gen'] == gen:        # the builder finished in between
-                            stale = False
-                        meta = _write_block(bi, bj, fields, hdr, raw, t0, sliced_from=sup[0].get('fh'))
+                        remember_fieldset(fields)
+                        raise cb.building_error(bi, bj)
                 if body is None:
                     body = _read_stored(bi, bj, fields, meta)
                 if body is None:
@@ -430,36 +454,44 @@ def block_gens() -> tuple[str, dict]:
 def manifest(fields) -> dict:
     """``/api/v1/cells/blocks``: one row per block — bi, bj, gen, etag, bytes,
     stored (prebuilt for this field set), current (stored gen == gen), n,
-    bins_n (manifest bins), complete."""
-    fields = [f for f in fields if f != 'id']
+    bins_n (manifest bins), complete, served_gen.
+
+    ``current`` = a request is answered with ``gen`` at once (own build or a stored superset at
+    ``gen`` — base and base + tree_h flip together, the unit builds the superset first);
+    ``served_gen`` = the generation a request gets right now (== gen when current, the stale
+    one otherwise, null → 503).  ``generation`` (the ETag) hashes every served_gen, so it
+    changes whenever a block's ``current`` flips."""
+    fields = cb.with_ragged_counts([f for f in fields if f != 'id'])
     fh = fields_hash(fields)
     gen_key, gens = block_gens()
     ck = (gen_key, fh, int(time.time() // 20))
     with _manifest_guard:
-        hit = _manifest_cache.get('manifest')
+        hit = _manifest_cache.get(('manifest', fh))
         if hit and hit[0] == ck:
             return hit[1]
     t0 = time.time()
-    BI = []; BJ = []; G = []; ET = []; BY = []; ST = []; CU = []; N = []; BN = []; C = []
+    BI = []; BJ = []; G = []; ET = []; BY = []; ST = []; CU = []; N = []; BN = []; C = []; SG = []
+    pf = prewarm_fieldsets(); hs = hashlib.sha256((gen_key + '|' + fh).encode())
     n_cur = 0; n_stored = 0; bytes_total = 0
     for (bi, bj), (g, nman, comp) in gens.items():
         meta = stored_meta(bi, bj, fields)
         ok = bool(meta and meta.get('algo') == ALGO and meta.get('zstd_level') == ZSTD_LEVEL)
-        cur = ok and meta.get('gen') == g
+        sg, cur = served_state(bi, bj, fields, g, pf)
+        SG.append(sg); hs.update(f'|{bi},{bj},{sg}'.encode())
         BI.append(bi); BJ.append(bj); G.append(g); ET.append(block_etag(g, fields))
         BY.append(int(meta['bytes']) if ok else None); ST.append(int(ok)); CU.append(int(cur))
         N.append(int(meta['n']) if ok else None); BN.append(nman); C.append(int(comp))
         n_cur += cur; n_stored += ok; bytes_total += int(meta['bytes']) if ok else 0
     v = {'block_deg': cb.BLOCK_DEG, 'bin_deg': cb.BIN_DEG, 'algo': ALGO, 'ids': 'bitmap', 'fields': fields, 'fh': fh,
-         'epoch': ca.epoch_hdr(None), 'generation': hashlib.sha256((gen_key + '|' + fh).encode()).hexdigest()[:16],
+         'epoch': ca.epoch_hdr(None), 'generation': hs.hexdigest()[:16],
          'n': len(BI), 'prebuilt_current': n_cur, 'prebuilt_any': n_stored, 'bytes_total': bytes_total,
          'blocks': {'bi': BI, 'bj': BJ, 'gen': G, 'etag': ET, 'bytes': BY, 'stored': ST, 'current': CU, 'n': N,
-                    'bins_n': BN, 'complete': C},
+                    'bins_n': BN, 'complete': C, 'served_gen': SG},
          'bbox_of': 'w = bi·block_deg, s = bj·block_deg, e = w + block_deg, n = s + block_deg (half-open)',
          'request': 'GET /api/v1/cells?bbox=w,s,e,n&format=bin&block=1&fields=' + ','.join(fields),
          'computed_ms': int((time.time() - t0) * 1000)}
     with _manifest_guard:
-        _manifest_cache['manifest'] = (ck, v)
+        _manifest_cache[('manifest', fh)] = (ck, v)
     return v
 
 
@@ -797,8 +829,13 @@ def dict_block() -> dict:
                                          '(never built inside the request): X-Cells-Gen / ETag are those of the served body, '
                                          'X-Cells-Gen-Current the generation under way, Retry-After + max-age = 120 s',
                         'Retry-After': 'on a stale 200/304 and on 503 {building:true} (nothing stored yet for this block + field set)'},
+            'manifest_state': 'gen = the target generation; current = 1 → a request is answered with gen now; served_gen = '
+                              'the generation a request gets right now (== gen when current, the previous one while '
+                              'rebuilding = X-Cells-Gen of the stale 200, null → 503). One stale generation per block: '
+                              'the base set is cut from the stored base + tree_h body. ETag "blocks-<hash(bin generation, '
+                              'fields, every served_gen)>" → changes whenever a block flips',
             'manifest': 'GET /api/v1/cells/blocks[?fields=…][&epoch=…] → columns {bi, bj, gen, etag, bytes, stored, current, n, '
-                        'bins_n, complete} for every block touching a published product (bytes/n null until prebuilt for that '
+                        'bins_n, complete, served_gen} for every block touching a published product (bytes/n null until prebuilt for that '
                         'field set); epoch= must equal the current X-Cells-Epoch or you get 409 with the current one',
             'precompute': 'cells-bins.timer (hourly, 50 min budget, nice 15) builds bins → blocks (default + glyph field sets + '
                           'any field set a block request used) → the national sample; a block that is requested before it is '

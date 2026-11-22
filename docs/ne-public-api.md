@@ -453,6 +453,14 @@ reached the block phase *after* all bins were current).
   `journalctl -u cells-bins -n 3` (`block_units`, `wanted_built`,
   `wanted_open`). Tests: `tests/test_cells_blocks.py::test_request_never_builds`,
   `::test_slice_is_build`.
+* **Manifest tells the truth while rebuilding** (`/cells/blocks`, same day): per block
+  `served_gen` = what a request gets now (`cbl.served_state`; == `gen` when `current`,
+  previous generation when stale, null → 503); `current` = own build *or* a stored
+  superset at `gen`; the manifest `generation` / ETag hashes every `served_gen`, so
+  it changes on every flip (was: bin generation only → 304 forever). **One stale
+  generation per block**: in the stale case a subset is always cut from the first
+  stored superset in prewarm order (base from base + tree_h), never from its own
+  previous build. A 304 on a stale ETag queues the block like the 200 does.
 * **Sample**: `fields=…,tree_h` is served from the stored superset
   (`tree_h_n` + `tree_h` columns); `fields=glyph` has no tree columns by
   definition.
