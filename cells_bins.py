@@ -242,9 +242,9 @@ def bin_inputs(i: int, j: int) -> dict:
 
 
 def _gen(gen_prev: str) -> str:
-    """Bin generation = the pre-``thx1`` generation + ``tree_qa.THX_ID`` (2026-11-22: tree_h_max
-    == max(tree_h) in every bin — one bump for all bins; a stored blob that is current for
-    ``gen_prev`` is upgraded in place by ``load_bin`` from its own tree_h lists, no rebuild)."""
+    """Bin generation = the tree-QA-aware generation + ``tree_qa.THX_ID`` (the token of the
+    per-cell tree figures: thx1 = tree_h_max == max(tree_h); rb1 = apices counted in the cell of
+    their served position, ``ne_rebin``).  A bump rebuilds every bin (the lists themselves move)."""
     return hashlib.sha256(f'{gen_prev}|{_tree_qa.THX_ID}'.encode()).hexdigest()[:24]
 
 
@@ -725,12 +725,6 @@ def load_bin(i: int, j: int, *, rebuild: bool = False, need=None) -> tuple[dict,
                     if ok(hdr, cols):
                         _blob_lru.put(key, (hdr, cols))
                         return hdr, cols, inp
-                    up = _thx_upgrade(hdr, cols, inp)
-                    if up is not None:
-                        hdr, cols = up
-                        _store_blob(i, j, hdr, cols)
-                        _blob_lru.put(key, (hdr, cols))
-                        return hdr, cols, inp
                 except Exception as e:  # noqa: BLE001
                     log.warning('cells_bins: unreadable %s: %s', p, e)
             # about to build and replace the stored blob: never on a stale tree-QA snapshot
@@ -764,17 +758,6 @@ def thx_from_lists(cols) -> np.ndarray:
     sel = np.asarray(cols['tree_n']) < 255
     out[sel] = mx[sel]
     return out
-
-
-def _thx_upgrade(hdr: dict, cols, inp: dict):
-    """Stored blob current for the pre-thx generation → same blob with tree_h_max derived from
-    its lists, stamped with today's generation (≈ 30 ms instead of a ~1.2 s build)."""
-    if hdr.get('gen') != inp.get('gen_prev') or hdr.get('algo') != ALGO or any(c not in cols for c in TREE_COLS):
-        return None
-    cols = OrderedDict((k, v) for k, v in cols.items())
-    cols['tree_h_max'] = thx_from_lists(cols)
-    return dict(hdr, gen=inp['gen'], thx=_tree_qa.THX_ID,
-                thx_upgraded_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())), cols
 
 
 def _store_blob(i: int, j: int, hdr: dict, cols) -> None:
@@ -1162,7 +1145,7 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
             stop = True
             return
         try:
-            load_bin(*ij)       # stale → built (or thx-upgraded in place when only THX_ID is behind)
+            load_bin(*ij)       # stale → built
             with lock:
                 n_built += 1
                 if verbose and n_built % 50 == 0:

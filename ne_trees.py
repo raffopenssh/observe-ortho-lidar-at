@@ -34,6 +34,7 @@ import numpy as np
 
 import cells_api as ca
 import ne_pos_fix as _pos_fix
+import ne_rebin as _rebin
 import tree_rule
 
 log = logging.getLogger('ne_trees')
@@ -89,16 +90,18 @@ def _have_cols(c) -> bool:
 
 
 def chunk_max_from_file(kg: str, hdr: dict | None = None) -> dict[int, tuple[int, int]]:
-    """{r10: (hmax_q, bmax_q)} for every chunk of ``<kg>.h3b`` (q = m*4; 0 = none)."""
+    """{r10: (hmax_q, bmax_q)} for every chunk of ``<kg>.h3b`` (q = m*4; 0 = none) — of the
+    chunk AS SERVED (after ``ne_rebin``: an apex counts under the chunk of its served cell)."""
     kg = str(kg).zfill(5)
     h = hdr or ca.header(kg, with_chunks=True)
     out: dict = {}
     if not h:
         return out
+    live = _rebin.live_r10s(int(c['r10'], 16) for c in h.get('chunks') or [] if int(c.get('trees') or 0))
     for hrow in h.get('chunks') or []:
         r10 = int(hrow['r10'], 16)
         nt, nb = int(hrow.get('trees') or 0), int(hrow.get('bld') or 0)
-        if not nt and not nb:
+        if r10 not in live and not nb:       # no apex stored here or next door (ne_rebin moves at most one chunk)
             out[r10] = (0, 0)
             continue
         row = dict(hrow, r10=r10, trees=nt, bld=nb)
@@ -129,21 +132,34 @@ def write_max(kg: str, hm: dict, conn=None) -> int:
 
 def index_kg(kg: str, hdr: dict | None = None) -> int:
     """Hook for ``cells_api.index_file``: fill hmax/bmax for a freshly (re)indexed file."""
-    return write_max(kg, chunk_max_from_file(kg, hdr))
+    n = write_max(kg, chunk_max_from_file(kg, hdr))
+    c = ca._idx_conn(write=True)
+    if c is not None and n:
+        with ca._idx_write_lock:
+            c.execute('INSERT OR REPLACE INTO meta VALUES (?, ?)', ('hmax_exact:' + str(kg).zfill(5), _rebin.REBIN_ID)); c.commit()
+    return n
 
 
-def backfill_hmax(limit: int | None = None, log_every: int = 200) -> dict:
+def backfill_hmax(limit: int | None = None, log_every: int = 200, force: bool = False) -> dict:
     """Fill ``chunk.hmax/bmax`` for every KG that still has NULLs.  Idempotent;
-    safe to run while serving (short write transactions per KG)."""
+    safe to run while serving (short write transactions per KG).  ``force``: every file not
+    yet recomputed under the current ``ne_rebin.REBIN_ID`` (resumable: meta ``hmax_exact:<kg>``)
+    — replaces the upper bounds of ``ne_rebin.bound_hmax`` by exact values."""
     c = ca._idx_conn(write=True)
     ensure_schema(c)
     kgs = [r[0] for r in c.execute('SELECT DISTINCT kg FROM chunk WHERE hmax IS NULL OR bmax IS NULL ORDER BY kg')]
+    if force:
+        done = {r[0][11:] for r in c.execute("SELECT k FROM meta WHERE k LIKE 'hmax_exact:%' AND v=?", (_rebin.REBIN_ID,))}
+        kgs = sorted(set(kgs) | ({r[0] for r in c.execute('SELECT kg FROM file')} - done))
     if limit:
         kgs = kgs[:limit]
     t0 = time.time(); n = 0
     for i, kg in enumerate(kgs, 1):
         try:
             n += write_max(kg, chunk_max_from_file(kg), c)
+            if force:
+                with ca._idx_write_lock:
+                    c.execute('INSERT OR REPLACE INTO meta VALUES (?, ?)', ('hmax_exact:' + kg, _rebin.REBIN_ID)); c.commit()
         except Exception as ex:  # noqa: BLE001
             log.warning('ne_trees backfill %s: %s', kg, ex)
         ca._chunk_lru.pop_if(lambda k, _kg=kg: k[0] == _kg)   # don't let the scan evict hot chunks
@@ -432,7 +448,7 @@ def _decode_chunk_uncached(key, kg: str, r: dict, hdr: dict, kind: str) -> dict:
          'x': x.astype(np.int32), 'y': y.astype(np.int32), 'h': hs.astype(np.float32),
          'cell': ch.ids[cell_idx].astype(np.uint64)}
     if kind == 'trees':
-        ok = tree_rule.chunk_keep(hdr, int(r['r10']), hs)   # header verdict, else tree_rule.keep_mask(
+        ok = _rebin.marker_keep(hdr, int(r['r10']), hs, ch.t_src)   # header verdict, else tree_rule.keep_mask(
         d.update(crown_m2=dec['crown_m2'].astype(np.float32), species=dec['species'].astype(np.uint8),
                  vitality=dec['vitality'].astype(np.uint8), ndsm_only=dec['ndsm_only'].astype(bool))
     else:
@@ -644,7 +660,10 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
         for r in rows:
             copies.setdefault(int(r['r10']), []).append(r)
         copies = {k: v for k, v in copies.items() if len(v) > 1}
-    rows = [r for r in rows if int(r.get(cnt_key) or 0) > 0]
+    # trees: `max` is the tallest apex of the chunk AS SERVED (ne_rebin: a chunk without stored
+    # trees can carry a neighbour's apex) — unknown (None) is scanned; structures: stored count
+    rows = [r for r in rows if (int(r.get(cnt_key) or 0) > 0 if kind != 'trees'
+                                else r['max'] is None or int(r['max']) > 0)]
     rows.sort(key=lambda r: -(255 if r['max'] is None else int(r['max'])))   # unknown first, then tallest
     type_codes = None
     if kind == 'structures' and types:

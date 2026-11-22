@@ -50,7 +50,7 @@ def test_patch():
     cols = {'tree_h_n': np.array([2, 0, 3, 1], '<u2'), 'tree_h': np.array([40, 128, 24, 50, 60, 128], np.uint8),
             'tree_n': o3['tn'], 'tree_h_max': obs['thx']}
     assert cb.thx_from_lists(cols).tolist() == o3['thx'].tolist()
-    g0 = cb._gen_prev(1, 2, [], []); assert cb._gen(g0) != g0 and tree_qa.THX_ID in ('thx1',)
+    g0 = cb._gen_prev(1, 2, [], []); assert cb._gen(g0) != g0 and tree_qa.THX_ID.startswith('thx1')
     # out-of-range index → trees returned unchanged
     assert tree_qa.patch(obs.tobytes(), trees.tobytes(), np.array([99], '<u2').tobytes())[1] == trees.tobytes()
     # quantiser = the tree_h list's
@@ -117,7 +117,7 @@ def test_snapshot_race():
         con = tree_qa._conn()
         con.execute("INSERT INTO hid VALUES ('00001', 77, ?)", (np.array([3], '<u2').tobytes(),))
         con.execute("INSERT INTO binkg VALUES (?, ?, '00001', 'abc')", (I, J))
-        con.execute("INSERT INTO kg VALUES ('00001', 'sig', 'tok', 1, 1, 0, 'd')")
+        con.execute("INSERT INTO kg VALUES ('00001', 'sig', 'tok', 1, 1, 0, ?)", ('d' + tree_qa._DIG_SUF,))
         con.commit(); con.close()
         new_gen = cb._gen(hashlib.sha256(f"{cb._base_gen(I, J, parts, [])}|tq|{tree_qa._bin_tok({'00001': 'abc'})}".encode()).hexdigest()[:24])
         cb._store_blob(I, J, {'gen': new_gen, 'algo': cb.ALGO, 'n': 1, 'built_by': 'refresher'}, OrderedDict(id=np.array([5], '<u8')))

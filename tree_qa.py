@@ -127,14 +127,14 @@ def chunk_idx(kg: str, r10: int, digest: str | None = None):
     (the file's NEO1 digest) a store entry evaluated on another file version is ignored."""
     s = _snapshot()
     b = s['hid'].get((kg, int(r10)))
-    if b is not None and digest is not None and s['dig'].get(kg) != digest:
+    if b is not None and digest is not None and s['dig'].get(kg) != digest + _DIG_SUF:
         return None
     return b
 
 
 def kg_tok(kg: str, digest: str | None = None) -> str:
     s = _snapshot()
-    if digest is not None and s['dig'].get(str(kg)) != digest:
+    if digest is not None and s['dig'].get(str(kg)) != digest + _DIG_SUF:
         return ''
     return s['kg'].get(str(kg), '')
 
@@ -164,8 +164,14 @@ def _offsets():
 quant_h = tree_rule.quant_h     # apex height → u8 ×0.5 m (shared with the ne_h3 builder)
 
 
-THX_ID = 'thx1'     # tree_h_max derived from the kept NET1 rows at chunk load (2026-11-22). Folded into
-                    # the chunk LRU key, every bin generation, per-KG ETags and the posted-rows token.
+# THE generation token of the per-cell tree figures.  thx1 (2026-11-22): tree_h_max derived from
+# the kept NET1 rows at chunk load; + tree_rule.CELL_RULE_ID (rb1, 2026-11-22): every apex counted
+# in the res-12 cell of its served position (ne_rebin.py, docs/tree-cell-assignment.md).  Folded
+# into the chunk LRU key, every bin / block / national generation, per-KG ETags, the public
+# per-KG file name, the unit-stats fingerprint and the posted-rows token.
+THX_ID = 'thx1+' + tree_rule.CELL_RULE_ID
+_DIG_SUF = '|' + tree_rule.CELL_RULE_ID   # store rows are NET1 row indices of the chunk AS SERVED → valid
+                                           # for one (file digest, cell rule) only
 
 
 def patch(obs: bytes, trees: bytes, idx: bytes | None = None) -> tuple[bytes, bytes]:
@@ -273,7 +279,7 @@ class _Ctx:
 
     def in_sig(self, kg: str) -> str:
         f = self.files[kg]
-        parts = [RULE_ID, str(f.get('neo1_digest')), self.ca._pos_fix.tag(kg),
+        parts = [RULE_ID + _DIG_SUF, str(f.get('neo1_digest')), self.ca._pos_fix.tag(kg),
                  ','.join(f'{k}:{self.sn["tok"].get(k)}' for k in self.lin_kgs(kg)),
                  self.nt.flag_rev(kg) if kg in self.flag_kgs else '',
                  hashlib.sha1(repr(sorted(self.legacy[kg])).encode()).hexdigest()[:10] if kg in self.legacy else '']
@@ -296,7 +302,7 @@ def evaluate_kg(kg: str, ctx: _Ctx) -> tuple[dict, dict]:
     hdr = ca.header(kg, with_chunks=True)
     if hdr is None:
         return {}, {}
-    rows = {int(c['r10'], 16): c for c in hdr['chunks'] if int(c.get('trees') or 0) > 0}
+    rows = {int(c['r10'], 16): c for c in hdr['chunks']}      # as served, a chunk without stored trees can carry one
     # height rule: the chunks the file's header marks (net1.tree_rule, written by ne_h3.write_h3b),
     # else — files without a current marker — the index scan for chunks that can trip it
     cand = tree_rule.marked_chunks(hdr)
@@ -316,6 +322,10 @@ def evaluate_kg(kg: str, ctx: _Ctx) -> tuple[dict, dict]:
     if kg in ctx.legacy:
         a = np.array(ctx.legacy[kg])
         cand |= _ring_r10(hn, a[:, 0], a[:, 1])
+    # an apex is served under the chunk of its cell — at most one chunk from where it is stored
+    # (ne_rebin) or from where the header marker / the index saw it
+    import ne_rebin
+    cand = ne_rebin.live_r10s(cand)
     q = nt._qa_state((), 'trees')
     q['lin'], q['lin_grid'] = ctx.lin_all
     hid: dict = {}; cells = []; words = []
@@ -379,6 +389,7 @@ def _hidden_cells(con, kg: str, ca) -> dict:
 
 
 def _commit_kg(con, kg: str, sig: str | None, hid: dict, bins: dict, dig: str | None = None) -> None:
+    dig = dig + _DIG_SUF if dig else dig
     con.execute('BEGIN IMMEDIATE')
     con.execute('DELETE FROM hid WHERE kg=?', (kg,)); con.execute('DELETE FROM binkg WHERE kg=?', (kg,))
     if sig is None:

@@ -376,9 +376,11 @@ def load_kg(kg: str) -> dict | None:
     if not hdr:
         return None
     xs, ys, hs, cs, ids = [], [], [], [], []
+    import ne_rebin
+    live = ne_rebin.live_r10s(int(c['r10'], 16) for c in hdr.get('chunks') or [] if int(c.get('trees') or 0))
     for hrow in hdr.get('chunks') or []:
         nt = int(hrow.get('trees') or 0)
-        if not nt:
+        if int(hrow['r10'], 16) not in live:    # as served, a chunk can carry a neighbour chunk's apex
             continue
         row = dict(hrow, r10=int(hrow['r10'], 16), trees=nt, bld=int(hrow.get('bld') or 0))
         try:

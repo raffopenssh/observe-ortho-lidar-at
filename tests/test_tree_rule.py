@@ -35,7 +35,7 @@ def test_one_function():
     assert tree_rule.keep_mask(np.array([63.75]))[0] == False and tree_rule.keep_mask(np.array([50.0]))[0]  # noqa: E712
     assert tree_rule.keep_mask(np.zeros(0), np.zeros(0, np.uint64)).size == 0
     import ne_trees, tree_qa
-    assert 'tree_rule.chunk_keep(' in inspect.getsource(ne_trees._decode_chunk_uncached)
+    assert '_rebin.marker_keep(' in inspect.getsource(ne_trees._decode_chunk_uncached)   # = tree_rule.chunk_keep per stored row
     import tree_qa
     assert tree_qa.RULE_ID == tree_rule.RULE_ID and tree_qa.quant_h is tree_rule.quant_h
     mk = tree_rule.marker({'8a1f8e333717fff': [2, 5]})

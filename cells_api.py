@@ -26,6 +26,7 @@ import os
 import sqlite3
 import ne_green_fix as _green_fix
 import ne_pos_fix as _pos_fix
+import ne_rebin as _rebin
 import tree_qa as _tree_qa
 import struct
 import threading
@@ -489,7 +490,7 @@ import mem_lru as _mem_lru
 def _chunk_bytes(ch) -> int:
     # obs/trees/bld raw + offsets + centres/pub_z once materialised (~3× raw worst case)
     o, t, b = ch.raw_pub
-    return 3 * (len(o) + len(t) + len(b)) + 512
+    return 3 * (len(o) + len(t) + len(b)) + 512 + (0 if ch.t_src is None else 12 * len(ch.t_src[1]))
 
 
 _header_lru = _mem_lru.ByteLRU('cells_headers', 24, env='CELLS_HEADER_MB')
@@ -579,7 +580,7 @@ def public_summary(s: dict) -> dict:
 class Chunk:
     """One inflated res-10 chunk: NEO1 rows + NET1 / NEB1 rows + offsets."""
     __slots__ = ('kg', 'r10', 'ids', 'obs', 'trees', 'tree_off', 'bld', 'bld_off', 'cells', 'pub_z',
-                 'raw_pub', 'row', '_cen', '_als')
+                 'raw_pub', 'row', '_cen', '_als', 't_src')
 
     def __init__(self, kg: str, row: dict, parts: dict):
         self.kg = kg
@@ -598,6 +599,7 @@ class Chunk:
         self.pub_z = None
         self._cen = None
         self._als = None
+        self.t_src = None       # (src_r10[], src_idx[]) per NET1 row when ne_rebin changed the chunk (qa=False only)
 
     def als(self) -> tuple[np.ndarray, np.ndarray]:
         """(als_year_newest, als_year_oldest) u16 per row (65535 = null) from the
@@ -623,18 +625,8 @@ class Chunk:
         return self.pub_z
 
 
-def _load_chunk(kg: str, row: dict, hdr: dict, raw: bool = False, qa: bool = True) -> Chunk:
-    """``raw=True`` (ne_pos_fix measurement only): stored positions, not cached.
-    ``qa`` (default): the apices /trees/bbox hides by default are dropped and tree_n /
-    tree_h_max follow (``tree_qa.py``); ``qa=False`` = the stored inventory (ne_trees,
-    ne_linear, tree_qa itself)."""
-    qa_idx = _tree_qa.chunk_idx(kg, int(row['r10']), hdr['neo1_digest']) if qa and not raw else None
-    key = (kg, hdr['neo1_digest'], int(row['r10']), _green_fix.FIX_ID + _pos_fix.tag(kg)
-           + ('' if qa_idx is None else '|tq%08x' % zlib.crc32(qa_idx))
-           + ('|' + _tree_qa.THX_ID if qa and not raw else ''))
-    ch = None if raw else _lru_get(_chunk_lru, key)
-    if ch is not None:
-        return ch
+def _inflate_parts(kg: str, row: dict, hdr: dict) -> tuple[dict, bytes]:
+    """Stored rows of one chunk → ({'obs','trees','bld'}, NEC1 rows)."""
     p = _file_path(kg)
     with open(p, 'rb') as fh:
         fh.seek(body_base(fh, kg, hdr) + int(row['off']))
@@ -647,10 +639,46 @@ def _load_chunk(kg: str, row: dict, hdr: dict, raw: bool = False, qa: bool = Tru
     if shuffled:
         parts = {'obs': ne_h3._unshuffle(buf[o1:o2], r1, n), 'trees': ne_h3._unshuffle(buf[o2:o3], r2, t),
                  'bld': ne_h3._unshuffle(buf[o3:o3 + b * r3], r3, b)}
-        ctx_rows = ne_h3._unshuffle(buf[:o1], r0, n)
-    else:
-        parts = {'obs': buf[o1:o2], 'trees': buf[o2:o3], 'bld': buf[o3:o3 + b * r3]}
-        ctx_rows = buf[:o1]
+        return parts, ne_h3._unshuffle(buf[:o1], r0, n)
+    return {'obs': buf[o1:o2], 'trees': buf[o2:o3], 'bld': buf[o3:o3 + b * r3]}, buf[:o1]
+
+
+class _RebinSource(_rebin.Source):
+    """The corpus file of *kg* for ``ne_rebin`` (neighbour chunks through the index)."""
+
+    def __init__(self, kg: str, hdr: dict):
+        self.kg = kg; self.hdr = hdr
+        self.key = (kg, str(hdr['neo1_digest']) + _pos_fix.tag(kg))
+
+    def rows(self, r10s) -> dict:
+        return {int(r['r10']): r for r in _chunk_rows(np.asarray(list(r10s), np.uint64)) if r['kg'] == self.kg}
+
+    def stored(self, r10, handle):
+        parts, _ = _inflate_parts(self.kg, handle, self.hdr)
+        return parts['obs'], _pos_fix.fix_words(self.kg, parts['trees'], b'')[0]
+
+
+_O_TN = OBS_DT.fields['tn'][1]; _O_THX = OBS_DT.fields['thx'][1]
+
+
+def _load_chunk(kg: str, row: dict, hdr: dict, raw: bool = False, qa: bool = True, stats: dict | None = None) -> Chunk:
+    """One chunk AS SERVED.  Order of the read-time overrides is load-bearing
+    (docs/tree-cell-assignment.md): green fix → position overrides (``ne_pos_fix``) → cell
+    assignment (``ne_rebin``: every apex sits in the row of the cell that contains its served
+    position; tree_n / tree_h_max follow) → tree QA (hidden apices dropped).
+
+    ``raw=True`` (ne_pos_fix measurement only): stored positions and rows, not cached.
+    ``qa`` (default): the apices /trees/bbox hides by default are dropped and tree_n /
+    tree_h_max follow (``tree_qa.py``); ``qa=False`` = the full inventory (ne_trees,
+    ne_linear, tree_qa itself) with ``Chunk.t_src`` naming each apex's stored row."""
+    qa_idx = _tree_qa.chunk_idx(kg, int(row['r10']), hdr['neo1_digest']) if qa and not raw else None
+    key = (kg, hdr['neo1_digest'], int(row['r10']), _green_fix.FIX_ID + _pos_fix.tag(kg)
+           + ('' if qa_idx is None else '|tq%08x' % zlib.crc32(qa_idx))
+           + ('|' + _tree_qa.THX_ID if qa and not raw else ''))
+    ch = None if raw or stats is not None else _lru_get(_chunk_lru, key)
+    if ch is not None:
+        return ch
+    parts, ctx_rows = _inflate_parts(kg, row, hdr)
     # read-time overrides (tree rule: alpen/bau/gruen under a LiDAR canopy → wald;
     # green rule: bau/alpen on S2-green cells → gruen); the file is untouched — see ne_green_fix.py
     parts['obs'], _ = _green_fix.fix_rows(parts["obs"], ctx_rows)
@@ -658,13 +686,22 @@ def _load_chunk(kg: str, row: dict, hdr: dict, raw: bool = False, qa: bool = Tru
         return Chunk(kg, row, parts)
     # position override for KGs built on 5 m-shifted rasters (ne_pos_fix.py, measured per KG)
     parts['trees'], parts['bld'] = _pos_fix.fix_words(kg, parts['trees'], parts['bld'])
+    # cell assignment: apex → the res-12 cell of its served position (ne_rebin.py)
+    rb = _rebin.rebin(_RebinSource(kg, hdr), int(row['r10']), parts['obs'], parts['trees'], REC, _O_TN, _O_THX, stats)
+    t_src = None
+    if rb is not None:
+        parts['obs'], parts['trees'], *t_src = rb
+        row = dict(row, trees=len(parts['trees']) // 4)
     if qa:
         # hidden apices dropped (qa_idx) + tree_h_max = max of the kept NET1 rows (every chunk)
         parts['obs'], parts['trees'] = _tree_qa.patch(parts['obs'], parts['trees'], qa_idx)
         if qa_idx is not None:
             row = dict(row, trees=len(parts['trees']) // 4)
     ch = Chunk(kg, row, parts)
-    _lru_put(_chunk_lru, key, ch, CHUNK_LRU_N)
+    if not qa and t_src is not None:
+        ch.t_src = tuple(t_src)
+    if stats is None:
+        _lru_put(_chunk_lru, key, ch, CHUNK_LRU_N)
     return ch
 
 
@@ -834,9 +871,9 @@ def gather(chunks: list[Chunk], want_ids: np.ndarray | None) -> Table:
 
 def lost_cells(kg: str, rows: list[dict]) -> np.ndarray | None:
     """Cell ids of *kg*'s chunk that another KG file's copy owns (None = it owns all of them).
-    *rows* = every chunk row of ONE res-10 id (all KG files storing it).  The owner rule is
+    *rows* = every chunk row of ONE res-10 id (all KG files storing it).  The serving-file rule is
     :func:`gather`'s dedupe itself — one implementation for the cell products and for
-    ``ne_trees.collect`` (/trees/bbox returns a cell's apices from its owner KG only)."""
+    ``ne_trees.collect`` (/trees/bbox returns a cell's apices from the one KG file that serves the cell)."""
     if len(rows) < 2:
         return None
     chunks = []; mine = None

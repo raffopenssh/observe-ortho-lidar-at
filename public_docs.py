@@ -164,6 +164,10 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
     canopy_h_p90 count exactly the apices /api/v1/trees/bbox returns by default (realistic=1, min_height=3) for
     the cell's kg; h_max / h_p90 / crown_frac stay raw surface statistics. A bin's gen changes only when its apex
     set does.
+    Cell of an apex (one rule, since 2026-11-22): the res-12 cell containing the lon/lat /trees/bbox publishes for
+    it — latLngToCell(lat, lon, 12) — position frames included; the /trees/bbox "cell" field is the same value.
+    List values: step = round-half-even(2·h); apex heights are multiples of 0.25 m, so x.25 / x.75 go to the whole
+    metre (41.25 → 41.0, 41.75 → 42.0). JS Math.round(2*h) rounds half up and differs on every x.25 value.
     fields=* for everything, ~17 k cells per bin, ≤ ~60 KB gz for the 9-field terrain+building set.
     Headers: ETag "b-<gen>-<fields>" (strong; If-None-Match → 304 without touching the blob),
     X-Cells-Gen = the bin generation — KEY YOUR COPY ON THIS (changes iff a contributing product changed;

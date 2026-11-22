@@ -1426,7 +1426,28 @@ def build_observed(declared: Section, seg_type_full: np.ndarray, ndsm_full: np.n
         ti = np.searchsorted(cids, tc)
         ok = (ti < n_cells) & (cids[np.minimum(ti, n_cells - 1)] == tc)
         rows_k = [r for r, k in zip(apex_rows, keep) if k]
-        for j in np.nonzero(ok)[0]:
+        # ONE cell rule (ne_rebin.py, docs/tree-cell-assignment.md): an apex is stored under the
+        # cell that contains its SERVED position = metre-snapped centre + the 5-bit dx / dy.
+        # The float position picks the first cell; where the stored position falls into the
+        # neighbouring hexagon (≈ 5 % — dx / dy are whole metres) the row moves there, the
+        # position itself does not.
+        tj = np.nonzero(ok)[0]
+        dxa = np.zeros(len(rows_k), np.int64); dya = np.zeros(len(rows_k), np.int64)
+        if tj.size:
+            dxa[tj] = np.clip(np.round(te[keep][tj] - ce[ti[tj]]), -16, 15)
+            dya[tj] = np.clip(np.round(tn[keep][tj] - cn[ti[tj]]), -16, 15)
+            try:
+                import ne_rebin as _rb
+                sx = ce[ti[tj]] + dxa[tj]; sy = cn[ti[tj]] + dya[tj]
+                c2 = _rb.cells_of_xy(sx, sy)
+                i2 = np.searchsorted(cids, c2)
+                mv = (c2 != tc[tj]) & (i2 < n_cells) & (cids[np.minimum(i2, n_cells - 1)] == c2)
+                ndx = sx - ce[np.minimum(i2, n_cells - 1)]; ndy = sy - cn[np.minimum(i2, n_cells - 1)]
+                mv &= (ndx >= -16) & (ndx <= 15) & (ndy >= -16) & (ndy <= 15)
+                ti[tj[mv]] = i2[mv]; dxa[tj[mv]] = ndx[mv]; dya[tj[mv]] = ndy[mv]
+            except Exception as e:  # noqa: BLE001 — readers rebin at load anyway
+                log.warning("ne_h3: apex cell rule skipped: %s", e)
+        for j in tj:
             c = int(ti[j]); r = rows_k[j]
             if tree_n[c] >= 255:
                 continue
@@ -1435,8 +1456,7 @@ def build_observed(declared: Section, seg_type_full: np.ndarray, ndsm_full: np.n
             tree_h_max[c] = h if not np.isfinite(tree_h_max[c]) else max(tree_h_max[c], h)
             ca = float(r.get("crown_area_m2") or 0.0)
             crown_m2[c] += ca
-            dx = int(np.clip(round(float(r["e"]) - ce[c]), -16, 15))
-            dy = int(np.clip(round(float(r["n"]) - cn[c]), -16, 15))
+            dx = int(dxa[j]); dy = int(dya[j])
             hq = int(np.clip(math.floor(h * 4 + 0.5), 0, 255))
             cq = int(np.clip(math.floor(math.log2(max(ca, 1.0)) * 5 + 0.5), 0, 63))  # log2 steps /5 → 1..~6000 m²
             sp = _SPECIES_IDX.get(str(r.get("species_hint") or "unknown"), 0)
@@ -1862,6 +1882,13 @@ def neo1_rows_from_h3b(path: str | Path, green_fix: bool = True,
             except Exception:  # noqa: BLE001
                 tq = thx = None
     n_qa = 0
+    rb_src = None
+    if thx is not None:
+        # same chunk pipeline as cells_api._load_chunk: position overrides → cell assignment
+        # (ne_rebin: tree_n / tree_h_max per cell of the SERVED position) → tree QA
+        import ne_rebin
+        rb_src = ne_rebin.FileSource(path, hdr)
+        o_tn, o_thx, rec = thx._offsets()
     for ch in hdr["chunks"]:
         part = read_h3b_chunk(path, hdr, ch)
         o = part["obs"]
@@ -1869,9 +1896,15 @@ def neo1_rows_from_h3b(path: str | Path, green_fix: bool = True,
             o, kt, kg = _gf.fix_rows_detail(o, part["lu"])
             n_fix += kt + kg
             n_tree += kt
+            trees = part["trees"]
+            if rb_src is not None:
+                trees = rb_src.fix(trees)
+                rb = ne_rebin.rebin(rb_src, int(ch["r10"], 16), o, trees, rec, o_tn, o_thx)
+                if rb is not None:
+                    o, trees = rb[0], rb[1]
             idx = tq.chunk_idx(hdr["kg"], int(ch["r10"], 16), hdr["neo1"]["digest"]) if tq else None
             if idx is not None or thx is not None:
-                o, _ = (tq or thx).patch(o, part["trees"], idx)
+                o, _ = (tq or thx).patch(o, trees, idx)
                 n_qa += len(idx or b"") // 2
         obs += o
     if counts is not None:

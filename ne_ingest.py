@@ -1026,14 +1026,15 @@ def _our_digest(parent: str, idx: dict, green_fix: bool = True) -> str | None:
     tq_base = tq
     try:
         if tree_qa.version() is not None:
-            tq = f"{tq}|{tree_qa.THX_ID}"    # tree_h_max == max(tree_h) in the posted rows (thx1, 2026-11-22)
+            tq = f"{tq}|{tree_qa.THX_ID}"    # tree_h_max == max(tree_h) (thx1) + tree_n / tree_h_max per cell of the
+                                             # served apex position (rb1, ne_rebin) in the posted rows (2026-11-22)
     except Exception:  # noqa: BLE001
         pass
     if gf.get("id") == ne_green_fix.FIX_ID and gf.get("of") == raw and gf.get("digest"):
         if (gf.get("tq") or "") == tq:
             return gf["digest"]
-        if tq != tq_base and (gf.get("tq") or "") == tq_base:
-            # only the thx fold is behind: every KG with trees re-posts (~0.95 MB each incl. the
+        if tq != tq_base and (gf.get("tq") or "") in (tq_base, f"{tq_base}|thx1"):
+            # only the thx / cell-rule fold is behind: every KG with trees re-posts (~0.95 MB each incl. the
             # declared GET) — paced below the primary's bandwidth nominal instead of one burst
             if _thx_budget[0] <= 0:
                 return gf["digest"]

@@ -21,6 +21,9 @@ from __future__ import annotations
 import numpy as np
 
 RULE_ID = 'tq-1'
+CELL_RULE_ID = 'rb1'    # apex → cell assignment rule (ne_rebin.py, docs/tree-cell-assignment.md): the res-12
+                        # cell of the SERVED lon / lat.  Bump when that rule (or what moves a served
+                        # position without changing the file digest / frame tag) changes.
 H_SATURATED = 60.0      # >= this: quantisation ceiling, treated as non-tree
 SPIKE_H = 45.0          # spike rules apply from here
 SPIKE_RATIO = 1.6       # h / p90(chunk)
