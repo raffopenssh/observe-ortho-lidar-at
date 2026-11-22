@@ -407,7 +407,8 @@ def scan(kg: str) -> tuple[dict, dict]:
 def check(kg: str) -> dict:
     """Every apex of a KG as served: is it inside the cell row that lists it?  With the off-file
     store (``rebin_added``) scanned for this KG also the invariant
-    stored == served + added + dup + qa (+ capped): no apex is lost by the rule."""
+    stored == served − lost + added + dup + qa (+ capped): no apex is lost by the cell rule or by the
+    one-file-per-cell rule."""
     st = scan(kg)[0]
     try:
         import rebin_added
@@ -416,8 +417,10 @@ def check(kg: str) -> dict:
         c = None
     if c is not None:
         st.update(added=c['added'], dup=c['dup'], qa=c['qa'], no_row=c['no_row'], other_file=c['other_file'])
+        # lost = apices in cells another KG file serves (rebin_added lost-cell part; 0 until that part is scanned)
+        st.update(lost=c['lost'], lost_cell=c['lost_cell'], lost_dup=c['lost_dup'], lost_qa=c['lost_qa'])
         st['invariant'] = (c['stored'] == st['stored'] and c['off'] == st['off_file']
-                           and st['stored'] == st['apices'] + c['added'] + c['dup'] + c['qa'] + st['capped'])
+                           and st['stored'] == st['apices'] - (c['lost'] or 0) + c['added'] + c['dup'] + c['qa'] + st['capped'])
         st['ok'] = bool(st['ok'] and st['invariant'])
     return st
 

@@ -12,19 +12,29 @@ Decision per off-file apex A (height h, served position p, source file S):
                (where that tolerance is the full 2 m, a TALLER other apex is a twin at any dh)
     dup_frame  the two files sit in different position frames and the other apex is at exactly
                p - (frame_S - frame_other) with dh <= FRAME_DH: the same stored apex in two files
+    dup_shift  the kept apices of a file pair have their equal-height partners at ONE
+               offset beyond the twin reach: an unregistered position frame — :func:`_shift_twins`
     dup_added  A is the twin (same rule) of an already kept off-file apex of ANOTHER source file
                (kept = the first in (kg, r10, idx) order)
     add        everything else → a row in the added-tree store (``tree_user``, op add, system
                reporter, source ``auto-rebin``), reason ``no_row`` (target cell in no file) or
                ``other_file`` in the ``client_id``:  auto-rebin:<kg>:<rule>:<reason>:<r10 hex>:<idx>:<v>
 
-Invariant per KG file:  stored == served + added + dup + qa (+ capped).
+LOST-CELL apices (rule ``lc1``): an apex whose served cell IS a row of its file, but the one-file-per-cell
+rule (``cells_api.gather``) serves that cell from another KG file, is not on /trees/bbox either.  It is
+decided by the very same twin rule against what the other files serve; reason ``lost_cell``.  Roughly 1.5 %
+of all stored apices stand in such cells and ~94 % of them are twins, so only the kept ones are stored
+(table ``lcand``); twins / QA-hidden ones are counted per KG (``kgs.ldup`` / ``lqa``).  That part has its
+own token (``kgs.ltoken``), so it is scanned and refreshed independently of the off-file part.
+
+Invariant per KG file:  stored == served − lost + added + dup + qa (+ capped)   (served = apices in rows
+of the file, lost = those in cells another file owns; added / dup / qa over both parts).
 
 The twin rule is a pure function of (h, offsets, heights) — :func:`twin`.  Every candidate keeps
 its evidence (all apices of other files within NB_R m) in ``data/rebin_added.sqlite``, so a rule
 change is re-decided (:func:`resolve`) without re-reading a product file.
 
-    python3 rebin_added.py --scan [--budget-s N] [--kg K …]   # resumable; stale / unscanned KGs only
+    python3 rebin_added.py --scan [--budget-s N] [--kg K …] [--part off|lost]   # resumable; stale / unscanned KGs only
     python3 rebin_added.py --sync                              # resolve + write tree_user / flags (idempotent)
     python3 rebin_added.py --status
 """
@@ -60,6 +70,7 @@ TWIN_COVER = 2.0                # the largest tolerance: beyond it two inventori
 FRAME_DH = 0.25                 # frame rule: identical stored position, height within one quantisation step
 NB_R = 8                        # evidence kept per candidate: other files' apices within this Chebyshev distance (m)
 RULE = f'{ne_rebin.REBIN_ID}.{TWIN_ID}'
+LOST_ID = 'lc1'                 # lost-cell part (scan_lost_kg); its token = LOST_ID + RULE + file digests
 DB_PATH = Path(__file__).resolve().parent / 'data' / 'rebin_added.sqlite'
 
 _SCHEMA = (
@@ -80,6 +91,9 @@ _SCHEMA = (
         ok INTEGER, ts INTEGER, err TEXT, synced TEXT)""",
     'CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)',
 )
+# lost-cell part: kept apices only, same columns as cand (r10 / idx = NET1 row of the chunk AS SERVED)
+_KGS_ADD = (('ltoken', 'TEXT'), ('ldeps', 'TEXT'), ('lost', 'INTEGER'), ('ldup', 'INTEGER'), ('lqa', 'INTEGER'), ('lost_cell', 'INTEGER'))
+TABLES = ('cand', 'lcand')
 
 
 def _conn(write: bool = False):
@@ -87,12 +101,21 @@ def _conn(write: bool = False):
         if not DB_PATH.exists():
             return None
         c = sqlite3.connect(f'file:{DB_PATH}?mode=ro', uri=True, timeout=10)
+        if 'ltoken' not in {r[1] for r in c.execute('PRAGMA table_info(kgs)')}:      # store from before the lost-cell part
+            c.close()
+            _conn(write=True).close()
+            c = sqlite3.connect(f'file:{DB_PATH}?mode=ro', uri=True, timeout=10)
     else:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         c = sqlite3.connect(str(DB_PATH), timeout=60)
         c.execute('PRAGMA journal_mode=WAL')
         for s in _SCHEMA:
             c.execute(s)
+        c.execute(_SCHEMA[0].replace('EXISTS cand', 'EXISTS lcand'))
+        have = {r[1] for r in c.execute('PRAGMA table_info(kgs)')}
+        for k, t in _KGS_ADD:
+            if k not in have:
+                c.execute(f'ALTER TABLE kgs ADD COLUMN {k} {t}')
     c.row_factory = sqlite3.Row
     return c
 
@@ -148,7 +171,12 @@ def _token(kg, deps) -> str:
     return RULE + '|' + _file_tok(kg) + '|' + ','.join(f'{k}:{_file_tok(k)}' for k in sorted(deps))
 
 
-def evidence(kg: str, off: dict) -> dict:
+def _ltoken(kg, deps) -> str:
+    import cells_api as ca
+    return f'{LOST_ID}.{ca._green_fix.FIX_ID}.' + _token(kg, deps)
+
+
+def evidence(kg: str, off: dict, tight: bool = False) -> dict:
     """What the other KG files hold around the off-file apices of *kg*: per apex the file that serves
     its target cell (``okg``, -1 = the cell is in no file) and every apex another file serves within
     ``NB_R`` m (``ni`` = apex index, ``ndx`` / ``ndy`` / ``nh`` / ``nk`` = offset, height, file)."""
@@ -160,10 +188,14 @@ def evidence(kg: str, off: dict) -> dict:
            'ndy': np.zeros(0, np.int64), 'nh': np.zeros(0, np.float64), 'nk': np.zeros(0, np.int64), 'deps': set()}
     if not n:
         return out
-    par = np.fromiter((h3.cell_to_parent(int(c), 10) for c in off['cell']), np.uint64, count=n)
     need: set = set()
-    for p in np.unique(par).tolist():
-        need.update(int(c) for c in h3.grid_disk(int(p), 1))
+    if tight:                                       # res-12 disk 2 reaches > NB_R m beyond the cell: only those chunks
+        for c in np.unique(off['cell']).tolist():
+            need.update(int(h3.cell_to_parent(int(q), 10)) for q in h3.grid_disk(int(c), 2))
+    else:
+        par = np.fromiter((h3.cell_to_parent(int(c), 10) for c in off['cell']), np.uint64, count=n)
+        for p in np.unique(par).tolist():
+            need.update(int(c) for c in h3.grid_disk(int(p), 1))
     by: dict = {}
     for r in ca._chunk_rows(np.array(sorted(need), np.uint64)):
         by.setdefault(int(r['r10']), []).append(r)
@@ -224,7 +256,8 @@ def decide(kg: str, off: dict, ev: dict) -> list[dict]:
     n = int(off['idx'].size)
     fs = _frame(kg)
     fr = {int(k): _frame(k) for k in np.unique(ev['nk']).tolist()}
-    qa = _qa_hidden(kg, off) if n else np.zeros(0, bool)
+    qa = (off['qa'] if 'qa' in off else _qa_hidden(kg, off)) if n else np.zeros(0, bool)
+    reason = off.get('reason')
     cut = np.searchsorted(ev['ni'], np.arange(n + 1))
     rows = []
     for i in range(n):
@@ -239,7 +272,7 @@ def decide(kg: str, off: dict, ev: dict) -> list[dict]:
         blob['dx'] = dx; blob['dy'] = dy; blob['hq'] = np.round(nh * 4); blob['k'] = [ks.index(int(k)) for k in nk]
         rows.append(dict(kg=int(kg), r10=int(off['r10'][i]), idx=int(off['idx'][i]), cell=int(off['cell'][i]),
                          x=int(off['x'][i]), y=int(off['y'][i]), hq=int(round(h * 4)), word=int(off['word'][i]),
-                         reason='other_file' if ev['okg'][i] >= 0 else 'no_row',
+                         reason=reason or ('other_file' if ev['okg'][i] >= 0 else 'no_row'),
                          okg=int(ev['okg'][i]) if ev['okg'][i] >= 0 else None, v0=v0,
                          tw_d=int(max(abs(dx[j]), abs(dy[j]))) if j >= 0 else None,
                          tw_dh=float(abs(nh[j] - h)) if j >= 0 else None, tw_kg=int(nk[j]) if j >= 0 else None,
@@ -267,12 +300,94 @@ def scan_kg(kg: str, con=None) -> dict:
                         'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                         [(r['kg'], _i64(r['r10']), r['idx'], _i64(r['cell']), r['x'], r['y'], r['hq'], r['word'], r['reason'], r['okg'],
                           r['v0'], r['tw_d'], r['tw_dh'], r['tw_kg'], r['nb'], r['nbk']) for r in rows])
-        con.execute('INSERT OR REPLACE INTO kgs(kg, token, deps, stored, served, off, capped, outside, ts, err, synced) '
-                    'VALUES (?,?,?,?,?,?,?,?,?,NULL,(SELECT synced FROM kgs WHERE kg=?))',
+        con.execute('INSERT INTO kgs(kg, token, deps, stored, served, off, capped, outside, ts, err) VALUES (?,?,?,?,?,?,?,?,?,NULL) '
+                    'ON CONFLICT(kg) DO UPDATE SET token=excluded.token, deps=excluded.deps, stored=excluded.stored, served=excluded.served, '
+                    'off=excluded.off, capped=excluded.capped, outside=excluded.outside, ts=excluded.ts, err=NULL',
                     (int(kg), tok, json.dumps(sorted(ev['deps'])), st['stored'], st['apices'], st['off_file'], st['capped'],
-                     st['outside'], int(time.time()), int(kg)))
+                     st['outside'], int(time.time())))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('resolved', '0')")
     return dict(st, candidates=len(rows))
+
+
+# === SECTION: lost-cell part (apices in cells another KG file serves) ===
+
+def lost_apices(kg: str) -> tuple[dict, dict]:
+    """Apices of *kg* as served by its file (after rb1) whose cell the one-file-per-cell rule gives to
+    another KG file → ``(stats, off)``; *off* has the columns of ``ne_rebin.scan`` (``r10`` / ``idx`` =
+    NET1 row of the chunk as served) + ``qa`` (static apex rule) and ``reason`` = ``lost_cell``.
+    Only chunks stored by more than one file are read."""
+    import cells_api as ca
+    import ne_trees
+    kg = str(kg).zfill(5)
+    hdr = ca.header(kg, with_chunks=True)
+    mine = {int(c['r10'], 16): c for c in hdr['chunks'] if int(c.get('trees') or 0)}
+    by: dict = {}
+    if mine:
+        for r in ca._chunk_rows(np.array(sorted(mine), np.uint64)):
+            by.setdefault(int(r['r10']), []).append(r)
+    cols = {k: [] for k in ('r10', 'idx', 'cell', 'word', 'x', 'y', 'h_m', 'qa')}
+    st = {'kg': kg, 'chunks': 0, 'lost_cells': 0}
+    for r10 in sorted(by):
+        rs = by[r10]
+        if len(rs) < 2:
+            continue
+        row = next((r for r in rs if r['kg'] == kg), None)
+        if row is None:
+            continue
+        st['chunks'] += 1
+        lost = ca.lost_cells(kg, rs)
+        if lost is None or not len(lost):
+            continue
+        st['lost_cells'] += int(len(lost))
+        d = ne_trees._decoded_chunk(kg, row, hdr, 'trees')
+        if not d or not d['n']:
+            continue
+        m = np.isin(d['cell'], lost)
+        if not m.any():
+            continue
+        ch = ca._load_chunk(kg, row, hdr, qa=False)
+        i = np.flatnonzero(m)
+        cols['r10'].append(np.full(i.size, r10, np.uint64)); cols['idx'].append(i.astype(np.int64))
+        cols['cell'].append(d['cell'][i]); cols['word'].append(np.asarray(ch.trees)[i].astype(np.uint32))
+        cols['x'].append(d['x'][i].astype(np.int64)); cols['y'].append(d['y'][i].astype(np.int64))
+        cols['h_m'].append(d['h'][i].astype(np.float64)); cols['qa'].append(~np.asarray(d['ok'], bool)[i])
+    dt = {'r10': np.uint64, 'idx': np.int64, 'cell': np.uint64, 'word': np.uint32, 'x': np.int64, 'y': np.int64, 'h_m': np.float64, 'qa': bool}
+    off = {k: (np.concatenate(v) if v else np.zeros(0, dt[k])) for k, v in cols.items()}
+    off['reason'] = 'lost_cell'
+    st['lost'] = int(off['idx'].size)
+    return st, off
+
+
+def scan_lost_kg(kg: str, con=None) -> dict:
+    """Lost-cell part of one KG: verdicts by the same twin rule; kept apices → ``lcand`` (with their
+    evidence), twins / QA-hidden ones → counts in ``kgs``.  Replaces the KG's rows."""
+    kg = str(kg).zfill(5)
+    con = con or _conn(write=True)
+    st, off = lost_apices(kg)
+    ev = evidence(kg, off, tight=True)
+    rows = decide(kg, off, ev)
+    keep = [r for r in rows if r['v0'] == 'add']
+    ndup = sum(1 for r in rows if r['v0'].startswith('dup')); nqa = sum(1 for r in rows if r['v0'] == 'qa')
+    tok = _ltoken(kg, ev['deps'])
+    with con:
+        con.execute('DELETE FROM lcand WHERE kg=?', (int(kg),))
+        con.executemany('INSERT INTO lcand(kg, r10, idx, cell, x, y, hq, word, reason, okg, v0, tw_d, tw_dh, tw_kg, nb, nbk) '
+                        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                        [(r['kg'], _i64(r['r10']), r['idx'], _i64(r['cell']), r['x'], r['y'], r['hq'], r['word'], r['reason'], r['okg'],
+                          r['v0'], r['tw_d'], r['tw_dh'], r['tw_kg'], r['nb'], r['nbk']) for r in keep])
+        n = con.execute('UPDATE kgs SET ltoken=?, ldeps=?, lost=?, ldup=?, lqa=? WHERE kg=? AND token IS NOT NULL',
+                        (tok, json.dumps(sorted(ev['deps'])), st['lost'], ndup, nqa, int(kg))).rowcount
+        if not n:
+            raise RuntimeError(f'{kg}: off-file part not scanned')
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('resolved', '0')")
+    return dict(st, kept=len(keep), dup=ndup, qa=nqa)
+
+
+def stale_lost(con=None) -> list[str]:
+    """KG files whose lost-cell part is missing or out of date (own file / rule / a compared file changed)."""
+    con = con or _conn(write=True)
+    return [f'{r["kg"]:05d}' for r in con.execute('SELECT kg, ltoken, ldeps FROM kgs WHERE token IS NOT NULL ORDER BY kg').fetchall()
+            if r['ltoken'] is None or r['ltoken'] != _ltoken(f'{r["kg"]:05d}', json.loads(r['ldeps'] or '[]'))]
 
 
 def stale_kgs(con=None) -> list[str]:
@@ -303,24 +418,33 @@ def stale_kgs(con=None) -> list[str]:
     if gone:
         with con:
             for k in gone:
-                con.execute('DELETE FROM cand WHERE kg=?', (int(k),)); con.execute('DELETE FROM kgs WHERE kg=?', (int(k),))
+                con.execute('DELETE FROM cand WHERE kg=?', (int(k),)); con.execute('DELETE FROM lcand WHERE kg=?', (int(k),))
+                con.execute('DELETE FROM kgs WHERE kg=?', (int(k),))
             con.execute("INSERT OR REPLACE INTO meta VALUES ('resolved', '0')")
     return out
 
 
-def scan(budget_s: float | None = None, kgs=None, verbose: bool = True) -> dict:
+def scan(budget_s: float | None = None, kgs=None, verbose: bool = True, part: str = 'all') -> dict:
+    """Both parts, resumable: the off-file part of every stale KG first, then the lost-cell part
+    (*part* = ``off`` | ``lost`` | ``all``)."""
     con = _conn(write=True)
-    todo = [str(k).zfill(5) for k in kgs] if kgs else stale_kgs(con)
+    ks = [str(k).zfill(5) for k in kgs] if kgs else None
+    todo = [] if part == 'lost' else [(k, 'off') for k in (ks or stale_kgs(con))]
+    if part != 'off':
+        todo += [(k, 'lost') for k in (ks or sorted(set(stale_lost(con)) | {k for k, _ in todo}))]
     t0 = time.time(); done = err = 0
-    for kg in todo:
+    for kg, what in todo:
         if budget_s and time.time() - t0 > budget_s:
             break
         try:
-            scan_kg(kg, con); done += 1
+            (scan_kg if what == 'off' else scan_lost_kg)(kg, con); done += 1
         except Exception as e:  # noqa: BLE001
             err += 1
-            log.warning('rebin_added: scan %s: %s', kg, e)
+            log.warning('rebin_added: scan %s %s: %s', what, kg, e)
             with con:
+                if what == 'lost':
+                    con.execute('UPDATE kgs SET ltoken=NULL, err=?, ts=? WHERE kg=?', (('lost: ' + str(e))[:200], int(time.time()), int(kg)))
+                    continue
                 con.execute('INSERT INTO kgs(kg, err, ts) VALUES (?,?,?) ON CONFLICT(kg) DO UPDATE SET err=excluded.err, ts=excluded.ts, token=NULL',
                             (int(kg), str(e)[:200], int(time.time())))
         if verbose and (done + err) % 100 == 0:
@@ -335,7 +459,8 @@ def resolve(con=None) -> dict:
     then twins among the kept apices of DIFFERENT source files (the same tree off-file in two
     files) — the first in (kg, r10, idx) order stays, the others are ``dup_added``.  Deterministic."""
     con = con or _conn(write=True)
-    rows = con.execute('SELECT kg, r10, idx, x, y, hq, v0, nb, nbk FROM cand ORDER BY kg, r10, idx').fetchall()
+    rows = con.execute("SELECT 'cand' AS tb, kg, r10, idx, x, y, hq, v0, nb, nbk FROM cand UNION ALL "
+                       "SELECT 'lcand', kg, r10, idx, x, y, hq, v0, nb, nbk FROM lcand ORDER BY kg, tb, r10, idx").fetchall()
     n = len(rows)
     dt = np.dtype([('dx', 'i1'), ('dy', 'i1'), ('hq', 'u1'), ('k', 'u1')])
     v = []; upd0 = []
@@ -352,9 +477,10 @@ def resolve(con=None) -> dict:
             if nv != v0:
                 upd0.append((nv, int(max(abs(int(b['dx'][j])), abs(int(b['dy'][j])))) if j >= 0 else None,
                              abs(b['hq'][j] / 4.0 - r['hq'] / 4.0) if j >= 0 else None, ks[b['k'][j]][0] if j >= 0 else None,
-                             r['kg'], r['r10'], r['idx']))
+                             r['kg'], r['r10'], r['idx'], r['tb']))
                 v0 = nv
         v.append(v0)
+    shifts = _shift_twins(rows, v, dt)
     kept = np.array([x == 'add' for x in v], bool)
     if kept.any():
         from scipy.spatial import cKDTree
@@ -377,34 +503,92 @@ def resolve(con=None) -> dict:
             if any(alive[a] for a in part[b]):
                 alive[b] = False; v[ki[b]] = 'dup_added'
     with con:
-        con.executemany('UPDATE cand SET v0=?, tw_d=?, tw_dh=?, tw_kg=? WHERE kg=? AND r10=? AND idx=?', upd0)
-        con.executemany('UPDATE cand SET verdict=? WHERE kg=? AND r10=? AND idx=? AND verdict IS NOT ?',
-                        [(x, r['kg'], r['r10'], r['idx'], x) for x, r in zip(v, rows)])
+        for tb in TABLES:
+            con.executemany(f'UPDATE {tb} SET v0=?, tw_d=?, tw_dh=?, tw_kg=? WHERE kg=? AND r10=? AND idx=?', [u[:7] for u in upd0 if u[7] == tb])
+            con.executemany(f'UPDATE {tb} SET verdict=? WHERE kg=? AND r10=? AND idx=? AND verdict IS NOT ?',
+                            [(x, r['kg'], r['r10'], r['idx'], x) for x, r in zip(v, rows) if r['tb'] == tb])
+        # per KG over both parts; the lost-cell part stores kept apices only — its twins / QA are kgs.ldup / lqa
         con.execute("""UPDATE kgs SET
-            added = (SELECT COUNT(*) FROM cand c WHERE c.kg = kgs.kg AND c.verdict = 'add'),
+            lost_cell = (SELECT COUNT(*) FROM lcand c WHERE c.kg = kgs.kg AND c.verdict = 'add'),
             no_row = (SELECT COUNT(*) FROM cand c WHERE c.kg = kgs.kg AND c.verdict = 'add' AND c.reason = 'no_row'),
             other_file = (SELECT COUNT(*) FROM cand c WHERE c.kg = kgs.kg AND c.verdict = 'add' AND c.reason = 'other_file'),
-            dup = (SELECT COUNT(*) FROM cand c WHERE c.kg = kgs.kg AND c.verdict LIKE 'dup%'),
-            qa = (SELECT COUNT(*) FROM cand c WHERE c.kg = kgs.kg AND c.verdict = 'qa') WHERE token IS NOT NULL""")
-        con.execute('UPDATE kgs SET ok = (outside = 0 AND stored = served + added + dup + qa + capped) WHERE token IS NOT NULL')
+            dup = (SELECT COUNT(*) FROM cand c WHERE c.kg = kgs.kg AND c.verdict LIKE 'dup%')
+                  + (SELECT COUNT(*) FROM lcand c WHERE c.kg = kgs.kg AND c.verdict LIKE 'dup%') + COALESCE(ldup, 0),
+            qa = (SELECT COUNT(*) FROM cand c WHERE c.kg = kgs.kg AND c.verdict = 'qa') + COALESCE(lqa, 0) WHERE token IS NOT NULL""")
+        con.execute('UPDATE kgs SET added = no_row + other_file + lost_cell WHERE token IS NOT NULL')
+        con.execute('UPDATE kgs SET ok = (outside = 0 AND stored = served - COALESCE(lost, 0) + added + dup + qa + capped) WHERE token IS NOT NULL')
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('shifts', ?)",
+                    (json.dumps([[f'{a:05d}', f'{b:05d}', *t] for (a, b), t in sorted(shifts.items())], separators=(',', ':')),))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('resolved', ?)", (RULE,))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('resolved_ts', ?)", (str(int(time.time())),))
     return {'candidates': n, 'redecided': len(upd0), **totals(con)}
+
+
+SHIFT_MIN_D = 3                 # a file-pair offset is looked for beyond the twin rule's reach …
+SHIFT_JIT = 2                   # … apices agree with it within this (m, per axis; frame-KG jitter) and FRAME_DH in height
+SHIFT_MIN_N = 20                # … and it must explain at least this many kept apices of the pair
+SHIFT_MIN_SHARE = 0.3           # … and this share of the kept apices that have an apex of the other file nearby
+
+
+def _shift_twins(rows, v: list, dt) -> dict:
+    """Apices kept so far (both parts), per (source file, other file): when the equal-height neighbours
+    pile up at ONE offset beyond the twin reach, the two files sit in different position frames that
+    ``ne_pos_fix`` has not registered or only to the nearest raster step (a "5 m" KG) — the apices that have their equal-height partner at
+    that offset are the same trees → ``dup_shift``.  Pure function of the stored evidence; mutates *v*.
+    → {(kg, other kg): (dx, dy, matched, with_neighbour)} for the status line (ne_pos_fix to-do list)."""
+    from collections import Counter, defaultdict
+    grp = defaultdict(list)
+    for i, r in enumerate(rows):
+        if v[i] == 'add' and r['nb']:
+            grp[r['kg']].append(i)
+    out = {}
+    for kg, ii in grp.items():
+        if len(ii) < SHIFT_MIN_N:
+            continue
+        per = defaultdict(list)                          # other kg → [(row, dx[], dy[])] equal-height neighbours
+        for i in ii:
+            r = rows[i]; b = np.frombuffer(r['nb'], dt); ks = json.loads(r['nbk'] or '[]')
+            m = (np.abs(b['hq'].astype(np.int64) - r['hq']) <= round(FRAME_DH * 4)) & (np.maximum(np.abs(b['dx']), np.abs(b['dy'])) >= SHIFT_MIN_D)
+            for k in set(b['k'].tolist()):
+                mk = m & (b['k'] == k)
+                per[ks[k][0]].append((i, b['dx'][mk].astype(np.int64), b['dy'][mk].astype(np.int64)))
+        for ok, lst in sorted(per.items()):
+            if len(lst) < SHIFT_MIN_N:
+                continue
+            cnt = Counter((int(a), int(b_)) for _, dx, dy in lst for a, b_ in zip(dx, dy))
+            if not cnt:
+                continue
+            (mx, my), _ = min(cnt.items(), key=lambda kv: (-kv[1], kv[0]))
+            hit = [i for i, dx, dy in lst if ((np.abs(dx - mx) <= SHIFT_JIT) & (np.abs(dy - my) <= SHIFT_JIT)).any()]
+            if len(hit) >= SHIFT_MIN_N and len(hit) >= SHIFT_MIN_SHARE * len(lst):
+                for i in hit:
+                    v[i] = 'dup_shift'
+                out[(int(kg), int(ok))] = (mx, my, len(hit), len(lst))
+    return out
 
 
 def totals(con=None) -> dict:
     con = con or _conn()
     if con is None:
         return {}
-    t = {r[0] or 'pending': r[1] for r in con.execute('SELECT verdict, COUNT(*) FROM cand GROUP BY 1')}
-    rs = {r[0]: r[1] for r in con.execute("SELECT reason, COUNT(*) FROM cand WHERE verdict='add' GROUP BY 1")}
+    t: dict = {}; rs: dict = {}
+    for tb in TABLES:
+        for r in con.execute(f'SELECT verdict, COUNT(*) FROM {tb} GROUP BY 1'):
+            t[r[0] or 'pending'] = t.get(r[0] or 'pending', 0) + r[1]
+        for r in con.execute(f"SELECT reason, COUNT(*) FROM {tb} WHERE verdict='add' GROUP BY 1"):
+            rs[r[0]] = rs.get(r[0], 0) + r[1]
+    lk = con.execute('SELECT SUM(ltoken IS NOT NULL), SUM(lost), SUM(ldup), SUM(lqa), SUM(err IS NOT NULL AND token IS NOT NULL AND ltoken IS NULL) '
+                     'FROM kgs WHERE token IS NOT NULL').fetchone()
     k = con.execute('SELECT COUNT(*), SUM(token IS NOT NULL), SUM(ok = 1), SUM(err IS NOT NULL AND token IS NULL), SUM(stored), SUM(served), '
                     'SUM(off), SUM(capped), SUM(added > 0), SUM(ok = 0) FROM kgs').fetchone()
     return {'rule': RULE, 'kgs': k[0], 'scanned': k[1] or 0, 'invariant_ok': k[2] or 0, 'invariant_bad': k[9] or 0, 'errors': k[3] or 0,
             'stored': k[4] or 0, 'served': k[5] or 0, 'off_file': k[6] or 0, 'capped': k[7] or 0, 'kgs_with_added': k[8] or 0,
             'added': t.get('add', 0), 'no_row': rs.get('no_row', 0), 'other_file': rs.get('other_file', 0),
             'dup': t.get('dup', 0), 'dup_frame': t.get('dup_frame', 0), 'dup_added': t.get('dup_added', 0), 'qa': t.get('qa', 0),
-            'pending': t.get('pending', 0)}
+            'pending': t.get('pending', 0), 'dup_shift': t.get('dup_shift', 0),
+            # lost-cell part: 'dup' / 'qa' above are stored rows; its twins / QA-hidden vs the served inventory are counts only
+            'lost_scanned': lk[0] or 0, 'lost': lk[1] or 0, 'lost_cell': rs.get('lost_cell', 0), 'lost_dup': lk[2] or 0, 'lost_qa': lk[3] or 0,
+            'lost_errors': lk[4] or 0}
 
 
 def kg_counts(kg) -> dict | None:
@@ -415,7 +599,10 @@ def kg_counts(kg) -> dict | None:
     r = con.execute('SELECT * FROM kgs WHERE kg=?', (int(kg),)).fetchone()
     if r is None or r['token'] is None or r['added'] is None or not r['token'].startswith(RULE + '|'):
         return None
-    return {k: r[k] for k in ('stored', 'served', 'off', 'capped', 'added', 'no_row', 'other_file', 'dup', 'qa', 'ok')}
+    out = {k: r[k] for k in ('stored', 'served', 'off', 'capped', 'added', 'no_row', 'other_file', 'dup', 'qa', 'ok')}
+    lost_ok = r['ltoken'] is not None and r['ltoken'].startswith(f'{LOST_ID}.')
+    out.update(lost=r['lost'] if lost_ok else None, lost_cell=r['lost_cell'] or 0, lost_dup=r['ldup'] or 0, lost_qa=r['lqa'] or 0)
+    return out
 
 
 # === SECTION: sync (kept apices → tree_user added trees + one flag per KG) ===
@@ -482,7 +669,7 @@ def sync_kg(kg, con=None, dry: bool = False) -> dict:
     import tree_user as tu
     con = con or _conn(write=True)
     kg = int(kg)
-    want = {cid_of(r): r for r in con.execute("SELECT * FROM cand WHERE kg=? AND verdict='add' ORDER BY r10, idx", (kg,))}
+    want = {cid_of(r): r for tb in TABLES for r in con.execute(f"SELECT * FROM {tb} WHERE kg=? AND verdict='add' ORDER BY r10, idx", (kg,))}
     c = tu._conn()
     rep = tu.system_reporter(SOURCE)
     live: dict = {}                                     # cid → (kg, x, y) of the system's live adds
@@ -541,6 +728,8 @@ def _flag(con, kg: int) -> None:
     exp = {'hint': 'rebin', 'rule': RULE, 'added': r['added'], 'no_row': r['no_row'], 'other_file': r['other_file'],
            'dup': r['dup'], 'qa': r['qa']}
     obs = {'stored': r['stored'], 'served': r['served'], 'off_file': r['off'], 'ok': bool(r['ok'])}
+    if r['ltoken'] is not None:                         # lost-cell part scanned: apices in cells another file serves
+        exp['lost_cell'] = r['lost_cell']; obs['lost'] = r['lost']; obs['served'] = r['served'] - (r['lost'] or 0)
     pf.auto_kg(code, SOURCE, 'trees', 'missing', json.dumps(exp, separators=(',', ':')), json.dumps(obs, separators=(',', ':')))
 
 
@@ -553,8 +742,8 @@ def sync(verbose: bool = True, dry: bool = False) -> dict:
         log.warning('rebin_added: %d/%d KGs scanned, %d errors — syncing what is decided', res['scanned'], res['kgs'], res['errors'])
     out = {'kgs': 0, 'add': 0, 'retract': 0}
     for r in con.execute('SELECT kg, synced FROM kgs WHERE token IS NOT NULL ORDER BY kg').fetchall():
-        sig = hashlib.sha1('\n'.join(cid_of(q) for q in con.execute(
-            "SELECT kg, r10, idx, x, y, hq, reason FROM cand WHERE kg=? AND verdict='add' ORDER BY r10, idx", (r['kg'],))).encode()).hexdigest()[:16]
+        sig = hashlib.sha1('\n'.join(cid_of(q) for tb in TABLES for q in con.execute(
+            f"SELECT kg, r10, idx, x, y, hq, reason FROM {tb} WHERE kg=? AND verdict='add' ORDER BY r10, idx", (r['kg'],))).encode()).hexdigest()[:16]
         cnt = con.execute('SELECT added, dup, qa, ok FROM kgs WHERE kg=?', (r['kg'],)).fetchone()
         sig += f".{cnt['added']}.{cnt['dup']}.{cnt['qa']}.{cnt['ok']}"
         if r['synced'] == sig:
@@ -583,7 +772,9 @@ def status() -> dict:
         s['files'] = sum(1 for k in ca._files() if len(k) == 5 and k.isdigit())
     except Exception:  # noqa: BLE001
         s['files'] = s['kgs']
-    s['complete'] = s['scanned'] >= s['files'] and not s['errors']
+    s['complete'] = s['scanned'] >= s['files'] and not s['errors'] and s['lost_scanned'] >= s['files'] and not s['lost_errors']
+    sh = json.loads(m.get('shifts') or '[]')
+    s['shift_pairs'] = len(sh); s['shifts'] = sorted(sh, key=lambda q: -q[4])[:20]
     s.update(resolved=m.get('resolved') == RULE, synced_ts=int(m.get('synced_ts') or 0),
              unsynced=con.execute("SELECT COUNT(*) FROM kgs WHERE token IS NOT NULL AND synced IS NULL").fetchone()[0])
     return s
@@ -594,9 +785,12 @@ def text_line() -> str:
     if not s.get('kgs'):
         return f'rebin: {RULE} — no scan yet (python3 rebin_added.py --scan)'
     ts = time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(s['synced_ts'])) if s.get('synced_ts') else '-'
-    return (f"rebin: {RULE} scanned {s['scanned']}/{s['files']} KGs ({s['errors']} errors) · off_file {s['off_file']} of {s['stored']} stored = "
-            f"added {s['added']} (no_row {s['no_row']} / other_file {s['other_file']}) + dup {s['dup'] + s['dup_frame'] + s['dup_added']} "
-            f"(twin {s['dup']} / frame {s['dup_frame']} / added-twin {s['dup_added']}) + qa {s['qa']}"
+    return (f"rebin: {RULE} scanned {s['scanned']}/{s['files']} KGs ({s['errors']} errors) · off_file {s['off_file']} of {s['stored']} stored"
+            f" · lost_cell {LOST_ID} {s['lost_scanned']}/{s['files']} KGs: {s['lost']} apices in cells of another file"
+            + (f" ({s['lost_errors']} errors)" if s['lost_errors'] else '')
+            + f" · added {s['added']} (no_row {s['no_row']} / other_file {s['other_file']} / lost_cell {s['lost_cell']})"
+            f" + dup {s['dup'] + s['dup_frame'] + s['dup_shift'] + s['dup_added'] + s['lost_dup']} (twin {s['dup'] + s['lost_dup']} / frame {s['dup_frame']}"
+            f" / shift {s['dup_shift']} in {s['shift_pairs']} file pairs / added-twin {s['dup_added']}) + qa {s['qa'] + s['lost_qa']}"
             + (f" + undecided {s['pending']}" if s['pending'] else '')
             + f" · capped {s['capped']} · invariant ok {s['invariant_ok']}/{s['scanned']}"
             + (f" BAD {s['invariant_bad']}" if s['invariant_bad'] else '')
@@ -610,11 +804,11 @@ if __name__ == '__main__':
     ap.add_argument('--scan', action='store_true'); ap.add_argument('--sync', action='store_true')
     ap.add_argument('--resolve', action='store_true'); ap.add_argument('--dry', action='store_true')
     ap.add_argument('--status', action='store_true'); ap.add_argument('--kg', action='append')
-    ap.add_argument('--budget-s', type=float)
+    ap.add_argument('--budget-s', type=float); ap.add_argument('--part', default='all', choices=('all', 'off', 'lost'))
     a = ap.parse_args()
     logging.basicConfig(level=logging.WARNING)
     if a.scan:
-        print(json.dumps(scan(a.budget_s, a.kg)))
+        print(json.dumps(scan(a.budget_s, a.kg, part=a.part)))
     if a.resolve:
         print(json.dumps(resolve()))
     if a.sync:

@@ -111,14 +111,58 @@ rows hide no cell and change no ETag. Machine rows are in the `/trees/bbox` ETag
 shorten its cache lifetime (`tree_user.kgs_rev(human=True)`).
 
 ```bash
-python3 rebin_added.py --scan [--budget-s N]   # resumable; only unscanned / stale KGs
+python3 rebin_added.py --scan [--budget-s N] [--part off|lost]   # resumable; only unscanned / stale KGs, off-file part first
 python3 rebin_added.py --sync [--dry]          # resolve + write added trees / flags (after a FULL scan)
 python3 rebin_added.py --status                # = the `rebin:` line on /process.txt
 python3 tools/rebin_twin_model.py --report     # the model table behind TWIN_DH
 ```
 
-Not covered (pre-existing, separate): apices of a file standing in cells `lost` to another file under
-the one-file-per-cell rule were never served and are not off-file in the rb1 sense.
+### Lost-cell apices (`lc1`) — the second way an apex was not served
+
+A res-12 cell stored in several KG files is served from ONE of them (`cells_api.gather`: observed copy,
+larger chunk, lowest KG; `ne_trees._own_mask` applies the same owner on `/trees/bbox`). An apex of file S
+standing in a cell that S stores but file O owns was therefore never served — before rb1 and after. This
+is not a cell-rule effect, but the same question: *is that tree in the served inventory?*
+
+Measured (90 plain + 15 frame KGs, seed 7; 6.9 M stored apices): 1.50 % of cells and 1.54 % of stored
+apices are in lost cells (national ≈ 8.5 M apices); **81 % have an identical apex (same metre, same
+height) in the owner file, 94 % are twins under `tw1`**; frame KGs: 2.6 % lost, 80 % twins. Cover of the
+cell is ~complete in both copies — both files measured the same ground, so the non-twins are mostly the
+second reading of a crown, plus one systematic group, below.
+
+Handling = the off-file pipeline, nothing new on the read path and no change to any cell figure or bin:
+
+* `rebin_added.lost_apices(kg)` reads only the chunks stored by more than one file (~10 % of chunks),
+  takes the apices in `ca.lost_cells`, and decides them with the same `evidence()` → `twin()` against what
+  the other files serve. Kept ones are rows of table `lcand` (reason `lost_cell`, identity = NET1 row of
+  the chunk as served, evidence blob kept); twins / QA-hidden ones are only counted (`kgs.ldup` / `lqa`)
+  — ~94 % of 8.5 M rows that would never be read again.
+* Own token `kgs.ltoken` (`lc1` + green-fix id + rule + file digests of the KG and of every compared
+  file): the part is scanned and refreshed independently; a re-upload of either file re-decides it.
+* `resolve()` runs over both tables (`dup_added` across parts and files), `sync()` writes the kept ones
+  as added trees: `client_id auto-rebin:<kg>:rb1:lost_cell:<r10>:<row>:<v>`, note `auto-rebin rb1.tw1
+  lost_cell kg=… h_m=… crown_m2=…`. They are in the `added` block of `/trees/bbox` only (Option 1).
+* **Position frames the twin rule cannot see** (`dup_shift`, `_shift_twins`, both parts): in a few file pairs most non-twins have
+  their equal-height partner at one offset of 4–6 m (22138 vs 22102 / 22126 / 22106: (−6, +6); 19714 vs
+  19731: (+5, −5)) — a "5 m" KG `ne_pos_fix` has no offset for. Per (file, other file): modal offset of
+  the equal-height neighbours beyond the twin reach; apices with a partner within ±2 m of it are
+  `dup_shift` when that explains ≥ 20 apices and ≥ 30 % of the pair. The pairs are listed in
+  `rebin_added.status()['shifts']` and counted on the `rebin:` line — the to-do list for `ne_pos_fix`
+  (once a frame is registered the file token changes and the KG is re-decided by the normal twin rule).
+  In the off-file part the same rule catches frame KGs whose residual is (5, −7) / (7, −5) instead of the
+  registered (5, −5): ~5 % of the `other_file` adds at half scan.
+* Found while checking the invariant: KG 01807 had 5 apices neither served nor off-file — its file was
+  newer than its index rows, so `ne_rebin` did not see the neighbour chunks (`docs/ne-public-api.md` →
+  Index-lag guard). An invariant-BAD KG on the `rebin:` line is always a real hole; look before syncing.
+
+Invariant per file, checked by `ne_rebin.check` and the `rebin:` line:
+
+    stored == served − lost + added + dup + qa (+ capped)
+
+(`served` = apices in rows of the file, `lost` = those of them in cells another file owns; `added` =
+no_row + other_file + lost_cell.) What a user sees is unchanged except for the `added` block; provenance
+is exact: measured apices come from the 2.4 file that owns the cell, everything else carries
+`source auto-rebin` and its reason.
 
 The two checks that led here:
 
