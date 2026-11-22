@@ -47,14 +47,17 @@ the `sidecar gpkg_full: dtm=a/b` line of the v1 stitch from the per-day log
 archive (`data/log_archive`, cached per day file in
 `data/qc_ledger_archive.json`).
 
-## Totals (build 2026-11-22 17:13 UTC)
+## Totals (build 2026-11-22 17:57 UTC)
 
-2 761 products in 2 511 KGs carry a row; 614 rows open in 355 products.
+2 777 products in 2 511 KGs carry a row; 832 rows open in 355 products
+(614 `pos_shift` — the per-tile pass adds unmeasured tiles as it goes — 166
+`grid25_mixed`, 47 `regenerated` = on the reprocess list, 5 `layer_gap`).
 
 | class | detector | products / tiles | open | read-time action |
 |---|---|---|---|---|
-| `pos_shift` | `ne_pos_fix` | 447 / 454 tiles (KGs: shift 247, partial 51, mixed 49, unclear 88; tiles: moved 249, kept 185, unmeasured 205) | 382 | moved |
-| `pos_sweep_unit` | ledger (from `ne_pos_fix` + store) | 61 | 61 | moved with the KG — suspected wrong |
+| `pos_shift` | `ne_pos_fix` | 474 / 794 tiles (KGs: shift 247, partial 67, mixed 33, unclear 88; tiles: moved 354, kept 428, unmeasured 440) | 614 | moved |
+| `pos_sweep_unit` | ledger (from `ne_pos_fix` + store) | 61 | 0 | **kept**: rows the unit supplied are exempt from the move (125 units / 155 265 cells in 84 moved KGs, 2026-11-22) |
+| `regenerated` | `qc_generation` | 47 | 47 | on the reprocess list (`grid25_stale`), fresh v2.4 generation in place |
 | `grid25_shift` | `grid25_registration` | 416 | 0 | registered (−5, +5 m) |
 | `grid25_mixed` | `grid25_registration` | 166 | 166 | blended; bad tiles patched |
 | `grid25_stale` | `grid25_patch` | 49 / 274 tiles (3 864 tiles checked ok) | 0 | patched from BEV |
@@ -121,10 +124,10 @@ Inputs still moving at that build: `ne_pos_fix` per-tile pass (134 KGs to do),
   `data/ne/<parent>.h3b` without attribution; `ne_pos_fix.fix_words` moves
   every word of a whole-`shift` KG. `ne_pos_fix.kg_tiles` skips sweep codes.
 * **Evidence**: 61 sweep units in 56 `shift` KGs.
-* **Guard**: missing. Needed: `ne_pos_fix` treats a `shift` KG with sweep
-  units as `partial` with the unit envelopes as `kept` tiles. Not done here
-  (changes served positions) — **decision for the owner**.
-
+* **Guard**: **added** (owner decision 2026-11-22: sweep units are exempt) —
+  `ne_pos_fix.sweep_keep`: the rows whose merged NEO1 record is byte-identical
+  to the unit's are kept. 12149: 1 902 apices in 472 kept rows, all unmoved,
+  cell rule intact (`ne_rebin --check`). See *Generations / reprocess / keep cells*.
 ### 3. `grid25_stale` — terrain that BEV no longer serves
 
 * **Symptom**: one processing tile holds terrain that does not match today's
@@ -208,6 +211,68 @@ Off-file / lost-cell apices (`rebin_added`): mostly a consequence of class 1
 re-read this section's numbers from `--report` after the resolve. Guard: the
 class-1 guard; the cell rule `rb1` is read-time by design.
 
+## Run history and v2.4 data quality (read this before touching a read-time fix)
+
+| when | what | effect on the data |
+|---|---|---|
+| 2026-04 … 05-28 | v1 run, **pre-sidecar era**: the stitch re-read every tile from BEV with a 5 m pad and pasted it at the tile's offset | whole products (+5, −5) m off: `pos_shift` / `grid25_shift` |
+| 2026-05-28 (dd08d74) | raster sidecars next to the tile checkpoints; pickles travel between peers (Zenodo registry), sidecars do not | only tiles restored from a foreign checkpoint are re-read → **partly** shifted products |
+| June … Oct | BEV served elevation beyond the border, later withdrew / replaced it | `grid25_stale` tiles (260 of 274 within 5 km of the border) |
+| until 2026-10-19 (5a6817b) | restored checkpoint kept old label ids | `label_mix` (reprocessed) |
+| 09-18 … Nov | v2.x upgrade **from the v1 GPKG** (`upgraded_from`): rasters inherited, some tiles re-read from BEV (true frame) | shift inherited tile by tile → `grid25_mixed`, `partial` KGs |
+| 2026-10 | v2.4: cadastre-free, NE cells `.h3b`; 10-27 sliver sweep units (fresh, true grid) merged into the parent `.h3b` | `pos_sweep_unit` |
+| 2026-11-21 (eead178) | `pad=0` + `_align_tdata_to_tile`: rasters placed by transform | every run since is on the true grid |
+| 2026-11-22 04:41 | run complete (7 850 / 7 850), director on hold | — |
+
+Nothing in a stored v2.4 product was rewritten for these faults. They are
+corrected **at read time**, each fix keyed to the generation it was measured on:
+
+| fix | does | store | retired by a fresh generation |
+|---|---|---|---|
+| `grid25_registration` | shifts a product's 25 m terrain (−5, +5) m / blends a mixed one | `data/grid25_registration.json` | `retire(code)` |
+| `grid25_patch` | overlays stale tiles with the 25 m block mean of today's BEV DTM (read once, throttled), per-tile verdicts, edge findings | `data/grid25_patches/` | `retire(code)` |
+| `ne_pos_fix` | moves tree / structure words per KG or per processing tile; `keep` cells of sweep units stay | `data/ne_pos_fix.json`, `data/ne_pos_keep/` | `regenerated(code)`: block tiles → kept, last block → `retired`; frame history stays for old client copies |
+| `ne_rebin` (rb1) + `rebin_added` | apex listed in the cell of its served position; off-file / lost-cell apices added back or de-twinned | `data/rebin_added.sqlite` | follows the file tag automatically (rescan) |
+| `ne_linear`, `tree_qa`, `ne_green_fix`, `austria_mask` | hide chains / implausible apices, class overrides, national outline | own stores | independent of the frame; re-evaluated per file digest |
+
+## Generations / reprocess / keep cells (`qc_generation.py`)
+
+* **Generation** = one `generated_at` of a code's `_json_v2`. `v2_ingest` calls
+  `qc_generation.on_ingest` for every stored document: the row in
+  `data/qc_generations.sqlite` documents the new quality from the document
+  alone (tiles, restored tiles, internal edge cliffs, `-partial` label, model);
+  a **fresh** generation (no `upgraded_from`) additionally snapshots the
+  ledger rows held against the old one and retires the three raster-bound
+  fixes above. QC **never enrols** anything; it documents.
+* **Reprocess list** (`data/austria_processor/qc_reprocess.json`,
+  `qc_reprocess:` line): operator only —
+  `python3 qc_generation.py --enroll-fault grid25_stale --why '…'` /
+  `--enroll CODE…` / `--cancel CODE`. The director's audit tick requeues
+  2 per tick, ≤ 6 in flight, with `keep_products` + `fresh_run`: no manifest
+  entry and no Zenodo file is deleted, the `<code>_fresh` marker only stops
+  the processor from reusing the old full GPKG; files are overwritten in
+  place and the old product is served until the new one is ingested.
+  States: `enrolled → requeued → done` (`stuck` after 2 attempts,
+  `waiting: label_mix|v2_regen|product_repair` when another list owns the code).
+* **Hold caveat**: the audit tick does not run during the run-complete hold.
+  `_run_complete_checks` counts the list as open work (`qc_reprocess`); on a
+  director started before that commit kick once by hand:
+  `python3 qc_generation.py --sweep` (posts the first two, the queue wakes the director).
+* **Keep cells** (`ne_pos_fix.sweep_keep`, `data/ne_pos_keep/<kg>.npy`): the
+  res-12 rows a sweep unit won in the merged `.h3b` of a moved KG are never
+  moved. Row-aware readers (`fix_words` with cell context: `_load_chunk`,
+  `ne_rebin.FileSource` = posted rows) decide by the **row**; point readers
+  (`moved`, `moves_point`, `served_frame` for the twin rule) by the cell of
+  the position. The file tag gets `~k<crc>`, so bins / blocks / rebin store /
+  linear runs of the KG recompute. `ne_pos_fix.py --sweep-keep [--only kg,…]`
+  is idempotent (seen units are skipped) — rerun it after new sweep units land
+  in a moved KG (not on a timer).
+* **Same version only**: this path regenerates v2.4 in place. A v2.5 kept
+  next to v2.4 needs its own manifest keys / filenames; the hook
+  (`on_ingest`) and the retire calls are version-agnostic and are what every
+  product of such a roll-out walks through.
+* Tests: `python3 tests/test_qc_generation.py`.
+
 ## What the next run should do differently (short list)
 
 1. Place every raster by transform (`_align_tdata_to_tile`) — done.
@@ -216,6 +281,6 @@ class-1 guard; the cell rule `rb1` is read-time by design.
 3. Record per-tile provenance in the product (`restored`, BEV source identity)
    — `restored` done, source identity open.
 4. Clip to the national outline at read time — open.
-5. Attribute sweep-unit cells in the merged `.h3b` — open.
+5. Attribute sweep-unit cells in the merged `.h3b` — open (read-time: keep cells).
 6. Run the detectors' rules before upload as warnings
    (`check_grid25_tile_edges` done; neighbour registration, linear noise open).

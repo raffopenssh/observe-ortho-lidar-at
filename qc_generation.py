@@ -330,6 +330,11 @@ def enroll(codes, why: str = 'operator', dry: bool = False) -> dict:
     return out
 
 
+def open_count() -> int:
+    """Codes enrolled or in flight — open work for the director's run-complete hold check."""
+    return sum(1 for e in _load()['codes'].values() if e.get('state') in ('enrolled', 'requeued'))
+
+
 def cancel(codes) -> int:
     n = 0
     with _LOCK:

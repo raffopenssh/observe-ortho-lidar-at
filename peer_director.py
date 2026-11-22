@@ -6170,6 +6170,16 @@ class PeerDirector:
                 open_['repair_fixable'] = fx
         except Exception:
             pass
+        try:
+            # operator's reprocess list (qc_generation.py): the audit tick
+            # that requeues it does not run during the hold, so codes
+            # waiting on the list are open work by themselves.
+            import qc_generation as _qg
+            n = _qg.open_count()
+            if n:
+                open_['qc_reprocess'] = n
+        except Exception:
+            pass
         return {'ok': not open_, 'open': open_,
                 'at': datetime.now(timezone.utc).isoformat(timespec='seconds')}
 

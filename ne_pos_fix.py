@@ -415,7 +415,8 @@ def sweep_keep(only=None, max_units: int = 200, quiet: bool = True) -> dict:
     once), and keep (= never move) the cells whose merged NEO1 row is byte-identical to the unit's
     observed row, i.e. the cells the unit won in ``ne_ingest.merge_blocks``.  State: sorted u64 ids in
     ``data/ne_pos_keep/<kg>.npy`` + ``keep_units`` {unit: cells} / ``keep_n`` / ``keep_crc`` on the entry.  User reports that followed the
-    whole-KG move into such a cell are moved back.  Idempotent; hourly via ``ne-linear.service``."""
+    whole-KG move into such a cell are moved back.  Idempotent (seen units are skipped); run by hand
+    after new sweep units land in a moved KG: ``python3 ne_pos_fix.py --sweep-keep [--only kg,…]``."""
     import kg_splitter
     import kg_v2_store as kvs
     import label_mix as lm
