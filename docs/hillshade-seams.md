@@ -124,6 +124,15 @@ the DTM's own 25 m domain:
   191 → 268 tiles, seams +6 tiles in 5 more products (49 products, 274
   tiles, ~1 GB BEV). Seams that survive both are product-rim steps of
   0.5 m class or real terrain — not repairable without a reprocess.
+* **Rim** (2026-11-22, `RIM_CELLS = 2`, `_rim`): the stitch wrote one blended
+  cell just *outside* a tile's cell range; next to a stale tile it is half
+  stale — a one-cell spike line of 100–250 m that survived the tile rebuild
+  (84114 Samnaun: 2370 m between 2140 and 2132 m; 85106-southwest-1), while
+  the neighbour tile it belongs to matches BEV. Four 2-cell strips around
+  every rebuilt tile are rebuilt from BEV too (`patched.<code>.rim_blocks`,
+  `rimmed`) — BEV values, so real cliffs / quarries stay; nothing is masked.
+  Products patched earlier get their strips on the next `--scan` (strips
+  only, the tiles are not re-read); `--status → products_rimmed`.
 * TileJSON `tile_edge_check` = `{edges_open, products_patched, tiles_patched, …}`;
   remaining pixel-rule seams: `/tiles/hillshade/seams.json` (tile + row/col).
 

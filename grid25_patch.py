@@ -102,7 +102,8 @@ def status() -> dict:
     c = collections.Counter(t['v'] for e in (d.get('checked') or {}).values() for t in e.get('tiles') or [])
     return {'version': version(), 'products_checked': len(d.get('checked') or {}), 'tiles': dict(c),
             'products_patched': len(d.get('patched') or {}),
-            'tiles_patched': sum(len(e['blocks']) for e in (d.get('patched') or {}).values()),
+            'tiles_patched': sum(len(e['blocks']) - len(e.get('rim_blocks') or []) for e in (d.get('patched') or {}).values()),
+            'products_rimmed': sum(1 for e in (d.get('patched') or {}).values() if 'rimmed' in e),
             'edge_scan': d.get('edge_scan'), 'edges_open': edges_open(d),
             'mb': round(float(d.get('mb') or 0), 1), 'updated_at': d.get('updated_at')}
 
@@ -314,6 +315,22 @@ def _save(doc):
 
 
 GROW_CELLS = 6          # tiles overlap by ~4 cells; "adjacent" = boxes within this many cells
+RIM_CELLS = 2           # cells around a rebuilt tile that are rebuilt from BEV as well (stitch blend, see _rim)
+
+
+def _rim(t, shape) -> list:
+    """Four strips ``[r0, c0, r1, c1]`` of RIM_CELLS around tile *t*, clamped.
+
+    The stitch wrote ONE blended cell just outside a tile's cell range: next
+    to a stale tile that cell is half stale (84114: 2370 m between 2140 and
+    2132 m) — a 100–250 m spike line the tile rebuild leaves behind, and the
+    neighbour tile it formally belongs to matches BEV everywhere else.
+    Rebuilt from BEV like the tile itself, so real cliffs / quarries stay."""
+    rows, cols = shape
+    _, r0, c0, r1, c1 = t
+    R0, C0, R1, C1 = max(r0 - RIM_CELLS, 0), max(c0 - RIM_CELLS, 0), min(r1 + RIM_CELLS, rows), min(c1 + RIM_CELLS, cols)
+    out = [[R0, C0, r0, C1], [r1, C0, R1, C1], [r0, C0, r1, c0], [r0, c1, r1, C1]]
+    return [b for b in out if b[2] > b[0] and b[3] > b[1]]
 
 
 def _adjacent(t, u) -> bool:
@@ -374,18 +391,35 @@ def process(code, doc, tiles=None, force=False, check=None) -> dict:
     res = []
     old = (doc.get('patched') or {}).get(code)
     have = [list(b) for b in old['blocks']] if old and (DIR / f'{code}.npz').exists() else []
-    for i, v in verd.items():
+    rimmed = [list(b) for b in (old or {}).get('rimmed') or []] if have else []
+    rim_blocks = [list(b) for b in (old or {}).get('rim_blocks') or []] if have else []
+
+    def _build(r0, c0, r1, c1):
+        e, s = _bev_block(g['x0'] + c0 * CELL, g['y0'] - r0 * CELL, r1 - r0, c1 - c0)
+        k = len(blocks)
+        arrs[f'e{k}'] = np.where(np.isfinite(e), np.round(e * 10), -32768).astype(np.int16)
+        arrs[f's{k}'] = np.where(np.isfinite(s), np.clip(np.round(s), 0, 254), 255).astype(np.uint8)
+        blocks.append([r0, c0, r1, c1])
+
+    def _note(i, v):
         t = by_idx.get(i) or next(x for x in tiles if x[0] == i)
         v['tile'] = t[0]; v['rc'] = list(t[1:])
         if v['v'] == 'bad' and (force or list(t[1:]) not in have):
-            _, r0, c0, r1, c1 = t
-            e, s = _bev_block(g['x0'] + c0 * CELL, g['y0'] - r0 * CELL, r1 - r0, c1 - c0)
-            k = len(blocks)
-            arrs[f'e{k}'] = np.where(np.isfinite(e), np.round(e * 10), -32768).astype(np.int16)
-            arrs[f's{k}'] = np.where(np.isfinite(s), np.clip(np.round(s), 0, 254), 255).astype(np.uint8)
-            blocks.append([r0, c0, r1, c1])
+            _build(*t[1:])
+        if v['v'] == 'bad' and RIM_CELLS and list(t[1:]) not in rimmed:
+            for b in _rim(t, g['elev'].shape):
+                if b not in rim_blocks:
+                    _build(*b); rim_blocks.append(b)
+            rimmed.append(list(t[1:]))
+
+    for i, v in verd.items():
+        _note(i, v)
         res.append(v)
-    res += [v for i, v in prev.items() if i not in verd]
+    for i, v in prev.items():                    # bad tiles of an earlier run: rim only (no tile re-read)
+        if i not in verd:
+            if v.get('v') == 'bad' and i in by_idx and list(by_idx[i][1:]) in have:
+                _note(i, v)
+            res.append(v)
     ent = {'tiles': res, 'ts': int(time.time()), 'edges_done': bool((doc.get('edges') or {}).get(code)), 'grown': True}
     doc.setdefault('checked', {})[code] = ent
     if blocks:
@@ -398,7 +432,7 @@ def process(code, doc, tiles=None, force=False, check=None) -> dict:
         tmp = DIR / f'.{code}.tmp.npz'
         np.savez_compressed(tmp, **arrs); os.replace(tmp, DIR / f'{code}.npz')
         doc.setdefault('patched', {})[code] = {'grid': [float(g['x0']), float(g['y0']), g['elev'].shape[0], g['elev'].shape[1]],
-                                               'blocks': blocks, 'ts': int(time.time())}
+                                               'blocks': blocks, 'rimmed': rimmed, 'rim_blocks': rim_blocks, 'ts': int(time.time())}
         doc['dirty'] = True
     return ent
 
@@ -473,6 +507,7 @@ def scan(budget_mb_h=150.0, codes=None, max_n=None, quiet=False, seams=False) ->
     todo = [c for c in codes if c not in (doc.get('checked') or {})
             or ((doc.get('edges') or {}).get(c) and not doc['checked'][c].get('edges_done'))
             or (c in (doc.get('patched') or {}) and not doc['checked'][c].get('grown'))
+            or (RIM_CELLS and c in (doc.get('patched') or {}) and 'rimmed' not in doc['patched'][c])
             or c in by_seam]
     if max_n:
         todo = todo[:max_n]

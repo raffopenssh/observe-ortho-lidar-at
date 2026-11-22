@@ -79,7 +79,26 @@ doc = {'checked': {'f': {'tiles': [{'v': 'ok', 'tile': 4, 'rc': [0, 168, 60, 228
 ent = gp.process('f', doc, tiles=[T[0]], check=chk)
 assert asked == [1, 2, 3], asked                       # 2 = neighbour of bad 1, 3 = neighbour of bad 2, 4 never
 assert {v['tile']: v['v'] for v in ent['tiles']} == {1: 'bad', 2: 'bad', 3: 'ok', 4: 'ok'} and ent['grown']
-assert sorted(doc['patched']['f']['blocks']) == [[0, 0, 60, 60], [0, 56, 60, 116]] and doc['dirty']
+P = doc['patched']['f']
+assert sorted(b for b in P['blocks'] if b not in P['rim_blocks']) == [[0, 0, 60, 60], [0, 56, 60, 116]] and doc['dirty']
+# rim: the stitch's blended cells just outside a rebuilt tile are rebuilt too (clamped at the grid edge)
+assert sorted(P['rim_blocks']) == [[0, 54, 60, 56], [0, 60, 60, 62], [0, 116, 60, 118]], P['rim_blocks']
+assert sorted(P['rimmed']) == [[0, 0, 60, 60], [0, 56, 60, 116]]
+built = []; bev = gp._bev_block
+gp._bev_block = lambda x0, y0, rows, cols: (built.append((rows, cols)), bev(x0, y0, rows, cols))[1]
 asked.clear(); gp.process('f', doc, check=chk)       # re-run: nothing re-read, nothing re-built
-assert asked == [] and len(doc['patched']['f']['blocks']) == 2
+assert asked == [] and built == [] and len(P['blocks']) == 5
 print('ok flood fill')
+
+# 6) products patched before the rim rule: rim strips only, the tile itself is not re-read
+del P['rimmed'], P['rim_blocks']; P['blocks'] = [[0, 0, 60, 60], [0, 56, 60, 116]]
+np.savez_compressed(gp.DIR / 'f.npz', e0=np.full((60, 60), 4000, np.int16), s0=np.zeros((60, 60), np.uint8),
+                    e1=np.full((60, 60), 4000, np.int16), s1=np.zeros((60, 60), np.uint8))
+doc.pop('dirty'); gp.process('f', doc, check=chk)
+P = doc['patched']['f']
+assert asked == [] and sorted(built) == [(60, 2)] * 3 and len(P['blocks']) == 5 and len(P['rim_blocks']) == 3 and doc['dirty'], (built, P)
+g = {'elev': np.full((60, 228), 500.0, np.float32), 'x0': 0.0, 'y0': 0.0}
+gp._ST['mtime'] = None; json.dump(dict(doc, version=1), open(gp.INDEX, 'w'))
+assert gp.apply('f', g) and (g['elev'][:, :118] == 400).all() and (g['elev'][:, 118:] == 500).all()
+assert gp.status()['tiles_patched'] == 2
+print('ok rim')
