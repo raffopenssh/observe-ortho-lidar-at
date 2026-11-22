@@ -14,6 +14,7 @@ and setup: `README.md`. Security model: `SECURITY.md`.
 | tree QA in cell products (cell tree fields = the default `/trees/bbox` apex set) | `docs/ne-public-api.md` → 12e | `tree_qa.py`, `cells_api._load_chunk`, `cells_bins.patch_tree_cols`, `tests/test_tree_qa.py` |
 | public "this looks wrong" flags | `docs/public-flags.md` | `public_flags.py` |
 | tree apex → cell: one rule (apex counted in the res-12 cell of its served position, read-time rebin) | `docs/tree-cell-assignment.md` | `ne_rebin.py`, `tests/test_tree_cell_rule.py` |
+| off-file apices → added trees (height-aware twin rule `tw1`, system-added trees in the `/trees/bbox` `added` block) | `docs/tree-cell-assignment.md → Off-file apices` | `rebin_added.py`, `tools/rebin_twin_model.py`, `tests/test_rebin_added.py` |
 | linear noise in the tree apices | `docs/linear-noise.md` | `ne_linear.py`, `tests/test_ne_linear.py` |
 | per-tree user species + user-added trees (versioned, via `/flags`; notes; same-tree `spurious` + `hint: crown` in `tree_crown.py`; sparse read-back on `/trees/bbox`, `/trees/taxa`) | `docs/tree-user.md` | `tree_user.py`, `tree_taxa.py` (species dictionary + resolver), `ne_trees._user_blocks` |
 | the Austria-wide processor, tiles, checkpoints, splitting | `docs/austria-processor.md` | `austria_processor.py`, `kg_splitter.py`, `tile_checkpoint_registry.py` |
