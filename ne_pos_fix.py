@@ -45,6 +45,7 @@ import numpy as np
 
 DATA = Path(__file__).resolve().parent / 'data'
 PATH = Path(os.environ.get('NE_POS_FIX', str(DATA / 'ne_pos_fix.json')))
+KEEP_DIR = PATH.parent / 'ne_pos_keep'     # <kg>.npy: res-12 cells a fresh sweep unit supplied (sweep_keep)
 SHIFT = (-5, 5)                 # true position = stored position + SHIFT
 WINDOW_M = 250
 WINDOWS_PER_KG = 4
@@ -61,7 +62,7 @@ TILE_MARGIN = 100.0            # feather width of the product mosaic (austria_pr
 CORE_M = 100.0                  # a tile is measured where its feather weight is 1 (no blend with a neighbour)
 PAIR_MIN = 20                   # same-height partners in a neighbour file that decide an unmeasured tile
 TILE_RULE = 2                   # entry field `tv`: measured per processing tile with this rule
-_ST = {'mtime': None, 'off': {}, 'n': 0, 'past': {}, 'part': {}}
+_ST = {'mtime': None, 'off': {}, 'n': 0, 'past': {}, 'part': {}, 'keep': {}, 'hist': {}}
 
 
 def _load() -> dict:
@@ -89,7 +90,19 @@ def _load() -> dict:
                     f = _frames_of(v)
                     if f:
                         past[k] = f
-                _ST.update(mtime=mt, off=off, n=len(off), past=past, part=part)
+                # cells of a whole-`shift` KG that a fresh sliver-sweep unit supplied: true frame, never moved
+                keep = {}
+                for k, v in (d.get('kgs') or {}).items():
+                    if (k in off or k in part) and v.get('keep_n'):
+                        keep[k] = (k, str(v.get('keep_crc') or ''), {})     # ids load lazily (data/ne_pos_keep/<kg>.npy)
+                # tiles as they were moved before a product of the KG was regenerated on the true grid
+                # (:func:`regenerated`): what a copy made before the fix still needs
+                hist = {}
+                for k, v in (d.get('kgs') or {}).items():
+                    if v.get('was_tiles') and (v.get('off') or v.get('was')):
+                        t = np.asarray(v['was_tiles'], np.float64).reshape(-1, 5)
+                        hist[k] = (t[:, :4].copy(), t[:, 4] > 0)
+                _ST.update(mtime=mt, off=off, n=len(off), past=past, part=part, keep=keep, hist=hist)
             except Exception:  # noqa: BLE001 — a half-written file never breaks a read path
                 _ST['mtime'] = mt
     return _ST
@@ -144,12 +157,58 @@ def moved(kg, x, y) -> np.ndarray:
     st = _load(); kg = str(kg).zfill(5)
     n = np.asarray(x).reshape(-1).shape[0]
     if kg in st['off']:
-        return np.ones(n, bool)
+        kp = st['keep'].get(kg)
+        return np.ones(n, bool) if kp is None else ~in_keep(kp, x, y)
     p = st['part'].get(kg)
     if p is None:
         return np.zeros(n, bool)
     o = tile_owner(p[1], x, y)
-    return (o >= 0) & p[2][np.clip(o, 0, None)]
+    m = (o >= 0) & p[2][np.clip(o, 0, None)]
+    kp = st['keep'].get(kg)
+    return m if kp is None or not m.any() else m & ~in_keep(kp, x, y)
+
+
+def in_keep(kp, x, y) -> np.ndarray:
+    """Per stored position: does it lie in a res-12 cell a fresh sweep unit supplied (*kp* = the KG's
+    ``_ST['keep']`` entry)?  Envelope prefilter, then the exact H3 cell of the few candidates."""
+    x = np.asarray(x, np.float64).reshape(-1); y = np.asarray(y, np.float64).reshape(-1)
+    out = np.zeros(x.shape[0], bool)
+    ids = _keep_ids(kp)
+    if not ids.size or not x.size:
+        return out
+    import cells_api as ca
+    memo = kp[2]
+    if 'bins' not in memo:              # 64 m bins around the kept cells: cheap prefilter
+        c = ca._centres_3035(ids)
+        bx = np.floor(c[:, 0] / 64).astype(np.int64); by = np.floor(c[:, 1] / 64).astype(np.int64)
+        memo['bins'] = np.unique(np.concatenate([(bx + i) * (1 << 24) + (by + j) for i in (-1, 0, 1) for j in (-1, 0, 1)]))
+    key = np.floor(x / 64).astype(np.int64) * (1 << 24) + np.floor(y / 64).astype(np.int64)
+    cand = np.flatnonzero(np.isin(key, memo['bins']))
+    if cand.size:
+        import h3
+        lon, lat = ca._tf('EPSG:3035', 'EPSG:4326').transform(x[cand], y[cand])
+        got = np.fromiter((h3.str_to_int(h3.latlng_to_cell(float(b), float(a), 12)) for a, b in zip(lon, lat)), np.uint64, cand.size)
+        out[cand] = np.isin(got, ids)
+    return out
+
+
+def _keep_ids(kp) -> np.ndarray:
+    """Sorted u64 res-12 ids of a keep entry (``(kg | ids, crc, memo)``)."""
+    if not isinstance(kp[0], str):
+        return np.asarray(kp[0], np.uint64)
+    memo = kp[2]
+    if 'ids' not in memo:
+        try:
+            memo['ids'] = np.load(KEEP_DIR / f'{kp[0]}.npy').astype(np.uint64)
+        except Exception:  # noqa: BLE001 — a missing file = nothing kept (the whole-KG behaviour of before)
+            memo['ids'] = np.zeros(0, np.uint64)
+    return memo['ids']
+
+
+def keep_cells(kg):
+    """Moved KG → frozenset of the res-12 cell ids fresh sweep units supplied (never moved), else None."""
+    kp = _load()['keep'].get(str(kg).zfill(5))
+    return _keep_ids(kp) if kp else None
 
 
 def moves_point(kgs, x, y) -> bool:
@@ -157,7 +216,18 @@ def moves_point(kgs, x, y) -> bool:
     st = _load()
     for k in kgs:
         k = str(k).zfill(5)
-        if k not in st['part'] or bool(moved(k, [x], [y])[0]):      # whole-KG frames (and their history) always move
+        kp = st['keep'].get(k)
+        if kp is not None and bool(in_keep(kp, [x], [y])[0]):
+            continue
+        h = st['hist'].get(k)
+        if h is not None:               # a product was regenerated since: the copy predates it → tiles as they were
+            o = tile_owner(h[0], [x], [y])[0]
+            if o >= 0 and bool(h[1][o]):
+                return True
+        elif k in st['off'] or k in st['part']:
+            if bool(moved(k, [x], [y])[0]):
+                return True
+        else:                           # retired / rejected whole-KG frame: its history always moves
             return True
     return False
 
@@ -166,9 +236,13 @@ def tag(kg) -> str:
     """Cache-key / ETag suffix: '' for an untouched KG (keys stay as they were)."""
     o = offset(kg)
     if o:
-        return f'|p{o[0]:+d}{o[1]:+d}'
+        kp = _load()['keep'].get(str(kg).zfill(5))
+        return f'|p{o[0]:+d}{o[1]:+d}' + (f'~k{kp[1]}' if kp else '')
     p = partial(kg)
-    return f'|p{p[0][0]:+d}{p[0][1]:+d}~{p[3]}' if p else ''
+    if not p:
+        return ''
+    kp = _load()['keep'].get(str(kg).zfill(5))
+    return f'|p{p[0][0]:+d}{p[0][1]:+d}~{p[3]}' + (f'~k{kp[1]}' if kp else '')
 
 
 def _tok(o) -> str:
@@ -185,7 +259,7 @@ def _frames_of(v: dict) -> dict | None:
     if not o:
         return None
     o = (int(o[0]), int(o[1])); ts = int(v.get('ts') or 0)
-    pt = {'partial': True} if vd == 'partial' or v.get('was_tiles') else {}
+    pt = {'partial': True} if vd == 'partial' or v.get('was_tiles') or v.get('keep_n') else {}
     if vd == 'rejected':
         return {'frame': FRAME_STALE, 'stale': _tok(o), 'delta': (-o[0], -o[1]), 'from': ts, 'until': int(v.get('rejected_ts') or ts), **pt}
     return {'frame': _tok(o), 'stale': FRAME_STALE, 'delta': o, 'from': 0, 'until': ts, **pt}
@@ -217,6 +291,7 @@ def _update(fn):
         out = fn(doc)
         doc['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         tmp = PATH.with_suffix('.tmp'); tmp.write_text(json.dumps(doc)); os.replace(tmp, PATH)
+        _ST['mtime'] = None            # two writes within one mtime tick (~4 ms) must not leave this process stale
         return out
 
 
@@ -233,6 +308,170 @@ def retire(kg) -> bool:
                           **({'was_tiles': v['tiles']} if v.get('tiles') else {})}
         return True
     return _update(f)
+
+
+def _code_tiles(code) -> list:
+    """Integer EPSG:3035 envelopes of the processing tiles of ONE product (the rounding of :func:`kg_tiles`)."""
+    import cells_api as ca
+    import kg_v2_store as kvs
+    tf = ca._tf('EPSG:4326', 'EPSG:3035')
+    out = []
+    for t in ((kvs.get(code) or {}).get('data_quality') or {}).get('tiles') or []:
+        if t.get('bbox_wgs'):
+            w, s_, e, n = t['bbox_wgs']
+            x, y = tf.transform([w, e, e, w], [s_, s_, n, n])
+            out.append([round(min(x)), round(min(y)), round(max(x)), round(max(y))])
+    return out
+
+
+def regenerated(code, tiles=None, all_tiles=None) -> dict:
+    """A product was REGENERATED on the true grid (fresh run, no ``upgraded_from``) — the generic
+    hook of every new product generation (``qc_generation.on_ingest``; a v2.5 roll-out walks through
+    here product by product).  Its tiles stop being moved, the frame history stays:
+
+    * the KG's only product → :func:`retire`;
+    * a block of a split KG → the KG becomes ``partial`` with that block's tiles kept (flag 0);
+      ``was_tiles`` remembers the flags before, for copies made before the fix
+      (:func:`moves_point`).  When no moved tile is left the KG is retired;
+    * a KG that was never moved (``mixed`` / ``unclear``) and is fresh as a whole → ``fresh``.
+
+    Sweep units never count (fresh already, see ``keep_cells``).  Idempotent."""
+    import kg_splitter
+    code = str(code)
+    if kg_splitter.is_sweep_code(code):
+        return {'action': None}
+    kg = code.split('-')[0].zfill(5)
+    res = {'action': None}
+
+    def f(doc):
+        v = doc['kgs'].get(kg)
+        if not v:
+            return False
+        vd = v.get('verdict')
+        if code == kg:
+            if vd in ('mixed', 'unclear', 'error'):
+                doc['kgs'][kg] = {'verdict': 'fresh', 'was_verdict': vd, 'ts': v.get('ts'), 'retired_ts': int(time.time()), 'windows': []}
+                res['action'] = 'fresh'
+                return True
+            return False
+        if vd not in ('shift', 'partial'):
+            return False
+        mine = {tuple(int(q) for q in t[:4]) for t in (tiles if tiles is not None else _code_tiles(code))}
+        cur = v.get('tiles') or [list(t) + [1] for t in (all_tiles if all_tiles is not None else kg_tiles(kg).astype(int).tolist())]
+        if not mine or not cur:
+            return False
+        new = [list(t[:4]) + [0 if tuple(int(q) for q in t[:4]) in mine else int(t[4])] for t in cur]
+        if new == [list(t) for t in cur] and vd == 'partial':
+            return False
+        was = v.get('was_tiles') or [list(t) for t in cur]
+        rg = dict(v.get('regen') or {}); rg[code] = int(time.time())
+        if not any(t[4] > 0 for t in new):
+            doc['kgs'][kg] = {'verdict': 'retired', 'was': v['off'], 'ts': v.get('ts'), 'retired_ts': int(time.time()),
+                              'windows': [], 'was_tiles': was, 'regen': rg}
+            res['action'] = 'retired'
+            return True
+        fl = [t[4] for t in new]
+        v = dict(v, verdict='partial', tiles=new, was_tiles=was, regen=rg, tv=TILE_RULE,
+                 tiles_n=[sum(q > 0 for q in fl), fl.count(0), sum(q < 0 for q in fl)])
+        if vd == 'shift':
+            v['was_verdict'] = 'shift'
+        doc['kgs'][kg] = v
+        res['action'] = 'tiles'
+        return True
+    if code == kg and (json.loads(PATH.read_text()).get('kgs') or {}).get(kg, {}).get('verdict') in ('shift', 'partial'):
+        return {'action': 'retired' if retire(kg) else None}
+    _update(f)
+    return res
+
+
+def sweep_keep(only=None, max_units: int = 200, quiet: bool = True) -> dict:
+    """Sliver-sweep units (``<kg>-sw<k>``) are FRESH products on the true grid, merged into the parent's
+    ``data/ne/<kg>.h3b`` without attribution — a KG moved as a whole dragged their cells 5 m the wrong
+    way.  For every moved KG: fetch each not-yet-seen unit's small ``_ne_h3b`` archive (Zenodo, ~100 KB,
+    once), and keep (= never move) the cells whose merged NEO1 row is byte-identical to the unit's
+    observed row, i.e. the cells the unit won in ``ne_ingest.merge_blocks``.  State: sorted u64 ids in
+    ``data/ne_pos_keep/<kg>.npy`` + ``keep_units`` {unit: cells} / ``keep_n`` / ``keep_crc`` on the entry.  User reports that followed the
+    whole-KG move into such a cell are moved back.  Idempotent; hourly via ``ne-linear.service``."""
+    import kg_splitter
+    import kg_v2_store as kvs
+    import label_mix as lm
+    import ne_ingest as ni
+    try:
+        doc = json.loads(PATH.read_text())
+    except Exception:  # noqa: BLE001
+        return {'kgs': 0}
+    out = {'kgs': 0, 'units': 0, 'cells': 0, 'no_h3b': 0, 'moved_back': 0}
+    ent = None
+    for kg, v in sorted((doc.get('kgs') or {}).items()):
+        if v.get('verdict') not in ('shift', 'partial') or not v.get('off') or (only and kg not in only):
+            continue
+        seen = v.get('keep_units') or {}
+        todo = [u for u in sorted(kvs.codes_for_parent(kg)) if kg_splitter.is_sweep_code(u) and u not in seen]
+        if not todo or out['units'] >= max_units:
+            continue
+        pp = DATA / 'ne' / f'{kg}.h3b'
+        if not pp.exists():
+            continue
+        if ent is None:
+            ent = lm._manifest_entries()
+        P = ni._read_compact(pp, want_rows=False)
+        n = P['obs'].shape[0]; pid = ni._lu_ids(P['lu'], n)
+        new = set(); units = {}
+        for u in todo:
+            up = lm._fetch_block_h3b(u, ent)
+            if up is None:
+                out['no_h3b'] += 1
+                continue
+            try:
+                U = ni._read_compact(up, want_rows=False)
+                m = U['obs'].shape[0]; uid = ni._lu_ids(U['lu'], m)
+                pos = np.searchsorted(pid, uid); pos[pos >= n] = 0
+                same = (pid[pos] == uid) & ni.row_observed(U['obs']) & (P['obs'][pos] == U['obs']).all(axis=1)
+                ids = {int(i) for i in uid[same]}
+            except Exception as e:  # noqa: BLE001
+                print('sweep_keep', u, repr(e)[:120], file=sys.stderr)
+                continue
+            finally:
+                try:
+                    up.unlink()
+                except OSError:
+                    pass
+            units[u] = len(ids); new |= ids
+        del P
+        if not units:
+            continue
+        try:
+            old = set(np.load(KEEP_DIR / f'{kg}.npy').astype(np.uint64).tolist())
+        except Exception:  # noqa: BLE001
+            old = set()
+        add = sorted(new - old)
+        allc = np.asarray(sorted(old | new), np.uint64)
+        if add:
+            KEEP_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = KEEP_DIR / f'{kg}.tmp.npy'
+            np.save(tmp, allc); os.replace(tmp, KEEP_DIR / f'{kg}.npy')
+
+        def put(d, kg=kg, units=units, allc=allc):
+            e = d['kgs'].get(kg)
+            if not e or e.get('verdict') not in ('shift', 'partial'):
+                return False
+            e['keep_units'] = dict(e.get('keep_units') or {}, **units)
+            e['keep_n'] = int(allc.size)
+            e['keep_crc'] = '%08x' % (zlib.crc32(allc.tobytes()) & 0xFFFFFFFF)
+            return True
+        _update(put)
+        if add and PATH.parent == DATA:
+            try:    # reports that followed the whole-KG move into a kept cell go back to the stored place
+                kp = (np.asarray(add, np.uint64), '', {})
+                o = v['off']
+                r = _migrate_stores(kg, (-int(o[0]), -int(o[1])), stored=False, sel=lambda x, y, kp=kp: in_keep(kp, x, y))
+                out['moved_back'] += sum(int(q) for q in r.values() if isinstance(q, int) and not isinstance(q, bool))
+            except Exception as e:  # noqa: BLE001
+                print('sweep_keep migrate', kg, repr(e)[:120], file=sys.stderr)
+        out['kgs'] += 1; out['units'] += len(units); out['cells'] += len(add)
+        if not quiet:
+            print(kg, units, len(add), flush=True)
+    return out
 
 
 def unfix(kg, db=None) -> bool:
@@ -320,6 +559,8 @@ def fix_words(kg, trees: bytes, bld: bytes, cells=None) -> tuple[bytes, bytes]:
     p = None if o else partial(kg)
     if not o and (p is None or cells is None or not (trees or bld)):
         return trees, bld
+    if o and cells is not None and (trees or bld) and keep_cells(kg) is not None:
+        p = (o,)                        # whole KG minus the cells a fresh sweep unit supplied: per word as well
     if p is not None:
         o = p[0]
         cen, tn, bn = cells()
@@ -807,6 +1048,10 @@ def verify_tiles(budget_mb_h: float = 150.0, max_kgs: int | None = None, only=No
 
         def put(doc, kg=kg, r=r, mb=mb):
             if r['verdict'] != 'error':
+                old = doc['kgs'].get(kg) or {}
+                for f in ('keep_units', 'keep_n', 'keep_crc', 'regen', 'was_tiles'):   # facts of other passes survive a re-measure
+                    if f in old and f not in r:
+                        r[f] = old[f]
                 doc['kgs'][kg] = r
             doc['mb'] = float(doc.get('mb') or 0) + mb
         _update(put)
@@ -990,6 +1235,8 @@ def verify(budget_mb_h: float = 150.0, max_kgs: int | None = None, only=None, qu
 if __name__ == '__main__':
     if '--sync' in sys.argv:
         print(json.dumps(sync()))
+    elif '--sweep-keep' in sys.argv:
+        print(json.dumps(sweep_keep(quiet=False)))
     elif '--unfix' in sys.argv or '--retire' in sys.argv:
         f = unfix if '--unfix' in sys.argv else retire
         kg = sys.argv[sys.argv.index('--unfix' if f is unfix else '--retire') + 1]

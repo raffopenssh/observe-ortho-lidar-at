@@ -6349,6 +6349,15 @@ def processing_queue_add():
                (products verified missing on Zenodo, e.g.
                ``<code>_full_gpkg``) are deleted + tombstoned. Used by the
                director's v2_regen auto-requeue.
+      fresh_run: (only with keep_products) stamp a ``<code>_fresh`` marker
+               tombstone and delete NOTHING: the processor then rebuilds
+               the full GPKG from BEV instead of reusing the one on Zenodo
+               (``austria_processor`` manifest-aware reuse), while every
+               manifest entry — incl. ``_full_gpkg`` — stays referenced
+               until the fresh run overwrites it in place.  The marker
+               travels to peers as a ``gone_keys`` item (it never names a
+               manifest entry).  Used by ``qc_generation`` (QC reprocess;
+               the path a v2.5 regeneration would take).
 
     Duplicates already in the queue are moved to the new position.
     """
@@ -6363,6 +6372,8 @@ def processing_queue_add():
     skip_processed = data.get('skip_processed', True)
     keep_products = bool(data.get('keep_products')) and not skip_processed
     gone_keys = {str(k) for k in (data.get('gone_keys') or []) if str(k).strip()}
+    if keep_products and data.get('fresh_run'):
+        gone_keys |= {c + '_fresh' for c in new_codes}
     # ``drop``: codes the director reserved for *other* peers. They are
     # purged from this peer's local retry_queue.json (incl. blocks of a
     # dropped parent) — the director's exclude only ever filtered what
@@ -6491,6 +6502,10 @@ def processing_queue_add():
                 # the verified-gone keys of THIS code are invalidated.
                 partial_keys = [k for k in partial_keys
                                 if k in gone_keys and (k.startswith(c + '_') or k.startswith(c + '-'))]
+            if keep_products and (c + '_fresh') in gone_keys and (c + '_fresh') not in _MANIFEST_TOMBSTONES:
+                # fresh-run marker (see docstring): idempotent, first sight only
+                _MANIFEST_TOMBSTONES[c + '_fresh'] = ts
+                tombstoned.append(c + '_fresh')
             if c not in completed and not partial_keys:
                 continue
             # Guard against the force-requeue self-perpetuation loop: if the
@@ -18853,7 +18868,7 @@ _PTXT_GROUPS = (
                   'throttle:', 'versions:', 'rollout:', 'frontier plan',
                   'primary_net:')),
     ('progress', ('progress:', 'products:', 'zenodo:', 'zen_stall:', 'v2:',
-                  'v2_verify_fails', 'v2_regen:', 'qc:', 'qc worst', 'qc key', 'label_mix:', 'stale_blocks:', 'json_heal:', 'repair:',
+                  'v2_verify_fails', 'v2_regen:', 'qc:', 'qc worst', 'qc key', 'qc_reprocess', 'label_mix:', 'stale_blocks:', 'json_heal:', 'repair:',
                   'chkpt_registry:', 'zen_cache:', 'hansen_cover:', 'cache_reconcile:',
                   'priority queue', 'recent failures')),
     ('upstreams', ('warn_top', 'zenodo_circuit:', 'zenodo_uploads:',
@@ -20591,6 +20606,16 @@ def process_txt():
                 out.append(_lml)
         except Exception as _e:
             out.append(f'label_mix: unavailable ({_e})')
+        # qc_reprocess: operator-enrolled reprocess list (director-paced,
+        # products stay served) + product generations documented on
+        # ingest (qc_generation.py, docs/qc-lessons.md -> Generations).
+        try:
+            import qc_generation as _qg
+            _qgl = _qg.status_line()
+            if _qgl:
+                out.append(_qgl)
+        except Exception as _e:
+            out.append(f'qc_reprocess: unavailable ({_e})')
         # stale_blocks: old-split-layout residue still carrying live
         # products while the current layout covers the parent on its own
         # (stale_blocks.py scan|apply); 5-min cache, manifest-only scan.

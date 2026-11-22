@@ -42,6 +42,7 @@ reader never sees a half-built ledger.
 """
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
 import os
@@ -55,7 +56,7 @@ HERE = Path(__file__).resolve().parent
 DATA = HERE / 'data'
 DB_PATH = Path(os.environ.get('QC_LEDGER_DB', str(DATA / 'qc_ledger.sqlite')))
 SUMMARY_PATH = Path(os.environ.get('QC_LEDGER_SUMMARY', str(DATA / 'qc_ledger.json')))
-VERSION = 1
+VERSION = 2
 SIDECAR_COMMIT_DATE = '2026-05-29'      # dd08d74 (2026-05-28): raster sidecars; v1 GPKGs before it re-read every tile
 ALIGN_COMMIT = 'eead178'                # _align_tdata_to_tile: no new shifted rasters
 
@@ -73,6 +74,7 @@ FAULTS = {
     'label_mix':       ('label_mix', False, 'restored tile kept the label ids of the first run'),
     'layer_gap':       ('product_repair', False, 'cache-fillable layer missing (-partial)'),
     'linear_noise':    ('ne_linear', False, 'straight chains of noise apices'),
+    'regenerated':     ('qc_generation', False, 'new product generation ingested: fixes of the old one retired, new quality documented'),
 }
 # classes whose products get the (costlier) document + log timing; the rest only manifest times
 TIMED = ('pos_shift', 'pos_sweep_unit', 'apex_frame_pair', 'grid25_stale', 'grid25_edge', 'grid25_shift',
@@ -112,6 +114,7 @@ class Sources:
         'label_mix': AP / 'label_mix.json', 'repair': AP / 'product_repair.json',
         'linear': DATA / 'linear_noise.sqlite', 'manifest': AP / 'zenodo_manifest.json',
         'origin': AP / 'product_origin.json', 'store': DATA / 'kg_v2_store.db',
+        'gen': DATA / 'qc_generations.sqlite', 'reprocess': AP / 'qc_reprocess.json',
     }
 
     def _json(self, k):
@@ -181,6 +184,17 @@ class Sources:
         except Exception as e:  # noqa: BLE001
             out['error'] = str(e)[:120]
         return out
+
+    def generations(self) -> list:
+        """Product generations that replaced an earlier one (``qc_generation.on_ingest``)."""
+        try:
+            import qc_generation as qg
+            return qg.generations(acted_only=True)
+        except Exception:  # noqa: BLE001
+            return []
+
+    def reprocess(self) -> dict:
+        return (self._json('reprocess') or {}).get('codes') or {}
 
     def linear(self) -> list:
         try:
@@ -522,8 +536,13 @@ def collect(src: Sources) -> dict:
             add(kg, -1, 'pos_shift', 'shift', 'handled', 'none' if v.get('retired') else 'moved', ev)
             for c in sweeps:                # a sweep unit is a fresh product on the true grid, but its cells are merged
                 d = doc(c)                  # into the parent .h3b and move with the KG → 5 m off the other way
-                add(c, -1, 'pos_sweep_unit', 'suspect', 'open', 'moved',
-                    {'kg': kg, 'generated_at': str(d.get('generated_at') or '')[:19], 'tiles': len(doc_tiles(d))})
+                ku = (v.get('keep_units') or {})
+                if c in ku:                 # ne_pos_fix.sweep_keep: the cells the unit supplied are exempt from the move
+                    add(c, -1, 'pos_sweep_unit', 'kept', 'handled', 'kept',
+                        {'kg': kg, 'generated_at': str(d.get('generated_at') or '')[:19], 'cells_kept': ku[c]})
+                else:
+                    add(c, -1, 'pos_sweep_unit', 'suspect', 'open', 'moved',
+                        {'kg': kg, 'generated_at': str(d.get('generated_at') or '')[:19], 'tiles': len(doc_tiles(d))})
         elif vd in ('mixed', 'unclear'):
             add(kg, -1, 'pos_shift', vd, 'open', 'none', ev)
         elif vd == 'zero':
@@ -614,6 +633,25 @@ def collect(src: Sources) -> dict:
         st = e.get('state') or 'pending'
         add(code, -1, 'layer_gap', st, 'handled' if st == 'done' else 'open', 're-upgrade' if st == 'done' else 'none',
             {k: e[k] for k in ('defects', 'tiles', 'missing_cells', 'attempts', 'detected_at', 'product_ts', 'version') if e.get(k) not in (None, '', [])})
+    gens = src.generations()
+    rp = src.reprocess()
+    inputs['qc_generation'] = {'generations': len(gens), 'reprocess': dict(collections.Counter(e.get('state') for e in rp.values()))}
+    for g in gens:
+        q = g.get('quality') or {}
+        bad_now = bool(q.get('restored') or q.get('edges') or q.get('missing') or 'partial' in str(q.get('label') or ''))
+        add(g['code'], -1, 'regenerated', 'fresh' if g.get('fresh') else 'upgraded', 'handled' if not bad_now else 'open',
+            'regenerated' if g.get('retired') else 'none',
+            {'generated_at': str(g['generated_at'])[:19], 'prev_generated_at': str(g.get('prev_generated_at') or '')[:19],
+             'was': [f"{b['fault']}={b['verdict']}" + (f"x{b['n']}" if b.get('n', 1) > 1 else '') for b in (g.get('before') or [])][:8],
+             'retired': sorted(g.get('retired') or {}), 'now': q, 'reprocess': (rp.get(g['code']) or {}).get('why')})
+    for code, e in rp.items():
+        if e.get('state') in ('enrolled', 'requeued', 'stuck'):
+            add(code, -1, 'regenerated', e['state'], 'open', 'none',
+                {k: e[k] for k in ('why', 'enrolled_at', 'requeued_at', 'attempts', 'note') if e.get(k)})
+    for code, e in ((src.grid25_index() or {}).get('retired') or {}).items():
+        if e.get('bad'):
+            add(code, -1, 'grid25_stale', 'regenerated', 'handled', 'regenerated',
+                {'stale_tiles_before': e['bad'], 'tiles': e.get('tiles'), 'generated_at': str(e.get('generated_at') or '')[:19]})
     ln = src.linear()
     inputs['ne_linear'] = {'kgs': len(ln)}
     for r in ln:
@@ -833,7 +871,8 @@ def _ro(db_path=None):
 
 _SHORT = {'pos_shift': 'pos', 'pos_sweep_unit': 'pos_sweep', 'apex_frame_pair': 'apex_pair', 'apex_unserved': 'apex_added',
           'apex_invariant': 'apex_inv', 'grid25_stale': 'g25_stale', 'grid25_edge': 'g25_edge', 'grid25_shift': 'g25_shift',
-          'grid25_mixed': 'g25_mixed', 'label_mix': 'label_mix', 'layer_gap': 'layer_gap', 'linear_noise': 'linear'}
+          'grid25_mixed': 'g25_mixed', 'label_mix': 'label_mix', 'layer_gap': 'layer_gap', 'linear_noise': 'linear',
+          'regenerated': 'regen'}
 
 
 def text_line(s: dict | None = None, now: float | None = None) -> str:

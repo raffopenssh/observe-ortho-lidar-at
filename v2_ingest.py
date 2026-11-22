@@ -622,6 +622,12 @@ def ingest_one(code: str, entries: dict, *, delete_v1: bool = True,
             return {"code": code, "ok": False, "reason": rep.summary()}
     # 1) store FIRST — the index selector reads the store
     info = store.put(code, blob, uploaded_at=up_at, doc=doc, source="zenodo")
+    try:  # one hook per new product generation: retire the read-time fixes measured on the old
+        # rasters, document the new quality (qc_generation.py, docs/qc-lessons.md → Generations)
+        import qc_generation as _qg
+        _qg.on_ingest(code, doc, uploaded_at=up_at, version_label=str(e.get("version") or ""))
+    except Exception as ex:  # noqa: BLE001
+        log.debug("v2_ingest: %s qc_generation: %s", code, ex)
     if _is_sweep(code):
         # Sliver-sweep add-on (docs/sliver-sweep.md → Products): it only
         # needs to exist in the store (bbox + grid25 for trees v3 /

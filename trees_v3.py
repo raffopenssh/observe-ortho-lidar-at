@@ -301,9 +301,12 @@ def read_apices(path: str, geom_3035, code: str, version: str | None = None) -> 
     # `off` away from its true place → select in the stored frame, serve in the true one
     off = None; part = False
     try:
+        import kg_splitter
         import ne_pos_fix
-        off = ne_pos_fix.any_offset(str(code).split('-')[0])
-        part = off is not None and ne_pos_fix.offset(str(code).split('-')[0]) is None
+        # a sliver-sweep unit is a FRESH product on the true grid: never moved with its parent KG
+        if not kg_splitter.is_sweep_code(str(code)):
+            off = ne_pos_fix.any_offset(str(code).split('-')[0])
+            part = off is not None and ne_pos_fix.offset(str(code).split('-')[0]) is None
     except Exception:  # noqa: BLE001
         pass
     want = None

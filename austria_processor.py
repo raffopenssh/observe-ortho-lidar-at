@@ -8660,6 +8660,25 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
                                      "tombstone (%s) >= entry (%s) -- rebuilding",
                                      kg_code, _tomb_ts, _entry_ts or "<none>")
                             _fe_ok = False
+                        # Fresh-run marker (QC reprocess / a future v2.5
+                        # regeneration, ``qc_generation``): ``<code>_fresh``
+                        # is stamped by the requeue WITHOUT deleting the
+                        # manifest entry, so the old full GPKG stays
+                        # referenced until this run overwrites it. An entry
+                        # that predates the marker holds the OLD rasters ->
+                        # rebuild; the entry this run uploads is newer ->
+                        # a retry reuses it as usual.
+                        if _fe_ok:
+                            _fresh_ts = ""
+                            try:
+                                _fresh_ts = str(json.loads((DATA_DIR / "manifest_tombstones.json").read_text())
+                                                .get(f"{kg_code}_fresh", "") or "")
+                            except Exception:
+                                _fresh_ts = ""
+                            if _fresh_ts and not (_entry_ts and _entry_ts > _fresh_ts):
+                                log.info("KG %s: full GPKG on Zenodo predates the fresh-run marker "
+                                         "(%s >= %s) -- rebuilding from BEV", kg_code, _fresh_ts, _entry_ts or "<none>")
+                                _fe_ok = False
                     if _fe_ok:
                         _full_already_on_zenodo = True
                         full_gpkg = ""

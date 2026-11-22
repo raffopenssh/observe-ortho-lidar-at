@@ -96,6 +96,33 @@ def apply(code, grid: dict) -> bool:
     return True
 
 
+def retire(code, generated_at: str = '') -> dict | None:
+    """The product was REGENERATED (new generation ingested, ``qc_generation.on_ingest``): its patch
+    blocks and per-tile verdicts described the OLD rasters — drop the patch (the fresh grid is served
+    as stored), keep the verdicts under ``retired`` as the record.  The global ``version`` is NOT
+    bumped (it keys every client's tile cache; the product's own ingest stamp already re-keys its
+    tiles).  A later ``--scan`` / ``--edge-scan`` judges the new generation from scratch."""
+    code = str(code)
+    doc = dict(_index())
+    had = {k: (doc.get(k) or {}).get(code) for k in ('checked', 'patched', 'edges')}
+    if not any(had.values()):
+        return None
+    for k in ('checked', 'patched', 'edges'):
+        if had[k] is not None:
+            doc[k] = {c: v for c, v in doc[k].items() if c != code}
+    tl = (had['checked'] or {}).get('tiles') or []
+    rec = {'ts': int(time.time()), 'generated_at': generated_at, 'tiles': len(tl),
+           'bad': sum(t.get('v') == 'bad' for t in tl), 'patched': bool(had['patched']),
+           'blocks': len((had['patched'] or {}).get('blocks') or []), 'edges': len(had['edges'] or [])}
+    doc['retired'] = dict(doc.get('retired') or {}, **{code: rec})
+    _save(doc)
+    try:
+        (DIR / f'{code}.npz').unlink()
+    except OSError:
+        pass
+    return rec
+
+
 def status() -> dict:
     d = _index()
     import collections
@@ -317,6 +344,7 @@ def _save(doc):
     DIR.mkdir(parents=True, exist_ok=True)
     doc['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     tmp = INDEX.with_suffix('.tmp'); tmp.write_text(json.dumps(doc, separators=(',', ':'))); os.replace(tmp, INDEX)
+    _ST['mtime'] = None      # two writes within one mtime tick must not leave this process stale
 
 
 GROW_CELLS = 6          # tiles overlap by ~4 cells; "adjacent" = boxes within this many cells

@@ -30,6 +30,8 @@ env_1 = tuple(env['00001'][1])
 class Fake(q.Sources):
     n_sig = 0
     def sig(self): return 'sig%d' % self.n_sig
+    def generations(self): return getattr(self, 'gens', [])
+    def reprocess(self): return getattr(self, 'rp', {})
     def pos_fix(self):
         e = env['00001']
         return {'kgs': {

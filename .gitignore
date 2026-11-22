@@ -66,3 +66,5 @@ data/ne_pos_fix.json
 data/qc_ledger.sqlite*
 data/qc_ledger.json
 data/qc_ledger_archive.json
+data/qc_generations.sqlite*
+data/ne_pos_keep/

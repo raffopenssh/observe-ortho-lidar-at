@@ -193,6 +193,8 @@ def build(write=True, progress=print):
            'mixed': sorted(mixed)}
     try:    # offsets unchanged → keep the version (it keys every client's tile cache)
         prev = json.loads(OUT.read_text())
+        if prev.get('retired'):     # record of offsets dropped by a fresh generation (retire)
+            doc['retired'] = prev['retired']
         if prev.get('offsets') == offsets:
             doc['version'] = prev['version']
     except Exception:  # noqa: BLE001
@@ -203,6 +205,30 @@ def build(write=True, progress=print):
         tmp.write_text(json.dumps(doc))
         os.replace(tmp, OUT)
     return doc
+
+
+def retire(code, generated_at: str = '') -> list | None:
+    """The product was REGENERATED on the true grid (fresh run, no ``upgraded_from`` — the anchor
+    class of rule 2): its measured offset belonged to the old rasters.  Drop it now instead of at
+    the next weekly build; ``version`` stays (it keys every client's tile cache — the product's own
+    ingest stamp re-keys its tiles).  Called by ``qc_generation.on_ingest``."""
+    code = str(code)
+    try:
+        doc = json.loads(OUT.read_text())
+    except Exception:  # noqa: BLE001
+        return None
+    off = (doc.get('offsets') or {}).pop(code, None)
+    mixed = code in (doc.get('mixed') or [])
+    if off is None and not mixed:
+        return None
+    if mixed:
+        doc['mixed'] = [c for c in doc['mixed'] if c != code]
+    doc['retired'] = dict(doc.get('retired') or {}, **{code: {'ts': int(time.time()), 'generated_at': generated_at,
+                                                               'off': off, 'mixed': mixed}})
+    tmp = OUT.with_suffix('.tmp')
+    tmp.write_text(json.dumps(doc))
+    os.replace(tmp, OUT)
+    return off or [0, 0]
 
 
 def status():

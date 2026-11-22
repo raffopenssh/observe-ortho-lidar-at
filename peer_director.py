@@ -8357,6 +8357,16 @@ class PeerDirector:
                     log.info('label_mix sweep: %s', _lr)
             except Exception as e:  # noqa: BLE001
                 log.warning('label_mix sweep failed: %s', e)
+            # qc_reprocess: pace the OPERATOR's reprocess list (nothing is
+            # enrolled automatically — qc_generation.py); products stay
+            # served until the fresh generation is ingested.
+            try:
+                import qc_generation as _qg
+                _qr = _qg.sweep()
+                if _qr.get('requeued') or _qr.get('events'):
+                    log.info('qc_reprocess sweep: %s', _qr)
+            except Exception as e:  # noqa: BLE001
+                log.warning('qc_reprocess sweep failed: %s', e)
             try:
                 # 10 min is plenty; each miss costs ~260 KB on the metered link.
                 ne_rollout.refresh_ne_manifest(max_age_s=600)
