@@ -619,13 +619,22 @@ def _index_cells(path: Path) -> None:
     ``os.replace``."""
     if path.name.startswith("."):
         return
+    import cells_api
+    for attempt in range(3):                 # a busy index (bins build, hmax backfill) must not leave the file unindexed
+        try:
+            cells_api.index_file(path)
+            break
+        except Exception as ex:  # noqa: BLE001
+            log.warning("ne_ingest: cells index %s failed (try %d; cells_api.reindex_lagging retries hourly): %s",
+                        path.name, attempt + 1, ex)
+            time.sleep(2 * (attempt + 1))
+    else:
+        return
     try:
-        import cells_api
-        cells_api.index_file(path)
         import tree_qa
         tree_qa.refresh_kg(path.stem)        # hidden-apex store follows the new file at once
     except Exception as ex:  # noqa: BLE001
-        log.warning("ne_ingest: cells index %s failed: %s", path.name, ex)
+        log.warning("ne_ingest: tree_qa refresh %s failed: %s", path.name, ex)
 
 
 def _live_blocks(parent: str, entries: dict) -> list[str]:
@@ -716,6 +725,9 @@ def merge_dirty_parents(idx: dict, entries: dict, max_n: int = 10) -> list[dict]
             tmp_out = path_for(parent).with_name(f".{parent}.dirty_merge.h3b")
             hdr = merge_blocks(parent, inputs, tmp_out, complete=complete)
             os.replace(tmp_out, path_for(parent))
+            # merge_blocks skipped the index for the dot-prefixed temp: without this the file is
+            # newer than its index rows (old digest, new chunks invisible — cells_api.lagging_files)
+            _index_cells(path_for(parent))
         except Exception as ex:  # noqa: BLE001
             log.warning("ne_ingest: merge %s failed: %s", parent, ex)
             st["merge_error"] = str(ex)[:200]; st["dirty"] = False

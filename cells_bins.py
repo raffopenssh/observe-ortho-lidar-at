@@ -1109,6 +1109,10 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
     # phase 0 (tree_qa): re-evaluate the default tree filter where its inputs changed and patch
     # the affected cells inside the stored bins + re-store their blocks (≤ 50 % of the budget)
     tq = None; t00 = time.time()
+    try:                                             # files written without their index_file (see ca.lagging_files)
+        ca.reindex_lagging()
+    except Exception as e:  # noqa: BLE001
+        log.warning('cells_bins: reindex_lagging: %s', e)
     try:
         tq = _tree_qa.refresh(None if budget_s is None else budget_s * 0.5, None, verbose=verbose)
     except Exception as e:  # noqa: BLE001

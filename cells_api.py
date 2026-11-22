@@ -284,6 +284,56 @@ def index_file(path: str | Path, *, conn: sqlite3.Connection | None = None) -> d
     return {'kg': kg, 'chunks': len(rows), 'cells_n': hdr['cells_n']}
 
 
+def _disk_mtimes() -> dict:
+    """kg → mtime of every ``data/ne/<kg>.h3b`` (one directory scan, ~50 ms for the corpus)."""
+    out = {}
+    try:
+        with os.scandir(NE_DIR) as it:
+            for e in it:
+                n = e.name
+                if n.endswith('.h3b') and not n.startswith('.'):
+                    try:
+                        out[n[:-4]] = e.stat().st_mtime
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+    return out
+
+
+def lagging_files(min_age_s: float = 120.0) -> list[str]:
+    """Corpus files newer on disk than their ``file`` row (a write whose ``index_file`` never ran).
+    The index then still carries the OLD digest and chunk list: chunks new in the file are in no
+    query (``_reconcile_stale_rows`` only repairs r10s the old list knows), so cells and apices of
+    the file are silently missing and nothing downstream is invalidated.  *min_age_s* leaves the
+    writer its own few seconds."""
+    c = _idx_conn()
+    if c is None:
+        return []
+    out = []; now = time.time(); disk = _disk_mtimes()
+    for kg, mt in c.execute('SELECT kg, mtime FROM file').fetchall():
+        d = disk.get(kg)
+        if d is None:
+            continue
+        if (mt is None or abs(float(mt) - d) > 1e-6) and now - d >= min_age_s:
+            out.append(kg)
+    return sorted(out)
+
+
+def reindex_lagging(min_age_s: float = 120.0) -> list[str]:
+    """``index_file`` for every lagging file (digest, chunk rows, hmax, ALS years follow; bins,
+    tree QA and the rebin store pick the new digest up through their own tokens).  Run at the
+    start of every ``cells-bins`` pass."""
+    done = []
+    for kg in lagging_files(min_age_s):
+        try:
+            index_file(_file_path(kg)); done.append(kg)
+            log.warning('cells: %s.h3b was newer than its index rows — re-indexed', kg)
+        except Exception as ex:  # noqa: BLE001
+            log.warning('cells: re-index of lagging %s failed: %s', kg, ex)
+    return done
+
+
 def index_remove(kg: str) -> None:
     c = _idx_conn(write=True)
     with _idx_write_lock:
@@ -337,7 +387,23 @@ def _files() -> dict:
             v[row[0]] = dict(zip(('kg', 'body_offset', 'cells_n', 'built', 'product_version', 'neo1_digest',
                                   'partial', 'mtime', 'w', 's', 'e', 'n'), row))
             v[row[0]]['epoch'] = NE_EPOCH
-    _files_cache.update(t=now, v=v)
+    # files newer on disk than their index row (index_file pending / never ran): digest + flags from
+    # the live header, and _chunk_rows serves ALL their chunks from it — also ones the old list lacks
+    lag = set()
+    disk = _disk_mtimes()
+    for kg, f in v.items():
+        mt = disk.get(kg)
+        if mt is None:
+            continue
+        if f['mtime'] is None or abs(float(f['mtime']) - mt) > 1e-6:
+            try:
+                h = ne_h3.read_h3b_header(_file_path(kg))
+                f.update(neo1_digest=(h.get('neo1') or {}).get('digest'), partial=1 if h.get('partial_cells') else 0,
+                         cells_n=int(h['cells_n']), body_offset=int(h['body_offset']), product_version=h.get('product_version'))
+                lag.add(kg)
+            except Exception as ex:  # noqa: BLE001 - mid-write: the next refresh sees it whole
+                log.debug('cells: lagging %s header unreadable: %s', kg, ex)
+    _files_cache.update(t=now, v=v, lag=lag)
     return v
 
 
@@ -720,6 +786,9 @@ def _chunk_rows(r10s: np.ndarray) -> list[dict]:
         for row in c.execute(q, part):
             out.append(dict(zip(('r10', 'kg', 'off', 'len', 'raw_len', 'cells', 'trees', 'bld'), row[:8])))
             idx_mtime[row[1]] = row[8]
+    _files()
+    for kg in _files_cache.get('lag') or ():         # known-lagging files: no index row may exist for a new chunk
+        idx_mtime.setdefault(kg, None)
     return _reconcile_stale_rows(out, idx_mtime, set(ids))
 
 
@@ -755,7 +824,8 @@ def _reconcile_stale_rows(rows: list[dict], idx_mtime: dict, want: set) -> list[
                             'raw_len': int(ch.get('raw_len') or 0), 'cells': int(ch['cells']),
                             'trees': int(ch.get('trees') or 0), 'bld': int(ch.get('bld') or 0)})
                 n += 1
-        log.info('cells: index lags file for %s (file newer) — %d chunk rows served from live header', kg, n)
+        if n:
+            log.info('cells: index lags file for %s (file newer) — %d chunk rows served from live header', kg, n)
     return out
 
 

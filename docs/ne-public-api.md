@@ -503,6 +503,15 @@ apices `/api/v1/trees/bbox` returns by default (`realistic=1`, `min_height=3`). 
   (marker == `write_h3b`'s, body sha equal, old-header reads). Trap: never run `ne_ingest.merge_blocks`
   on a corpus file "to look" — it calls `index_file` on its output and overwrites that KG's index row
   (repair: `cells_api.index_file(data/ne/<kg>.h3b)`).
+
+**Index-lag guard (2026-11-22).** A file newer on disk than its `file` row used to be half-visible:
+`_files()` kept the old digest (no bin / tree-QA / rebin token changed) and chunks the old chunk list
+did not know were in no query (8 files, 8–10 Nov: `ne_ingest`'s dirty-merge swapped a dot-prefixed
+temp into place and never indexed the final path — fixed). Now: (1) `_files()` compares one directory
+scan with the index on its 30 s refresh, takes digest / flags of a lagging file from its live header
+and `_chunk_rows` serves **all** its chunks from the header; (2) `cells_api.reindex_lagging()` runs at
+the start of every `cells-bins` pass (`index_file` → digest, chunk rows, hmax, ALS years); (3) a
+`cells_index:` line appears on `/process.txt` while any file lags. `python3 tests/test_index_lag.py`.
 * **Snapshot race guard** (`tree_qa.sync()`): the per-process snapshot is ≤ 30 s old; before a reader
   builds or replaces a stored product on a generation mismatch (`cells_bins.load_bin`,
   `cells_blocks.serve_block`, and `store_block` always) it stats the store (`version()`), reloads when

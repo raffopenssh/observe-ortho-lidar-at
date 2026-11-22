@@ -20545,6 +20545,16 @@ def process_txt():
             out.append(_tq.text_line())
         except Exception as _e:
             out.append(f'tree_qa: unavailable ({_e})')
+        # cells index: corpus files newer than their index rows (served from the live header until the
+        # hourly cells-bins pass re-indexes them; cells_api.lagging_files) — only shown when there are any
+        try:
+            import cells_api as _ca
+            _lag = _ca.lagging_files(0)
+            if _lag:
+                out.append(f"cells_index: {len(_lag)} file(s) newer than their index rows ({' '.join(_lag[:8])}) — "
+                           'served from the live header; re-indexed by the next cells-bins pass')
+        except Exception as _e:
+            out.append(f'cells_index: unavailable ({_e})')
         # rebin: off-file apices of cell rule rb1 → added trees / twins (rebin_added.py)
         try:
             import rebin_added as _ra
