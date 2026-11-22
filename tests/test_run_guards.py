@@ -177,3 +177,79 @@ def test_neighbour_registration():
 if __name__ == '__main__':
     test_neighbour_registration()
     print('ALL OK')
+
+
+def test_linear_noise_flag():
+    """The processing-time flag marks what the read-time detector marks."""
+    import importlib.util, v21_products as v21, ne_linear as nl
+    spec = importlib.util.spec_from_file_location('t_nl', Path(__file__).resolve().parent / 'test_ne_linear.py')
+    t = importlib.util.module_from_spec(spec); spec.loader.exec_module(t)
+    base = (4_700_000, 2_650_000)
+    ln = t.line(base[0], base[1], 0.3, 300)
+    forest = t.trees(base[0] - 400, base[1] - 400, 200, 200, 600)
+    x, y, h, cr = t.cat(ln, forest)
+    rows = [{'e': float(a) + 0.5, 'n': float(b) + 0.5, 'h_m': float(c), 'crown_area_m2': float(d)}
+            for a, b, c, d in zip(x, y, h, cr)]
+    di = {}
+    n = v21.flag_linear_noise(rows, di)
+    k = ln[0].size
+    assert n >= 0.9 * k and all(r.get('noise') == 'linear' for r in rows[:k] if 'noise' in r)
+    assert not any(r.get('noise') for r in rows[k:]), 'a real tree was flagged'
+    assert di['linear_noise']['runs'] == 1 and di['linear_noise']['n_apices'] == n and di['linear_noise']['len_m'] > 200
+    assert ('noise', 'str') in v21.TREE_APICES_SCHEMA['properties']
+    # layer round trip: the column exists, NULL for ordinary trees
+    import tempfile, fiona
+    with tempfile.TemporaryDirectory() as td:
+        p = str(Path(td) / 'a.gpkg')
+        for i, r in enumerate(rows):
+            r['tree_id'] = f't{i}'
+        assert v21.write_tree_apices(p, rows) == len(rows)
+        with fiona.open(p, layer='tree_apices') as src:
+            got = [f['properties']['noise'] for f in src]
+        assert got.count('linear') == n and got.count(None) == len(rows) - n
+    assert v21.flag_linear_noise([], {}) == 0
+    print('ok linear_noise_flag', n, k)
+
+
+if __name__ == '__main__':
+    test_linear_noise_flag()
+    print('ALL OK')
+
+
+def test_cell_attribution():
+    """merge_blocks records the source product per cell (NEA1 trailer): a sweep
+    unit's cells are the unit's, also through a re-merge and when the parent is
+    an older merge that already holds them."""
+    import tempfile, ne_h3, ne_ingest as ni
+    sw = sorted(Path('data/ne/sweeps').glob('*-sw*.h3b'), key=lambda p: p.stat().st_size)
+    sw = [u for u in sw if Path(f'data/ne/{u.stem.split("-")[0]}.h3b').exists()]
+    if not sw:
+        print('skip cell_attribution (no sweep units on disk)'); return
+    u = sw[0]; kg = u.stem.split('-')[0]; par = Path(f'data/ne/{kg}.h3b')
+    keep_index = ni._index_cells; ni._index_cells = lambda p: None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td); out = td / f'{kg}.h3b'
+            h = ni.merge_blocks(kg, [par, u], td / '.m1.h3b', complete=True)
+            (td / '.m1.h3b').rename(out)
+            names, idx = ne_h3.read_attribution(out)
+            P = ni._read_compact(out, want_rows=False); U = ni._read_compact(u, want_rows=False)
+            pid = ni._lu_ids(P['lu'], idx.size); uid = ni._lu_ids(U['lu'], U['obs'].shape[0])
+            pos = np.searchsorted(pid, uid); pos[pos >= pid.size] = 0
+            same = (pid[pos] == uid) & ni.row_observed(U['obs']) & (P['obs'][pos] == U['obs']).all(axis=1)
+            assert int((idx == 0).sum()) == int((~ni.row_observed(P['obs'])).sum())
+            if same.any():
+                k = names.index(u.stem) + 1
+                assert set(pid[idx == k].tolist()) == set(uid[same].tolist())
+            h2 = ni.merge_blocks(kg, [out, u], td / '.m2.h3b', complete=True)
+            n2, i2 = ne_h3.read_attribution(td / '.m2.h3b')
+            assert [n2[j - 1] if j else None for j in i2] == [names[j - 1] if j else None for j in idx]
+            assert ne_h3.verify_h3b(td / '.m2.h3b')['ok'] and h2['neo1']['digest'] == h['neo1']['digest']
+            print('ok cell_attribution', dict(zip(names, h['attribution']['cells'])))
+    finally:
+        ni._index_cells = keep_index
+
+
+if __name__ == '__main__':
+    test_cell_attribution()
+    print('ALL OK')

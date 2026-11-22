@@ -6168,6 +6168,10 @@ def build_json_summary_tiled(kg_code, kg_info, tile_seg_results, all_objects,
         _di = v21_extras.get("det_info") or {}
         if _di:
             ts_["apex_rejected_by_surface"] = int(_di.get("rejected_by_surface", 0) or 0)
+            if isinstance(_di.get("linear_noise"), dict):
+                # chains of small "trees" under overhead lines, flagged per apex
+                # (tree_apices.noise = 'linear'); nothing is removed from the product
+                ts_["linear_noise"] = _di["linear_noise"]
         summary["methods"]["tree_apices"] = (
             "tree_inventory.build_inventory on the stitched 1 m nDSM (variable-window "
             "local maxima + marker watershed, building-context roof mask, v2 segment stand context); "

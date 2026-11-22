@@ -447,7 +447,9 @@ def merge_blocks(parent: str, block_paths: list[Path], out_path: Path, *, comple
         h = ne_h3.read_h3b_header(p)
         facts.append({"nec1": dict(h["nec1"] or {}), "cells_n": int(h["cells_n"]),
                       "epoch": str((h.get("neo1") or {}).get("epoch") or ""),
-                      "pv": str(h.get("product_version") or ""), "record_bytes": dict(h.get("record_bytes") or {})})
+                      "pv": str(h.get("product_version") or ""), "record_bytes": dict(h.get("record_bytes") or {}),
+                      # an earlier merge without the NEA1 trailer: its rows are of unknown origin
+                      "anon_merge": bool(h.get("merged_from")) and not h.get("attribution")})
         del h
     # Declared layer: all blocks normally share the parent's NEC1.  Since bev
     # mode builds it per block (bevdirect viewport on each peer) they can
@@ -514,6 +516,7 @@ def merge_blocks(parent: str, block_paths: list[Path], out_path: Path, *, comple
     best = np.full(n, -1, np.int64)
     src_row_all = np.arange(n, dtype=np.int64)
     tree_n = np.zeros(n, np.int64); bld_n = np.zeros(n, np.int64)
+    tie_src = np.full(n, -1, np.int64)   # attribution override (see pass 1)
     rekey = {}        # bi → src_row (base index → block row, -1 absent) for disagreeing blocks
 
     # pass 1 — NEO1 only: pick the best-observed block per cell
@@ -558,6 +561,16 @@ def merge_blocks(parent: str, block_paths: list[Path], out_path: Path, *, comple
         seen = row_observed(obs)
         mass = obs[:, 8:17].astype(np.int32).sum(axis=1)
         better = seen & (mass > best)
+        # attribution only: a row an unattributed earlier merge holds byte for
+        # byte is this block's (the merge took it from here) — the pick stays
+        anon = np.array([f2["anon_merge"] for f2 in facts], bool)
+        if anon.any() and not f["anon_merge"]:
+            tie = seen & (pick >= 0) & (mass == best)
+            tie[tie] = anon[pick[tie]]
+            if tie.any():
+                tie[tie] = (obs[tie] == merged_obs[tie]).all(axis=1)
+                tie_src[tie] = bi
+        tie_src[better] = -1
         pick[better] = bi; best[better] = mass[better]
         merged_obs[better] = obs[better]
         tree_n[better] = tn_b[better]; bld_n[better] = bn_b[better]
@@ -596,12 +609,46 @@ def merge_blocks(parent: str, block_paths: list[Path], out_path: Path, *, comple
            "tree_n": np.minimum(tree_n, 255).astype(np.uint8), "bld_n": np.minimum(bld_n, 255).astype(np.uint8),
            "summary": summary}
     pv = sorted({f["pv"] for f in facts})[-1]
+    # per-cell source attribution: the product each picked row came from.  An
+    # input that is itself a merged file (sweep integrate: [parent] + units)
+    # passes its own attribution through, so a unit's cells stay the unit's.
+    attr_hdr = attr_trailer = None
+    try:
+        names = []; name_ix = {}
+        src_ix = np.zeros(n, np.uint16)
+        for bi, p in enumerate(paths):
+            sel = pick == bi
+            if not sel.any():
+                continue
+            own = ne_h3.read_attribution(p)
+            if own is None:
+                lab = [p.stem]; loc = np.ones(int(sel.sum()), np.int64)
+            else:
+                lab = own[0]; loc = own[1][src_row_all[sel]].astype(np.int64)
+            lut = np.zeros(len(lab) + 1, np.uint16)
+            for k in np.unique(loc[loc > 0]).tolist():
+                nm = str(lab[k - 1])
+                if nm not in name_ix:
+                    names.append(nm); name_ix[nm] = len(names)
+                lut[k] = name_ix[nm]
+            src_ix[sel] = lut[loc]
+        for bi in np.unique(tie_src[tie_src >= 0]).tolist():
+            nm = paths[bi].stem
+            if nm not in name_ix:
+                names.append(nm); name_ix[nm] = len(names)
+            src_ix[tie_src == bi] = name_ix[nm]
+        attr_hdr, attr_trailer = ne_h3.attribution_header(names, src_ix)
+    except Exception as ex:  # noqa: BLE001
+        log.warning("ne_ingest: %s: cell attribution skipped: %s", parent, ex)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     hdr = ne_h3.write_h3b(out_path, declared, obs, parent, pv,
                           extra_header={"merged_from": [p.stem for p in paths], "partial_cells": not complete,
                                         "parent_kg": parent, "block": None, "path": "ne_ingest.merge",
                                         "nec1_disagree": disagree or None,
-                                        "nec1_union": union_added or None})
+                                        "nec1_union": union_added or None,
+                                        "attribution": attr_hdr})
+    if attr_trailer:
+        ne_h3.append_attribution(out_path, hdr, attr_trailer)
     chk = ne_h3.verify_h3b(out_path, expected_declared_digest=nec_digest)
     if not chk["ok"]:
         out_path.unlink(missing_ok=True)

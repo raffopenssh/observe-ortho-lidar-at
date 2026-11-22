@@ -805,6 +805,7 @@ def build_tree_apices(ndsm_full: np.ndarray, full_tf, seg_type_full: np.ndarray 
         r["dh_per_year_m"] = (round(float(g) / float(y), 3)
                               if np.isfinite(g) and np.isfinite(y) and y > 0 else None)
         r["als_year"] = None if not np.isfinite(als_year[i]) else int(als_year[i])
+    flag_linear_noise(rows_out, det_info)
     return rows_out
 
 
@@ -818,7 +819,41 @@ TREE_APICES_SCHEMA = {"geometry": "Point", "properties": [
     ("vitality", "str"), ("vitality_conf", "float"), ("species_hint", "str"), ("species_conf", "float"),
     ("ndvi_mean", "float"), ("ndvi_p10", "float"), ("nir_mean", "float"),
     ("brightness_mean", "float"), ("green_ratio_mean", "float"),
-    ("dbh_est_cm", "float"), ("volume_m3_est", "float")]}
+    ("dbh_est_cm", "float"), ("volume_m3_est", "float"),
+    # 2.4+ (docs/linear-noise.md): 'linear' = member of a straight chain of small
+    # "trees" under an overhead line (ne_linear.detect at processing time); NULL otherwise
+    ("noise", "str")]}
+
+def flag_linear_noise(rows: list[dict], det_info: dict | None = None) -> int:
+    """Set ``noise = 'linear'`` on the apex rows that ``ne_linear.detect`` puts
+    on a chain (thin elevated linear object → ridge in the nDSM → a row of
+    "trees").  Same detector, gates and input quantisation (1 m position,
+    0.25 m height, log2/5 crown steps) as the read-time pass over the NE cells,
+    so both mark the same apices.  Nothing is dropped: the flag travels in
+    ``tree_apices.noise`` and ``tree_stats.linear_noise``.  Never raises."""
+    if not rows:
+        return 0
+    try:
+        import ne_linear
+        x = np.floor(np.array([r["e"] for r in rows], np.float64))
+        y = np.floor(np.array([r["n"] for r in rows], np.float64))
+        h = np.clip(np.floor(np.array([r.get("h_m") or 0.0 for r in rows], np.float64) * 4 + 0.5), 0, 255) / 4.0
+        ca = np.array([r.get("crown_area_m2") or 0.0 for r in rows], np.float64)
+        cq = np.clip(np.floor(np.log2(np.maximum(ca, 1.0)) * 5 + 0.5), 0, 63)
+        mask, runs = ne_linear.detect(x, y, h, np.round(np.power(2.0, cq / 5.0), 1))
+        n = int(mask.sum())
+        for i in np.nonzero(mask)[0]:
+            rows[int(i)]["noise"] = "linear"
+        if det_info is not None:
+            det_info["linear_noise"] = {
+                "n_apices": n, "runs": len(runs),
+                "len_m": int(round(sum(float(r.get("len_m") or 0.0) for r in runs))),
+                "detector": f"ne_linear v{ne_linear.VERSION}"}
+        return n
+    except Exception as e:  # noqa: BLE001
+        log.warning("linear-noise flag skipped: %s", e)
+        return 0
+
 
 TREE_CROWNS_SCHEMA = {"geometry": "Polygon", "properties": [("tree_id", "str")]}
 

@@ -442,7 +442,17 @@ def sweep_keep(only=None, max_units: int = 200, quiet: bool = True) -> dict:
         P = ni._read_compact(pp, want_rows=False)
         n = P['obs'].shape[0]; pid = ni._lu_ids(P['lu'], n)
         new = set(); units = {}
+        try:        # files merged since 2026-11-22 say which product each cell came from (NEA1 trailer)
+            import ne_h3
+            att = ne_h3.read_attribution(pp)
+        except Exception:  # noqa: BLE001
+            att = None
         for u in todo:
+            if att is not None and u in att[0]:
+                ids = {int(i) for i in pid[att[1] == att[0].index(u) + 1]}
+                units[u] = len(ids); new |= ids
+                out['attributed'] = out.get('attributed', 0) + 1
+                continue
             up = lm._fetch_block_h3b(u, ent)
             if up is None:
                 out['no_h3b'] += 1

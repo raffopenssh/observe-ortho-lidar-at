@@ -1791,6 +1791,59 @@ def read_h3b_header(path: str | Path) -> dict:
         return json.loads(fh.read(hl).decode("utf-8"))
 
 
+# --- per-cell source attribution (NEA1 trailer) --------------------------------
+# A merged parent file (``ne_ingest.merge_blocks``) is the per-cell pick over its
+# blocks and sliver-sweep units.  Which product a cell's observation came from was
+# not recorded until 2026-11-22 (a KG moved as a whole dragged its sweep-unit cells
+# the wrong way; ``ne_pos_fix.sweep_keep`` had to re-derive them by comparing bytes).
+# The trailer sits AFTER the last chunk, so every reader that follows the header's
+# chunk directory ignores it:  ``NEA1 | u32 zlen | zlib(<u2 per cell)``, value 0 =
+# not observed, k = ``header.attribution.sources[k-1]`` (product codes).
+ATTR_MAGIC = b"NEA1"
+
+
+def attribution_header(names: list, idx: np.ndarray) -> tuple[dict, bytes]:
+    """Header entry + trailer bytes for a per-cell source index (0 = unobserved)."""
+    idx = np.asarray(idx).astype("<u2")
+    z = zlib.compress(idx.tobytes(), 6)
+    cnt = np.bincount(idx, minlength=len(names) + 1)
+    return ({"sources": list(names), "cells": [int(c) for c in cnt[1:len(names) + 1]],
+             "layout": "trailer after the last chunk: NEA1 | u32 zlen | zlib(<u2 per cell); "
+                       "0 = not observed, k = sources[k-1]", "bytes": 8 + len(z)},
+            ATTR_MAGIC + struct.pack("<I", len(z)) + z)
+
+
+def append_attribution(path: str | Path, hdr: dict, trailer: bytes) -> None:
+    end = int(hdr["body_offset"]) + sum(int(c["len"]) for c in hdr["chunks"])
+    with open(path, "r+b") as fh:
+        fh.truncate(end)
+        fh.seek(end)
+        fh.write(trailer)
+
+
+def read_attribution(path: str | Path, hdr: dict | None = None):
+    """``(sources, idx)`` — product code list + per-cell 1-based index into it
+    (0 = unobserved), in the file's cell order — or None for a file without one."""
+    hdr = hdr or read_h3b_header(path)
+    a = hdr.get("attribution")
+    if not isinstance(a, dict) or not a.get("sources"):
+        return None
+    end = int(hdr["body_offset"]) + sum(int(c["len"]) for c in hdr["chunks"])
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(end)
+            head = fh.read(8)
+            if head[:4] != ATTR_MAGIC:
+                return None
+            (zl,) = struct.unpack_from("<I", head, 4)
+            idx = np.frombuffer(zlib.decompress(fh.read(zl)), "<u2")
+    except Exception:  # noqa: BLE001
+        return None
+    if idx.size != int(hdr["cells_n"]):
+        return None
+    return list(a["sources"]), idx
+
+
 def read_h3b_chunk(path: str | Path, hdr: dict, chunk: dict) -> dict:
     """Inflate one chunk → {"lu": bytes, "obs": bytes, "trees": bytes, "bld": bytes}."""
     with open(path, "rb") as fh:
