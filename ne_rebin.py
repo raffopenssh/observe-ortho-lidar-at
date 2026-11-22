@@ -238,6 +238,9 @@ def rebin(src: Source, r10: int, obs: bytes, trees: bytes, rec: int, o_tn: int, 
                 # one-file-per-cell rule of cells_api.lost_cells)
                 keep[idx[sel]] = False
                 n_drop += int((~has).sum())
+                if stats is not None and 'off' in stats and not has.all():
+                    g = sel[~has]               # the caller's list: (source r10, stored row idx, target cell, re-encoded word)
+                    stats['off'].append((r10, idx[g].copy(), tgt[g].copy(), nw[g].copy()))
     in_row = []; in_w = []; in_r = []; in_i = []
     for r in sorted(nb_rows):
         if not src.trees_n(nb_rows[r]):
@@ -266,6 +269,8 @@ def rebin(src: Source, r10: int, obs: bytes, trees: bytes, rec: int, o_tn: int, 
         rank = np.arange(rows_all.size) - np.repeat(np.concatenate([[0], np.cumsum(cnt)[:-1]]), cnt)
         k = rank < 255
         log.warning('ne_rebin: %s/%x: %d apices over the 255-per-cell cap dropped', src.key[0], r10, int((~k).sum()))
+        if stats is not None:
+            stats['capped'] = stats.get('capped', 0) + int((~k).sum())
         rows_all, w_all, s_r, s_i = rows_all[k], w_all[k], s_r[k], s_i[k]
         cnt = np.minimum(cnt, 255)
     ob = np.frombuffer(obs, np.uint8).reshape(-1, rec).copy()
@@ -358,13 +363,16 @@ def bound_hmax(verbose: bool = True) -> dict:
     return {'files': len(kgs), 'chunks_raised': n, 'seconds': round(time.time() - t0, 1)}
 
 
-def check(kg: str) -> dict:
-    """Every apex of a KG as served: is it inside the cell row that lists it?"""
+def scan(kg: str) -> tuple[dict, dict]:
+    """ONE pass over a KG file as served → ``(check dict, off)``; *off* = every apex the cell rule
+    takes out of this file (target cell is no row of it), as columns: ``r10`` / ``idx`` (stored
+    NET1 row), ``cell`` (target res-12), ``x`` / ``y`` (served EPSG:3035 m), ``lon`` / ``lat``
+    (6 dp), ``h_m``, ``crown_m2``, ``species``, ``vitality``, ``ndsm_only``, ``word``."""
     import cells_api as ca
     kg = str(kg).zfill(5)
     hdr = ca.header(kg, with_chunks=True)
     st = {'kg': kg, 'apices': 0, 'outside': 0, 'stored': 0, 'chunks': 0, 'frame': bool(ca._pos_fix.offset(kg))}
-    rs: dict = {}
+    rs: dict = {'off': []}
     for c in hdr['chunks']:
         row = dict(c, r10=int(c['r10'], 16), trees=int(c.get('trees') or 0), bld=int(c.get('bld') or 0))
         st['stored'] += row['trees']
@@ -377,9 +385,28 @@ def check(kg: str) -> dict:
         cen = ch.centres()
         st['apices'] += int(ch.trees.size)
         st['outside'] += int((cells_of_xy(cen[ci, 0] + d['dx'], cen[ci, 1] + d['dy']) != ch.ids[ci]).sum())
-    st.update(moved=rs.get('moved', 0), off_file=rs.get('dropped', 0),
-              ok=st['outside'] == 0 and st['apices'] == st['stored'] - rs.get('dropped', 0))
-    return st
+    parts = rs['off']
+    off = {'r10': np.concatenate([np.full(p[1].size, p[0], np.uint64) for p in parts]) if parts else np.zeros(0, np.uint64),
+           'idx': np.concatenate([p[1] for p in parts]).astype(np.int64) if parts else np.zeros(0, np.int64),
+           'cell': np.concatenate([p[2] for p in parts]).astype(np.uint64) if parts else np.zeros(0, np.uint64),
+           'word': np.concatenate([p[3] for p in parts]).astype(np.uint32) if parts else np.zeros(0, np.uint32)}
+    d = ca.decode_trees(off['word'])
+    ut, inv = np.unique(off['cell'], return_inverse=True)
+    cen = _centres(ut)[inv] if ut.size else np.zeros((0, 2), np.int64)
+    off['x'] = cen[:, 0] + d['dx']; off['y'] = cen[:, 1] + d['dy']
+    lon, lat = _to_wgs(off['x'].astype(np.float64), off['y'].astype(np.float64)) if ut.size else (np.zeros(0), np.zeros(0))
+    off['lon'] = np.round(lon, LL_DECIMALS); off['lat'] = np.round(lat, LL_DECIMALS)
+    for k in ('h_m', 'crown_m2', 'species', 'vitality', 'ndsm_only'):
+        off[k] = d[k]
+    st.update(moved=rs.get('moved', 0), off_file=rs.get('dropped', 0), capped=rs.get('capped', 0),
+              ok=st['outside'] == 0 and st['apices'] == st['stored'] - rs.get('dropped', 0) - rs.get('capped', 0)
+              and off['idx'].size == rs.get('dropped', 0))
+    return st, off
+
+
+def check(kg: str) -> dict:
+    """Every apex of a KG as served: is it inside the cell row that lists it?"""
+    return scan(kg)[0]
 
 
 if __name__ == '__main__':
