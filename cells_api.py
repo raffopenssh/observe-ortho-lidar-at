@@ -721,7 +721,14 @@ class _RebinSource(_rebin.Source):
 
     def stored(self, r10, handle):
         parts, _ = _inflate_parts(self.kg, handle, self.hdr)
-        return parts['obs'], _pos_fix.fix_words(self.kg, parts['trees'], b'')[0]
+        return parts['obs'], _pos_fix.fix_words(self.kg, parts['trees'], b'', lambda: _fix_cells(parts['obs']))[0]
+
+
+def _fix_cells(obs: bytes):
+    """(centres, trees per row, structures per row) of stored NEO1 rows — what ``ne_pos_fix.fix_words``
+    needs to place every word of a partly shifted KG (called for those only)."""
+    o = np.frombuffer(obs, OBS_DT)
+    return _centres_3035(o['id']), o['tn'].astype(np.int64), o['sn'].astype(np.int64)
 
 
 _O_TN = OBS_DT.fields['tn'][1]; _O_THX = OBS_DT.fields['thx'][1]
@@ -751,7 +758,7 @@ def _load_chunk(kg: str, row: dict, hdr: dict, raw: bool = False, qa: bool = Tru
     if raw:
         return Chunk(kg, row, parts)
     # position override for KGs built on 5 m-shifted rasters (ne_pos_fix.py, measured per KG)
-    parts['trees'], parts['bld'] = _pos_fix.fix_words(kg, parts['trees'], parts['bld'])
+    parts['trees'], parts['bld'] = _pos_fix.fix_words(kg, parts['trees'], parts['bld'], lambda: _fix_cells(parts['obs']))
     # cell assignment: apex → the res-12 cell of its served position (ne_rebin.py)
     rb = _rebin.rebin(_RebinSource(kg, hdr), int(row['r10']), parts['obs'], parts['trees'], REC, _O_TN, _O_THX, stats)
     t_src = None

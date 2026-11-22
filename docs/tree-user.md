@@ -158,6 +158,29 @@ Tree / structure positions of a KG can change after a client downloaded them
 Rule: **a report made with any copy lands on the same tree; nothing is dropped;
 a refresh returns today's positions.**
 
+* **Partly shifted KGs** (verdict `partial`, 2026-11-22). The 5 m shift is a
+  property of a *processing tile* (restored without raster sidecar → pasted
+  5 m off; its neighbour not), so a parent can be shifted in some ~1.6 km
+  tiles only — `mixed` / `unclear` in the whole-KG pass, and the source of
+  `rebin_added`'s `dup_shift` pairs. `python3 ne_pos_fix.py --verify-tiles`
+  (throttled on host RX, resumable via entry field `tv`; unit
+  `ne-pos-tiles`) measures one 250 m BEV window in each tile's *core*
+  (inside exactly one tile envelope = no feather blend; windows of the
+  earlier pass that lie in a core are reused for free) and stores `tiles:
+  [[x0,y0,x1,y1, 1 moved | 0 kept | -1 unmeasured]]` (EPSG:3035 envelopes
+  from `kg_v2_store … data_quality.tiles`). Serving: every tree / structure
+  word is tested at its **stored** position — owner tile = highest feather
+  weight, first tile on ties (the mosaic's own rule, `tile_owner`) — and
+  moved only if that tile is `1` (`moved()`, `fix_words(…, cells)`);
+  unmeasured tiles stay. All measured tiles shifted → plain `shift`; none →
+  `zero`. Frame token is the same `p-5+5` (`partial: true` on
+  `/trees/frame` and the flag, which lists `moved_tiles`); the cache tag
+  carries a digest of the tile list. `reframe` / `frame_vote` /
+  `_migrate_stores` / `shift_lonlat_points` / `trees_v3.read_apices` move a
+  stale position only where `moved()` says so. KGs already served moved as
+  a whole are never re-measured automatically (that would be a second
+  frame epoch): `status()['per_tile']['review']`. Test
+  `python3 tests/test_pos_fix_partial.py`.
 * **Record = flag.** One KG-level machine report per decided KG: layer
   `trees`, claim `misplaced`, source `auto-shift`, `expected {hint:"shift",
   applied, moved_m:[dx,dy], crs, frame, since[, until], verdict}`, `observed

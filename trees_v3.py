@@ -299,15 +299,21 @@ def read_apices(path: str, geom_3035, code: str, version: str | None = None) -> 
     out = []
     # KGs built on 5 m-shifted rasters (ne_pos_fix, measured per parent): the product stores every apex
     # `off` away from its true place → select in the stored frame, serve in the true one
-    off = None
+    off = None; part = False
     try:
         import ne_pos_fix
-        off = ne_pos_fix.offset(str(code).split('-')[0])
+        off = ne_pos_fix.any_offset(str(code).split('-')[0])
+        part = off is not None and ne_pos_fix.offset(str(code).split('-')[0]) is None
     except Exception:  # noqa: BLE001
         pass
+    want = None
     if off:
         from shapely.affinity import translate
-        geom_3035 = translate(geom_3035, -off[0], -off[1])
+        if part:        # partly shifted KG: an apex is moved or not by its own stored position
+            want = prep(geom_3035)
+            geom_3035 = geom_3035.union(translate(geom_3035, -off[0], -off[1])).envelope
+        else:
+            geom_3035 = translate(geom_3035, -off[0], -off[1])
     pg = prep(geom_3035)
     with fiona.open(path, layer=v21_products.TREE_APICES_LAYER) as src:
         for f in src.filter(bbox=geom_3035.bounds):
@@ -320,9 +326,20 @@ def read_apices(path: str, geom_3035, code: str, version: str | None = None) -> 
             r["product_version"] = version
             out.append(r)
     canonicalize_rows(out)
+    if want is not None and out:
+        import numpy as _np
+        mv = ne_pos_fix.moved(str(code).split('-')[0], _np.array([r["e"] for r in out]), _np.array([r["n"] for r in out]))
+        keep = []
+        for r, m in zip(out, mv.tolist()):
+            if want.contains(Point(r["e"] + (off[0] if m else 0), r["n"] + (off[1] if m else 0))):
+                r["_mv"] = m
+                keep.append(r)
+        out = keep
     if off:
         import tree_inventory as tv
         for r in out:
+            if not r.pop("_mv", True):
+                continue
             # tree_id_prev = the id (and position) every client copy made before the fix holds;
             # reports sent with it are re-bound by tree_user.reframe
             r["tree_id_prev"] = r.get("tree_id")

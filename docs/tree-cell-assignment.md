@@ -149,6 +149,12 @@ Handling = the off-file pipeline, nothing new on the read path and no change to 
   `dup_shift` when that explains ≥ 20 apices and ≥ 30 % of the pair. The pairs are listed in
   `rebin_added.status()['shifts']` and counted on the `rebin:` line — the to-do list for `ne_pos_fix`
   (once a frame is registered the file token changes and the KG is re-decided by the normal twin rule).
+  **Registered since 2026-11-22**: these are *partly* shifted KGs (22138 = `mixed`, 19731 = `unclear` in
+  the whole-KG pass; their partners are correct). `ne_pos_fix.py --verify-tiles` gives every processing
+  tile its own verdict (verdict `partial`, `docs/tree-user.md → Partly shifted KGs`); its to-do list =
+  the KGs of these pairs first, then all `mixed` / `unclear`. `dup_shift` then only remains for tiles
+  that could not be measured (no trees in the tile) and for pairs whose KG is served moved as a whole
+  (`ne_pos_fix.status()['per_tile']['review']`, by hand).
   In the off-file part the same rule catches frame KGs whose residual is (5, −7) / (7, −5) instead of the
   registered (5, −5): ~5 % of the `other_file` adds at half scan.
 * Found while checking the invariant: KG 01807 had 5 apices neither served nor off-file — its file was

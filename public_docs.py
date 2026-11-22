@@ -491,6 +491,9 @@ IDENTITY — say which tree you mean, in this order of preference:
        /trees/taxa carries frames_rev: when it changes, positions of old rows moved without a new rev → re-read
        from since=0 once. What we did per KG is public: GET /api/v1/flags?source=auto-shift&group=report
        (claim misplaced, expected{{applied, moved_m, frame, since}}); a rejected one is switched off again.
+       A KG can be moved IN PART (frame entry / flag carry partial:true; expected.moved_tiles = EPSG:3035
+       [x0,y0,x1,y1] of the processing tiles whose trees / structures moved): same token, same answers — a stale
+       position outside those tiles is today's position and is filed unmoved.
 
   Read back — cheapest first:
   1. /api/v1/trees/bbox grows ONLY where something was reported (untouched KGs: byte-identical, 1-day cache;

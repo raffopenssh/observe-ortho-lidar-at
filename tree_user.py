@@ -1620,6 +1620,8 @@ def reframe(body: dict, rep: bytes | None = None) -> dict | None:
     px, py = (tid[0] / 10.0, tid[1] / 10.0) if tid else _to_3035(lon, lat)
     tok = body.get('frame')
     by = None; stale = False
+    import ne_pos_fix
+    mv = ne_pos_fix.moves_point(g['kgs'], px, py)     # partly shifted KG: only what its moved tiles own
     if tok not in (None, ''):
         stale, by = str(tok).strip().lower() == g['stale'], 'frame'
     elif body.get('as_of') not in (None, ''):
@@ -1629,7 +1631,7 @@ def reframe(body: dict, rep: bytes | None = None) -> dict | None:
         c = _conn()
         tid_b = (tid[0] + dx * 10, tid[1] + dy * 10) if tid else None
         here = (tid is not None and _id_bound(c, tid, _near_kgs(lon, lat, 3.0))) or _on_apex(px, py)
-        there = (tid is not None and _id_bound(c, tid_b, g['kgs'])) or _on_apex(px + dx, py + dy, g['kgs'])
+        there = mv and ((tid is not None and _id_bound(c, tid_b, g['kgs'])) or _on_apex(px + dx, py + dy, g['kgs']))
         if here != there:
             stale, by = there, 'exact'
         elif here and rep is not None:
@@ -1649,7 +1651,7 @@ def reframe(body: dict, rep: bytes | None = None) -> dict | None:
         body['_fr'] = 3 if here else None
         return out
     body['_fr'] = FR_STALE if stale else FR_CURRENT
-    if not stale:
+    if not stale or not mv:      # a stale copy names an unmoved spot by today's coordinates
         return out
     inv = _tf('EPSG:3035', 'EPSG:4326')
 
@@ -1713,7 +1715,7 @@ def frame_vote(points=None, tree_ids=None) -> dict:
             ns = nc = nb = 0
             for i in idx[::step][:FRAME_VOTE_SAMPLE]:
                 x, y = xy[i]
-                h = _on_apex(x, y); t = _on_apex(x + dx, y + dy, {int(kg)})
+                h = _on_apex(x, y); t = ne_pos_fix.moves_point((kg,), x, y) and _on_apex(x + dx, y + dy, {int(kg)})
                 ns += t and not h; nc += h and not t; nb += h and t
             win = f['stale'] if ns > nc else f['frame']
             hi, lo_ = max(ns, nc), min(ns, nc)
@@ -1729,7 +1731,8 @@ def frame_route():
     from flask import request
     import ne_pos_fix
     if request.method == 'GET':
-        r = pf._resp({'kgs': {k: {'frame': v['frame'], 'stale': v['stale'], 'moved_m': list(v['delta']), 'from': v['from'], 'until': v['until']}
+        r = pf._resp({'kgs': {k: {'frame': v['frame'], 'stale': v['stale'], 'moved_m': list(v['delta']), 'from': v['from'], 'until': v['until'],
+                                  **({'partial': True} if v.get('partial') else {})}
                               for k, v in sorted(ne_pos_fix.all_frames().items())},
                       'frames_rev': frames_rev(), 'default': 'KGs not listed never moved', 'record': '/api/v1/flags?source=auto-shift',
                       'meta': _meta()})
