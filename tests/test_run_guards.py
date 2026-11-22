@@ -253,3 +253,18 @@ def test_cell_attribution():
 if __name__ == '__main__':
     test_cell_attribution()
     print('ALL OK')
+
+
+def test_fetch_shim_signature():
+    """The v2-upgrade Copernicus shim replaces the fresh-run fetcher: it must
+    accept every keyword that one takes (a TypeError = all layers lost)."""
+    import inspect, austria_processor as ap, v2_source as vs
+    a = inspect.signature(ap._fetch_copernicus_for_tile).parameters
+    b = inspect.signature(vs._gpkg_fetch_copernicus).parameters
+    assert any(p.kind == p.VAR_KEYWORD for p in b.values()) or not (set(a) - set(b)), set(a) - set(b)
+    print('ok fetch_shim_signature')
+
+
+if __name__ == '__main__':
+    test_fetch_shim_signature()
+    print('ALL OK')

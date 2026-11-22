@@ -113,9 +113,24 @@ Inputs still moving at that build: `ne_pos_fix` per-tile pass (134 KGs to do),
   `data_quality.tiles[]`, so the next ledger knows the tiles without sampling
   the log.
 * **Open**: 205 tiles unmeasured, 49 mixed + 88 unclear KGs (per-tile pass
-  running). No pre-upload check compares a product with its neighbours'
-  registration — a `v2_verify` check against the overlap with already
-  uploaded neighbours would catch any future whole-product offset.
+  running).
+* **Guard added 2026-11-22** (`tests/test_run_guards.py`):
+  - `v2_verify.check_neighbour_registration` → `neighbour_registration.py`:
+    before upload the product's `terrain.grid25` is compared with up to 6
+    already uploaded neighbours (`_json_v2` straight from Zenodo, ≤ 90 s) over
+    a ±10 m offset search, whole product and per processing tile. Warning
+    only, verdict in `result.v2_verify.neighbour_registration`
+    (`aligned / shifted / tiles-shifted / no-signal / no-neighbours`,
+    `mismatch` = best RMS > 3 m). Known neighbour offsets
+    (`data/grid25_registration.json`) are taken out first. Off:
+    `NEIGHBOUR_REG_CHECK=0`. By hand: `python3 neighbour_registration.py <code>`.
+  - Raster sidecars travel in the checkpoint tar
+    (`tile_checkpoint_registry`, lossless `F32Z1`, pickles first, rasters fill
+    what is left of the 200 MB cap; a tile that does not fit ships its
+    `meta.json` only): a restored tile no longer re-reads DTM/DSM from BEV.
+    Off: `CHKPT_SHIP_RASTERS=0`.
+  - `gpkg_streamed` had its own `_read_dtm_for_tile` with the old `pad=5`
+    (the > 100 Mpx path) — now the shared reader.
 
 ### 2. `pos_sweep_unit` — fresh strip inside a moved KG (found by the ledger)
 
@@ -128,6 +143,15 @@ Inputs still moving at that build: `ne_pos_fix` per-tile pass (134 KGs to do),
   `ne_pos_fix.sweep_keep`: the rows whose merged NEO1 record is byte-identical
   to the unit's are kept. 12149: 1 902 apices in 472 kept rows, all unmoved,
   cell rule intact (`ne_rebin --check`). See *Generations / reprocess / keep cells*.
+* **Guard at merge time, added 2026-11-22**: `ne_ingest.merge_blocks` writes
+  the source product of every cell into the merged file — `NEA1` trailer after
+  the last chunk (`<u2` per cell, zlib; `header.attribution.sources / cells`;
+  `ne_h3.read_attribution`). Readers that follow the chunk directory do not
+  see it; digests are unchanged. It passes through re-merges, and rows that an
+  older, unattributed merge holds byte for byte are credited to the unit they
+  came from. `sweep_keep` reads it instead of fetching units. Existing files
+  get it at their next merge (no backfill run).
+
 ### 3. `grid25_stale` — terrain that BEV no longer serves
 
 * **Symptom**: one processing tile holds terrain that does not match today's
@@ -158,11 +182,17 @@ Inputs still moving at that build: `ne_pos_fix` per-tile pass (134 KGs to do),
   fatal): the detector's edge rule on the product document before upload.
   Real terrain fires it too (553 of 16 775 products, 19 with a stale tile), so
   it only puts a line next to the upload in the log.
-  **Missing**: (a) clip tile rasters to the national outline + buffer at read
-  time (`austria_mask`, exists since c1a818e but only at read time); (b) store
-  the BEV source identity (file URL + ETag / Last-Modified) per tile in
-  `acquisition.tiles[]`, so "upstream changed" is a metadata comparison and
-  not a 13 GB re-read. Both change product content — not done here.
+  **Added 2026-11-22** (both change product content, from the next
+  processed product on): (a) `raster_io.clip_national` — DTM / DSM / nDSM are
+  NaN beyond outline + 100 m at read time (`OUTLINE_CLIP_M`, env `off`
+  disables; also on GPKG-inherited rasters in `v2_source`);
+  `data_quality.tiles[].outline_clip_px` counts the pixels. (b)
+  `raster_io.source_identity` — one HEAD per BEV file (ETag, Last-Modified,
+  size) stored as `data_quality.tiles[].bev_source`, in the sidecar
+  `meta.json` and in the checkpoint tar. A stitch-time re-read compares it:
+  `source_changed: true` on the tile, `source_changed_tiles=` on the sidecar
+  summary line. "Upstream changed" is now a metadata comparison
+  (`raster_io.sources_changed`).
 
 ### 4. `grid25_edge` — step along an internal tile edge
 
@@ -191,7 +221,15 @@ tile without a BEV verdict is the cheapest suspect list. Guard: same as 3.
 * **Root cause**: openEO / tile-store gap at processing time.
 * **Evidence**: 5 products left, all `stuck` (81201-* blocks and others).
 * **Guard**: exists — `product_repair.defects`, `-partial` label, repair
-  probe (26fa14e, 2026-09-23). Open: the 5 stuck ones.
+  probe (26fa14e, 2026-09-23).
+* **The 5 stuck ones (2026-11-22)**: not a cache gap. `v2_source` replaces the
+  processor's `_fetch_copernicus_for_tile` with `_gpkg_fetch_copernicus`
+  during a v2 upgrade; 394887e (11-10) added the keyword `tolerate_miss` to
+  the caller only → `TypeError` on every tile → all four Copernicus layers
+  lost → `-partial` again → 2 attempts → `stuck`, with every cell cached.
+  Fixed (shim takes `**_kw`, `test_fetch_shim_signature`); the 5 codes were
+  reset to `pending` after the rollout. Lesson: a function that is swapped at
+  run time needs a signature test.
 
 ### 7. `linear_noise` — chains of small "trees"
 
@@ -200,9 +238,12 @@ tile without a BEV verdict is the cheapest suspect list. Guard: same as 3.
   apex finder has no shape test.
 * **Evidence**: 1 756 KGs with runs (255 949 apices hidden).
 * **Detected by**: `ne_linear` (4c0e800, 2026-11-11), read time only.
-* **Guard**: missing at processing time. The detector needs only the apex
-  columns, so the next run can call `ne_linear` on the tile's apices inside
-  `v21_products` and write a `noise` flag. Not done here (changes products).
+* **Guard added 2026-11-22**: `v21_products.flag_linear_noise` runs
+  `ne_linear.detect` on the product's apex rows (same quantisation as the NE
+  cells, so both passes mark the same apices) and writes
+  `tree_apices.noise = 'linear'` + `tree_stats.linear_noise {n_apices, runs,
+  len_m, detector}`. Nothing is dropped; the NET1 word has no free bit, so
+  the `.h3b` is unchanged and the read-time pass stays the serving rule.
 
 ### 8. `apex_*` — apices their file cannot serve
 
@@ -275,12 +316,23 @@ corrected **at read time**, each fix keyed to the generation it was measured on:
 
 ## What the next run should do differently (short list)
 
-1. Place every raster by transform (`_align_tdata_to_tile`) — done.
-2. Ship raster sidecars with the checkpoint tar, or accept the re-read but log
-   the tiles (`reread_dtm_tiles=`) — logging done, shipping open.
-3. Record per-tile provenance in the product (`restored`, BEV source identity)
-   — `restored` done, source identity open.
-4. Clip to the national outline at read time — open.
-5. Attribute sweep-unit cells in the merged `.h3b` — open (read-time: keep cells).
-6. Run the detectors' rules before upload as warnings
-   (`check_grid25_tile_edges` done; neighbour registration, linear noise open).
+All items are in the code since 2026-11-22 (`tests/test_run_guards.py`).
+
+1. Place every raster by transform (`_align_tdata_to_tile`) — done, now also
+   in `gpkg_streamed`.
+2. Ship raster sidecars with the checkpoint tar — done
+   (`tile_checkpoint_registry`, `CHKPT_SHIP_RASTERS`).
+3. Record per-tile provenance in the product — done (`restored`,
+   `bev_source`, `stitch_reread`, `source_changed`, `outline_clip_px`).
+4. Clip to the national outline at read time — done (`raster_io.clip_national`).
+5. Attribute sweep-unit cells in the merged `.h3b` — done (`NEA1` trailer).
+6. Run the detectors' rules before upload as warnings — done
+   (`check_grid25_tile_edges`, `check_neighbour_registration`,
+   `flag_linear_noise`).
+7. Every function swapped at run time has a signature test
+   (`test_fetch_shim_signature`) — the cause of the 5 stuck `layer_gap` products.
+
+Not verified on the fleet yet: the first regenerated products after the
+rollout should show `bev_source` in `data_quality.tiles[]`, a
+`neighbour_registration` entry in the verify result and
+`tree_stats.linear_noise`.

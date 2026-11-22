@@ -373,7 +373,11 @@ def _cache_only_fetch(bbox_dict, obs_year, cop_cache, layers):
     return out
 
 
-def _gpkg_fetch_copernicus(bbox_dict, obs_year, cop_cache, report_fn=None, tile_label=""):
+def _gpkg_fetch_copernicus(bbox_dict, obs_year, cop_cache, report_fn=None, tile_label="", **_kw):
+    # **_kw: keyword arguments the fresh-run fetcher gained later (``tolerate_miss``,
+    # 2026-11) — this shim replaces it and must accept the same call.  A TypeError
+    # here cost every tile its four Copernicus layers on each re-upgrade
+    # (5 layer_gap products ``stuck`` after two attempts, 2026-11-20/21).
     g: _Gpkg = _STATE["gpkg"]
     geom = _bbox_wgs_to_3035(bbox_dict)
     b = geom.bounds
