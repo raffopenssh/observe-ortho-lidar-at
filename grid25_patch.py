@@ -19,6 +19,7 @@ resumable (``data/grid25_patches/index.json``).
 
     python3 grid25_patch.py --edge-scan           # local: flag cliff-like internal tile edges (all products)
     python3 grid25_patch.py --scan [--budget-mb-h 150] [--codes a,b] [--max N]
+    python3 grid25_patch.py --scan --seams        # tiles next to a seam of the country seam report
     python3 grid25_patch.py --tile CODE E N       # force-check the tile at an EPSG:3035 point
     python3 grid25_patch.py --status
 
@@ -312,52 +313,128 @@ def _save(doc):
     tmp = INDEX.with_suffix('.tmp'); tmp.write_text(json.dumps(doc, separators=(',', ':'))); os.replace(tmp, INDEX)
 
 
-def process(code, doc, tiles=None, force=False) -> dict:
-    """Check the suspect (or given) tiles of one product; patch the bad ones."""
+GROW_CELLS = 6          # tiles overlap by ~4 cells; "adjacent" = boxes within this many cells
+
+
+def _adjacent(t, u) -> bool:
+    return (t[1] - GROW_CELLS < u[3] and u[1] - GROW_CELLS < t[3]
+            and t[2] - GROW_CELLS < u[4] and u[2] - GROW_CELLS < t[4])
+
+
+def process(code, doc, tiles=None, force=False, check=None) -> dict:
+    """Check the suspect (or given) tiles of one product; patch the bad ones.
+
+    Flood fill (2026-11-22): every tile adjacent to a bad tile is checked as
+    well, until the bad region is enclosed by tiles that match BEV.  Two
+    neighbouring stale tiles agree with each other — no cliff between them,
+    so the edge rule never made the second one a suspect; the first run left
+    a patched tile next to a still-wrong one (Ischgl 84005-southeast: 15
+    seams of 40–110 m).  Earlier verdicts of the product are kept."""
     import grid25_sample as g25
     g = _raw_grid(code)
     if g is None:
         return {'tiles': []}
     g25._drop_zero_fill(g)
     reg = tuple(g25.registration()['map'].get(str(code)) or (0.0, 0.0))
-    res = []; blocks = []; arrs = {}
+    check = check or (lambda t: check_tile(code, g, t, reg))
+    blocks = []; arrs = {}
+    all_tiles = _tiles(code, g)
+    by_idx = {t[0]: t for t in all_tiles}
+    prev = {v['tile']: v for v in ((doc.get('checked') or {}).get(code) or {}).get('tiles') or [] if 'tile' in v}
     if tiles is None:
         tiles = suspects(code, g)
         ed = (doc.get('edges') or {}).get(code)
         if ed:
-            tiles = tiles + [t for t in edge_tiles(code, g, ed) if t not in tiles]
-    todo = list(tiles)
-    verd = [{'v': 'bad', 'forced': True} if force else check_tile(code, g, t, reg) for t in todo]
-    if any(v['v'] == 'bad' for v in verd):
-        # a suspect tile with too few Austrian cells to judge, in a product with proven stale
-        # tiles: rebuild it too (its cells only feed the interpolation along the border)
-        verd = [dict(v, v='bad', by='sibling') if v['v'] == 'unchecked' else v for v in verd]
-    for t, v in zip(todo, verd):
+            tiles = tiles + [t for t in edge_tiles(code, g, ed, all_tiles) if t not in tiles]
+        # products of an earlier run: grow from the tiles already found bad
+        tiles = tiles + [by_idx[i] for i, v in prev.items() if v.get('v') == 'bad' and i in by_idx and by_idx[i] not in tiles]
+    verd = {}                                    # tile index → verdict of THIS call
+    for t in tiles:
+        if force:
+            verd[t[0]] = {'v': 'bad', 'forced': True}
+        elif t[0] in prev and prev[t[0]].get('v') in ('bad', 'ok'):
+            verd[t[0]] = dict(prev[t[0]])
+        else:
+            verd[t[0]] = check(t)
+    while True:
+        bad = [by_idx[i] for i, v in verd.items() if v['v'] == 'bad' and i in by_idx]
+        if bad:
+            # a suspect tile with too few Austrian cells to judge, in a product with proven stale
+            # tiles: rebuild it too (its cells only feed the interpolation along the border)
+            for i, v in verd.items():
+                if v['v'] == 'unchecked':
+                    verd[i] = dict(v, v='bad', by='sibling')
+            bad = [by_idx[i] for i, v in verd.items() if v['v'] == 'bad' and i in by_idx]
+        new = [u for u in all_tiles if u[0] not in verd and any(_adjacent(t, u) for t in bad)]
+        if not new:
+            break
+        for u in new:
+            pv = prev.get(u[0])
+            verd[u[0]] = dict(pv) if pv and pv.get('v') == 'ok' else dict(check(u), by_grow=True)
+    res = []
+    old = (doc.get('patched') or {}).get(code)
+    have = [list(b) for b in old['blocks']] if old and (DIR / f'{code}.npz').exists() else []
+    for i, v in verd.items():
+        t = by_idx.get(i) or next(x for x in tiles if x[0] == i)
         v['tile'] = t[0]; v['rc'] = list(t[1:])
-        if v['v'] == 'bad':
+        if v['v'] == 'bad' and (force or list(t[1:]) not in have):
             _, r0, c0, r1, c1 = t
             e, s = _bev_block(g['x0'] + c0 * CELL, g['y0'] - r0 * CELL, r1 - r0, c1 - c0)
-            i = len(blocks)
-            arrs[f'e{i}'] = np.where(np.isfinite(e), np.round(e * 10), -32768).astype(np.int16)
-            arrs[f's{i}'] = np.where(np.isfinite(s), np.clip(np.round(s), 0, 254), 255).astype(np.uint8)
+            k = len(blocks)
+            arrs[f'e{k}'] = np.where(np.isfinite(e), np.round(e * 10), -32768).astype(np.int16)
+            arrs[f's{k}'] = np.where(np.isfinite(s), np.clip(np.round(s), 0, 254), 255).astype(np.uint8)
             blocks.append([r0, c0, r1, c1])
         res.append(v)
-    ent = {'tiles': res, 'ts': int(time.time()), 'edges_done': bool((doc.get('edges') or {}).get(code))}
+    res += [v for i, v in prev.items() if i not in verd]
+    ent = {'tiles': res, 'ts': int(time.time()), 'edges_done': bool((doc.get('edges') or {}).get(code)), 'grown': True}
     doc.setdefault('checked', {})[code] = ent
     if blocks:
         DIR.mkdir(parents=True, exist_ok=True)
-        old = (doc.get('patched') or {}).get(code)
-        if old and (DIR / f'{code}.npz').exists():       # keep earlier blocks of the same product
+        if have:                                         # keep earlier blocks of the same product
             z = np.load(DIR / f'{code}.npz')
-            keep = [(b, z[f'e{j}'], z[f's{j}']) for j, b in enumerate(old['blocks']) if b not in blocks]
+            keep = [(b, z[f'e{j}'], z[f's{j}']) for j, b in enumerate(old['blocks']) if list(b) not in blocks]
             for b, e_, s_ in keep:
-                i = len(blocks); arrs[f'e{i}'] = e_; arrs[f's{i}'] = s_; blocks.append(b)
+                i = len(blocks); arrs[f'e{i}'] = e_; arrs[f's{i}'] = s_; blocks.append(list(b))
         tmp = DIR / f'.{code}.tmp.npz'
         np.savez_compressed(tmp, **arrs); os.replace(tmp, DIR / f'{code}.npz')
         doc.setdefault('patched', {})[code] = {'grid': [float(g['x0']), float(g['y0']), g['elev'].shape[0], g['elev'].shape[1]],
                                                'blocks': blocks, 'ts': int(time.time())}
         doc['dirty'] = True
     return ent
+
+
+def seam_tiles(report=None) -> dict:
+    """{code: [tile, …]} — processing tiles within ``GROW_CELLS`` of a seam of
+    the country seam report that carry no BEV verdict yet (local, no network).
+    A seam is the visible end of a stale tile the two DTM-domain rules missed
+    (whole product stale, or stale tile on the product rim)."""
+    import math
+    import grid25_sample as g25
+    import hillshade_tiles as hs
+    import search_index as si
+    rep = report if report is not None else json.loads((DIR.parent / 'hillshade_seam_report.json').read_text())
+    ch = _index().get('checked') or {}
+    tf = hs._to3035(); out = {}
+    regm = g25.registration()['map']
+    for s in rep.get('seams') or []:
+        z, x, y = map(int, s['tile'].split('/')); r, c = s['px']; n = 2 ** z
+        lon = (x + (c + .5) / 256) / n * 360 - 180
+        lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + (r + .5) / 256) / n))))
+        E, N = tf.transform(lon, lat)
+        for kg in si.get_index().kgs_in_bbox(lon - .002, lat - .002, lon + .002, lat + .002):
+            import kg_v2_store as kvs
+            for code in kvs.codes_for_parent(kg) or []:
+                g = _raw_grid(code)
+                if g is None:
+                    continue
+                off = regm.get(str(code)) or (0.0, 0.0)
+                cc = (E - off[0] - g['x0']) / CELL; rr = (g['y0'] - (N - off[1])) / CELL
+                done = {v.get('tile') for v in (ch.get(code) or {}).get('tiles') or [] if v.get('v') in ('ok', 'bad')}
+                for t in _tiles(code, g):
+                    if (t[1] - GROW_CELLS <= rr < t[3] + GROW_CELLS and t[2] - GROW_CELLS <= cc < t[4] + GROW_CELLS
+                            and t[0] not in done and t not in out.get(code, [])):
+                        out.setdefault(code, []).append(t)
+    return out
 
 
 def candidates() -> list:
@@ -382,23 +459,28 @@ def candidates() -> list:
     return out
 
 
-def scan(budget_mb_h=150.0, codes=None, max_n=None, quiet=False) -> dict:
+def scan(budget_mb_h=150.0, codes=None, max_n=None, quiet=False, seams=False) -> dict:
     import psutil
     doc = dict(_index()) or {'version': 0, 'checked': {}, 'patched': {}}
+    by_seam = {}
+    if seams:
+        by_seam = seam_tiles(); codes = sorted(by_seam)
     if codes is None:
         codes = doc.get('candidates')
         if not codes:
             codes = candidates(); doc['candidates'] = codes; _save(doc)
         codes = sorted(set(codes) | set(doc.get('edges') or {}))
     todo = [c for c in codes if c not in (doc.get('checked') or {})
-            or ((doc.get('edges') or {}).get(c) and not doc['checked'][c].get('edges_done'))]
+            or ((doc.get('edges') or {}).get(c) and not doc['checked'][c].get('edges_done'))
+            or (c in (doc.get('patched') or {}) and not doc['checked'][c].get('grown'))
+            or c in by_seam]
     if max_n:
         todo = todo[:max_n]
     t0 = time.time(); n0 = psutil.net_io_counters().bytes_recv
     for code in todo:
         b0 = psutil.net_io_counters().bytes_recv
         try:
-            ent = process(code, doc)
+            ent = process(code, doc, tiles=by_seam.get(code))
         except Exception as e:  # noqa: BLE001
             print(code, 'ERR', repr(e)[:200], file=sys.stderr, flush=True)
             continue
@@ -421,7 +503,8 @@ if __name__ == '__main__':
     def _arg(n, d, t):
         return t(sys.argv[sys.argv.index(n) + 1]) if n in sys.argv else d
     if '--scan' in sys.argv:
-        print(json.dumps(scan(_arg('--budget-mb-h', 150.0, float), _arg('--codes', None, lambda s: s.split(',')), _arg('--max', None, int))))
+        print(json.dumps(scan(_arg('--budget-mb-h', 150.0, float), _arg('--codes', None, lambda s: s.split(',')), _arg('--max', None, int),
+                              seams='--seams' in sys.argv)))
     elif '--edge-scan' in sys.argv:
         print(json.dumps(edge_scan()))
     elif '--tile' in sys.argv:

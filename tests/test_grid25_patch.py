@@ -66,3 +66,20 @@ assert (sx(int(w[0]) & 31), sx((int(w[0]) >> 5) & 31), int(w[0]) >> 10) == (-4, 
 assert pf.fix_words('00002', t, b) == (t, b) and pf.fix_words('99999', t, b) == (t, b)
 assert pf.tag('00001') == '|p-5+5' and pf.tag('00002') == '' and pf.offset('1') == (-5, 5)
 print('ok')
+
+# 5) flood fill: a tile adjacent to a bad tile is checked too, earlier verdicts are kept
+T = [(1, 0, 0, 60, 60), (2, 0, 56, 60, 116), (3, 0, 112, 60, 172), (4, 0, 168, 60, 228)]
+gp._raw_grid = lambda code: {'elev': np.full((60, 228), 500.0, np.float32), 'x0': 0.0, 'y0': 0.0}
+gp._tiles = lambda code, g: T
+gp._bev_block = lambda x0, y0, rows, cols: (np.full((rows, cols), 400.0, np.float32), np.zeros((rows, cols), np.float32))
+asked = []
+def chk(t):
+    asked.append(t[0]); return {'v': 'bad' if t[0] in (1, 2) else 'ok', 'n': 9, 'med': 100.0 if t[0] in (1, 2) else 0.0}
+doc = {'checked': {'f': {'tiles': [{'v': 'ok', 'tile': 4, 'rc': [0, 168, 60, 228]}]}}, 'patched': {}}
+ent = gp.process('f', doc, tiles=[T[0]], check=chk)
+assert asked == [1, 2, 3], asked                       # 2 = neighbour of bad 1, 3 = neighbour of bad 2, 4 never
+assert {v['tile']: v['v'] for v in ent['tiles']} == {1: 'bad', 2: 'bad', 3: 'ok', 4: 'ok'} and ent['grown']
+assert sorted(doc['patched']['f']['blocks']) == [[0, 0, 60, 60], [0, 56, 60, 116]] and doc['dirty']
+asked.clear(); gp.process('f', doc, check=chk)       # re-run: nothing re-read, nothing re-built
+assert asked == [] and len(doc['patched']['f']['blocks']) == 2
+print('ok flood fill')

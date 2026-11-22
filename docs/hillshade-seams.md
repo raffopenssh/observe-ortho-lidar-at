@@ -112,6 +112,18 @@ the DTM's own 25 m domain:
   version bump per scan that changed something. This also repairs the
   5 m-shifted tiles of *mixed* products and corrupt tiles (90102).
 * `--tile CODE E N [--force]` for a spot reported by hand.
+* **Flood fill** (2026-11-22): every tile adjacent to a bad tile is checked
+  too, until the bad region is enclosed by tiles matching BEV (`grown` in
+  `checked`). Two neighbouring stale tiles agree with each other, so the
+  edge rule never flagged the second: the first run left patched tiles next
+  to still-wrong ones (Ischgl 84005-southeast: stored terrain 150–600 m off,
+  39 of the 61 seams of the first country check). Earlier verdicts are kept;
+  a re-run re-reads nothing.
+* `--scan --seams` (manual, after a country seam check): tiles within 6
+  cells of a reported seam without a BEV verdict. Run of 2026-11-22: grow
+  191 → 268 tiles, seams +6 tiles in 5 more products (49 products, 274
+  tiles, ~1 GB BEV). Seams that survive both are product-rim steps of
+  0.5 m class or real terrain — not repairable without a reprocess.
 * TileJSON `tile_edge_check` = `{edges_open, products_patched, tiles_patched, …}`;
   remaining pixel-rule seams: `/tiles/hillshade/seams.json` (tile + row/col).
 
