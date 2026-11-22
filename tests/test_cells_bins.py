@@ -107,12 +107,12 @@ def test_block_geometry():
 
 def test_block_container_roundtrip(monkeypatch):
     """serve_block = NEXB header + 16 frames, each byte-identical to encode() of the bin."""
-    def fake_load(i, j, rebuild=False, need=None):
+    def fake_load(i, j, rebuild=False, need=None, build=True):
         n = 3
         ids = np.array([i * 100 + j * 10 + k for k in range(n)], '<u8')
         cols = {'id': ids, 'obs': np.ones(n, np.uint8), 'elev_mean': np.full(n, i, '<u2')}
         hdr = {'n': n, 'gen': f'g{i}_{j}', 'epoch': '2026-10', 'kgs': [f'{i}'], 'complete': True}
-        return hdr, cols, {'missing': [], 'partial_files': []}
+        return hdr, cols, {'missing': [], 'partial_files': [], 'gen': hdr['gen']}
     monkeypatch.setattr(cb, 'load_bin', fake_load)
     monkeypatch.setattr(cb.ca, '_with_epoch', lambda hx, v=None: dict(hx, **({'X-Cells-Epoch': v} if v else {})))
     body, hx, etag, entries = cb.serve_block(163, 482, ['elev_mean'], 'delta_u64')

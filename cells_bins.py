@@ -697,12 +697,67 @@ def stored_gen(i: int, j: int) -> str | None:
 
 COMPAT_ALGOS = ('nex-1',)        # older on-disk blobs still served for field lists they contain
 
+# === SECTION: demand queue (request path never builds a bin with products) ===
+# A request that meets a missing / stale bin does not build it (1–3 s each, 16 per block, in a
+# 2-worker gunicorn): it answers the stored previous generation (``X-Cells-Stale: 1``) or 503 +
+# Retry-After and drops a marker file here.  ``cells-want.path`` starts ``cells-bins.service`` on a
+# non-empty directory; the builder takes these blocks first (``prewarm`` → wanted blocks).
+WANT_DIR = ca.NE_DIR / 'nexb' / 'want'
+BUILD_RETRY_S = 120              # Retry-After of a 503 / stale answer
+STALE_MAX_AGE = 120              # Cache-Control max-age of a stale answer
 
-def load_bin(i: int, j: int, *, rebuild: bool = False, need=None) -> tuple[dict, 'OrderedDict[str, np.ndarray]', dict]:
+
+def want_block(bi: int, bj: int) -> None:
+    p = WANT_DIR / f'{bi}_{bj}'
+    try:
+        if not p.exists():
+            WANT_DIR.mkdir(parents=True, exist_ok=True)
+            p.touch()
+    except OSError as e:
+        log.debug('cells_bins: want %s: %s', p, e)
+
+
+def wanted_blocks() -> list[tuple[int, int]]:
+    """Blocks asked for by requests, oldest first."""
+    try:
+        ps = sorted(WANT_DIR.iterdir(), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return []
+    out = []
+    for p in ps:
+        try:
+            bi, bj = (int(x) for x in p.name.split('_'))
+            out.append((bi, bj))
+        except ValueError:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    return out
+
+
+def unwant_block(bi: int, bj: int) -> None:
+    try:
+        (WANT_DIR / f'{bi}_{bj}').unlink()
+    except OSError:
+        pass
+
+
+def building_error(bi: int, bj: int) -> 'ca.CellsError':
+    return ca.CellsError(503, f'block {bi},{bj} is being built — retry after {BUILD_RETRY_S} s', building=True,
+                         block=[bi, bj], retry_after_s=BUILD_RETRY_S)
+
+
+def load_bin(i: int, j: int, *, rebuild: bool = False, need=None, build: bool = True) -> tuple[dict, 'OrderedDict[str, np.ndarray]', dict]:
     """Current blob for a bin: memory → disk (if its gen matches) → build.
     Returns (hdr, cols, inputs).  A blob of an older algo is accepted (its
     columns are byte-identical) unless a column in ``need`` is absent from it —
-    then it is rebuilt in place (and the prewarm rebuilds all of them anyway)."""
+    then it is rebuilt in place (and the prewarm rebuilds all of them anyway).
+
+    ``build=False`` (request path): a bin with published products underneath is never built
+    here — the stored previous generation is returned as is (``hdr['gen']`` != ``inp['gen']``,
+    callers flag it stale) or :func:`building_error` (503) is raised; the block is queued
+    (:func:`want_block`).  Bins without products are cheap and still built on the spot."""
     need = tuple(need or ())
     for attempt in (0, 1):
         inp = bin_inputs(i, j)
@@ -718,15 +773,23 @@ def load_bin(i: int, j: int, *, rebuild: bool = False, need=None) -> tuple[dict,
             hit = None if rebuild else _blob_lru.get(key)
             if hit is not None and ok(*hit):
                 return hit[0], hit[1], inp
-            p = _path(i, j)
+            p = _path(i, j); old = None
             if not rebuild and p.exists():
                 try:
                     hdr, cols = decode(zlib.decompress(p.read_bytes()))
                     if ok(hdr, cols):
                         _blob_lru.put(key, (hdr, cols))
                         return hdr, cols, inp
+                    old = (hdr, cols)
                 except Exception as e:  # noqa: BLE001
                     log.warning('cells_bins: unreadable %s: %s', p, e)
+            if not build and not rebuild and inp['on_disk']:
+                if attempt == 0 and _tree_qa.sync():
+                    continue
+                want_block(i // BLOCK_N, j // BLOCK_N)
+                if old is not None and old[0].get('algo') in (ALGO, *COMPAT_ALGOS) and all(f in old[1] for f in need):
+                    return old[0], old[1], inp
+                raise building_error(i // BLOCK_N, j // BLOCK_N)
             # about to build and replace the stored blob: never on a stale tree-QA snapshot
             # (tree_qa.sync — the blob on disk may be the refresher's newer generation)
             if attempt == 0 and _tree_qa.sync():
@@ -735,7 +798,7 @@ def load_bin(i: int, j: int, *, rebuild: bool = False, need=None) -> tuple[dict,
             hdr, cols = b['hdr'], b['cols']
             try:
                 BIN_DIR.mkdir(parents=True, exist_ok=True)
-                tmp = p.with_suffix('.tmp')
+                tmp = p.with_suffix(f'.{os.getpid()}.tmp')
                 tmp.write_bytes(zlib.compress(encode(hdr, cols, None, 'delta_u64'), 6))
                 os.replace(tmp, p)
                 with _stored_gen_guard:
@@ -763,7 +826,7 @@ def thx_from_lists(cols) -> np.ndarray:
 def _store_blob(i: int, j: int, hdr: dict, cols) -> None:
     p = _path(i, j)
     BIN_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix('.tmp')
+    tmp = p.with_suffix(f'.{os.getpid()}.tmp')
     tmp.write_bytes(zlib.compress(encode(hdr, cols, None, 'delta_u64'), 6))
     os.replace(tmp, p)
     with _stored_gen_guard:
@@ -949,16 +1012,23 @@ def _kgs_of_bin_sorted(inp):
     return inp['kgs']
 
 
-def serve(i: int, j: int, fields: list[str], ids_enc: str, *, rebuild: bool = False) -> tuple[bytes, dict, str]:
+def _stale_hx(hx: dict, gen_now: str) -> dict:
+    hx['X-Cells-Stale'] = '1'; hx['X-Cells-Gen-Current'] = gen_now; hx['Retry-After'] = str(BUILD_RETRY_S)
+    return hx
+
+
+def serve(i: int, j: int, fields: list[str], ids_enc: str, *, rebuild: bool = False, build: bool = True) -> tuple[bytes, dict, str]:
     """→ (body, headers, etag) for a bin request.  Only the ETag check needs
     the generation; the blob is read lazily (304 never touches it)."""
-    hdr, cols, inp = load_bin(i, j, rebuild=rebuild, need=fields)
+    hdr, cols, inp = load_bin(i, j, rebuild=rebuild, need=fields, build=build)
     body = encode(hdr, cols, fields, ids_enc)
     etag = bin_etag(hdr['gen'], fields, ids_enc)
     hx = {'X-Cells-Gen': hdr['gen'], 'X-Cells-Bin': f'{i},{j}',
           'X-Cells-Record': f'nex1/{ALGO}', 'X-Cells-Kgs': ','.join(hdr.get('kgs') or []),
           'X-Cells-Fields': ','.join(fields), 'X-Cells-Layout': f'nex1={hdr["n"]}'}
     hx = ca._with_epoch(hx, hdr.get('epoch'))  # empty bin → corpus epoch pin, never 'None'
+    if hdr['gen'] != inp['gen']:
+        _stale_hx(hx, inp['gen'])
     return body, hx, etag
 
 
@@ -972,7 +1042,7 @@ def quick_block_etag(bi: int, bj: int, fields: list[str], ids_enc: str) -> tuple
     return block_etag(block_gen([x['gen'] for x in inps]), fields, ids_enc), inps
 
 
-def serve_block(bi: int, bj: int, fields: list[str], ids_enc: str, *, rebuild: bool = False) -> tuple[bytes, dict, str, list[dict]]:
+def serve_block(bi: int, bj: int, fields: list[str], ids_enc: str, *, rebuild: bool = False, build: bool = True) -> tuple[bytes, dict, str, list[dict]]:
     """``block=1``: the 16 bins of a 0.1° block in one body.
 
     Container ``NEXB`` (little-endian)::
@@ -986,9 +1056,10 @@ def serve_block(bi: int, bj: int, fields: list[str], ids_enc: str, *, rebuild: b
     (:func:`block_bins`).  ``header.gen`` = sha256 of the 16 bin generations.
     → (body, headers, etag, inputs)."""
     frames = []; entries = []; gens = []; kgs = set(); epochs = []; partial = False
-    off = 0
+    off = 0; gens_now = []
     for i, j in block_bins(bi, bj):
-        hdr, cols, inp = load_bin(i, j, rebuild=rebuild, need=fields)
+        hdr, cols, inp = load_bin(i, j, rebuild=rebuild, need=fields, build=build)
+        gens_now.append(inp['gen'])
         fb = encode(hdr, cols, fields, ids_enc)
         entries.append({'i': i, 'j': j, 'off': off, 'len': len(fb), 'gen': hdr['gen'], 'n': int(hdr['n']),
                         'complete': bool(hdr.get('complete'))})
@@ -1011,6 +1082,8 @@ def serve_block(bi: int, bj: int, fields: list[str], ids_enc: str, *, rebuild: b
     hx = ca._with_epoch(hx, max(epochs) if epochs else None)
     if partial:
         hx['X-Cells-Partial'] = '1'
+    if gens_now != gens:
+        _stale_hx(hx, block_gen(gens_now))
     return body, hx, etag, entries
 
 
@@ -1098,6 +1171,28 @@ def builder_status() -> dict:
             'complete': missing == 0 and stale == 0, 'generation': m['generation'], 'last_run': st or None}
 
 
+def build_block_unit(bi: int, bj: int) -> dict:
+    """One builder unit (runs in a pool process): every bin of the block whose stored generation
+    is not current, then every prewarm field set of the block that is not current; clears the
+    block's demand marker."""
+    if __name__ != 'cells_bins':                     # run as a script: use the importable module's caches
+        import cells_bins
+        return cells_bins.build_block_unit(bi, bj)
+    import cells_blocks
+    nb = 0
+    for i, j in block_bins(bi, bj):
+        if stored_gen(i, j) != bin_inputs(i, j)['gen']:
+            load_bin(i, j); nb += 1
+    nblk = 0
+    for fs in cells_blocks.prewarm_fieldsets():
+        gen, _ = cells_blocks.current_gen(bi, bj)
+        meta = cells_blocks.stored_meta(bi, bj, fs)
+        if not (cells_blocks._meta_ok(meta) and meta.get('gen') == gen):
+            cells_blocks.store_block(bi, bj, fs); nblk += 1
+    unwant_block(bi, bj)
+    return {'bins': nb, 'blocks': nblk}
+
+
 def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | None = None, jobs: int = 1,
             blocks: bool = True) -> dict:
     """Build / refresh every manifest bin whose stored generation is not current.
@@ -1106,15 +1201,64 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
     runs with a 30 min budget until all of Austria is on disk).  The on-disk
     generation is read from the blob header only (:func:`stored_gen`), so a
     pass over an all-current corpus costs ~2 s."""
+    from collections import deque
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, wait, FIRST_COMPLETED
+    import multiprocessing
+    t00 = time.time()
+    n_built = 0; n_err = 0; n_units = 0; n_blk = 0; n_wanted = 0; stop = False
+    submitted: set = set()
+    # block units run in spawned processes (the build is pure-python heavy → threads share one core)
+    ex = (ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context('spawn'))
+          if jobs > 1 else ThreadPoolExecutor(max_workers=1))
+
+    def run_units(order, deadline, wanted_only=False):
+        """Build block units: blocks asked for by requests first (re-read before every submit),
+        then ``order``.  Stops submitting at ``deadline``."""
+        nonlocal n_built, n_err, n_units, n_blk, n_wanted, stop
+        pending = deque(order); inflight = {}
+        while True:
+            while len(inflight) < max(1, jobs):
+                if deadline is not None and time.time() > deadline:
+                    stop = True
+                    break
+                nxt = next((w for w in wanted_blocks() if w not in submitted), None)
+                if nxt is not None:
+                    n_wanted += 1
+                else:
+                    while pending and pending[0] in submitted:
+                        pending.popleft()
+                    if not pending or wanted_only:
+                        break
+                    nxt = pending.popleft()
+                    if limit and n_units >= limit:
+                        break
+                submitted.add(nxt); inflight[ex.submit(build_block_unit, *nxt)] = nxt
+            if not inflight:
+                return
+            for f in wait(list(inflight), return_when=FIRST_COMPLETED)[0]:
+                bij = inflight.pop(f)
+                try:
+                    r = f.result(); n_built += r['bins']; n_blk += r['blocks']; n_units += 1
+                    if verbose and n_units % 10 == 0:
+                        print(f'  units {n_units} (bins {n_built}, blocks {n_blk}, wanted {n_wanted}) … {time.time() - t00:.0f}s', flush=True)
+                except Exception as e:  # noqa: BLE001
+                    n_err += 1; unwant_block(*bij)       # never loop on a failing block
+                    log.warning('cells_bins: prewarm block %s: %s', bij, e)
+
+    # phase W: blocks a request is waiting for (cells-want.path started us) — before anything else
+    run_units([], None if budget_s is None else t00 + budget_s, wanted_only=True)
+    m = manifest(); b = m['bins']
+    n_todo0 = sum(1 for i, j, g in zip(b['i'], b['j'], b['gen']) if stored_gen(i, j) != g)
     # phase 0 (tree_qa): re-evaluate the default tree filter where its inputs changed and patch
-    # the affected cells inside the stored bins + re-store their blocks (≤ 50 % of the budget)
-    tq = None; t00 = time.time()
+    # the affected cells inside the stored bins + re-store their blocks (≤ 50 % of the budget;
+    # ≤ 20 % while a national bin rebuild is under way — the rebuild bakes the current store in)
+    tq = None; tq_frac = 0.2 if n_todo0 > 1000 else 0.5
     try:                                             # files written without their index_file (see ca.lagging_files)
         ca.reindex_lagging()
     except Exception as e:  # noqa: BLE001
         log.warning('cells_bins: reindex_lagging: %s', e)
     try:
-        tq = _tree_qa.refresh(None if budget_s is None else budget_s * 0.5, None, verbose=verbose)
+        tq = _tree_qa.refresh(None if budget_s is None else budget_s * tq_frac, None, verbose=verbose)
     except Exception as e:  # noqa: BLE001
         log.warning('cells_bins: tree_qa refresh: %s', e); tq = {'error': str(e)}
     # phase 0b: header marker (net1.tree_rule) for corpus files written before the writer set it —
@@ -1125,51 +1269,29 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
         log.warning('cells_bins: tree_qa mark_files: %s', e)
     if budget_s is not None:
         budget_s = max(30.0, budget_s - (time.time() - t00))
-    from concurrent.futures import ThreadPoolExecutor
+    # phase 1: every block with a missing / stale manifest bin, as one unit = its bins + every
+    # prewarm field set of the block (so a rebuilt block is servable at once, not after the
+    # whole bin pass).  Blocks with missing bins first, then stale ones.
     m = manifest(); b = m['bins']
     t0 = time.time()
-    todo_missing = []; todo_stale = []; n_ok = 0
+    n_missing = n_stale = n_ok = 0; blk_missing: dict = {}; blk_stale: dict = {}
     for i, j, g in zip(b['i'], b['j'], b['gen']):
         sg = stored_gen(i, j)
         if sg == g:
             n_ok += 1
         elif sg is None:
-            todo_missing.append((i, j))
+            n_missing += 1; blk_missing[(i // BLOCK_N, j // BLOCK_N)] = 1
         else:
-            todo_stale.append((i, j))
-    todo = todo_missing + todo_stale
-    if limit:
-        todo = todo[:limit]
-    n_built = 0; n_err = 0; stop = False
-    lock = threading.Lock()
-
-    def one(ij):
-        nonlocal n_built, n_err, stop
-        if stop or (budget_s and time.time() - t0 > budget_s):
-            stop = True
-            return
-        try:
-            load_bin(*ij)       # stale → built
-            with lock:
-                n_built += 1
-                if verbose and n_built % 50 == 0:
-                    print(f'  built {n_built}/{len(todo)} (+{n_ok} current) … {time.time() - t0:.0f}s', flush=True)
-        except Exception as e:  # noqa: BLE001
-            with lock:
-                n_err += 1
-            log.warning('cells_bins: prewarm %d_%d: %s', ij[0], ij[1], e)
-
-    if jobs > 1:
-        with ThreadPoolExecutor(max_workers=jobs) as ex:
-            list(ex.map(one, todo))
-    else:
-        for ij in todo:
-            one(ij)
-            if stop:
-                break
+            n_stale += 1; blk_stale[(i // BLOCK_N, j // BLOCK_N)] = 1
+    order = list(blk_missing) + [k for k in blk_stale if k not in blk_missing]
+    try:
+        run_units(order, None if budget_s is None else t0 + budget_s)
+    finally:
+        ex.shutdown(wait=True)
     out = {'bins': m['n'], 'built': n_built, 'errors': n_err, 'current_before': n_ok,
-           'missing_before': len(todo_missing), 'stale_before': len(todo_stale),
-           'remaining': len(todo_missing) + len(todo_stale) - n_built,
+           'missing_before': n_missing, 'stale_before': n_stale,
+           'remaining': max(0, n_missing + n_stale - n_built), 'block_units': n_units, 'unit_blocks_stored': n_blk,
+           'wanted_built': n_wanted, 'wanted_open': len(wanted_blocks()),
            'budget_s': budget_s, 'stopped_on_budget': bool(stop), 'seconds': round(time.time() - t0, 1),
            'finished_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'generation': m['generation']}
     # phase 2 + 3 (cells_blocks): prebuilt NEXB v2 blocks, then the national

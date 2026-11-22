@@ -183,6 +183,13 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
     Check n / ids_xor against your enumeration; on mismatch re-request with ids=1 (NEXB v1 frames with ids, unchanged).
     Prebuilt on disk and served zstd (send Accept-Encoding: zstd; else inflated + gzip): ≈ 0.7–1.1 MB per block
     for the 9 glyph fields, < 100 ms warm. ETag "B-<gen>-<hash>", X-Cells-Gen, X-Cells-Epoch, X-Cells-Ids: bitmap.
+    Latency contract (2026-11-22): a bin/block request is never built inside the request. While a block is being
+    rebuilt (new generation after a product / tree-QA change) you get the stored previous generation at once:
+    200 + X-Cells-Stale: 1, its own ETag (304 works), X-Cells-Gen = the served gen, X-Cells-Gen-Current = the one
+    being built, Retry-After: 120, Cache-Control max-age=120. Nothing stored for that block + field set →
+    503 + Retry-After: 120 ({{"building": true}}), answered in milliseconds. Either answer queues the block; the
+    builder takes queued blocks first (≈ 1–2 min). The glyph set and glyph + tree_h are prebuilt for every block;
+    a subset of a prebuilt set is sliced from it (same bytes and ETag as its own build). rebuild=1 is ignored.
     Manifest: GET /api/v1/cells/blocks?fields=… → columns {{bi, bj, gen, etag, bytes, stored, current, n, bins_n,
     complete}} (bytes null until prebuilt for that field set); epoch= must equal X-Cells-Epoch (else 409).
   /api/v1/cells/sample?res=10&format=bin[&fields=glyph|default|*|a,b,…]  → the NATIONAL SAMPLE for the glyph

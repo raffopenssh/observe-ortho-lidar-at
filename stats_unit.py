@@ -710,7 +710,7 @@ def _cells_meta_from_ids(ids: np.ndarray) -> tuple[str, int, tuple, str]:
 
 def cells_meta_for_body(raw: bytes, encoding: str | None) -> tuple[str, int, tuple, str, np.ndarray | None]:
     """(h, n, bbox, fp, ids|None) — ids is None when the raw body was seen before
-    on this worker (no re-parse: the list hash alone addresses cache + job)."""
+    on this worker (no re-parse: the list hash alone keys cache + job)."""
     bh = hashlib.sha256(raw).hexdigest()
     with _mem_lock:
         hit = _body_lru.get(bh)

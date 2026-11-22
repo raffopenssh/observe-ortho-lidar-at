@@ -108,6 +108,50 @@ def test_routes():
     d = c.get('/api/v1/cells/dict').get_json(); assert 'sample' in d and 'blocks_v2' in d
 
 
+def test_slice_is_build():
+    """The base set sliced from the tree_h build is byte-identical to its own build (same ETag)."""
+    bi, bj = _stored_block()
+    _, sup, _ = cbl.build_block(bi, bj, cbl.GLYPH_TREE_FIELDS)
+    _, direct, _ = cbl.build_block(bi, bj, cbl.GLYPH_FIELDS)
+    assert cbl.slice_block(sup, cbl.GLYPH_FIELDS)[1] == direct
+    assert cbl.slice_block(sup, ['elev_mean', 'tree_h_n', 'tree_h'])[1] == cbl.build_block(bi, bj, ['elev_mean', 'tree_h'])[1]
+
+
+def test_request_never_builds(monkeypatch, tmp_path):
+    """Stale bins: stored previous generation → 200 + X-Cells-Stale (304 on its ETag), nothing
+    stored → 503 + Retry-After; the block is queued; build_bin is never called; rebuild=1 ignored."""
+    import public_api
+    c = public_api.app.test_client()
+    bi, bj = _stored_block()
+    w, s, e, n = cb.block_bbox(bi, bj)
+    q = f'/api/v1/cells?bbox={w},{s},{e},{n}&format=bin&block=1&fields='
+    r0 = c.get(q + ','.join(cbl.GLYPH_TREE_FIELDS)); assert r0.status_code == 200
+    monkeypatch.setattr(cb, 'WANT_DIR', tmp_path / 'want')
+    monkeypatch.setattr(cb, 'build_bin', lambda *a, **k: (_ for _ in ()).throw(AssertionError('built in a request')))
+    real = cb._gen
+    monkeypatch.setattr(cb, '_gen', lambda g: real(g + '|test-bump'))      # every bin is stale now
+    monkeypatch.setattr(cb, '_blob_lru', type(cb._blob_lru)('t', 8)); cbl._manifest_cache.clear()
+    try:
+        r = c.get(q + ','.join(cbl.GLYPH_TREE_FIELDS) + '&rebuild=1')
+        if r0.headers.get('X-Cells-Stale'):
+            pytest.skip('block already stale on disk')
+        assert r.status_code == 200 and r.headers['X-Cells-Stale'] == '1' and r.headers['Retry-After']
+        assert r.headers['ETag'] == r0.headers['ETag'] and 'max-age=%d' % cb.STALE_MAX_AGE in r.headers['Cache-Control']
+        assert r.headers['X-Cells-Gen-Current'] != r.headers['X-Cells-Gen'] and cb.wanted_blocks() == [(bi, bj)]
+        r2 = c.get(q + ','.join(cbl.GLYPH_TREE_FIELDS), headers={'If-None-Match': r.headers['ETag']})
+        assert r2.status_code == 304 and r2.headers['X-Cells-Stale'] == '1'
+        monkeypatch.setattr(cbl, '_superset', lambda *a, **k: None); monkeypatch.setattr(cbl, 'remember_fieldset', lambda f: None)
+        r3 = c.get(q + 'tpi,tri')
+        if r3.status_code == 200:
+            assert r3.headers.get('X-Cells-Stale') == '1'      # someone stored exactly this set before
+        else:
+            assert r3.status_code == 503 and r3.headers['Retry-After'] == str(cb.BUILD_RETRY_S) and r3.get_json()['building']
+        r4 = c.get(q + 'elev_mean&ids=1')                       # v1 frames: stored stale bins as they are
+        assert r4.status_code == 200 and r4.headers['X-Cells-Stale'] == '1'
+    finally:
+        cbl._manifest_cache.clear()
+
+
 if __name__ == '__main__':
     for n, f in list(globals().items()):
         if n.startswith('test_'):

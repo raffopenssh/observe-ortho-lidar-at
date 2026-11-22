@@ -419,6 +419,44 @@ Split-parent ingest and merge mechanics: `ne_ingest.py` (thread in
 `app.py`; `ne_ingest:` line in `/process.txt`; knob
 `POST /api/v1/director/config {"ne_ingest_enabled": false}` stops pulls).
 
+## 12b-2. Request path never builds; demand queue; block-wise builder (2026-11-22)
+
+A downstream client measured 34 s → > 120 s on cold `block=1` requests during a national
+bin rebuild (generation bump → 13 k stale bins; the request path rebuilt up to
+16 bins at 1–3 s each inside a 2-worker gunicorn, and the hourly builder only
+reached the block phase *after* all bins were current).
+
+* **Request path** (`cells_blocks.serve_block(build=False)`, `cells_bins.load_bin(build=False)`
+  for single bins / `ids=1`): current stored block → **column subset of a
+  current stored superset** (`slice_block`; the base set comes out of the
+  `tree_h` build, byte-identical to its own build, same ETag) → concatenation
+  of 16 current stored bins (0.15 s) → **stale**: stored previous generation
+  (own, or sliced from a stale superset), `200` + `X-Cells-Stale: 1`,
+  `X-Cells-Gen-Current`, `Retry-After: 120`, `Cache-Control: max-age=120`,
+  its own ETag (304 keeps the stale markers) → **`503` + `Retry-After: 120`**
+  `{building: true}`. Bins with no product underneath are still built in
+  place (cheap). `rebuild=1` is ignored (was a public CPU knob).
+* **Demand queue**: the last two answers touch `data/ne/nexb/want/<bi>_<bj>`
+  (`cb.want_block`). `cells-want.path` (`DirectoryNotEmpty`) starts
+  `cells-bins.service` when it is not running; the builder runs wanted blocks
+  **first** (phase W) and re-reads the queue before every unit, so a wanted
+  block is current ≈ 1–2 min after the first request. A failing unit clears
+  its marker (no loop).
+* **Builder = block units in spawned processes** (`cb.build_block_unit`,
+  `--jobs 2` → 2 processes, not threads — the build is GIL-bound python):
+  one unit = the stale bins of a block + every `prewarm_fieldsets()` set
+  (glyph + tree_h first, glyph, defaults, ≤ 8 seen sets). A rebuilt block is
+  servable at once. tree-QA phase 0 gets 20 % of the budget (not 50 %) while
+  > 1000 bins are stale. Phase 2 (blocks whose bins were already current)
+  and phase 3 (sample) unchanged.
+* **Reading it**: `python3 cells_bins.py --status`, `ls data/ne/nexb/want`,
+  `journalctl -u cells-bins -n 3` (`block_units`, `wanted_built`,
+  `wanted_open`). Tests: `tests/test_cells_blocks.py::test_request_never_builds`,
+  `::test_slice_is_build`.
+* **Sample**: `fields=…,tree_h` is served from the stored superset
+  (`tree_h_n` + `tree_h` columns); `fields=glyph` has no tree columns by
+  definition.
+
 ## 12c. Stats envelope cell lists — `POST /api/v1/stats/unit?unit=cells` (`stats_unit.py`, 2026-11-03)
 
 A sibling statistical NE service's `f=<expr>` filter knows the matching res-12

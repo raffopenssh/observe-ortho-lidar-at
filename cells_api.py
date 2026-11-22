@@ -1749,7 +1749,20 @@ def _resp(body, *, status=200, mimetype='application/json', headers: dict | None
 def _error(e: CellsError) -> Response:
     d = {'error': e.msg}
     d.update(e.extra)
-    return _resp(d, status=e.status)
+    ra = e.extra.get('retry_after_s')
+    return _resp(d, status=e.status, headers={'Retry-After': str(int(ra))} if ra else None)
+
+
+def _stale_cc(r: Response, hx: dict | None = None) -> Response:
+    """A stale (previous-generation) bin/block answer, 200 or 304: short cache life + the
+    stale markers — the builder is on it (cells_bins.want_block)."""
+    if (hx or {}).get('X-Cells-Stale') or r.headers.get('X-Cells-Stale'):
+        import cells_bins
+        for k in ('X-Cells-Stale', 'X-Cells-Gen-Current', 'Retry-After'):
+            if hx and hx.get(k):
+                r.headers[k] = hx[k]
+        r.headers['Cache-Control'] = f'public, max-age={cells_bins.STALE_MAX_AGE}'
+    return r
 
 
 def _not_ready(meta: dict) -> Response:
@@ -1935,6 +1948,9 @@ def _bin_request():
     def _match(etag):
         return etag in [x.strip() for x in inm.split(',')] or inm.strip() == '*'
 
+    # ``rebuild=1`` used to rebuild bins inside the request (a public, unauthenticated 40 s CPU
+    # knob).  It is ignored now: the request path never builds; stale / missing blocks are queued
+    # for the builder by the serve functions themselves (cells_bins.want_block).
     if _flag('block'):
         bij = cells_bins.block_of(*bb)
         if bij is None:
@@ -1945,16 +1961,16 @@ def _bin_request():
             # NEXB v2 (2026-11-03): no ids, present bitmap + ids_xor, prebuilt zstd on disk
             import cells_blocks
             etag, gen, inps = cells_blocks.quick_etag(*bij, fields)
-            if not _flag('rebuild') and _match(etag):
+            if _match(etag):
                 return Response(status=304, headers={'ETag': etag, 'Cache-Control': cc, 'X-Cells-Gen': gen})
-            body, hx, etag, meta = cells_blocks.serve_block(*bij, fields, rebuild=_flag('rebuild'))
-            return _zstd_resp(body, hx, etag, partial=bool(meta.get('partial')))
+            body, hx, etag, meta = cells_blocks.serve_block(*bij, fields, build=False)
+            return _stale_cc(_zstd_resp(body, hx, etag, partial=bool(meta.get('partial'))), hx)
         etag, inps = cells_bins.quick_block_etag(*bij, fields, ids_enc)
-        if not _flag('rebuild') and _match(etag):
+        if _match(etag):
             return Response(status=304, headers={'ETag': etag, 'Cache-Control': cc, 'X-Cells-Gen': etag[3:-10]})
-        body, hx, etag, _ = cells_bins.serve_block(*bij, fields, ids_enc, rebuild=_flag('rebuild'))
-        return _resp(body, mimetype='application/octet-stream', headers=hx, etag=etag,
-                     partial=any(x['missing'] or x['partial_files'] for x in inps))
+        body, hx, etag, _ = cells_bins.serve_block(*bij, fields, ids_enc, build=False)
+        return _stale_cc(_resp(body, mimetype='application/octet-stream', headers=hx, etag=etag,
+                               partial=any(x['missing'] or x['partial_files'] for x in inps)), hx)
     ij = cells_bins.bin_of(*bb)
     if ij is None:
         raise CellsError(400, f'format=bin&fields= needs a {cells_bins.BIN_DEG}°-aligned bin: w=i·{cells_bins.BIN_DEG}, '
@@ -1962,11 +1978,11 @@ def _bin_request():
                               f'(or block=1 with a {cells_bins.BLOCK_DEG}°-aligned block)',
                          bins='/api/v1/cells/bins')
     etag, inp = cells_bins.quick_etag(*ij, fields, ids_enc)
-    if not _flag('rebuild') and _match(etag):
+    if _match(etag):
         return Response(status=304, headers={'ETag': etag, 'Cache-Control': cc, 'X-Cells-Gen': inp['gen']})
-    body, hx, etag = cells_bins.serve(*ij, fields, ids_enc, rebuild=_flag('rebuild'))
-    return _resp(body, mimetype='application/octet-stream', headers=hx, etag=etag,
-                 partial=bool(inp['missing'] or inp['partial_files']))
+    body, hx, etag = cells_bins.serve(*ij, fields, ids_enc, build=False)
+    return _stale_cc(_resp(body, mimetype='application/octet-stream', headers=hx, etag=etag,
+                           partial=bool(inp['missing'] or inp['partial_files'])), hx)
 
 
 def _zstd_resp(body_zst: bytes, hx: dict, etag: str, *, partial: bool = False) -> Response:

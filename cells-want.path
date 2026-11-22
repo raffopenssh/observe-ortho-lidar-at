@@ -1,0 +1,9 @@
+[Unit]
+Description=srtm-lidar-at: a public /api/v1/cells block request met a missing / stale block (marker in data/ne/nexb/want) → start the builder now; it takes the wanted blocks first
+
+[Path]
+DirectoryNotEmpty=/home/exedev/srtm-lidar/data/ne/nexb/want
+Unit=cells-bins.service
+
+[Install]
+WantedBy=paths.target

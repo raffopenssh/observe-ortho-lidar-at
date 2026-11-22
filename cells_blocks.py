@@ -88,6 +88,7 @@ SAMPLE_CACHE_FILES = 16
 GLYPH_FIELDS = ('bld_h_max', 'bld_h_p50', 'stories_max', 'roof_dom', 'canopy_h_p90',
                 'aspect_deg', 'slope_mean', 'slope_p90', 'elev_mean')
 # cheap extras (< ~2 MB each nationally, zstd) not used by the glyph filter yet
+GLYPH_TREE_FIELDS = (*GLYPH_FIELDS, 'tree_h_n', 'tree_h')     # the glyph set + apex-height lists (a client's second request per block)
 SAMPLE_EXTRA_FIELDS = ('obs', 'terrain_src', 'bld_n', 'bld_area_sum', 'struct_h_max', 'canopy_h_p50',
                        'lc25', 'tree_n', 'dh_m', 'consistency', 'forest_loss_year', 'phenology',
                        'als_year_newest')
@@ -132,7 +133,7 @@ def _bitmap(n: int) -> bytes:
     return b.tobytes()
 
 
-def build_block(bi: int, bj: int, fields, *, rebuild: bool = False) -> tuple[dict, bytes, list[dict]]:
+def build_block(bi: int, bj: int, fields, *, rebuild: bool = False, build: bool = True) -> tuple[dict, bytes, list[dict]]:
     """→ (header, raw NEXB v2 body, bin inputs).  Loads (builds if needed) the
     16 bins via :func:`cells_bins.load_bin`."""
     fields = cb.with_ragged_counts([f for f in fields if f != 'id'])
@@ -140,7 +141,9 @@ def build_block(bi: int, bj: int, fields, *, rebuild: bool = False) -> tuple[dic
     entries = []; gens = []; kgs = set(); epochs = []; inps = []
     row0 = 0; legend: dict = {}
     for i, j in cb.block_bins(bi, bj):
-        hdr, c, inp = cb.load_bin(i, j, rebuild=rebuild, need=fields)
+        hdr, c, inp = cb.load_bin(i, j, rebuild=rebuild, need=fields, build=build)
+        if not build and hdr['gen'] != inp['gen']:       # a stale bin slipped in (changed since _bins_ready)
+            raise cb.building_error(bi, bj)
         ids = np.ascontiguousarray(c['id']).astype(np.uint64)
         n = int(ids.size)
         x = int(np.bitwise_xor.reduce(ids)) if n else 0
@@ -196,6 +199,21 @@ def decode_block(blob: bytes) -> tuple[dict, np.ndarray, 'OrderedDict[str, np.nd
 
 # === SECTION: block store ===
 
+def slice_block(raw: bytes, fields) -> tuple[dict, bytes]:
+    """Column subset of a raw NEXB v2 body → (header, raw body), byte-identical to
+    :func:`build_block` on the same bins with ``fields`` (same header key order, same bitmap)."""
+    ln = struct.unpack('<I', raw[4:8])[0]
+    hdr = json.loads(raw[8:8 + ln])
+    off = 8 + ln; pb = raw[off:off + hdr['present_bytes']]; off += hdr['present_bytes']
+    at = {}
+    for c in hdr['columns']:
+        at[c['name']] = (c, off, off + int(c['bytes'])); off += int(c['bytes'])
+    fields = list(fields)
+    hdr['fields'] = fields; hdr['columns'] = [at[f][0] for f in fields]
+    hb = json.dumps(hdr, separators=(',', ':'), ensure_ascii=False).encode()
+    return hdr, cb.BLOCK_MAGIC + struct.pack('<I', len(hb)) + hb + pb + b''.join(raw[at[f][1]:at[f][2]] for f in fields)
+
+
 def _paths(bi: int, bj: int, fields) -> tuple[Path, Path]:
     stem = f'{bi}_{bj}.{fields_hash(fields)}'
     return BLOCK_DIR / f'{stem}.nexb.zst', BLOCK_DIR / f'{stem}.json'
@@ -214,48 +232,113 @@ def current_gen(bi: int, bj: int) -> tuple[str, list[dict]]:
     return cb.block_gen([x['gen'] for x in inps]), inps
 
 
-def store_block(bi: int, bj: int, fields, *, rebuild: bool = False) -> dict:
+def _meta_ok(meta) -> bool:
+    return bool(meta and meta.get('algo') == ALGO and meta.get('zstd_level') == ZSTD_LEVEL)
+
+
+def _read_stored(bi: int, bj: int, fields, meta) -> bytes | None:
+    try:
+        body = _paths(bi, bj, fields)[0].read_bytes()
+    except OSError:
+        return None
+    return body if len(body) == meta.get('bytes') else None
+
+
+def _superset(bi: int, bj: int, fields, gen: str | None):
+    """A stored block of the same (bi, bj) whose columns include ``fields`` → (meta, zstd body)
+    or None.  ``gen`` given → only that generation; None → any (newest build first)."""
+    want = set(fields); cands = []
+    for fs in prewarm_fieldsets():
+        fs = cb.with_ragged_counts(fs)
+        if fs == list(fields) or not want <= set(fs):
+            continue
+        m = stored_meta(bi, bj, fs)
+        if _meta_ok(m) and (gen is None or m.get('gen') == gen):
+            cands.append((m.get('built_at') or '', -len(fs), fs, m))
+    for _, _, fs, m in sorted(cands, key=lambda x: x[:2], reverse=True):
+        z = _read_stored(bi, bj, fs, m)
+        if z is not None:
+            return m, z
+    return None
+
+
+def store_block(bi: int, bj: int, fields, *, rebuild: bool = False, build: bool = True) -> dict:
     """Build + write ``<bi>_<bj>.<fh>.nexb.zst`` and its meta → meta."""
     t0 = time.time()
     cb._tree_qa.sync()                      # build on the current tree-QA store, never a stale snapshot
-    hdr, raw, inps = build_block(bi, bj, fields, rebuild=rebuild)
+    hdr, raw, inps = build_block(bi, bj, fields, rebuild=rebuild, build=build)
+    return _write_block(bi, bj, fields, hdr, raw, t0)
+
+
+def _write_block(bi: int, bj: int, fields, hdr: dict, raw: bytes, t0: float, **extra) -> dict:
     z = zcompress(raw)
     zp, mp = _paths(bi, bj, fields)
     meta = {'bi': bi, 'bj': bj, 'gen': hdr['gen'], 'etag': block_etag(hdr['gen'], fields), 'bytes': len(z),
             'raw_bytes': len(raw), 'n': hdr['n'], 'epoch': hdr.get('epoch'), 'fields': list(fields),
             'fh': fields_hash(fields), 'partial': bool(hdr.get('partial')), 'kgs': hdr.get('kgs'),
             'bins_n': [e['n'] for e in hdr['bins']], 'built_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-            'build_ms': int((time.time() - t0) * 1000), 'algo': ALGO, 'zstd_level': ZSTD_LEVEL}
+            'build_ms': int((time.time() - t0) * 1000), 'algo': ALGO, 'zstd_level': ZSTD_LEVEL, **extra}
     BLOCK_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = zp.with_name(zp.name + '.tmp'); tmp.write_bytes(z); os.replace(tmp, zp)
-    tmp = mp.with_name(mp.name + '.tmp'); tmp.write_text(json.dumps(meta)); os.replace(tmp, mp)
+    tmp = zp.with_name(f'{zp.name}.{os.getpid()}.tmp'); tmp.write_bytes(z); os.replace(tmp, zp)
+    tmp = mp.with_name(f'{mp.name}.{os.getpid()}.tmp'); tmp.write_text(json.dumps(meta)); os.replace(tmp, mp)
     return meta
 
 
-def serve_block(bi: int, bj: int, fields, *, rebuild: bool = False) -> tuple[bytes, dict, str, dict]:
-    """→ (zstd body, headers, etag, meta).  Disk when current, else build+store."""
+def _bins_ready(inps) -> bool:
+    """Every bin with products underneath is stored at its current generation → the block is a
+    0.15 s concatenation, fine in a request."""
+    return all((not x['on_disk']) or cb.stored_gen(x['i'], x['j']) == x['gen'] for x in inps)
+
+
+def serve_block(bi: int, bj: int, fields, *, rebuild: bool = False, build: bool = True) -> tuple[bytes, dict, str, dict]:
+    """→ (zstd body, headers, etag, meta).  Disk when current, else build+store.
+
+    ``build=False`` (the request path) never builds a bin that has products underneath:
+    current stored block → column subset of a current stored superset (the base set from the
+    tree_h build) → concatenation of 16 current stored bins → **stale**: the stored previous
+    generation (own or sliced from a superset; ``meta['stale']``, ``X-Cells-Stale: 1``, its own
+    ETag) → ``CellsError`` 503 + Retry-After.  The last two queue the block (``cb.want_block``)."""
     fields = cb.with_ragged_counts([f for f in fields if f != 'id'])
     gen, inps = current_gen(bi, bj)
-    zp, _ = _paths(bi, bj, fields)
     meta = None if rebuild else stored_meta(bi, bj, fields)
-    body = None
-    if meta and meta.get('gen') == gen and meta.get('algo') == ALGO and meta.get('zstd_level') == ZSTD_LEVEL:
-        try:
-            body = zp.read_bytes()
-            if len(body) != meta['bytes']:
-                body = None
-        except OSError:
-            body = None
+    body = None; stale = False
+    if _meta_ok(meta) and meta.get('gen') == gen:
+        body = _read_stored(bi, bj, fields, meta)
     if body is None:
         with cb._lock_for(('block', bi, bj, fields_hash(fields))):
             meta = None if rebuild else stored_meta(bi, bj, fields)
             if not (meta and meta.get('gen') == gen) and cb._tree_qa.sync():
                 gen, inps = current_gen(bi, bj)      # stale snapshot: the stored block may be the newer one
-            if meta and meta.get('gen') == gen and meta.get('algo') == ALGO and meta.get('zstd_level') == ZSTD_LEVEL:
-                body = zp.read_bytes()
-            else:
+            if _meta_ok(meta) and meta.get('gen') == gen:
+                body = _read_stored(bi, bj, fields, meta)
+            if body is None and (build or rebuild):
                 meta = store_block(bi, bj, fields, rebuild=rebuild)
-                body = zp.read_bytes()
+                body = _read_stored(bi, bj, fields, meta)
+            if body is None:
+                t0 = time.time()
+                sup = _superset(bi, bj, fields, gen)
+                if sup is not None:                  # subset of the current superset build
+                    hdr, raw = slice_block(zdecompress(sup[1]), fields)
+                    meta = _write_block(bi, bj, fields, hdr, raw, t0, sliced_from=sup[0].get('fh'))
+                elif _bins_ready(inps):
+                    meta = store_block(bi, bj, fields, build=False)
+                else:
+                    cb.want_block(bi, bj); stale = True
+                    if _meta_ok(meta):
+                        body = _read_stored(bi, bj, fields, meta)
+                    if body is None:
+                        sup = _superset(bi, bj, fields, None)
+                        if sup is None:
+                            remember_fieldset(fields)
+                            raise cb.building_error(bi, bj)
+                        hdr, raw = slice_block(zdecompress(sup[1]), fields)
+                        if hdr['gen'] == gen:        # the builder finished in between
+                            stale = False
+                        meta = _write_block(bi, bj, fields, hdr, raw, t0, sliced_from=sup[0].get('fh'))
+                if body is None:
+                    body = _read_stored(bi, bj, fields, meta)
+                if body is None:
+                    raise cb.building_error(bi, bj)
         remember_fieldset(fields)
     etag = meta['etag']
     hx = {'X-Cells-Gen': meta['gen'], 'X-Cells-Block': f'{bi},{bj}', 'X-Cells-Record': f'nexb2/{ALGO}',
@@ -265,6 +348,9 @@ def serve_block(bi: int, bj: int, fields, *, rebuild: bool = False) -> tuple[byt
     hx = ca._with_epoch(hx, meta.get('epoch'))
     if meta.get('partial'):
         hx['X-Cells-Partial'] = '1'
+    if stale and meta.get('gen') != gen:
+        meta = dict(meta, stale=True)
+        cb._stale_hx(hx, gen)
     return body, hx, etag, meta
 
 
@@ -277,7 +363,7 @@ def quick_etag(bi: int, bj: int, fields) -> tuple[str, str, list[dict]]:
 
 def prewarm_fieldsets() -> list[list[str]]:
     """Default + glyph field sets + every set a block request used (≤ 8)."""
-    out = [list(cb.DEFAULT_FIELDS), list(GLYPH_FIELDS)]
+    out = [list(GLYPH_TREE_FIELDS), list(GLYPH_FIELDS), list(cb.DEFAULT_FIELDS)]   # superset first: the base set is sliced from it
     try:
         for fs in json.loads(FIELDSETS_PATH.read_text()).get('fieldsets') or []:
             fs = [f for f in fs if f in cb.FIELDS and f != 'id']
@@ -285,12 +371,12 @@ def prewarm_fieldsets() -> list[list[str]]:
                 out.append(fs)
     except (OSError, ValueError):
         pass
-    return out[:2 + MAX_FIELDSETS]
+    return out[:3 + MAX_FIELDSETS]
 
 
 def remember_fieldset(fields) -> None:
     fields = [f for f in fields if f != 'id']
-    if fields in (list(cb.DEFAULT_FIELDS), list(GLYPH_FIELDS)):
+    if fields in (list(cb.DEFAULT_FIELDS), list(GLYPH_FIELDS), list(GLYPH_TREE_FIELDS)):
         return
     with _meta_lock:
         try:
@@ -706,7 +792,11 @@ def dict_block() -> dict:
                         'X-Cells-Gen': 'block gen = sha256 of the 16 bin gens — key your copy on this',
                         'X-Cells-Epoch': 'the ne-observe product epoch (same value as X-Cells-Epoch on /cells and /cells/bins)',
                         'X-Cells-Ids': 'bitmap', 'X-Cells-Layout': 'nexb2=n0,…,n15', 'Content-Encoding': 'zstd (when accepted)',
-                        'X-Cells-Partial': '1 when a KG in the block has no published cells yet or is partial'},
+                        'X-Cells-Partial': '1 when a KG in the block has no published cells yet or is partial',
+                        'X-Cells-Stale': '1 = the stored previous generation, served because the current one is still being built '
+                                         '(never built inside the request): X-Cells-Gen / ETag are those of the served body, '
+                                         'X-Cells-Gen-Current the generation under way, Retry-After + max-age = 120 s',
+                        'Retry-After': 'on a stale 200/304 and on 503 {building:true} (nothing stored yet for this block + field set)'},
             'manifest': 'GET /api/v1/cells/blocks[?fields=…][&epoch=…] → columns {bi, bj, gen, etag, bytes, stored, current, n, '
                         'bins_n, complete} for every block touching a published product (bytes/n null until prebuilt for that '
                         'field set); epoch= must equal the current X-Cells-Epoch or you get 409 with the current one',
