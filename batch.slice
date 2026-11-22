@@ -1,0 +1,11 @@
+[Unit]
+Description=batch tier: periodic builders / backfills run here so the web units (CPUWeight=500) always win; Nice= does not cross cgroups
+Before=slices.target
+
+[Slice]
+# whole tier vs srv / srv_public (500 each) and shelley (100): only bites under contention
+CPUWeight=20
+# collective anon+cache ceiling for ALL batch units together (8 GB host, no swap;
+# srv ≤ 4.2 G + srv_public ≤ 2.8 G worst case). High = reclaim-throttle, Max = OOM inside the slice only.
+MemoryHigh=2800M
+MemoryMax=3600M
