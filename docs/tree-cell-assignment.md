@@ -37,20 +37,90 @@ for them (still needed for frames).
   chunks **of the same KG file**. Order is deterministic: by cell row, own
   apices first (stored order), arrivals by (source chunk, source row).
 * **Off-file apices**: target cell is no row of that KG file (edge of the KG's
-  cell set; ≈ 0.05 %, ≈ 0.7 % with a frame) → not served from that file. An
-  apex without a cell row cannot be counted anywhere; where another KG file
-  stores that cell, its own inventory covers the spot (one file per cell,
-  `cells_api.lost_cells`).
+  cell set; ≈ 0.05 %, ≈ 0.7 % with a frame) → not served from that file; it
+  is a twin of what another file serves or comes back as an added tree
+  (next section).
 * `Chunk.t_src = (src_r10[], src_idx[])` (qa=False loads) names the stored
   NET1 row of each served apex → `ne_rebin.marker_keep` translates per-stored-row
   verdicts (the `tree_rule` header marker).
 
-## Off-file apices — measured, decision pending (2026-11-22)
+## Off-file apices → added trees (`rebin_added.py`, 2026-11-22)
 
-Goal: no tree disappears because of rb1 — off-file apices come back as system-added trees
-(`tree_user`, reason `auto-rebin`). **Not implemented yet**: Check B below needs one decision first.
-`ne_rebin.scan(kg)` already returns every off-file apex with full attributes in the same pass as
-`check()` (`stats['off']` in `rebin()`); the 255-per-cell cap is counted as `capped` (0 in all 54 sampled KGs).
+No tree disappears because of rb1. Every off-file apex is decided once, per KG file:
+
+| verdict | meaning | outcome |
+|---|---|---|
+| `qa` | the static apex rule hides it in its own file (header marker, ≥ 60 m) | not a tree anyway |
+| `dup` | **twin rule `tw1`** against an apex another KG file serves | already in the inventory |
+| `dup_frame` | files in different position frames, other apex at exactly `p − (frame_src − frame_other)`, dh ≤ 0.25 m | same stored apex |
+| `dup_added` | twin (same rule) of an already kept off-file apex of another source file; first in (kg, r10, idx) order stays | counted once |
+| `add` | everything else | system-added tree |
+
+Invariant per KG file, asserted by `ne_rebin.check()` and `tests/test_rebin_added.py`:
+**stored == served + added + dup + qa (+ capped)**.
+
+**Decision (Check B): Option 1.** Added trees stay out of every cell figure — `tree_h` / `tree_n` /
+`canopy_h_p*` remain the measured apex set of the cell's own file. An `add` appears only in the
+`/trees/bbox` `added` block, written through the same path as a `missing` report (`tree_user`, op add,
+reporter = `tree_user.system_reporter('auto-rebin')`). No new public field: `h_m` (1 dp) is public, the
+exact measured attributes are in `note` (`auto-rebin rb1.tw1 <reason> kg=<src> h_m= crown_m2= class=
+vitality=`), provenance in `client_id` = `auto-rebin:<kg>:rb1:<no_row|other_file>:<r10 hex>:<idx>:<v>`.
+`reason`: `no_row` = the target cell is in no file, `other_file` = another file serves it. The twin rule
+runs on `no_row` candidates too (a neighbouring cell of another file can hold the same tree).
+
+### Twin rule `tw1` — height-aware, measured
+
+D = Chebyshev offset (m) of the served positions, dh = |h − h_other|. Twin when dh ≤ the table:
+
+| height of the off-file apex | D = 0 | D = 1 | D = 2 |
+|---|---:|---:|---:|
+| < 5 m | 0.25 | 0 | 0 |
+| 5–10 m | 2 | 0 | 0 |
+| 10–20 m | 2 | 0.5 | 0 |
+| ≥ 20 m | 2 | 2 | 2 |
+
+plus: where the tolerance is the full 2 m (`TWIN_COVER`), an **at-least-as-tall** other apex is a twin
+at any dh — the tall off-file apex is kept only when it is > 2 m taller than what the other file has
+there (the taller reading matters for biomass; the lower one is covered). Nothing is a twin at D ≥ 3.
+
+Why it depends on height (`tools/rebin_twin_model.py`, 132 KGs, fixed seeds, 10.3 M stored apices,
+13 746 off-file): P(twin) = 1 − chance / observed per (height class, D, dh band). *Chance* = density of
+other-file apices 8–12 m around the apex × g(D), g = how often ONE file holds two different apices at
+that offset (relative to 6–8 m). g at D = 2 is 1.63 (< 5 m), 0.82, 0.52, 0.15, 0.02 (≥ 30 m): low
+trees stand close with similar heights, so a near pair is often two real trees (e.g. < 5 m, D = 2,
+dh ≤ 0.25: 49 observed / 54 chance → no signal); next to a tall apex the detector never puts a second
+one, so any near pair is the same tree. A cell is a twin cell when P ≥ 0.5 (smallest expected count
+error), contiguous from dh = 0. One documented exception: 20–30 m, D = 2, band 0.5–1 m is exactly 50 %
+and 1–2 m is 73 % (pooled 62 %) → tolerance 2.
+
+Expected error in the sample (pairs called twin / chance pairs among them = real tree not added /
+twins left among the kept = double count): < 5 m 627 / 47 / 4 · 5–10 m 1791 / 70 / 49 ·
+10–20 m 4194 / 137 / 134 · 20–30 m 4214 / 134 / 51 · ≥ 30 m 868 / 2.6 / 15.5. Both errors are a few
+per cent of the off-file set, i.e. ~10⁻⁵ of the inventory, and smallest where it matters (tall trees).
+
+### Store, idempotency, re-runs
+
+`data/rebin_added.sqlite`: `cand` (one row per off-file apex, key (kg, r10, idx), verdict + the
+**evidence**: all other-file apices within 8 m) and `kgs` (counts, invariant, staleness token =
+rule + own digest + frame tag + digests of the files compared with). `resolve()` re-decides from the
+evidence, so a constant change needs no product read. `sync()` diffs wanted `client_id`s against the
+live system rows in `tree_ver`: missing → add, no longer wanted (rule bump, re-upload, verdict change)
+→ retract. Append-only, a second run writes nothing. One KG-level `auto-rebin` flag per KG with added
+trees (layer trees, claim missing; expected = counts, observed = stored / served / off_file) — KG-level
+rows hide no cell and change no ETag. Machine rows are in the `/trees/bbox` ETag revision but do not
+shorten its cache lifetime (`tree_user.kgs_rev(human=True)`).
+
+```bash
+python3 rebin_added.py --scan [--budget-s N]   # resumable; only unscanned / stale KGs
+python3 rebin_added.py --sync [--dry]          # resolve + write added trees / flags (after a FULL scan)
+python3 rebin_added.py --status                # = the `rebin:` line on /process.txt
+python3 tools/rebin_twin_model.py --report     # the model table behind TWIN_DH
+```
+
+Not covered (pre-existing, separate): apices of a file standing in cells `lost` to another file under
+the one-file-per-cell rule were never served and are not off-file in the rb1 sense.
+
+The two checks that led here:
 
 ### Check A — is an off-file apex a duplicate of what another KG file serves?
 
@@ -145,4 +215,6 @@ x.25 value — use half-even, or compare `floor(2h + 0.5) − (4h mod 4 == 1)`.
 python3 ne_rebin.py --check 92124          # {"outside": 0, "moved": …, "off_file": …, "capped": 0, "ok": true}
 python3 tests/test_tree_cell_rule.py       # synthetic + live (/trees ≡ cells, the 3 reported apices)
 python3 tree_qa.py --status                # QA store re-evaluation progress after a rule bump
+python3 rebin_added.py --status            # off-file apices: added / dup / qa, invariant
+python3 tests/test_rebin_added.py
 ```

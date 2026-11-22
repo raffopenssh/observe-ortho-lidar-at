@@ -436,13 +436,14 @@ def trees_bbox():
     # user-reported taxa / added trees (tree_user.py): their newest revision in
     # these KGs joins the ETag — only when there is one, so untouched KGs keep
     # their day-long cache entries.
-    urev = 0
+    urev = hrev = 0
     if kind == 'trees':
         try:
             import tree_user
             urev = tree_user.kgs_rev(st['kgs'])
+            hrev = tree_user.kgs_rev(st['kgs'], human=True) if urev else 0   # machine-added trees (auto-rebin) keep the day
         except Exception:  # noqa: BLE001
-            urev = 0
+            urev = hrev = 0
     if urev:
         state += f'\nu={urev}'
     if kind == 'trees' and st.get('linear'):
@@ -463,7 +464,7 @@ def trees_bbox():
     # *no-cache*, not no-store: the browser keeps the body and revalidates with
     # If-None-Match on every use (304 is index-only here, and the ETag covers the
     # pending/not_processed lists so it flips the moment the KG lands).
-    cc = f'public, max-age={TREES_USER_MAX_AGE if (urev or frev) else TREES_MAX_AGE}' if cacheable else 'public, no-cache'
+    cc = f'public, max-age={TREES_USER_MAX_AGE if (hrev or frev) else TREES_MAX_AGE}' if cacheable else 'public, no-cache'
     lm = email.utils.formatdate(st['mtime'], usegmt=True) if st['mtime'] else None
     hdrs = {'ETag': etag, 'Cache-Control': cc}
     if lm:

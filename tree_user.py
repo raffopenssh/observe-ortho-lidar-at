@@ -229,7 +229,17 @@ def _to_3035(lon, lat):
 
 _state: dict = {}            # kg(int) -> state dict
 _state_lock = threading.Lock()
-_EMPTY = {'n': 0, 'rev': 0, 'path': None}
+_EMPTY = {'n': 0, 'rev': 0, 'hrev': 0, 'path': None}
+SYSTEM_SOURCES = ('auto-rebin',)     # machine writers of added trees (rebin_added.py): op add / retract rows only
+_sys_rep: dict = {}
+
+
+def system_reporter(source: str) -> bytes:
+    """Reporter hash of a machine writer (same derivation as ``public_flags.auto_sync``)."""
+    k = (source, str(pf.DB_PATH))
+    if k not in _sys_rep:
+        _sys_rep[k] = pf._reporter_hash(source, 'auto')
+    return _sys_rep[k]
 
 
 def _derive(rows) -> dict:
@@ -311,12 +321,14 @@ def _load(c, kg: int) -> dict:
         by.setdefault((r['x'], r['y']), []).append(r)
     xy = np.array(list(by), dtype=np.int64).reshape(-1, 2)
     cur = [_derive(v) for v in by.values()]
+    machine = {system_reporter(s) for s in SYSTEM_SOURCES}
+    hrev = max((r['rev'] for r in rows if bytes(r['reporter']) not in machine), default=0)
     # exact position where we know it: the inventory id of an apex, the reporter's point of an added tree
     ex = [(d['tid'] if not d['added'] else None) or d['pos'] or d['tid'] for d in cur]
     e = np.array([p[0] / 10.0 if p else float(k[0]) for p, k in zip(ex, by)], np.float64)
     n = np.array([p[1] / 10.0 if p else float(k[1]) for p, k in zip(ex, by)], np.float64)
     lon, lat = _tf('EPSG:3035', 'EPSG:4326').transform(e, n)
-    st = {'n': len(cur), 'rev': rows[-1]['rev'], 'path': str(pf.DB_PATH), 'x': xy[:, 0], 'y': xy[:, 1], 'e': e, 'n_': n,
+    st = {'n': len(cur), 'rev': rows[-1]['rev'], 'hrev': hrev, 'path': str(pf.DB_PATH), 'x': xy[:, 0], 'y': xy[:, 1], 'e': e, 'n_': n,
           'tid': [tree_id_str(d['tid']) for d in cur], 'cid': [d['cid'] for d in cur],
           'key': (xy[:, 0] << 32) | xy[:, 1], 'lon': np.asarray(lon), 'lat': np.asarray(lat),
           'sp': np.array([d['sp'] or 0 for d in cur], np.int64), 'cnt': np.array([d['n'] for d in cur], np.int32),
@@ -434,12 +446,14 @@ def state(kg, grev: int | None = None) -> dict:
     return st
 
 
-def kgs_rev(kgs) -> int:
-    """Newest revision touching any of ``kgs`` (0 = none) — ETag component."""
+def kgs_rev(kgs, human: bool = False) -> int:
+    """Newest revision touching any of ``kgs`` (0 = none) — ETag component.  ``human``: newest
+    revision written by a person (machine-added trees change only with a product / rule, like the
+    apices themselves — they do not shorten a cache lifetime)."""
     g = global_rev()
     if not g:
         return 0
-    return max([state(k, g)['rev'] for k in kgs] or [0])
+    return max([state(k, g).get('hrev' if human else 'rev', 0) for k in kgs] or [0])
 
 
 def _taxon(i) -> str | None:

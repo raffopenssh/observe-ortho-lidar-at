@@ -663,6 +663,8 @@ GET /api/v1/trees/bbox?bbox=…[&min_height=3][&max_height=…][&limit=2000][&re
       shared by all bands / concurrent calls (server ms ≈ 10 for a warm 0.025° tile band).
     User-reported species + user-added trees ride along sparsely ("user" / "added" blocks, row keys
     taxon / taxon_n / taxon_v / height_user_m / dbh_cm) only where someone reported one — see #tree-species.
+    "added" also holds measured apices that fall just outside their file's cell set and are no twin of a
+    served tree (client_id "auto-rebin:…", source auto-rebin; in no cell figure) — nothing is dropped at a file edge.
     realistic=1 (default) removes what the height distribution says are not trees: the saturated
     ≥ 60 m bin, local spikes ≥ 45 m (masts, wind turbines, cranes), flagged cells (dropped_qa) and
     the apices of machine-detected linear noise (straight chains of small "trees"; each run carries a

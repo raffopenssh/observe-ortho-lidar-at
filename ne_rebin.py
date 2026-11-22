@@ -405,8 +405,21 @@ def scan(kg: str) -> tuple[dict, dict]:
 
 
 def check(kg: str) -> dict:
-    """Every apex of a KG as served: is it inside the cell row that lists it?"""
-    return scan(kg)[0]
+    """Every apex of a KG as served: is it inside the cell row that lists it?  With the off-file
+    store (``rebin_added``) scanned for this KG also the invariant
+    stored == served + added + dup + qa (+ capped): no apex is lost by the rule."""
+    st = scan(kg)[0]
+    try:
+        import rebin_added
+        c = rebin_added.kg_counts(kg)
+    except Exception:  # noqa: BLE001
+        c = None
+    if c is not None:
+        st.update(added=c['added'], dup=c['dup'], qa=c['qa'], no_row=c['no_row'], other_file=c['other_file'])
+        st['invariant'] = (c['stored'] == st['stored'] and c['off'] == st['off_file']
+                           and st['stored'] == st['apices'] + c['added'] + c['dup'] + c['qa'] + st['capped'])
+        st['ok'] = bool(st['ok'] and st['invariant'])
+    return st
 
 
 if __name__ == '__main__':

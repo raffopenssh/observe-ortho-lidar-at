@@ -20545,6 +20545,12 @@ def process_txt():
             out.append(_tq.text_line())
         except Exception as _e:
             out.append(f'tree_qa: unavailable ({_e})')
+        # rebin: off-file apices of cell rule rb1 → added trees / twins (rebin_added.py)
+        try:
+            import rebin_added as _ra
+            out.append(_ra.text_line())
+        except Exception as _e:
+            out.append(f'rebin: unavailable ({_e})')
         # label_mix: products stitched with colliding label ids (restored
         # tile checkpoints, Oct 2026) — detected from the NE cells, auto-
         # requeued for a full rerun (label_mix.py); grep `?q=label_mix`.
