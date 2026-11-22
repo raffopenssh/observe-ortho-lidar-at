@@ -858,7 +858,9 @@ def text_line(s: dict | None = None, now: float | None = None) -> str:
     def cell(k):
         d = xt.get(k) or {}
         return f"{d.get('bad', 0)}/{d.get('bad', 0) + d.get('ok', 0)}"
-    ov = (f"overlap(tile envelope): g25_stale share of BEV-checked tiles — pos moved {cell('moved')} kept {cell('kept')} "
+    gs = s['classes'].get('grid25_stale') or {}
+    ov = (f"overlap(tile envelope, a cross-tab — terrain of {gs.get('handled', 0)} of {gs.get('handled', 0) + gs.get('open', 0)} stale tiles is patched): "
+          f"g25_stale / BEV-checked tiles by position verdict — pos moved {cell('moved')} kept {cell('kept')} "
           f"mixed/unclear {(xt.get('mixed') or {}).get('bad', 0) + (xt.get('unclear') or {}).get('bad', 0)}/"
           f"{sum((xt.get(k) or {}).get(b, 0) for k in ('mixed', 'unclear') for b in ('bad', 'ok'))} no pos verdict {cell('no_verdict')}")
     bx = (s.get('overlap_tiles') or {}).get('grid25_x_border') or {}
