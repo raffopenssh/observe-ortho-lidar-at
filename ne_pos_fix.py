@@ -112,20 +112,30 @@ def any_offset(kg) -> tuple[int, int] | None:
     return st['off'].get(kg) or (st['part'][kg][0] if kg in st['part'] else None)
 
 
+_OWNER_CHUNK = 1 << 20        # points x tiles float64 cells per block (8 MB a temporary)
+
+
 def tile_owner(tiles: np.ndarray, x, y) -> np.ndarray:
     """Index of the processing tile a mosaic position belongs to (-1 = none): the tile with the
     highest feather weight there, first tile on ties — the pipeline's own ownership rule
-    (``austria_processor``: weight = product of two 100 m edge ramps, ``fw > best``)."""
-    x = np.asarray(x, np.float64).reshape(-1, 1); y = np.asarray(y, np.float64).reshape(-1, 1)
+    (``austria_processor``: weight = product of two 100 m edge ramps, ``fw > best``).
+    Row-blocked: the points x tiles broadcast of a 1 M-apex / 63-tile KG is ~0.5 GB per temporary
+    (2.6 GB peak — the 2026-11-22 memory stall) when done in one piece."""
+    x = np.asarray(x, np.float64).reshape(-1); y = np.asarray(y, np.float64).reshape(-1)
+    out = np.full(x.shape[0], -1, np.int64)
     if not len(tiles):
-        return np.full(x.shape[0], -1, np.int64)
-    dx = np.minimum(x - tiles[:, 0], tiles[:, 2] - x); dy = np.minimum(y - tiles[:, 1], tiles[:, 3] - y)
-    w = np.clip(dx / TILE_MARGIN, 0.0, 1.0) * np.clip(dy / TILE_MARGIN, 0.0, 1.0)
-    # a point outside every ramp but inside an envelope still belongs to that tile
-    w = np.where((dx >= 0) & (dy >= 0), np.maximum(w, 1e-9), 0.0)
-    o = np.argmax(w, axis=1)
-    o[w[np.arange(w.shape[0]), o] <= 0] = -1
-    return o
+        return out
+    step = max(1024, _OWNER_CHUNK // len(tiles))
+    for i in range(0, x.shape[0], step):
+        xs = x[i:i + step, None]; ys = y[i:i + step, None]
+        dx = np.minimum(xs - tiles[:, 0], tiles[:, 2] - xs); dy = np.minimum(ys - tiles[:, 1], tiles[:, 3] - ys)
+        w = np.clip(dx / TILE_MARGIN, 0.0, 1.0) * np.clip(dy / TILE_MARGIN, 0.0, 1.0)
+        # a point outside every ramp but inside an envelope still belongs to that tile
+        w = np.where((dx >= 0) & (dy >= 0), np.maximum(w, 1e-9), 0.0)
+        o = np.argmax(w, axis=1)
+        o[w[np.arange(w.shape[0]), o] <= 0] = -1
+        out[i:i + step] = o
+    return out
 
 
 def moved(kg, x, y) -> np.ndarray:
@@ -577,8 +587,11 @@ def kg_tiles(kg) -> np.ndarray:
 
 def _core(tiles: np.ndarray, x, y) -> np.ndarray:
     """Positions inside exactly ONE tile envelope (the mosaic there is that tile alone)."""
-    x = np.asarray(x, np.float64).reshape(-1, 1); y = np.asarray(y, np.float64).reshape(-1, 1)
-    return ((x >= tiles[:, 0]) & (x <= tiles[:, 2]) & (y >= tiles[:, 1]) & (y <= tiles[:, 3])).sum(1) == 1
+    x = np.asarray(x, np.float64).reshape(-1); y = np.asarray(y, np.float64).reshape(-1)
+    n = np.zeros(x.shape[0], np.int32)
+    for t in tiles:             # per tile: O(points) memory, never points x tiles
+        n += (x >= t[0]) & (x <= t[2]) & (y >= t[1]) & (y <= t[3])
+    return n == 1
 
 
 def _clean(w: dict) -> str | None:
