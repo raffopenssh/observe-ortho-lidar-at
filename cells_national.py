@@ -379,7 +379,12 @@ def header_for(res: int, n: int, gen: str, epoch, extra: dict | None = None) -> 
 # === SECTION: build (CLI / timer) ===
 
 def current_gen() -> str:
-    h = hashlib.sha256(f'{ALGO}|{_green_fix.FIX_ID}|{ca.cells_generation()}'.encode())
+    """Corpus generation of the aggregate.  Folds the corpus-wide tree-QA token
+    (``tree_qa.corpus_sig``: tree_n / tree_hh / tree_h_max count the default /trees/bbox
+    apex set, 2026-11-22); hourly linear-noise churn of that token is absorbed by
+    :func:`minor_drift`."""
+    tq = ca._tree_qa.corpus_sig()
+    h = hashlib.sha256(f'{ALGO}|{_green_fix.FIX_ID}|{ca.cells_generation()}|tq|{tq["id"]}|{tq["tok"]}'.encode())
     return h.hexdigest()[:24]
 
 
@@ -399,6 +404,9 @@ def _dup_r10s() -> np.ndarray:
 MINOR_FILES = int(os.environ.get('CELLS_NATIONAL_MINOR_FILES', '25'))
 MINOR_CELLS_FRAC = float(os.environ.get('CELLS_NATIONAL_MINOR_CELLS_FRAC', '1e-4'))
 MAX_DEFER_D = float(os.environ.get('CELLS_NATIONAL_MAX_DEFER_D', '7'))
+# tree QA: same rule id and the hidden-apex total / filtered-KG count within this fraction of
+# the last build's (hourly linear-noise runs move a few hundred of ~300 k apices)
+MINOR_TQ_FRAC = float(os.environ.get('CELLS_NATIONAL_MINOR_TQ_FRAC', '0.02'))
 
 
 def _corpus_sig(files: dict) -> dict:
@@ -424,6 +432,12 @@ def minor_drift(meta: dict | None, files: dict, now: float | None = None) -> dic
     changed = sum(1 for f in files.values() if float(f.get('mtime') or 0) > start)
     if changed > MINOR_FILES:
         return None
+    tq = ca._tree_qa.corpus_sig(); tq0 = meta.get('tree_qa') or {}
+    if tq0.get('id') != tq['id']:
+        return None                      # never built with this tree-QA rule (or before the fold) → build
+    for k in ('kgs', 'hidden'):
+        if abs(int(tq[k]) - int(tq0.get(k) or 0)) > MINOR_TQ_FRAC * max(1, int(tq0.get(k) or 0)):
+            return None
     sig = _corpus_sig(files); old = meta.get('corpus') or {}
     delta = None
     if old:
@@ -432,11 +446,14 @@ def minor_drift(meta: dict | None, files: dict, now: float | None = None) -> dic
         delta = sig['cells'] - int(old.get('cells') or 0)
         if abs(delta) > MINOR_CELLS_FRAC * max(1, sig['cells']):
             return None
-    return {'changed_files': changed, 'cells_delta': delta, 'age_d': round(age_d, 2)}
+    return {'changed_files': changed, 'cells_delta': delta, 'age_d': round(age_d, 2),
+            'tree_qa_hidden_delta': int(tq['hidden']) - int(tq0.get('hidden') or 0)}
 
 
 def build(verbose: bool = True, force: bool = False) -> dict:
     t0 = time.time()
+    ca._tree_qa.sync()
+    tq_sig = ca._tree_qa.corpus_sig()
     gen = current_gen()
     meta = read_meta()
     have = all((NAT_DIR / f'r{r}.nex.gz').exists() for r in RESES)
@@ -489,7 +506,8 @@ def build(verbose: bool = True, force: bool = False) -> dict:
     NAT_DIR.mkdir(parents=True, exist_ok=True)
     out_meta = {'algo': ALGO, 'gen': gen, 'epoch': epoch, 'built_at': built_at, 'kgs': len(kgs), 'chunks': n_chunks,
                 'cells': acc.cells, 'dup_r10s': int(dup.size), 'rows': {}, 'bytes_gz': {}, 'fields': [f for f in FIELDS if f != 'id'],
-                'green_fix': _green_fix.FIX_ID, 'build_started': round(t0, 1), 'corpus': _corpus_sig(files)}
+                'green_fix': _green_fix.FIX_ID, 'build_started': round(t0, 1), 'corpus': _corpus_sig(files),
+                'tree_qa': {k: tq_sig[k] for k in ('id', 'kgs', 'hidden')}}
     reds = {9: red9, 8: rollup(red9, 9, 8)}
     for res in RESES:
         cols = finalise(reds[res])

@@ -81,6 +81,31 @@ def test_fields_and_route():
         assert r3.status_code == 200 and cn.decode(gzip.decompress(r3.data))[0]['res'] == 8
 
 
+def test_tree_qa_fold():
+    """current_gen follows the corpus tree-QA token; small churn of it is minor drift."""
+    import time
+    real = ca._tree_qa.corpus_sig
+    try:
+        sig = {'id': 'x+thx1', 'kgs': 3700, 'hidden': 300000, 'tok': 'aaa'}
+        ca._tree_qa.corpus_sig = lambda: dict(sig)
+        g0 = cn.current_gen()
+        files = ca._files()
+        meta = {'algo': cn.ALGO, 'green_fix': cn._green_fix.FIX_ID, 'kgs': len(files), 'corpus': cn._corpus_sig(files),
+                'built_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'build_started': time.time(),
+                'tree_qa': {'id': 'x+thx1', 'kgs': 3700, 'hidden': 300000}}
+        assert cn.minor_drift(meta, files) is not None
+        sig.update(tok='bbb', hidden=300400, kgs=3705)             # an hourly linear-noise run
+        assert cn.current_gen() != g0
+        d = cn.minor_drift(meta, files); assert d and d['tree_qa_hidden_delta'] == 400
+        sig.update(hidden=330000)                                  # a real change
+        assert cn.minor_drift(meta, files) is None
+        sig.update(hidden=300000, id='y+thx1')                     # rule bump
+        assert cn.minor_drift(meta, files) is None
+        assert cn.minor_drift({k: v for k, v in meta.items() if k != 'tree_qa'}, files) is None   # built before the fold
+    finally:
+        ca._tree_qa.corpus_sig = real
+
+
 if __name__ == '__main__':
     for n, f in list(globals().items()):
         if n.startswith('test_'):

@@ -524,6 +524,10 @@ apices `/api/v1/trees/bbox` returns by default (`realistic=1`, `min_height=3`). 
   whose only difference is the thx fold is recomputed at `ne_thx_repost_per_tick` (default 12 ≈ 140
   KGs/h ≈ 135 MB/h, plus the existing 2 GiB/day post cap) — all 7 850 KGs drain in ~3 days.
   Check: `tools/tree_qa_check.py` reports `thx_ne_max` (must be 0).
+* **National aggregate** (`cells_national.current_gen`): folds `tree_qa.corpus_sig()` (`id` = rule + thx
+  id, `tok` over the `kg` table). `minor_drift` defers a rebuild while the id is unchanged and the
+  hidden-apex total / filtered-KG count stay within `CELLS_NATIONAL_MINOR_TQ_FRAC` (2 %) of the last
+  build (`meta.tree_qa`), so hourly linear-noise churn does not force daily rebuilds; ≤ 7 days stale.
 * Ops: `python3 tree_qa.py --status`, `--refresh [--budget-s N]`, `--kg 92001`; `tree_qa:` line in
   `/process.txt`; `python3 tests/test_tree_qa.py`. `RULE_ID` bump = re-evaluate every KG.
 * Known: `/trees/bbox` returns a cell's apices once per KG file that stores the cell (KG-overlap

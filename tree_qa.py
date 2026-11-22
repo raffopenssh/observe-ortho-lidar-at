@@ -681,6 +681,25 @@ def _write_json(path, obj) -> None:
     os.replace(tmp, path)
 
 
+def corpus_sig() -> dict:
+    """One corpus-wide token of the tree-QA state (cheap: the ``kg`` table only) —
+    ``cells_national.current_gen`` folds ``tok``; ``kgs`` / ``hidden`` let it tell hourly
+    linear-noise churn from a real change (``minor_drift``)."""
+    out = {'id': f'{RULE_ID}+{THX_ID}', 'kgs': 0, 'hidden': 0, 'tok': ''}
+    if _db_path().exists():
+        try:
+            c = sqlite3.connect(f'file:{_db_path()}?mode=ro', uri=True, timeout=10)
+            try:
+                rows = c.execute("SELECT kg, tok, n FROM kg WHERE tok != '' ORDER BY kg").fetchall()
+            finally:
+                c.close()
+            out.update(kgs=len(rows), hidden=int(sum(r[2] or 0 for r in rows)),
+                       tok=hashlib.sha1(json.dumps([r[:2] for r in rows]).encode()).hexdigest()[:12])
+        except sqlite3.Error as e:
+            log.warning('tree_qa: corpus_sig: %s', e)
+    return out
+
+
 def status() -> dict:
     out = {'db': str(_db_path()), 'exists': _db_path().exists(), 'rule': RULE_ID}
     if out['exists']:
