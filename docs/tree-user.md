@@ -176,6 +176,9 @@ a refresh returns today's positions.**
   `zero`. Frame token is the same `p-5+5` (`partial: true` on
   `/trees/frame` and the flag, which lists `moved_tiles`); the cache tag
   carries a digest of the tile list. `reframe` / `frame_vote` /
+  Unmeasured tiles of a `partial` KG can still be decided later (a rebin
+  pair that appears after the pass puts the KG back on the to-do list: no
+  BEV read, decided tiles are final, only `-1 → 1` moves reports, `ts_fill`).
   `_migrate_stores` / `shift_lonlat_points` / `trees_v3.read_apices` move a
   stale position only where `moved()` says so. KGs already served moved as
   a whole are never re-measured automatically (that would be a second

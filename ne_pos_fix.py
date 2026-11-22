@@ -692,7 +692,7 @@ def verify_tiles_kg(kg, prev: dict | None = None, tries: int = 2, read: bool = T
         verdict = 'zero'
     else:
         verdict = 'unclear'
-    out = {'verdict': verdict, 'windows': wins, 'ts': now, 'tv': TILE_RULE, 'tiles_n': [ns, nz, len(T) - ns - nz]}
+    out = {'verdict': verdict, 'windows': wins, 'ts': now, 'tv': TILE_RULE, 'tiles_n': [ns, nz, len(T) - ns - nz], 'flags': flag}
     if prev and prev.get('verdict'):
         out['was_verdict'] = prev['verdict']
     if verdict in ('shift', 'partial'):
@@ -732,6 +732,11 @@ def tile_candidates(doc: dict | None = None) -> dict:
         for k in (str(q[0]).zfill(5), str(q[1]).zfill(5)):
             v = kgs.get(k) or {}
             if v.get('tv') == TILE_RULE:
+                # measured before this pair was known: its unmeasured tiles can still be decided by it
+                o = str(q[1] if k == str(q[0]).zfill(5) else q[0]).zfill(5)
+                if v.get('verdict') in ('partial', 'unclear', 'zero') and (v.get('tiles_n') or [0, 0, 0])[2] > 0 \
+                        and not any(w.get('src') == 'pair' and w.get('other') == o for w in v.get('windows') or []):
+                    todo.append(k)
                 continue
             (review if v.get('verdict') in ('shift', 'retired', 'rejected') else todo).append(k)
     todo += [k for vd in ('mixed', 'unclear') for k, v in sorted(kgs.items()) if v.get('verdict') == vd and v.get('tv') != TILE_RULE]
@@ -754,21 +759,35 @@ def verify_tiles(budget_mb_h: float = 150.0, max_kgs: int | None = None, only=No
     t0 = time.time(); done = 0; own = 0.0
     for kg in todo:
         prev = kgs.get(kg)
-        if prev and prev.get('verdict') in ('shift', 'partial', 'retired', 'rejected'):
+        fill = bool(prev and prev.get('verdict') == 'partial')
+        if prev and prev.get('verdict') in ('shift', 'retired', 'rejected'):
             if not quiet:
                 print(kg, 'skipped: positions already moved once', prev.get('verdict'), flush=True)
             continue
-        b0 = psutil.net_io_counters().bytes_recv
+        b0 = psutil.net_io_counters().bytes_recv; new = None
         try:
-            r = verify_tiles_kg(kg, prev, read=not dry)
+            r = verify_tiles_kg(kg, prev, read=not dry and not fill)
+            if fill:
+                # a partial KG is served moved already: decided tiles are final, only unmeasured ones
+                # may still become moved (their reports follow now — same frame token, new tile digest)
+                old = prev['tiles']; got = r.get('flags') or []
+                if len(got) != len(old):
+                    raise RuntimeError('tile list changed')
+                tl = [list(o[:4]) + [int(o[4]) if o[4] >= 0 else int(g)] for o, g in zip(old, got)]
+                new = [list(o[:4]) + [1 if (o[4] < 0 and t[4] > 0) else 0] for o, t in zip(old, tl)]
+                fl = [t[4] for t in tl]
+                r = dict(r, verdict='partial', off=list(prev['off']), tiles=tl, ts=prev.get('ts', r['ts']), ts_fill=r['ts'],
+                         tiles_n=[fl.count(1), fl.count(0), fl.count(-1)], was_verdict=prev.get('was_verdict'))
+                if not any(t[4] for t in new):
+                    new = False
         except Exception as e:  # noqa: BLE001
             r = {'verdict': 'error', 'error': repr(e)[:200], 'windows': [], 'ts': int(time.time())}
         if dry:
             print(kg, r['verdict'], r.get('tiles_n'), flush=True)
             continue
-        if r['verdict'] in ('shift', 'partial'):
+        if r['verdict'] in ('shift', 'partial') and new is not False and not dry:
             try:
-                r['migrated'] = _migrate_stores(kg, r['off'], sel=_tiles_sel(r.get('tiles')))
+                r['migrated'] = _migrate_stores(kg, r['off'], sel=_tiles_sel(new or r.get('tiles')))
             except Exception as e:  # noqa: BLE001 — do not serve a KG whose reports could not follow
                 r = dict(r, verdict='error', error='migrate: ' + repr(e)[:160]); r.pop('off', None); r.pop('tiles', None)
         mb = (psutil.net_io_counters().bytes_recv - b0) / 1e6
