@@ -23,7 +23,7 @@ BASE = 'http://localhost:8100/api/v1/trees/bbox'
 
 
 def check(i, j):
-    hdr, c, _ = cb.load_bin(i, j, need=('tree_h',))
+    hdr, c, _ = cb.load_bin(i, j, need=('tree_h', 'tree_h_max'))
     ids = c['id']; w, s, e, n = cb.bin_bbox(i, j)
     u = (f'{BASE}?bbox={w - PAD:.6f},{s - PAD:.6f},{e + PAD:.6f},{n + PAD:.6f}&format=columns&limit=100000'
          '&min_height=3&fields=h_m,cell,kg_code')
@@ -42,7 +42,9 @@ def check(i, j):
     side = np.stack([np.repeat(np.arange(ids.size), c['tree_h_n']), c['tree_h']])
     same = api.shape == side.shape and np.array_equal(api, side)
     tn_ok = bool(np.array_equal(np.minimum(c['tree_h_n'], 255), c['tree_n']))
-    return {'bin': (i, j), 'ok': bool(same and tn_ok), 'api_n': int(inb.sum()), 'list_n': int(c['tree_h'].size),
+    lt = c['tree_n'] < 255                                 # thx1: tree_h_max == max(tree_h) (255 = no apex)
+    thx_bad = int((cb.thx_from_lists(c)[lt] != c['tree_h_max'][lt]).sum()) if 'tree_h_max' in c else -1
+    return {'bin': (i, j), 'ok': bool(same and tn_ok and thx_bad == 0), 'thx_ne_max': thx_bad, 'api_n': int(inb.sum()), 'list_n': int(c['tree_h'].size),
             'tree_n_eq_len': tn_ok, 'api_dup_other_kg': raw_n - int(inb.sum()),
             'max_h': float(c['tree_h'].max() / 2) if c['tree_h'].size else None}
 

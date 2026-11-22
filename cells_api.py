@@ -630,7 +630,8 @@ def _load_chunk(kg: str, row: dict, hdr: dict, raw: bool = False, qa: bool = Tru
     ne_linear, tree_qa itself)."""
     qa_idx = _tree_qa.chunk_idx(kg, int(row['r10']), hdr['neo1_digest']) if qa and not raw else None
     key = (kg, hdr['neo1_digest'], int(row['r10']), _green_fix.FIX_ID + _pos_fix.tag(kg)
-           + ('' if qa_idx is None else '|tq%08x' % zlib.crc32(qa_idx)))
+           + ('' if qa_idx is None else '|tq%08x' % zlib.crc32(qa_idx))
+           + ('|' + _tree_qa.THX_ID if qa and not raw else ''))
     ch = None if raw else _lru_get(_chunk_lru, key)
     if ch is not None:
         return ch
@@ -657,9 +658,11 @@ def _load_chunk(kg: str, row: dict, hdr: dict, raw: bool = False, qa: bool = Tru
         return Chunk(kg, row, parts)
     # position override for KGs built on 5 m-shifted rasters (ne_pos_fix.py, measured per KG)
     parts['trees'], parts['bld'] = _pos_fix.fix_words(kg, parts['trees'], parts['bld'])
-    if qa_idx is not None:
+    if qa:
+        # hidden apices dropped (qa_idx) + tree_h_max = max of the kept NET1 rows (every chunk)
         parts['obs'], parts['trees'] = _tree_qa.patch(parts['obs'], parts['trees'], qa_idx)
-        row = dict(row, trees=len(parts['trees']) // 4)
+        if qa_idx is not None:
+            row = dict(row, trees=len(parts['trees']) // 4)
     ch = Chunk(kg, row, parts)
     _lru_put(_chunk_lru, key, ch, CHUNK_LRU_N)
     return ch
@@ -1474,7 +1477,7 @@ def pub_file(kg: str) -> Path | None:
     if h is None:
         return None
     tq = _tree_qa.kg_tok(kg)
-    out = PUB_DIR / f'{kg}-{h["neo1_digest"]}-{_green_fix.FIX_ID}{_pos_fix.tag(kg).replace("|", "-")}{"-tq" + tq if tq else ""}.h3b'
+    out = PUB_DIR / f'{kg}-{h["neo1_digest"]}-{_green_fix.FIX_ID}{_pos_fix.tag(kg).replace("|", "-")}{"-tq" + tq if tq else ""}-{_tree_qa.THX_ID}.h3b'
     if out.exists():
         return out
     with _pub_lock:
@@ -1570,7 +1573,7 @@ def _etag(hdrs: dict, extra: str = '') -> str:
     canon = request.method + ' ' + request.path + '?' + '&'.join(f'{k}={v}' for k, v in sorted(request.args.items(multi=True)))
     if request.method == 'POST':
         canon += '#' + hashlib.sha256(request.get_data() or b'').hexdigest()[:16]
-    return '"c-' + hashlib.sha256(('|'.join(digs) + '\n' + canon + extra + _green_fix.FIX_ID).encode()).hexdigest()[:16] + '"'
+    return '"c-' + hashlib.sha256(('|'.join(digs) + '\n' + canon + extra + _green_fix.FIX_ID + _tree_qa.THX_ID).encode()).hexdigest()[:16] + '"'
 
 
 def _dumps(obj, pretty: bool = False) -> bytes:
@@ -2083,7 +2086,7 @@ def kg_cells(code):
         if bb is None:
             raise CellsError(404, f'unknown KG {code}')
         return _not_ready({'kgs': [], 'kgs_missing': [code]})
-    etag = '"c-' + hashlib.sha256(f'{code}|{h["neo1_digest"]}{_pos_fix.tag(code)}{_tree_qa.kg_tok(code)}|{fmt}|{_green_fix.FIX_ID}'.encode()).hexdigest()[:16] + '"'
+    etag = '"c-' + hashlib.sha256(f'{code}|{h["neo1_digest"]}{_pos_fix.tag(code)}{_tree_qa.kg_tok(code)}|{fmt}|{_green_fix.FIX_ID}{_tree_qa.THX_ID}'.encode()).hexdigest()[:16] + '"'
     if fmt == 'json':
         d = {'kg': code, 'ready': True, 'cells_n': h['cells_n'], 'epoch': h['epoch'], 'product_version': h['product_version'],
              'partial': bool(h.get('partial_cells')), 'neo1_digest': h['neo1_digest'], 'summary': h['summary'],

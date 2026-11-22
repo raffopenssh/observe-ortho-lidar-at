@@ -271,7 +271,7 @@ def _fingerprint_bbox(w, s, e, n) -> tuple[str, list[str], list[str]]:
         f = fs.get(k)
         (on if f else miss).append(k)
     parts = [f"{k}:{int(float(fs[k].get('mtime') or 0))}:{int(fs[k].get('partial') or 0)}" for k in on]
-    fp = hashlib.sha256((ALGO + ca._green_fix.FIX_ID + '|' + ','.join(parts) + '|m' + str(len(miss)) + ca._tree_qa.kgs_tok(on)).encode()).hexdigest()[:16]
+    fp = hashlib.sha256((ALGO + ca._green_fix.FIX_ID + '|' + ','.join(parts) + '|m' + str(len(miss)) + ca._tree_qa.kgs_tok(on) + ca._tree_qa.THX_ID).encode()).hexdigest()[:16]
     return fp, on, miss
 
 
@@ -373,7 +373,7 @@ def _kg_acc_compute(kg: str) -> dict:
 
 def _kg_acc(kg: str, wait_s: float) -> tuple[dict, float] | None:
     f = ca._files().get(kg)
-    fp = hashlib.sha256(f"{ALGO}{ca._green_fix.FIX_ID}|{kg}:{int(float(f.get('mtime') or 0))}{ca._tree_qa.kg_tok(kg)}".encode()).hexdigest()[:16]
+    fp = hashlib.sha256(f"{ALGO}{ca._green_fix.FIX_ID}|{kg}:{int(float(f.get('mtime') or 0))}{ca._tree_qa.kg_tok(kg)}{ca._tree_qa.THX_ID}".encode()).hexdigest()[:16]
     return _get_or_compute(f'kg:{kg}', fp, lambda: _kg_acc_compute(kg), wait_s=wait_s)
 
 

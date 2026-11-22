@@ -164,25 +164,46 @@ def _offsets():
 quant_h = tree_rule.quant_h     # apex height → u8 ×0.5 m (shared with the ne_h3 builder)
 
 
-def patch(obs: bytes, trees: bytes, idx: bytes) -> tuple[bytes, bytes]:
-    """NEO1 rows + NET1 rows of one chunk without the hidden apices: rows dropped, and for
-    the cells that lost one ``tree_n`` = kept count, ``tree_h_max`` = tallest kept (255 = none)."""
+THX_ID = 'thx1'     # tree_h_max derived from the kept NET1 rows at chunk load (2026-11-22). Folded into
+                    # the chunk LRU key, every bin generation, per-KG ETags and the posted-rows token.
+
+
+def patch(obs: bytes, trees: bytes, idx: bytes | None = None) -> tuple[bytes, bytes]:
+    """NEO1 rows + NET1 rows of one chunk as the cell products see them (called for EVERY
+    chunk; *idx* = hidden NET1 row indices or None):
+
+    * hidden apices dropped; for the cells that lost one ``tree_n`` = kept count;
+    * ``tree_h_max`` of every cell with ``tree_n`` < 255 = tallest KEPT apex on the 0.5 m
+      scale of the ``tree_h`` list (``quant_h`` of the 0.25 m NET1 word; 255 = none) — the
+      stored value was rounded from the unclipped float and sat 0.5 m off in ~25 % of the
+      cells.  Skipped when the chunk's tree_n sum does not address the NET1 rows exactly.
+
+    The KG file is never written."""
     o_tn, o_thx, rec = _offsets()
-    rows = np.frombuffer(obs, np.uint8).reshape(-1, rec).copy()
+    rows = np.frombuffer(obs, np.uint8).reshape(-1, rec)
     w = np.frombuffer(trees, '<u4')
-    hide = np.frombuffer(idx, '<u2').astype(np.int64)
-    hide = hide[hide < w.size]
-    if not hide.size:
-        return obs, trees
     n = rows.shape[0]
-    cell = np.repeat(np.arange(n), rows[:, o_tn].astype(np.int64))[:w.size]
+    tn = rows[:, o_tn].astype(np.int64)
+    exact = int(tn.sum()) == w.size
+    hide = np.zeros(0, np.int64) if not idx else np.frombuffer(idx, '<u2').astype(np.int64)
+    hide = hide[hide < w.size]
+    if not hide.size and not exact:
+        return obs, trees
+    rows = rows.copy()
+    cell = np.repeat(np.arange(n), tn)[:w.size]
     keep = np.ones(w.size, bool); keep[hide] = False
-    touched = np.unique(cell[hide])
     cnt = np.bincount(cell[keep], minlength=n)
     mx = np.zeros(n, np.uint8)
     np.maximum.at(mx, cell[keep], quant_h(((w[keep] >> 10) & 0xFF) * 0.25))
-    rows[touched, o_tn] = np.minimum(cnt[touched], 255)
-    rows[touched, o_thx] = np.where(cnt[touched] > 0, mx[touched], 255)
+    if hide.size:
+        touched = np.unique(cell[hide])
+        rows[touched, o_tn] = np.minimum(cnt[touched], 255)
+        rows[touched, o_thx] = np.where(cnt[touched] > 0, mx[touched], 255)
+    if exact:
+        sel = tn < 255
+        rows[sel, o_thx] = np.where(cnt[sel] > 0, mx[sel], 255)
+    if not hide.size:
+        return rows.tobytes(), trees
     return rows.tobytes(), np.ascontiguousarray(w[keep]).tobytes()
 
 

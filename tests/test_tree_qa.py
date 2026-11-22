@@ -37,7 +37,21 @@ def test_patch():
     assert int(o2['tn'].sum()) == t2.size
     other = [f for f in ca.OBS_DT.names if f not in ('tn', 'thx')]
     assert all(np.array_equal(o2[f], obs[f]) for f in other)
-    # nothing to hide / out-of-range index → input returned unchanged
+    # thx1: no hidden rows → tree_h_max still derived from the NET1 rows (list scale), tn / rows untouched
+    o3, t3 = tree_qa.patch(obs.tobytes(), trees.tobytes(), None)
+    o3 = np.frombuffer(o3, ca.OBS_DT)
+    assert t3 == trees.tobytes() and o3['tn'].tolist() == [2, 0, 3, 1]
+    assert o3['thx'].tolist() == [128, 255, 60, 128], o3['thx']
+    assert all(np.array_equal(o3[f], obs[f]) for f in other)
+    # tree_n sum does not address the rows (saturated cell) → stored thx kept
+    sat = obs.copy(); sat['tn'] = [2, 0, 255, 1]
+    assert tree_qa.patch(sat.tobytes(), trees.tobytes(), None)[0] == sat.tobytes()
+    # a stored bin's own lists give the same column (cells_bins.thx_from_lists = the in-place upgrade)
+    cols = {'tree_h_n': np.array([2, 0, 3, 1], '<u2'), 'tree_h': np.array([40, 128, 24, 50, 60, 128], np.uint8),
+            'tree_n': o3['tn'], 'tree_h_max': obs['thx']}
+    assert cb.thx_from_lists(cols).tolist() == o3['thx'].tolist()
+    g0 = cb._gen_prev(1, 2, [], []); assert cb._gen(g0) != g0 and tree_qa.THX_ID in ('thx1',)
+    # out-of-range index → trees returned unchanged
     assert tree_qa.patch(obs.tobytes(), trees.tobytes(), np.array([99], '<u2').tobytes())[1] == trees.tobytes()
     # quantiser = the tree_h list's
     h = np.array([3.0, 12.25, 59.5, 63.75])
@@ -51,13 +65,13 @@ def test_gen_fold_and_snapshot():
     try:
         tree_qa._snap.update(t=0.0, ver='x')
         base = cb._base_gen(1, 2, [('00001', 'd', 0)], [])
-        assert cb._gen(1, 2, [('00001', 'd', 0)], []) == base          # no store → generation unchanged
+        assert cb._gen_prev(1, 2, [('00001', 'd', 0)], []) == base          # no store → generation unchanged
         con = tree_qa._conn()
         idx = np.array([3], '<u2').tobytes()
         tree_qa._commit_kg(con, '00001', 'sig', {77: idx}, {(1, 2): ('abc', np.array([5], np.uint64))}, 'd')
         con.close()
-        assert cb._gen(1, 2, [('00001', 'd', 0)], []) != base
-        assert cb._gen(1, 3, [('00001', 'd', 0)], []) == cb._base_gen(1, 3, [('00001', 'd', 0)], [])
+        assert cb._gen_prev(1, 2, [('00001', 'd', 0)], []) != base
+        assert cb._gen_prev(1, 3, [('00001', 'd', 0)], []) == cb._base_gen(1, 3, [('00001', 'd', 0)], [])
         assert tree_qa.chunk_idx('00001', 77, 'd') == idx
         assert tree_qa.chunk_idx('00001', 77, 'other-file-version') is None
         assert tree_qa.chunk_idx('00001', 78) is None and tree_qa.kg_tok('00002') == ''
@@ -65,7 +79,7 @@ def test_gen_fold_and_snapshot():
         tree_qa._snap.update(t=0.0, ver='x')                           # a second process: reload from disk
         assert tree_qa.kg_tok('00001') == tok and tree_qa.bin_tok(1, 2)
         con = tree_qa._conn(); tree_qa._commit_kg(con, '00001', None, {}, {}); con.close()
-        assert cb._gen(1, 2, [('00001', 'd', 0)], []) == base and tree_qa.chunk_idx('00001', 77) is None
+        assert cb._gen_prev(1, 2, [('00001', 'd', 0)], []) == base and tree_qa.chunk_idx('00001', 77) is None
     finally:
         tree_qa.DB_PATH = old
         tree_qa._snap.update(t=0.0, ver='x')
@@ -87,7 +101,7 @@ def test_snapshot_race():
     builds = []; stores = []
     try:
         cb.bin_inputs = lambda i, j: {'i': i, 'j': j, 'bbox': cb.bin_bbox(i, j), 'kgs': ['00001'], 'on_disk': ['00001'],
-                                       'missing': [], 'partial_files': [], 'gen': cb._gen(i, j, parts, []), 'epoch': None}
+                                       'missing': [], 'partial_files': [], 'gen': cb._gen(cb._gen_prev(i, j, parts, [])), 'gen_prev': cb._gen_prev(i, j, parts, []), 'epoch': None}
 
         def fake_build(i, j, inp=None):
             builds.append((i, j, inp['gen']))
@@ -98,18 +112,18 @@ def test_snapshot_race():
         tree_qa._conn().close()                                        # empty store
         tree_qa._snap.update(t=0.0, ver='x')
         old_gen = cb.bin_inputs(I, J)['gen']
-        assert old_gen == cb._base_gen(I, J, parts, []) and tree_qa._snap['ver'] == tree_qa.version()
+        assert old_gen == cb._gen(cb._base_gen(I, J, parts, [])) and tree_qa._snap['ver'] == tree_qa.version()
         # --- the refresher (another process): commit the KG, then patch the stored bin + block
         con = tree_qa._conn()
         con.execute("INSERT INTO hid VALUES ('00001', 77, ?)", (np.array([3], '<u2').tobytes(),))
         con.execute("INSERT INTO binkg VALUES (?, ?, '00001', 'abc')", (I, J))
         con.execute("INSERT INTO kg VALUES ('00001', 'sig', 'tok', 1, 1, 0, 'd')")
         con.commit(); con.close()
-        new_gen = hashlib.sha256(f"{old_gen}|tq|{tree_qa._bin_tok({'00001': 'abc'})}".encode()).hexdigest()[:24]
+        new_gen = cb._gen(hashlib.sha256(f"{cb._base_gen(I, J, parts, [])}|tq|{tree_qa._bin_tok({'00001': 'abc'})}".encode()).hexdigest()[:24])
         cb._store_blob(I, J, {'gen': new_gen, 'algo': cb.ALGO, 'n': 1, 'built_by': 'refresher'}, OrderedDict(id=np.array([5], '<u8')))
         blob = cb._path(I, J).read_bytes()
         fields = list(cb.DEFAULT_FIELDS)
-        gens = [new_gen if ij == (I, J) else cb._base_gen(*ij, parts, []) for ij in cb.block_bins(1, 2)]
+        gens = [new_gen if ij == (I, J) else cb._gen(cb._base_gen(*ij, parts, [])) for ij in cb.block_bins(1, 2)]
         zp, mp = cells_blocks._paths(1, 2, fields)
         zp.parent.mkdir(parents=True, exist_ok=True); zp.write_bytes(b'patched-block')
         meta = {'gen': cb.block_gen(gens), 'algo': cells_blocks.ALGO, 'zstd_level': cells_blocks.ZSTD_LEVEL, 'bytes': 13,

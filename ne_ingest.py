@@ -998,6 +998,8 @@ def _disk_row(parent: str, idx: dict) -> tuple[dict | None, str]:
 
 _gf_budget = [10 ** 9]          # fixed-digest computations left in this confirm pass (full corpus read ≈ 0.3 s/file)
 GF_COMPUTE_PER_TICK = 400
+THX_REPOST_PER_TICK = 12        # knob ne_thx_repost_per_tick: thx1-only re-posts per confirm pass (see _our_digest)
+_thx_budget = [0]
 
 
 def _our_digest(parent: str, idx: dict, green_fix: bool = True) -> str | None:
@@ -1021,8 +1023,21 @@ def _our_digest(parent: str, idx: dict, green_fix: bool = True) -> str | None:
         tq = tree_qa.kg_tok(parent)          # tree_n / tree_h_max follow the default /trees/bbox apex set
     except Exception:  # noqa: BLE001
         tq = ""
-    if gf.get("id") == ne_green_fix.FIX_ID and gf.get("of") == raw and gf.get("digest") and (gf.get("tq") or "") == tq:
-        return gf["digest"]
+    tq_base = tq
+    try:
+        if tree_qa.version() is not None:
+            tq = f"{tq}|{tree_qa.THX_ID}"    # tree_h_max == max(tree_h) in the posted rows (thx1, 2026-11-22)
+    except Exception:  # noqa: BLE001
+        pass
+    if gf.get("id") == ne_green_fix.FIX_ID and gf.get("of") == raw and gf.get("digest"):
+        if (gf.get("tq") or "") == tq:
+            return gf["digest"]
+        if tq != tq_base and (gf.get("tq") or "") == tq_base:
+            # only the thx fold is behind: every KG with trees re-posts (~0.95 MB each incl. the
+            # declared GET) — paced below the primary's bandwidth nominal instead of one burst
+            if _thx_budget[0] <= 0:
+                return gf["digest"]
+            _thx_budget[0] -= 1
     if _gf_budget[0] <= 0:
         return None                                       # computed on a later tick (budget per confirm pass)
     _gf_budget[0] -= 1
@@ -1265,6 +1280,7 @@ def confirm_ne_server(idx: dict, max_posts: int = 5) -> dict:
     day_cap = float(_knob("ne_post_gib_per_day", POST_GIB_PER_DAY)) * 2 ** 30
     out["day_bytes"] = int(pd["bytes"])
     _gf_budget[0] = int(_knob("ne_green_fix_compute_per_tick", GF_COMPUTE_PER_TICK))
+    _thx_budget[0] = int(_knob("ne_thx_repost_per_tick", THX_REPOST_PER_TICK))
     green_fix = bool(_knob("ne_green_fix", True))
     if mf.get("kgs_obs_on_index") is not None:
         vp = idx["stats"].setdefault("view_pass", {})

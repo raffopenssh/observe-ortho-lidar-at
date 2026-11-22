@@ -1846,7 +1846,7 @@ def neo1_rows_from_h3b(path: str | Path, green_fix: bool = True,
     hdr = read_h3b_header(path)
     obs = bytearray()
     n_fix = n_tree = 0
-    tq = None
+    tq = thx = None
     if green_fix:
         import ne_green_fix as _gf
         # tree QA (tree_qa.py, primary only): tree_n / tree_h_max follow the default /trees/bbox apex set.
@@ -1854,10 +1854,13 @@ def neo1_rows_from_h3b(path: str | Path, green_fix: bool = True,
         if Path(path).name == f"{hdr.get('kg')}.h3b":
             try:
                 import tree_qa as tq
+                # thx1: tree_h_max = max of the kept NET1 rows, as in the cell products — only where
+                # the tree-QA store lives (primary corpus); peers post nothing through this gate
+                thx = tq if tq.version() is not None else None
                 if not tq.kg_tok(hdr["kg"], hdr["neo1"]["digest"]):
                     tq = None
             except Exception:  # noqa: BLE001
-                tq = None
+                tq = thx = None
     n_qa = 0
     for ch in hdr["chunks"]:
         part = read_h3b_chunk(path, hdr, ch)
@@ -1867,9 +1870,9 @@ def neo1_rows_from_h3b(path: str | Path, green_fix: bool = True,
             n_fix += kt + kg
             n_tree += kt
             idx = tq.chunk_idx(hdr["kg"], int(ch["r10"], 16), hdr["neo1"]["digest"]) if tq else None
-            if idx is not None:
-                o, _ = tq.patch(o, part["trees"], idx)
-                n_qa += len(idx) // 2
+            if idx is not None or thx is not None:
+                o, _ = (tq or thx).patch(o, part["trees"], idx)
+                n_qa += len(idx or b"") // 2
         obs += o
     if counts is not None:
         counts["tree"] = n_tree

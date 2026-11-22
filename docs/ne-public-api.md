@@ -509,6 +509,21 @@ apices `/api/v1/trees/bbox` returns by default (`realistic=1`, `min_height=3`). 
   it changed and re-checks — a stale worker no longer rebuilds the refresher's patched bin with the
   old filter. Builds therefore run on a current snapshot (chunk LRU key included).
   `tests/test_tree_qa.py::test_snapshot_race`.
+* **`tree_h_max` == max(`tree_h`)** (`tree_qa.THX_ID = "thx1"`, 2026-11-22): the stored NEO1 `thx` was
+  rounded from the unclipped float and sat 0.5 m off the list maximum (0.25 m NET1 word → 0.5 m) in ~25 %
+  of the cells with trees. `tree_qa.patch` — now called for **every** chunk in `_load_chunk(qa=True)` and
+  for the posted rows (`ne_h3.neo1_rows_from_h3b`, primary corpus only) — rewrites `thx` of every cell
+  with `tree_n` < 255 from the kept NET1 rows (`quant_h`; 255 = none), in the same pass that drops the
+  hidden rows; no second rule evaluation, KG files untouched (`realistic=0` / `qa=False` = stored bytes).
+  Validity: `THX_ID` is in the chunk LRU key, the per-KG ETags, the pub-container name, the stats
+  fingerprints and **every bin generation** (`cells_bins._gen(gen_prev)`). Roll-out without a rebuild:
+  a stored bin that is current for `gen_prev` is upgraded in place by `load_bin` (`_thx_upgrade`:
+  `thx_from_lists` on its own `tree_h` lists, < 1 ms + re-compress; equal to a rebuild, checked on 23
+  bins), so the hourly prewarm (which no longer forces `rebuild=True`) finishes bins in minutes and
+  re-stores blocks + sample as usual. Posted rows: `ne_ingest._our_digest` token = `kg_tok|thx1`; a KG
+  whose only difference is the thx fold is recomputed at `ne_thx_repost_per_tick` (default 12 ≈ 140
+  KGs/h ≈ 135 MB/h, plus the existing 2 GiB/day post cap) — all 7 850 KGs drain in ~3 days.
+  Check: `tools/tree_qa_check.py` reports `thx_ne_max` (must be 0).
 * Ops: `python3 tree_qa.py --status`, `--refresh [--budget-s N]`, `--kg 92001`; `tree_qa:` line in
   `/process.txt`; `python3 tests/test_tree_qa.py`. `RULE_ID` bump = re-evaluate every KG.
 * Known: `/trees/bbox` returns a cell's apices once per KG file that stores the cell (KG-overlap

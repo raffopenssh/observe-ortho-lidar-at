@@ -233,15 +233,23 @@ def bin_inputs(i: int, j: int) -> dict:
     on_disk = [k for k in inter if k in files]
     missing = [k for k in inter if k not in files]
     parts = [(k, str(files[k].get('neo1_digest')) + _pos_fix.tag(k), int(files[k].get('partial') or 0)) for k in on_disk]
-    gen = _gen(i, j, parts, _store_stamps({k.split('-')[0] for k in inter}))
+    gen_prev = _gen_prev(i, j, parts, _store_stamps({k.split('-')[0] for k in inter}))
+    gen = _gen(gen_prev)
     epochs = sorted({str(files[k].get('epoch')) for k in on_disk if files[k].get('epoch')})
     return {'i': i, 'j': j, 'bbox': (w, s, e, n), 'kgs': inter, 'on_disk': on_disk, 'missing': missing,
-            'partial_files': [k for k, _, p in parts if p], 'gen': gen,
+            'partial_files': [k for k, _, p in parts if p], 'gen': gen, 'gen_prev': gen_prev,
             'epoch': epochs[-1] if epochs else None}
 
 
-def _gen(i: int, j: int, parts: list, stamps: list) -> str:
-    """Bin generation.  The tree-QA token (``tree_qa.py``: apices hidden by the default
+def _gen(gen_prev: str) -> str:
+    """Bin generation = the pre-``thx1`` generation + ``tree_qa.THX_ID`` (2026-11-22: tree_h_max
+    == max(tree_h) in every bin — one bump for all bins; a stored blob that is current for
+    ``gen_prev`` is upgraded in place by ``load_bin`` from its own tree_h lists, no rebuild)."""
+    return hashlib.sha256(f'{gen_prev}|{_tree_qa.THX_ID}'.encode()).hexdigest()[:24]
+
+
+def _gen_prev(i: int, j: int, parts: list, stamps: list) -> str:
+    """Bin generation before the thx fold.  The tree-QA token (``tree_qa.py``: apices hidden by the default
     /trees/bbox filter) is folded in only where it is non-empty — every other bin keeps
     its generation, bytes and ETag."""
     base = _base_gen(i, j, parts, stamps)
@@ -717,6 +725,12 @@ def load_bin(i: int, j: int, *, rebuild: bool = False, need=None) -> tuple[dict,
                     if ok(hdr, cols):
                         _blob_lru.put(key, (hdr, cols))
                         return hdr, cols, inp
+                    up = _thx_upgrade(hdr, cols, inp)
+                    if up is not None:
+                        hdr, cols = up
+                        _store_blob(i, j, hdr, cols)
+                        _blob_lru.put(key, (hdr, cols))
+                        return hdr, cols, inp
                 except Exception as e:  # noqa: BLE001
                     log.warning('cells_bins: unreadable %s: %s', p, e)
             # about to build and replace the stored blob: never on a stale tree-QA snapshot
@@ -736,6 +750,31 @@ def load_bin(i: int, j: int, *, rebuild: bool = False, need=None) -> tuple[dict,
                 log.warning('cells_bins: store %s: %s', p, e)
             _blob_lru.put(key, (hdr, cols))
             return hdr, cols, inp
+
+
+def thx_from_lists(cols) -> np.ndarray:
+    """tree_h_max per cell from the bin's own tree_h lists (cells with tree_n < 255) — what
+    a rebuild yields now that ``tree_qa.patch`` derives it from the same kept NET1 rows."""
+    n = np.asarray(cols['tree_h_n']).astype(np.int64); th = np.asarray(cols['tree_h'])
+    mx = np.full(n.size, 255, np.uint8)
+    nz = n > 0
+    if th.size and nz.any():
+        mx[nz] = np.maximum.reduceat(th, ragged_offsets(n)[:-1][nz])
+    out = np.array(cols['tree_h_max'])
+    sel = np.asarray(cols['tree_n']) < 255
+    out[sel] = mx[sel]
+    return out
+
+
+def _thx_upgrade(hdr: dict, cols, inp: dict):
+    """Stored blob current for the pre-thx generation → same blob with tree_h_max derived from
+    its lists, stamped with today's generation (≈ 30 ms instead of a ~1.2 s build)."""
+    if hdr.get('gen') != inp.get('gen_prev') or hdr.get('algo') != ALGO or any(c not in cols for c in TREE_COLS):
+        return None
+    cols = OrderedDict((k, v) for k, v in cols.items())
+    cols['tree_h_max'] = thx_from_lists(cols)
+    return dict(hdr, gen=inp['gen'], thx=_tree_qa.THX_ID,
+                thx_upgraded_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())), cols
 
 
 def _store_blob(i: int, j: int, hdr: dict, cols) -> None:
@@ -900,7 +939,7 @@ def manifest() -> dict:
             parts = [(k, str(files[k].get('neo1_digest')) + _pos_fix.tag(k), int(files[k].get('partial') or 0)) for k in on]
             st = [(p_, stamp_of.get(p_, '')) for p_ in {k.split('-')[0] for k in inter}]
             eps = sorted({str(files[k].get('epoch')) for k in on if files[k].get('epoch')})
-            I.append(i); J.append(j); G.append(_gen(i, j, parts, st)); EP.append(eps[-1] if eps else None)
+            I.append(i); J.append(j); G.append(_gen(_gen_prev(i, j, parts, st))); EP.append(eps[-1] if eps else None)
             C.append(int(not miss and not any(p for _, _, p in parts))); KN.append(len(on)); ST.append(int((i, j) in stored))
         v = {'bin_deg': BIN_DEG, 'algo': ALGO, 'n': len(I),
              'generation': hashlib.sha256('|'.join(G).encode()).hexdigest()[:16],
@@ -1123,7 +1162,7 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
             stop = True
             return
         try:
-            load_bin(*ij, rebuild=True)
+            load_bin(*ij)       # stale → built (or thx-upgraded in place when only THX_ID is behind)
             with lock:
                 n_built += 1
                 if verbose and n_built % 50 == 0:
