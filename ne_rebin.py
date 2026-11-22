@@ -319,11 +319,18 @@ class FileSource(Source):
     def stored(self, r10, handle):
         import ne_h3
         p = ne_h3.read_h3b_chunk(self.path, self.hdr, handle)
-        return p['obs'], self.fix(p['trees'])
+        return p['obs'], self.fix(p['trees'], p['obs'])
 
-    def fix(self, trees: bytes) -> bytes:
-        """Stored NET1 rows → with the position overrides every reader applies."""
-        return self._pf.fix_words(self.kg, trees, b'')[0]
+    def fix(self, trees: bytes, obs: bytes | None = None) -> bytes:
+        """Stored NET1 rows → with the position overrides every reader applies.  *obs* = the chunk's
+        NEO1 rows: the cell context ``fix_words`` needs for a partly shifted KG and for a whole-shift
+        KG with sweep-unit keep cells (same call as ``cells_api._load_chunk`` — without it the posted
+        rows moved every word of such a KG and none of a partial one)."""
+        cells = None
+        if obs is not None and trees and (self._pf.partial(self.kg) or self._pf.keep_cells(self.kg) is not None):
+            import cells_api as ca
+            cells = lambda: ca._fix_cells(obs)      # noqa: E731
+        return self._pf.fix_words(self.kg, trees, b'', cells)[0]
 
 
 # === SECTION: index accelerator + check CLI ===

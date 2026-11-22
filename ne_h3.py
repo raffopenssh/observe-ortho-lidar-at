@@ -1898,7 +1898,7 @@ def neo1_rows_from_h3b(path: str | Path, green_fix: bool = True,
             n_tree += kt
             trees = part["trees"]
             if rb_src is not None:
-                trees = rb_src.fix(trees)
+                trees = rb_src.fix(trees, part["obs"])
                 rb = ne_rebin.rebin(rb_src, int(ch["r10"], 16), o, trees, rec, o_tn, o_thx)
                 if rb is not None:
                     o, trees = rb[0], rb[1]

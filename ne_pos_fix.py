@@ -151,21 +151,26 @@ def tile_owner(tiles: np.ndarray, x, y) -> np.ndarray:
     return out
 
 
-def moved(kg, x, y) -> np.ndarray:
+def moved(kg, x, y, kx=None, ky=None) -> np.ndarray:
     """Per STORED position (EPSG:3035 m): is it served ``any_offset(kg)`` away?  All True for a KG
-    moved as a whole, all False for an untouched one, per owning tile for a partly shifted one."""
+    moved as a whole, all False for an untouched one, per owning tile for a partly shifted one.
+    *kx* / *ky* (``fix_words``): the centre of the cell ROW that lists the word — a sweep unit won
+    whole rows, and a stored apex may sit up to 16 m outside its row's cell, so the keep test of a
+    reader that knows the row is the row's cell; without them the position's own cell (point readers)."""
     st = _load(); kg = str(kg).zfill(5)
     n = np.asarray(x).reshape(-1).shape[0]
+    if kx is None:
+        kx, ky = x, y
     if kg in st['off']:
         kp = st['keep'].get(kg)
-        return np.ones(n, bool) if kp is None else ~in_keep(kp, x, y)
+        return np.ones(n, bool) if kp is None else ~in_keep(kp, kx, ky)
     p = st['part'].get(kg)
     if p is None:
         return np.zeros(n, bool)
     o = tile_owner(p[1], x, y)
     m = (o >= 0) & p[2][np.clip(o, 0, None)]
     kp = st['keep'].get(kg)
-    return m if kp is None or not m.any() else m & ~in_keep(kp, x, y)
+    return m if kp is None or not m.any() else m & ~in_keep(kp, kx, ky)
 
 
 def in_keep(kp, x, y) -> np.ndarray:
@@ -209,6 +214,25 @@ def keep_cells(kg):
     """Moved KG → frozenset of the res-12 cell ids fresh sweep units supplied (never moved), else None."""
     kp = _load()['keep'].get(str(kg).zfill(5))
     return _keep_ids(kp) if kp else None
+
+
+def served_frame(kg, x, y) -> np.ndarray:
+    """(n, 2) int offset between SERVED positions (EPSG:3035 m) of a KG and their stored place: the
+    whole-KG offset, (0, 0) inside a cell a fresh sweep unit supplied (``keep_cells``) and for every KG
+    not moved as a whole (a partly shifted KG has no single frame — consumers treat it as unframed,
+    as before).  The frame second-order consumers (``rebin_added`` twin rule) must use per apex."""
+    x = np.asarray(x, np.float64).reshape(-1); y = np.asarray(y, np.float64).reshape(-1)
+    out = np.zeros((x.shape[0], 2), np.int64)
+    st = _load(); kg = str(kg).zfill(5)
+    o = st['off'].get(kg)
+    if not o:
+        return out
+    out[:] = (int(o[0]), int(o[1]))
+    kp = st['keep'].get(kg)
+    if kp is not None and x.size:
+        # a kept apex is served where it is stored → its served position lies in a keep cell
+        out[in_keep(kp, x, y)] = 0
+    return out
 
 
 def moves_point(kgs, x, y) -> bool:
@@ -570,7 +594,7 @@ def fix_words(kg, trees: bytes, bld: bytes, cells=None) -> tuple[bytes, bytes]:
         m = None
         if p is not None:
             ci = np.repeat(np.arange(cen.shape[0]), np.asarray(tn, np.int64))[:w.size]
-            m = moved(kg, cen[ci, 0] + _s5(w[:ci.size] & 31), cen[ci, 1] + _s5((w[:ci.size] >> 5) & 31))
+            m = moved(kg, cen[ci, 0] + _s5(w[:ci.size] & 31), cen[ci, 1] + _s5((w[:ci.size] >> 5) & 31), cen[ci, 0], cen[ci, 1])
             m = np.concatenate([m, np.zeros(w.size - m.size, bool)])
         dx = _shift5(w & 31, o[0]); dy = _shift5((w >> 5) & 31, o[1])
         w2 = (w & np.uint32(0xFFFFFC00)) | dx.astype(np.uint32) | (dy.astype(np.uint32) << 5)
@@ -580,7 +604,8 @@ def fix_words(kg, trees: bytes, bld: bytes, cells=None) -> tuple[bytes, bytes]:
         m = None
         if p is not None:
             ci = np.repeat(np.arange(cen.shape[0]), np.asarray(bn, np.int64))[:w.size]
-            m = moved(kg, cen[ci, 0] + _s5(w[:ci.size] & np.uint64(31)), cen[ci, 1] + _s5((w[:ci.size] >> np.uint64(5)) & np.uint64(31)))
+            m = moved(kg, cen[ci, 0] + _s5(w[:ci.size] & np.uint64(31)), cen[ci, 1] + _s5((w[:ci.size] >> np.uint64(5)) & np.uint64(31)),
+                      cen[ci, 0], cen[ci, 1])
             m = np.concatenate([m, np.zeros(w.size - m.size, bool)])
         dx = _shift5(w & np.uint64(31), o[0]); dy = _shift5((w >> np.uint64(5)) & np.uint64(31), o[1])
         w2 = (w & ~np.uint64(1023)) | dx.astype(np.uint64) | (dy.astype(np.uint64) << np.uint64(5))
@@ -1236,7 +1261,7 @@ if __name__ == '__main__':
     if '--sync' in sys.argv:
         print(json.dumps(sync()))
     elif '--sweep-keep' in sys.argv:
-        print(json.dumps(sweep_keep(quiet=False)))
+        print(json.dumps(sweep_keep(only=set(sys.argv[sys.argv.index('--only') + 1].split(',')) if '--only' in sys.argv else None, quiet=False)))
     elif '--unfix' in sys.argv or '--retire' in sys.argv:
         f = unfix if '--unfix' in sys.argv else retire
         kg = sys.argv[sys.argv.index('--unfix' if f is unfix else '--retire') + 1]

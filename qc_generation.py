@@ -125,8 +125,8 @@ def _ledger_before(code: str) -> list:
         c = sqlite3.connect(f'file:{LEDGER}?mode=ro', uri=True, timeout=5)
         try:
             kg = code.split('-')[0]
-            rows = c.execute('SELECT code, fault, verdict, state, COUNT(*) FROM row WHERE code IN (?, ?) '
-                             'GROUP BY code, fault, verdict, state ORDER BY 1, 2', (code, kg)).fetchall()
+            rows = c.execute('SELECT code, fault, verdict, status, COUNT(*) FROM row WHERE code IN (?, ?) '
+                             'GROUP BY code, fault, verdict, status ORDER BY 1, 2', (code, kg)).fetchall()
         finally:
             c.close()
         return [{'code': r[0], 'fault': r[1], 'verdict': r[2], 'state': r[3], 'n': r[4]} for r in rows]

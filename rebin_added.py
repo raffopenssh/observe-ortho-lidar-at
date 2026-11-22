@@ -160,6 +160,13 @@ def _frame(kg) -> tuple[int, int]:
     return (int(o[0]), int(o[1])) if o else (0, 0)
 
 
+def _frames(kg, x, y) -> np.ndarray:
+    """(n, 2) frame of a KG file AT served positions: the whole-KG frame, (0, 0) in the cells a fresh
+    sweep unit supplied (``ne_pos_fix.served_frame``)."""
+    import ne_pos_fix
+    return ne_pos_fix.served_frame(str(kg).zfill(5), x, y)
+
+
 def _file_tok(kg) -> str:
     import cells_api as ca
     import ne_pos_fix
@@ -254,8 +261,9 @@ def _qa_hidden(kg: str, off: dict) -> np.ndarray:
 def decide(kg: str, off: dict, ev: dict) -> list[dict]:
     """Verdict of every off-file apex against the served inventory (``v0``)."""
     n = int(off['idx'].size)
-    fs = _frame(kg)
-    fr = {int(k): _frame(k) for k in np.unique(ev['nk']).tolist()}
+    # frames per apex: its own file's and every neighbour file's AT the apex (neighbours are <= NB_R m away)
+    fsa = _frames(kg, off['x'], off['y']) if n else np.zeros((0, 2), np.int64)
+    fra = {int(k): _frames(k, off['x'], off['y']) for k in np.unique(ev['nk']).tolist()}
     qa = (off['qa'] if 'qa' in off else _qa_hidden(kg, off)) if n else np.zeros(0, bool)
     reason = off.get('reason')
     cut = np.searchsorted(ev['ni'], np.arange(n + 1))
@@ -264,6 +272,7 @@ def decide(kg: str, off: dict, ev: dict) -> list[dict]:
         a, b = int(cut[i]), int(cut[i + 1])
         dx = ev['ndx'][a:b]; dy = ev['ndy'][a:b]; nh = ev['nh'][a:b]; nk = ev['nk'][a:b]
         ks = sorted(set(nk.tolist()))
+        fs = (int(fsa[i, 0]), int(fsa[i, 1])); fr = {int(k): (int(fra[int(k)][i, 0]), int(fra[int(k)][i, 1])) for k in ks}
         fdx = np.array([fs[0] - fr[int(k)][0] for k in nk], np.int64); fdy = np.array([fs[1] - fr[int(k)][1] for k in nk], np.int64)
         h = float(off['h_m'][i])
         j, kind = twin(h, dx, dy, nh, fdx, fdy)
@@ -487,13 +496,16 @@ def resolve(con=None) -> dict:
         ki = np.flatnonzero(kept)
         X = np.array([rows[i]['x'] for i in ki], np.int64); Y = np.array([rows[i]['y'] for i in ki], np.int64)
         H = np.array([rows[i]['hq'] for i in ki], np.float64) / 4.0; K = np.array([rows[i]['kg'] for i in ki], np.int64)
-        fr = {int(k): _frame(k) for k in np.unique(K).tolist()}
+        F = np.zeros((ki.size, 2), np.int64)
+        for k in np.unique(K).tolist():
+            m = K == k
+            F[m] = _frames(k, X[m], Y[m])
         pairs = cKDTree(np.c_[X, Y].astype(np.float64)).query_pairs(NB_R + 0.5, p=np.inf, output_type='ndarray')
         part: dict = {}
         for a, b in pairs.tolist():                      # a < b = (kg, r10, idx) order
             if K[a] == K[b]:
                 continue
-            fa, fb = fr[int(K[a])], fr[int(K[b])]
+            fa, fb = F[a], F[b]
             t1 = twin(H[b], [X[a] - X[b]], [Y[a] - Y[b]], [H[a]], [fb[0] - fa[0]], [fb[1] - fa[1]])[0]
             t2 = twin(H[a], [X[b] - X[a]], [Y[b] - Y[a]], [H[b]], [fa[0] - fb[0]], [fa[1] - fb[1]])[0]
             if t1 >= 0 or t2 >= 0:

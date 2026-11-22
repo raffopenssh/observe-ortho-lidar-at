@@ -57,6 +57,34 @@ def test_keep():
     assert out[0] == w[0] and out[1] == w[1] and out[2] != w[2], out
     assert (np.frombuffer(n.fix_words('00008', w.tobytes(), b'')[0], '<u4') != w).all()
     assert (np.frombuffer(n.fix_words('00007', w.tobytes(), b'')[0], '<u4') != w).all()     # no cell context: whole move as before
+    # the ROW decides for a reader that knows it: a word of the kept row stored 12 m aside (outside the cell) stays,
+    # a word of the far row never does
+    w2 = np.array([(1 << 10) | 12, (3 << 10) | 12], '<u4')
+    o2 = np.frombuffer(n.fix_words('00007', w2.tobytes(), b'', lambda: (cen, [1, 1], [0, 0]))[0], '<u4')
+    assert o2[0] == w2[0] and o2[1] != w2[1]
+    # second-order consumers honour the kept cells:
+    # (a) ne_rebin.FileSource (the posted-rows path of ne_h3) passes the chunk's cells like _load_chunk does
+    import ne_rebin
+    obs = np.zeros(2, ca.OBS_DT)
+    obs['id'] = [h3.str_to_int(cell), h3.str_to_int(h3.latlng_to_cell(*ca._tf('EPSG:3035', 'EPSG:4326').transform(4_700_300.0, 2_700_000.0)[::-1], 12))]
+    obs['tn'] = [2, 1]
+    fs = ne_rebin.FileSource('x', {'kg': '00007', 'neo1': {'digest': 'd'}, 'chunks': []})
+    assert fs.key[1] == 'd|p-5+5~kabcd0123'
+    got = np.frombuffer(fs.fix(w.tobytes(), obs.tobytes()), '<u4')
+    want = np.frombuffer(n.fix_words('00007', w.tobytes(), b'', lambda: ca._fix_cells(obs.tobytes()))[0], '<u4')
+    assert (got == want).all() and got[0] == w[0] and got[1] == w[1] and got[2] != w[2], got
+    # (b) the per-apex frame of rebin_added's twin rule: (0, 0) in a kept cell, the KG frame elsewhere
+    import rebin_added as ra
+    assert ra._frames('00007', [4_700_000, 4_700_300], [2_700_000, 2_700_000]).tolist() == [[0, 0], [-5, 5]]
+    assert ra._frames('00008', [4_700_000], [2_700_000]).tolist() == [[-5, 5]] and ra._frames('00099', [1], [1]).tolist() == [[0, 0]]
+    off = {k: np.array(v) for k, v in dict(idx=[0, 1], r10=[1, 1], cell=[1, 1], x=[4_700_000, 4_700_300], y=[2_700_000, 2_700_000],
+                                           h_m=[18.0, 18.0], word=[0, 0], qa=[False, False]).items()}
+    # one neighbour apex of file 00099 (unframed) per off-file apex, exactly one KG frame away, same height
+    ev = {'okg': np.array([-1, -1]), 'ni': np.array([0, 1]), 'ndx': np.array([5, 5]), 'ndy': np.array([-5, -5]),
+          'nh': np.array([18.0, 18.0]), 'nk': np.array([99, 99])}
+    rows = ra.decide('00007', off, ev)
+    assert [r['v0'] for r in rows] == ['add', 'dup_frame'], [r['v0'] for r in rows]     # kept cell: 7 m apart is another tree
+    assert json.loads(rows[0]['nbk']) == [[99, 0, 0]] and json.loads(rows[1]['nbk']) == [[99, -5, 5]]
 
 
 def test_regenerated():
