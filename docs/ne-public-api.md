@@ -530,8 +530,14 @@ apices `/api/v1/trees/bbox` returns by default (`realistic=1`, `min_height=3`). 
   build (`meta.tree_qa`), so hourly linear-noise churn does not force daily rebuilds; ≤ 7 days stale.
 * Ops: `python3 tree_qa.py --status`, `--refresh [--budget-s N]`, `--kg 92001`; `tree_qa:` line in
   `/process.txt`; `python3 tests/test_tree_qa.py`. `RULE_ID` bump = re-evaluate every KG.
-* Known: `/trees/bbox` returns a cell's apices once per KG file that stores the cell (KG-overlap
-  duplicates); the cell products keep the owner KG's copy only. Compare per owner KG.
+* **KG-overlap dedupe** (2026-11-22, `ne_trees.OWN_ID = "own1"`): a cell stored in several KG files is
+  served by `/trees/bbox` (trees and structures) from its **owner** file only — the copy the cell
+  products keep. One rule, one implementation: `cells_api.lost_cells(kg, rows)` runs `gather`'s dedupe
+  (observed copy first, then the larger chunk, then the lowest kg) over every copy of the res-10 chunk;
+  `ne_trees._own_mask` caches the result per (kg, r10) under all copies' digests. Bodies change only
+  where KG files overlap; the ETag state gets `own1` only when the bbox intersects > 1 KG
+  (single-KG bboxes keep bytes + ETag). `tools/tree_qa_check.py` compares the raw bbox answer
+  (`api_other_kg` must be 0, `sum(tree_n) == count`).
 
 ## 12d. Apex-height lists and national histogram (2026-11-03)
 

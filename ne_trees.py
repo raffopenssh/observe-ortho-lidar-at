@@ -445,6 +445,47 @@ def _decode_chunk_uncached(key, kg: str, r: dict, hdr: dict, kind: str) -> dict:
     return d
 
 
+# ── KG-overlap dedupe: a cell stored in several KG files is served from its owner only ──
+# (owner = cells_api.gather's rule, via ca.lost_cells — the cell products' copy)
+
+OWN_ID = 'own1'
+_own_lru: 'OrderedDict' = None
+_own_lock = threading.Lock()
+OWN_LRU_N = 50000
+
+
+def _own_mask(d: dict, kg: str, r10: int, copies: list[dict]):
+    """Per-object bool mask of the decoded chunk *d* — False where the object's cell is owned by
+    another KG file's copy of this res-10 chunk; None = all owned.  Cached per (kg, r10, kind)
+    under the digests of every copy."""
+    global _own_lru
+    if len(copies) < 2:
+        return None
+    files = ca._files()
+    sig = (ca._green_fix.FIX_ID,) + tuple(sorted((c['kg'], str((files.get(c['kg']) or {}).get('neo1_digest'))) for c in copies))
+    key = (kg, int(r10))
+    with _own_lock:
+        if _own_lru is None:
+            from collections import OrderedDict
+            _own_lru = OrderedDict()
+        hit = _own_lru.get(key)
+        if hit is not None and hit[0] == sig:
+            _own_lru.move_to_end(key)
+            lost = hit[1]
+        else:
+            hit = None
+    if hit is None:
+        lost = ca.lost_cells(kg, copies)
+        with _own_lock:
+            _own_lru[key] = (sig, lost)
+            while len(_own_lru) > OWN_LRU_N:
+                _own_lru.popitem(last=False)
+    if lost is None:
+        return None
+    m = ~np.isin(d['cell'], lost)
+    return None if m.all() else m
+
+
 # ── per-request state (ETag / Last-Modified) ───────────────────────────
 
 def bbox_state(w, s, e, n) -> dict:
@@ -458,6 +499,8 @@ def bbox_state(w, s, e, n) -> dict:
     have = [k for k in kgs_all if k in files]
     pending, not_proc = ca.split_missing([k for k in kgs_all if k not in files])
     digs = sorted(f'{k}:{files[k].get("neo1_digest")}{_pos_fix.tag(k)}' for k in have)
+    if len(have) > 1:
+        digs.append(OWN_ID)      # KG-overlap dedupe (2026-11-22): bodies changed only where KGs meet
     mt = max([float(files[k].get('mtime') or 0) for k in have] or [0.0])
     # ready = nothing of the bbox is still on its way: a bbox that intersects
     # no KG at all (outside Austria) is a stable, cacheable empty answer.
@@ -595,7 +638,13 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
         raise ValueError('max_height must be greater than min_height')
     st = bbox_state(w, s, e, n)
     cnt_key = _CNT[kind]
-    rows = [r for r in _chunk_rows_bbox(w, s, e, n, kind) if int(r.get(cnt_key) or 0) > 0]
+    rows = _chunk_rows_bbox(w, s, e, n, kind)
+    copies: dict = {}                                  # r10 -> every KG file's chunk row (owner rule)
+    if len({r['kg'] for r in rows}) > 1:
+        for r in rows:
+            copies.setdefault(int(r['r10']), []).append(r)
+        copies = {k: v for k, v in copies.items() if len(v) > 1}
+    rows = [r for r in rows if int(r.get(cnt_key) or 0) > 0]
     rows.sort(key=lambda r: -(255 if r['max'] is None else int(r['max'])))   # unknown first, then tallest
     type_codes = None
     if kind == 'structures' and types:
@@ -659,6 +708,11 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
         if max_h is not None and x_['hmax'] >= max_h:
             mb = hs < max_h
             m = mb if m is None else m & mb
+        cp = copies.get(int(r['r10'])) if copies else None
+        if cp is not None:
+            mb = _own_mask(d, kg, int(r['r10']), cp)
+            if mb is not None:
+                m = mb if m is None else m & mb
         if realistic:
             m = _qa_mask(d, x_, kg, m, q)
         if type_codes is not None:

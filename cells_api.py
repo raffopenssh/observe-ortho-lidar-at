@@ -832,6 +832,31 @@ def gather(chunks: list[Chunk], want_ids: np.ndarray | None) -> Table:
     return Table(ids[sel], obs[sel], krank[sel], kgs, src_chunk[sel], src_row[sel], chunks)
 
 
+def lost_cells(kg: str, rows: list[dict]) -> np.ndarray | None:
+    """Cell ids of *kg*'s chunk that another KG file's copy owns (None = it owns all of them).
+    *rows* = every chunk row of ONE res-10 id (all KG files storing it).  The owner rule is
+    :func:`gather`'s dedupe itself — one implementation for the cell products and for
+    ``ne_trees.collect`` (/trees/bbox returns a cell's apices from its owner KG only)."""
+    if len(rows) < 2:
+        return None
+    chunks = []; mine = None
+    for row in sorted(rows, key=lambda r: r['kg']):
+        h = header(row['kg'])
+        if h is None:
+            continue
+        if row['kg'] == kg:
+            mine = len(chunks)
+        chunks.append(_load_chunk(row['kg'], row, h))
+    if mine is None or len(chunks) < 2:
+        return None
+    t = gather(chunks, None)
+    kept = t.src_row[t.src_chunk == mine]
+    if kept.size == chunks[mine].cells:
+        return None
+    lost = np.ones(chunks[mine].cells, bool); lost[kept] = False
+    return np.ascontiguousarray(chunks[mine].ids[lost]).astype(np.uint64)
+
+
 # === SECTION: decode (quantised → public values) ===
 
 def _nan_where(v: np.ndarray, bad: np.ndarray) -> np.ndarray:

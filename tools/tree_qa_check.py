@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Acceptance check for tree_qa (docs/ne-public-api.md → 12e): per bin, the multiset of
 tree_h per cell must equal the default /api/v1/trees/bbox apices (0.5 m quantised) of the
-cell's owner KG, and sum(tree_n) == count.
+cell (raw bbox answer, no per-KG filter), sum(tree_n) == count, tree_h_max == max(tree_h).
 
     python3 tools/tree_qa_check.py --random 20 [--seed 1]     # random stored bins
     python3 tools/tree_qa_check.py 391,1895 ...               # given bins (i,j)
@@ -34,9 +34,11 @@ def check(i, j):
     cell = np.array([int(x, 16) for x in col['cell']], np.uint64); h = np.array(col['h_m'], float)
     k = np.searchsorted(ids, cell); kc = np.minimum(k, max(ids.size - 1, 0))
     inb = (k < ids.size) & (ids[kc] == cell) if ids.size else np.zeros(cell.size, bool)
-    raw_n = int(inb.sum()); kgs = hdr['kgs']
+    kgs = hdr['kgs']
     own = np.array([kgs[x] if x < len(kgs) else '' for x in c['kg'][kc]], object) if ids.size else np.zeros(0, object)
-    inb &= (own == np.array(col['kg_code'], object))      # /trees/bbox repeats a cell per KG file storing it
+    # since 2026-11-22 /trees/bbox serves a cell from its owner KG only (ne_trees._own_mask) — no
+    # per-owner restriction here any more; an apex from another KG's file counts as a failure
+    other_kg = int((inb & (own != np.array(col['kg_code'], object))).sum())
     q = np.clip(np.round(h[inb] * 2), 1, 254).astype(np.uint8)
     a = np.lexsort((q, k[inb])); api = np.stack([k[inb][a], q[a]])
     side = np.stack([np.repeat(np.arange(ids.size), c['tree_h_n']), c['tree_h']])
@@ -44,8 +46,8 @@ def check(i, j):
     tn_ok = bool(np.array_equal(np.minimum(c['tree_h_n'], 255), c['tree_n']))
     lt = c['tree_n'] < 255                                 # thx1: tree_h_max == max(tree_h) (255 = no apex)
     thx_bad = int((cb.thx_from_lists(c)[lt] != c['tree_h_max'][lt]).sum()) if 'tree_h_max' in c else -1
-    return {'bin': (i, j), 'ok': bool(same and tn_ok and thx_bad == 0), 'thx_ne_max': thx_bad, 'api_n': int(inb.sum()), 'list_n': int(c['tree_h'].size),
-            'tree_n_eq_len': tn_ok, 'api_dup_other_kg': raw_n - int(inb.sum()),
+    return {'bin': (i, j), 'ok': bool(same and tn_ok and thx_bad == 0 and other_kg == 0), 'thx_ne_max': thx_bad, 'api_n': int(inb.sum()), 'list_n': int(c['tree_h'].size),
+            'tree_n_eq_len': tn_ok, 'api_other_kg': other_kg, 'sum_tree_n': int(c['tree_h_n'].sum()),
             'max_h': float(c['tree_h'].max() / 2) if c['tree_h'].size else None}
 
 
