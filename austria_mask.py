@@ -24,6 +24,7 @@ import os
 import re
 import sys
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -129,6 +130,29 @@ def inside(E, N):
         return np.zeros(E.shape, bool)
     shapely.prepare(part)
     return shapely.contains_xy(part, E, N)
+
+
+_ENSURE = {'t': 0.0}
+
+
+def ensure(retry_s: float = 3600.0) -> bool:
+    """Outline on disk?  The file is not in git: a peer gets it with one small
+    fetch (2 GETs, once per VM; a failure is retried after *retry_s* at the
+    earliest).  Used by the processor's read-time clip — without the file the
+    clip is a silent no-op.  Never raises."""
+    if _load():
+        return True
+    with _LOCK:
+        if time.time() - _ENSURE['t'] < retry_s:
+            return False
+        _ENSURE['t'] = time.time()
+    try:
+        fetch()
+    except Exception as e:  # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).warning('austria_mask: outline fetch failed: %s', str(e)[:160])
+        return False
+    return bool(_load())
 
 
 # ── refresh ────────────────────────────────────────────────────────────

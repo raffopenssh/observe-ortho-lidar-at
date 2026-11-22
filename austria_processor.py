@@ -7025,6 +7025,13 @@ def process_one_kg(kg: dict, include_copernicus: bool = True, max_km: float = No
     # KG is clipped to the national outline and carries its BEV file identity.
     raster_io.OUTLINE_CLIP_M = _OUTLINE_CLIP_M
     raster_io.RECORD_SOURCES = True
+    if _OUTLINE_CLIP_M is not None:
+        try:
+            import austria_mask as _am
+            if not _am.ensure():
+                log.warning("KG %s: national outline unavailable — rasters are NOT clipped at the border", kg_code)
+        except Exception as _e:  # noqa: BLE001
+            log.warning("KG %s: outline check failed: %s", kg_code, _e)
 
     # --- Tile checkpoint cache for resume-on-restart ---
     _tile_ckpt_dir = DATA_DIR / "tile_checkpoints" / kg_code
