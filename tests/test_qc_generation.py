@@ -21,6 +21,7 @@ import grid25_patch as gp  # noqa: E402
 import grid25_registration as gr  # noqa: E402
 import ne_pos_fix as n  # noqa: E402
 import qc_generation as qg  # noqa: E402
+qg._event = lambda *a, **k: None     # never write test codes into the live director log (app.director_event)
 
 TA = [0, 0, 1600, 1600]; TB = [1400, 0, 3000, 1600]; TC = [0, 1400, 1600, 3000]
 
