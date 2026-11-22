@@ -601,6 +601,10 @@ def kg_counts(kg) -> dict | None:
         return None
     out = {k: r[k] for k in ('stored', 'served', 'off', 'capped', 'added', 'no_row', 'other_file', 'dup', 'qa', 'ok')}
     lost_ok = r['ltoken'] is not None and r['ltoken'].startswith(f'{LOST_ID}.')
+    # the lost-cell part is only folded into added / dup / qa by resolve(): between a (re)scan and the next
+    # resolve the per-KG counts are the off-file part alone, so `lost` must not enter the invariant yet
+    m = con.execute("SELECT v FROM meta WHERE k='resolved'").fetchone()
+    lost_ok = lost_ok and m is not None and m[0] == RULE
     out.update(lost=r['lost'] if lost_ok else None, lost_cell=r['lost_cell'] or 0, lost_dup=r['ldup'] or 0, lost_qa=r['lqa'] or 0)
     return out
 
