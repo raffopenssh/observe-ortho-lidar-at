@@ -170,6 +170,94 @@ no_row + other_file + lost_cell.) What a user sees is unchanged except for the `
 is exact: measured apices come from the 2.4 file that owns the cell, everything else carries
 `source auto-rebin` and its reason.
 
+### National reconciliation (2026-11-23)
+
+Both parts scanned **7,850 of 7,850 KGs**, with no scan errors or lagging index files.
+The invariant held in every KG: 557,770,807 stored = 557,434,258 served before ownership
+− 8,576,222 lost + 346,271 added + 8,565,576 duplicates + 924 QA-hidden + 0 capped.
+Added trees are published in the separate `added` block for **7,800 source KGs**;
+they do not change cell counts, heights or biomass inputs.
+
+| Verdict / count | Off-file (`cand`) | Lost-cell (`lcand` + KG counts) | Total |
+|---|---:|---:|---:|
+| Apices to account for | 336,549 | 8,576,222 | 8,912,771 |
+| Added `no_row` | 4,343 | 0 | 4,343 |
+| Added `other_file` | 18,219 | 0 | 18,219 |
+| Added `lost_cell` | 0 | 323,709 | 323,709 |
+| Twin (`dup` / `lost_dup`) | 301,598 | 8,169,307 | 8,470,905 |
+| Frame twin (`dup_frame`) | 1,483 | 0 | 1,483 |
+| Shifted twin (`dup_shift`) | 3,210 | 69,401 | 72,611 |
+| Added twin (`dup_added`) | 7,657 | 12,920 | 20,577 |
+| QA | 39 | 885 | 924 |
+| Capped | 0 | 0 | 0 |
+
+Off-file adds were **6.70%** of off-file apices, slightly above the earlier
+~20,000 national estimate in absolute terms. Lost-cell apices were **1.54%** of stored
+apices: 406,030 (4.73%) were eligible to add before `dup_shift`, 336,629 (3.93%)
+after it, and 323,709 (3.77%) after added-twin deduplication. Across both parts,
+added trees are 0.062% of stored apices.
+
+The live sync wrote 346,271 adds and no retractions; its repeat wrote no public
+tree or flag records. On `/trees/bbox`, KG 92124 returned
+`auto-rebin:92124:rb1:no_row:8a1f8e0cac2ffff:28:5a21` in `added`, with
+`h_m=50.8` and the exact 50.75 m in its note.
+
+Heights use quarter-metres (`hq / 4`) from `cand` and `lcand`, only rows with
+`verdict = 'add'`, with lower-inclusive, upper-exclusive bins:
+
+| Height (m) | Off-file | Lost-cell | Total |
+|---|---:|---:|---:|
+| < 5 | 2,025 | 28,235 | 30,260 |
+| 5–<10 | 4,571 | 59,985 | 64,556 |
+| 10–<20 | 8,821 | 131,840 | 140,661 |
+| 20–<30 | 5,754 | 82,754 | 88,508 |
+| ≥ 30 | 1,391 | 20,895 | 22,286 |
+
+`ne_pos_fix` follow-up: **642 directed file pairs** triggered `dup_shift`. These
+are the top 20 from `status()['shifts']`, in rank order. Counts are matches per
+pair over candidates with a neighbour in that file; a candidate can match
+more than one pair, so the pair counts are not additive.
+
+| Source → neighbour | Offset (E, N), m | Matched / with neighbour |
+|---|---:|---:|
+| 19034 → 19017 | −6, +6 | 757 / 1,278 |
+| 67112 → 60405 | −6, +4 | 691 / 928 |
+| 19017 → 19034 | +6, −6 | 635 / 1,096 |
+| 01908 → 20120 | +6, −4 | 606 / 763 |
+| 83119 → 83102 | +6, −4 | 606 / 640 |
+| 60405 → 67112 | +6, −4 | 568 / 732 |
+| 49314 → 67103 | +6, −4 | 562 / 609 |
+| 83102 → 83119 | −4, +4 | 557 / 587 |
+| 60336 → 60366 | −4, +6 | 520 / 613 |
+| 60366 → 60336 | +4, −6 | 490 / 594 |
+| 73310 → 73309 | +6, −6 | 470 / 537 |
+| 06301 → 06315 | +4, −6 | 466 / 621 |
+| 73309 → 73313 | −6, +6 | 465 / 672 |
+| 19034 → 19502 | −6, +6 | 455 / 707 |
+| 84012 → 84006 | −6, +6 | 442 / 512 |
+| 67103 → 49314 | −6, +4 | 441 / 458 |
+| 65322 → 65318 | +6, −6 | 440 / 586 |
+| 65318 → 65322 | −6, +6 | 427 / 544 |
+| 84003 → 84005 | −4, +4 | 427 / 506 |
+| 67312 → 67212 | +4, −4 | 417 / 485 |
+
+Reproduce the verdict split and height histogram from the resolved store:
+
+```sql
+WITH candidates AS (
+  SELECT 'off' AS part, verdict, reason, hq FROM cand UNION ALL
+  SELECT 'lost', verdict, reason, hq FROM lcand
+)
+SELECT part, verdict, reason,
+       CASE WHEN verdict <> 'add' THEN NULL WHEN hq < 20 THEN '<5'
+            WHEN hq < 40 THEN '5–<10' WHEN hq < 80 THEN '10–<20'
+            WHEN hq < 120 THEN '20–<30' ELSE '30+' END AS height_m, count(*)
+FROM candidates GROUP BY 1, 2, 3, 4;
+```
+
+`python3 rebin_added.py --status` also includes the aggregate-only lost-cell twin
+and QA counts, the invariant and the ranked shift pairs.
+
 The two checks that led here:
 
 ### Check A — is an off-file apex a duplicate of what another KG file serves?
