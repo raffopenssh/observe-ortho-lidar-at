@@ -36,6 +36,7 @@ A future v2.5 that must keep v2.4 next to it needs new manifest keys / filenames
 this one regenerates a product *of the same version* in place.
 
     python3 qc_generation.py --status
+    python3 qc_generation.py --edges              # fill missing edge counts of fresh generations (local)
     python3 qc_generation.py --enroll-fault grid25_stale [--dry]
     python3 qc_generation.py --enroll 92116 84114 --why 'operator'
     python3 qc_generation.py --cancel 92116
@@ -108,10 +109,14 @@ def quality(code: str, doc: dict, version_label: str = '') -> dict:
         q['missing'] = miss
     try:        # internal tile-edge cliffs of the 25 m terrain (the rule of v2_verify.check_grid25_tile_edges)
         import grid25_patch as gp
-        import kg_v2_store as kvs
-        g = kvs.get_grid25(code)
-        if g and g.get('elev') is not None:
-            q['edges'] = len(gp.edges(code, {'elev': g['elev'], 'x0': g['x0'], 'y0': g['y0']}, tiles=gp.tiles_of_doc(doc, g)) or [])
+        g = gp._raw_grid(code)       # the stored grid as is (no read-time patch: this judges the generation)
+        if g is not None and g.get('elev') is not None:
+            try:
+                import grid25_sample as g25
+                g25._drop_zero_fill(g)
+            except Exception:  # noqa: BLE001
+                pass
+            q['edges'] = len(gp.edges(code, g, tiles=gp.tiles_of_doc(doc, g)) or [])
     except Exception as e:  # noqa: BLE001
         q['edges_err'] = repr(e)[:80]
     return q
@@ -211,6 +216,34 @@ def on_ingest(code: str, doc: dict, uploaded_at: str = '', version_label: str = 
     except Exception as e:  # noqa: BLE001 — documentation must never break an ingest
         log.warning('qc_generation.on_ingest %s: %s', code, e)
         return None
+
+
+def backfill_edges() -> dict:
+    """Fresh generations documented without an ``edges`` count (rows written before the grid lookup
+    of ``quality`` was fixed, 2026-11-23): fill it from the stored grid when the row is still the
+    stored generation.  Local, idempotent."""
+    import kg_v2_store as kvs
+    n = 0; flagged = {}
+    with _LOCK:
+        c = _conn()
+        try:
+            rows = c.execute('SELECT code, generated_at, quality FROM gen WHERE fresh=1 AND prev_generated_at IS NOT NULL').fetchall()
+            for code, gen, qj in rows:
+                q = json.loads(qj or '{}')
+                doc = kvs.get(code)
+                if 'edges' in q or not doc or str(doc.get('generated_at') or '') != gen:
+                    continue
+                e = quality(code, doc).get('edges')
+                if e is None:
+                    continue
+                q['edges'] = e
+                c.execute('UPDATE gen SET quality=? WHERE code=? AND generated_at=?', (json.dumps(q), code, gen))
+                n += 1
+                if e:
+                    flagged[code] = e
+        finally:
+            c.close()
+    return {'filled': n, 'with_edges': flagged}
 
 
 def _brief_before(before: list) -> str:
@@ -549,5 +582,7 @@ if __name__ == '__main__':
         print(cancel([x for x in a[a.index('--cancel') + 1:] if not x.startswith('--')]))
     elif '--sweep' in a:
         print(json.dumps(sweep(requeue='--no-requeue' not in a)))
+    elif '--edges' in a:
+        print(json.dumps(backfill_edges()))
     else:
         print(status_line() or 'qc_reprocess: nothing enrolled, no generations documented')
