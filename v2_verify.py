@@ -98,6 +98,69 @@ HINTS = {
 }
 
 
+BORDER_INLAND_FRAC = 0.995     # tile envelope this far inside Austria = inland tile
+BORDER_KEEP_FRAC = 0.90        # a border tile must still hold ≥ 90 % of its in-Austria px
+
+
+def border_loss_explained(v2: dict, v1: dict | None) -> str | None:
+    """Evidence string when every tile that lost LiDAR vs the v1 baseline is a
+    BORDER tile that still covers its in-Austria part, None otherwise.
+
+    BEV served elevation beyond the border during the 2026 run and withdrew
+    it later; since the run guards the processor also clips at the outline
+    + 100 m (``raster_io.clip_national``).  A fresh run of a border KG
+    therefore *must* cover less than its v1 — the v1-comparison gates would
+    reject exactly the products the reprocess exists to make.  Judged
+    independently of what the peer recorded: per tile on the same grid,
+    ``valid_pixels`` must be ≥ min(0.98 × v1, 0.90 × the tile's px inside the
+    national outline (``austria_mask``, no buffer)); inland tiles get no
+    allowance at all, and a tile with an upstream failure explains nothing."""
+    try:
+        dq = (v2 or {}).get("data_quality") or {}
+        if int(dq.get("n_upstream_failed_tiles") or 0) > 0:
+            return None
+        t2 = {int(t.get("tile_index") or 0): t for t in (dq.get("tiles") or []) if isinstance(t, dict)}
+        t1 = {int(t.get("tile_index") or 0): t
+              for t in (((v1 or {}).get("data_quality") or {}).get("tiles") or []) if isinstance(t, dict)}
+        if not t2 or len(t1) != len(t2) or set(t1) != set(t2):
+            return None
+        import austria_mask
+        if not austria_mask.ensure():
+            return None
+        from pyproj import Transformer
+        tr = Transformer.from_crs(4326, 3035, always_xy=True)
+        full = max([int(t.get("valid_pixels") or 0) for t in list(t1.values()) + list(t2.values())] or [0])
+        if full <= 0:
+            return None
+        n = 0; lost = 0; clip = 0
+        for i, t in t2.items():
+            o = t1[i]
+            if (o.get("bbox_wgs") or None) != (t.get("bbox_wgs") or None):
+                return None                    # different grid → not comparable
+            a, b = int(t.get("valid_pixels") or 0), int(o.get("valid_pixels") or 0)
+            if a >= (1 - TOL["seg_area_rel"]) * b:
+                continue
+            if t.get("upstream_fail") or not t.get("bbox_wgs"):
+                return None
+            w, s, e, nn = [float(x) for x in t["bbox_wgs"]]
+            xs, ys = tr.transform([w, e, w, e], [s, s, nn, nn])
+            x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+            cell = 5.0
+            keep = austria_mask.grid_mask(x0, y1, max(1, int((y1 - y0) / cell)), max(1, int((x1 - x0) / cell)), cell, 0.0)
+            frac = 1.0 if keep is None else float(keep.mean())
+            if frac >= BORDER_INLAND_FRAC:
+                return None                    # an inland tile lost data → a real hole
+            if a < BORDER_KEEP_FRAC * frac * min(full, b):
+                return None                    # lost more than the outline explains
+            n += 1; lost += b - a; clip += int(t.get("outline_clip_px") or 0)
+        if not n:
+            return None
+        return f"{n} border tile(s) lost {lost / 1e6:.2f} km² beyond the national outline (own clip {clip / 1e6:.2f} km²)"
+    except Exception as e:  # noqa: BLE001 — no evidence, the gate stays fatal
+        log.debug("border_loss_explained: %s", e)
+        return None
+
+
 class Report(dict):
     def __init__(self):
         super().__init__(ok=True, checks=[], errors=[], warnings=[])
@@ -380,13 +443,21 @@ def check_document(v2: dict, v1: dict | None, rep: Report, *, code: str | None =
         rep.check("bbox_covers_v1", aoi_covered,
                   f"v2 x[{bb2[0]:.0f},{bb2[2]:.0f}] y[{bb2[1]:.0f},{bb2[3]:.0f}] "
                   f"v1 x[{bb1[0]:.0f},{bb1[2]:.0f}] y[{bb1[1]:.0f},{bb1[3]:.0f}]")
+    # LiDAR lost only beyond the national outline is the intended result of a
+    # run after BEV withdrew its cross-border elevation / with the read-time
+    # national clip — not an outage (docs/qc-lessons.md → grid25_stale).
+    _bl = None
+    if (sa is not None and sb and sa < (1 - TOL["seg_area_rel"]) * sb) or lidar < l1:
+        _bl = border_loss_explained(v2, v1)
     if sa is not None and sb and sb > 0:
         rep.check("segmented_area_ge_v1", sa >= (1 - TOL["seg_area_rel"]) * sb,
-                  f"v2={sa:.0f} v1={sb:.0f} m²" + ("" if same_grid else f" (grid {nt2} vs {nt1} tiles)"),
-                  fatal=same_grid or not aoi_covered)
+                  f"v2={sa:.0f} v1={sb:.0f} m²" + ("" if same_grid else f" (grid {nt2} vs {nt1} tiles)")
+                  + (f" — border loss only: {_bl}" if _bl else ""),
+                  fatal=(same_grid or not aoi_covered) and not _bl)
     rep.check("lidar_tiles_ge_v1", lidar >= l1, f"v2={lidar} v1={l1} lidar tiles"
-              + ("" if same_grid else f" (grid {nt2} vs {nt1} tiles)"),
-              fatal=same_grid or not aoi_covered)
+              + ("" if same_grid else f" (grid {nt2} vs {nt1} tiles)")
+              + (f" — border loss only: {_bl}" if _bl else ""),
+              fatal=(same_grid or not aoi_covered) and not _bl)
     n1 = int(_num(_g(v1, "landscape", "n_segments"), 0) or 0)
     if n1 > 0:
         rep.check("segments_vs_v1", n_seg >= TOL["segments_rel_min"] * n1,

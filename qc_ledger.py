@@ -722,7 +722,11 @@ def build(src: Sources | None = None, db_path: Path | None = None, summary_path:
     con.executemany('INSERT INTO tile VALUES (?,?,?,?,?,?,?,?,?)', [(c, ti, *v) for (c, ti), v in sorted(tiles.items())])
     con.executemany('INSERT INTO product VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', products)
     con.commit()
-    s = _summarise(con)
+    try:
+        s = _summarise(con)
+    except Exception:
+        con.close(); tmp.unlink(missing_ok=True)      # never leave a half-built ledger behind
+        raise
     built = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now or time.time()))
     s.update(version=VERSION, sig=sig, built_at=built, secs=round(time.time() - t0, 1), inputs=col['inputs'])
     con.executemany('INSERT INTO meta VALUES (?,?)', [('version', str(VERSION)), ('sig', sig), ('built_at', built)])
@@ -769,7 +773,7 @@ def _summarise(con) -> dict:
         w = whole.get((tinfo.get(env) or ('',))[0])
         return {'shift': 'moved', 'zero': 'kept'}.get(w, w if w in ('mixed', 'unclear') else None)
     xt: dict = {}
-    for x0, y0, x1, y1, v in q("SELECT x0,y0,x1,y1,verdict FROM row WHERE fault='grid25_stale' AND x0 IS NOT NULL"):
+    for x0, y0, x1, y1, v in q("SELECT x0,y0,x1,y1,verdict FROM row WHERE fault='grid25_stale' AND verdict IN ('bad','ok') AND x0 IS NOT NULL"):
         p = pos_of((x0, y0, x1, y1)) or 'no_verdict'
         xt.setdefault(p, {'bad': 0, 'ok': 0})[v] += 1
     out['overlap_tiles'] = {'pos_x_grid25': xt}
@@ -782,12 +786,12 @@ def _summarise(con) -> dict:
     out['overlap_tiles']['pos_x_v2_fallback'] = fx
     out['overlap_tiles']['pos_x_final_session'] = sx
     gx: dict = {}
-    for x0, y0, x1, y1, v in q("SELECT x0,y0,x1,y1,verdict FROM row WHERE fault='grid25_stale' AND x0 IS NOT NULL"):
+    for x0, y0, x1, y1, v in q("SELECT x0,y0,x1,y1,verdict FROM row WHERE fault='grid25_stale' AND verdict IN ('bad','ok') AND x0 IS NOT NULL"):
         fb = (tinfo.get((x0, y0, x1, y1)) or (None, None, None))[1]
         gx.setdefault(v, {'bev_reread': 0, 'from_gpkg': 0, 'unknown': 0})[{1: 'bev_reread', 0: 'from_gpkg'}.get(fb, 'unknown')] += 1
     out['overlap_tiles']['grid25_x_v2_fallback'] = gx
     bx: dict = {}
-    for v, ev in q("SELECT verdict, ev FROM row WHERE fault='grid25_stale'"):
+    for v, ev in q("SELECT verdict, ev FROM row WHERE fault='grid25_stale' AND verdict IN ('bad','ok')"):
         e = json.loads(ev or '{}')
         d = bx.setdefault(border_band(e.get('border_m')), {'bad': 0, 'ok': 0, 'bad_ge8m': 0})
         d[v] += 1

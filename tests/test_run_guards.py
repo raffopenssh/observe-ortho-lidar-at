@@ -269,3 +269,49 @@ def test_fetch_shim_signature():
 if __name__ == '__main__':
     test_fetch_shim_signature()
     print('ALL OK')
+
+
+def test_border_loss_waiver():
+    """A fresh run of a border KG covers less than its v1 (BEV withdrew the
+    cross-border elevation, the processor clips at the outline): the
+    v1-comparison gates must not reject it — but an inland hole, a border
+    tile that lost more than the outline explains, or an upstream failure
+    still must fail."""
+    import copy, austria_mask, v2_verify as vv, tile_index as ti
+    if not austria_mask.available():
+        print('skip border_loss_waiver (no outline)'); return
+    from pyproj import Transformer
+    from shapely.geometry import box
+    st = austria_mask._load()
+    inv = Transformer.from_crs(3035, 4326, always_xy=True)
+    def tile(i, x0, y0, px):
+        w, s = inv.transform(x0, y0); e, n = inv.transform(x0 + 1500, y0 + 1500)
+        return {'tile_index': i, 'bbox_wgs': [w, s, e, n], 'valid_pixels': px, 'dtm': px > 0}
+    # walk the outline for a 1.5 km square that is roughly half inside
+    bx = None
+    for k in range(0, 4000, 7):
+        p = st['line'].interpolate(k * 500.0)
+        m = austria_mask.grid_mask(p.x - 750, p.y + 750, 300, 300, 5.0, 0.0)
+        if 0.3 < float(m.mean()) < 0.6:
+            bx = (p.x - 750, p.y - 750, float(m.mean())); break
+    assert bx, 'no half-inside square found on the outline'
+    c = st['line'].centroid                      # deep inland
+    full = 2250000
+    v1 = {'data_quality': {'tiles': [tile(1, c.x, c.y, full), tile(2, bx[0], bx[1], full)]}}
+    v2 = copy.deepcopy(v1); v2['data_quality']['tiles'][1]['valid_pixels'] = int(full * bx[2])
+    assert vv.border_loss_explained(v2, v1), 'border-only loss must be explained'
+    assert vv.border_loss_explained(v1, v1) is None
+    x = copy.deepcopy(v2); x['data_quality']['tiles'][0]['valid_pixels'] = full // 2
+    assert vv.border_loss_explained(x, v1) is None, 'inland hole'
+    x = copy.deepcopy(v2); x['data_quality']['tiles'][1]['valid_pixels'] = int(full * bx[2] * 0.5)
+    assert vv.border_loss_explained(x, v1) is None, 'lost more than the outline explains'
+    x = copy.deepcopy(v2); x['data_quality']['n_upstream_failed_tiles'] = 1
+    assert vv.border_loss_explained(x, v1) is None, 'upstream failure'
+    x = copy.deepcopy(v2); x['data_quality']['tiles'].pop()
+    assert vv.border_loss_explained(x, v1) is None, 'different grid'
+    print('ok border_loss_waiver frac=%.2f' % bx[2])
+
+
+if __name__ == '__main__':
+    test_border_loss_waiver()
+    print('ALL OK')
