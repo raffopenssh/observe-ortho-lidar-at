@@ -670,9 +670,45 @@ def trees_summary():
     return _stands_reply(run)
 
 
+def _trees_hexes_national():
+    """All of Austria in one NEX1 body (res 9): the file the national build wrote, served as is."""
+    import tree_stands as ts
+    if request.method != 'GET' or any(request.args.get(k) for k in ('h3', 'bbox', 'kg', 'state', 'min_height', 'max_height')):
+        return _err('format=bin is the national table: GET, res=9, no area / height filter '
+                    '(filter client-side on the bands; areas → JSON form)', 400, docs='/api/v1/docs/llm.txt')
+    try:
+        res = int(request.args.get('res') or 9)
+    except ValueError:
+        res = 0
+    if res not in ts.HEX_RESES:
+        return _err(f'format=bin: res must be one of {list(ts.HEX_RESES)}', 400)
+    m = ts.read_meta()
+    if not m or str(res) not in (m.get('hex') or {}):
+        return _err('national tree hexagon table not built yet', 503, retry_after_s=3600)
+    etag = ts.hex_etag(m, res)
+    hx = {'ETag': etag, 'Cache-Control': 'public, max-age=3600', 'X-Stands-Gen': m.get('gen') or '',
+          'Access-Control-Expose-Headers': 'ETag, X-Stands-Gen', 'Vary': 'Accept-Encoding'}
+    inm = request.headers.get('If-None-Match') or ''
+    if etag in [x.strip() for x in inm.split(',')] or inm.strip() == '*':
+        return Response(status=304, headers=hx)
+    got = ts.hex_blob(res)
+    if got is None:
+        return _err('national tree hexagon table not built yet', 503, retry_after_s=3600)
+    body = got[0]
+    if 'gzip' in (request.headers.get('Accept-Encoding') or ''):
+        hx['Content-Encoding'] = 'gzip'
+    else:
+        import gzip as _gz
+        body = _gz.decompress(body)
+    hx['Content-Disposition'] = f'inline; filename="tree-hexes-r{res}.nex"'
+    return Response(body, mimetype='application/octet-stream', headers=hx)
+
+
 @app.route('/api/v1/trees/hexes', methods=['GET', 'POST'])
 def trees_hexes():
     """Tree columns per H3 hexagon (res 5..10, coarser = roll-up) for an area — the map / join form."""
+    if (request.args.get('format') or '').lower() == 'bin':
+        return _trees_hexes_national()
     return _stands_reply(lambda ts, s: ts.hexes(
         _stands_area(s), res=_num(s, 'res', int) or ts.RES, min_height=_num(s, 'min_height') or 3,
         max_height=_num(s, 'max_height'), bands=_truthy(s.get('bands', ''))))

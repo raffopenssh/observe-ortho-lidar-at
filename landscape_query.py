@@ -751,6 +751,13 @@ def _bilinear(grid, a, E, N):
 # per-KG summary
 # --------------------------------------------------------------------------
 def _kg_apices(code: str):
+    try:                    # as served (apex → cell rule + tree QA), cells this product wins: == trees_owned_n
+        import stats_unit
+        v = stats_unit.kg_trees_owned(code)
+        if v is not None:
+            return v
+    except Exception:  # noqa: BLE001
+        pass
     try:
         import tree_stats
         return tree_stats.kg_apices(code)

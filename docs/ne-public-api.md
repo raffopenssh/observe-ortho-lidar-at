@@ -647,3 +647,17 @@ the start of every `cells-bins` pass (`index_file` → digest, chunk rows, hmax,
   and national `?res=9&meta=1`. Small stale counts between successful
   hourly passes are expected while new products land; `current: false`
   alone does not imply a failed build.
+
+## Tree figures on /stats/unit + national hexagon table (2026-11-23)
+
+* `stats_unit` accumulators carry `th` — the exact apex-height histogram in 0.25 m steps (the NET1
+  step) of the cells behind `trees_n`. `trees.height_mean_m`, `trees.tallest_m`, `trees_height_n.*`
+  and the `min_height=` / `max_height=` window all derive from it (`tree_figures`), merge by addition.
+  `ALGO su2`. The streaming cell-list reader takes its tree part from `ca._load_chunk`
+  (`_trees_served`) — raw NEO1 rows carry the *stored* `tn` (pre rb1 / tree QA) and were off.
+* kg units: `trees_owned_n` = trees in cells the product wins in the dedup; same value feeds
+  `/kg/<code> vegetation.tree_apices` (`stats_unit.kg_trees_owned`), so it follows tree QA.
+* `/api/v1/trees/hexes?res=9&format=bin` = `data/ne/stands/hex9.nex.gz`, written by
+  `tree_stands.write_store` in the national build (exact `h_sum`); for a store on disk:
+  `python3 tree_stands.py --hex-blobs` (batch tier; merges unit partials, refuses unless they
+  reproduce the store). res 10 not offered (55 MB gzip).

@@ -40,7 +40,7 @@ stats_bp = Blueprint('stats_unit', __name__)
 
 SCHEMA = 'stats-envelope/1'
 SERVICE = 'srtm-lidar-at'
-ALGO = 'su1'                       # bump → every cached accumulator is recomputed
+ALGO = 'su2'                       # bump → every cached accumulator is recomputed
 MAX_KG = 50
 MAX_BBOX_SPAN = 0.1
 H3_MIN_RES, H3_MAX_RES = 5, 12
@@ -58,9 +58,13 @@ CELLS_EXACT_AREA_MAX_R10 = 60_000   # per-r10 h3 area below this many parents, r
 CELLS_FAST_MIN_N = 2_000             # above this the row-streaming reader replaces ca.select (no chunk LRU)
 CELLS_BATCH_ROWS = 8_000             # chunk rows read per batch (bounds the transient working set)
 CELLS_POLL_WAIT_S = 0.25             # synchronous wait on a repeat POST / GET key= poll
-CELLS_JOB_STALE_S = 180.0            # a job record older than this with no result → recompute
+CELLS_JOB_STALE_S = 900.0            # a job record older than this with no result → recompute
 CELLS_JOB_TTL_S = 24 * 3600          # key= lookups answer 404 past this
 BODY_LRU_N = 512                     # sha256(raw body) → parsed list meta (per worker)
+
+TREE_EDGES = (3, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55)    # m — tree_stands.EDGES / tree_hh on /cells/national
+TREE_BAND_KEYS = tuple(f'{a}_{b}' for a, b in zip(TREE_EDGES, TREE_EDGES[1:])) + ('55_up',)
+TREE_Q = 4                          # apex heights are stored in 0.25 m steps (NET1 h field, u8)
 
 GROUPS = list(ne_h3.GROUPS)
 CONS = list(ca._CONSISTENCY_NAMES)       # 7 public verdict names
@@ -79,10 +83,61 @@ def _acc_empty() -> dict:
             'elmin': None, 'elmax': None, 'el_s': 0.0, 'el_n': 0, 'sl_s': 0.0, 'sl_n': 0,
             'p90_s': 0.0, 'p90_n': 0, 'hm_s': 0.0, 'hm_n': 0, 'hmax': None, 'can_s': 0.0, 'can_n': 0,
             'nd_s': 0.0, 'nd_n': 0, 'hl': 0, 'dh_s': 0.0, 'dh_n': 0, 'sc_s': 0.0, 'sc_n': 0,
-            'area_m2': 0.0, 'als_new': {}, 'als_old': {}, 'kgs': [], 'epoch': None, 'src': None}
+            'area_m2': 0.0, 'als_new': {}, 'als_old': {}, 'kgs': [], 'epoch': None, 'src': None, 'th': []}
 
 
-def _acc_from_table(t: ca.Table, hdrs: dict) -> dict:
+# --- tree heights: one exact histogram per accumulator ------------------------
+# ``th[q]`` = apices whose height is q × 0.25 m (the stored NET1 step, so nothing is lost):
+# count, mean, tallest, the 5 m bands and any min_height / max_height window all derive from it,
+# and it merges by addition.  Same apices as trees_n: the NET1 rows of the selected cells AS
+# SERVED (position fix → cell assignment rb1 → tree QA), so sum(th) == trees_n by construction.
+
+def _th_of_words(words: np.ndarray) -> np.ndarray:
+    return np.bincount(((words.astype(np.uint32) >> 10) & 255).astype(np.int64), minlength=256)
+
+
+def _th_list(th: np.ndarray) -> list[int]:
+    nz = np.flatnonzero(th)
+    return th[:int(nz[-1]) + 1].astype(int).tolist() if nz.size else []
+
+
+def _th_add(a: list, b: list) -> list:
+    if len(a) < len(b):
+        a, b = b, a
+    return [x + y for x, y in zip(a, b)] + a[len(b):]
+
+
+def tree_window(min_h, max_h) -> tuple[int, int] | None:
+    """(q_lo, q_hi) inclusive quarter-metre bounds of a min_height / max_height window, None = no window."""
+    if min_h is None and max_h is None:
+        return None
+    import math
+    lo = 0 if min_h is None else max(0, math.ceil(float(min_h) * TREE_Q - 1e-9))
+    hi = 255 if max_h is None else min(255, math.floor(float(max_h) * TREE_Q + 1e-9))
+    return lo, hi
+
+
+def tree_figures(th: list, win: tuple[int, int] | None = None) -> OrderedDict:
+    """trees_n · trees.height_mean_m (0.1, half up on the exact sum) · trees.tallest_m (0.25 steps)
+    · trees_height_n.<band> — over the apices inside ``win`` (inclusive, exact heights)."""
+    h = np.zeros(256, np.int64); h[:len(th)] = th
+    if win is not None:
+        lo, hi = win
+        h[:lo] = 0; h[hi + 1:] = 0
+    n = int(h.sum())
+    q = np.arange(256, dtype=np.int64)
+    s = int((h * q).sum())                                   # Σ heights in 0.25 m units, exact
+    f = OrderedDict()
+    f['trees_n'] = n
+    f['trees.height_mean_m'] = ((s * 10 * 2 + TREE_Q * n) // (2 * TREE_Q * n)) / 10 if n else None
+    f['trees.tallest_m'] = float(np.flatnonzero(h)[-1]) / TREE_Q if n else None
+    band = np.where(q < 5 * TREE_Q, 0, np.clip(q // (5 * TREE_Q), 1, len(TREE_EDGES) - 1))
+    for k, c in zip(TREE_BAND_KEYS, np.bincount(band, weights=h, minlength=len(TREE_EDGES)).astype(np.int64).tolist()):
+        f[f'trees_height_n.{k}'] = int(c)
+    return f
+
+
+def _acc_from_table(t: ca.Table, hdrs: dict, trees: bool = True) -> dict:
     """Vectorised sums over a selected cell Table (no per-cell Python)."""
     a = _acc_empty()
     n = len(t)
@@ -96,6 +151,8 @@ def _acc_from_table(t: ca.Table, hdrs: dict) -> dict:
     cov = o['cover'].astype(np.float64) / 255.0
     a['obs'] = int(((o['hm'] != 255) | (o['cover'].sum(axis=1) > 0)).sum())
     a['trees'] = int(o['tn'].sum()); a['bld'] = int(o['sn'].sum())
+    if trees:
+        a['th'] = _th_list(_th_of_words(t.gather_trees()[1]))
     a['cov'] = [round(float(x), 3) for x in cov.sum(axis=0)]
     a['cons'] = np.bincount(np.minimum(o['vd'], 6), minlength=7).astype(int).tolist()
 
@@ -146,6 +203,7 @@ def _acc_merge(parts: list[dict]) -> dict:
             a[k] += p[k]
         a['cov'] = [x + y for x, y in zip(a['cov'], p['cov'])]
         a['cons'] = [x + y for x, y in zip(a['cons'], p['cons'])]
+        a['th'] = _th_add(a['th'], p.get('th') or [])
         for k, fn in (('elmin', min), ('elmax', max), ('hmax', max)):
             if p[k] is not None:
                 a[k] = p[k] if a[k] is None else fn(a[k], p[k])
@@ -159,7 +217,18 @@ def _acc_merge(parts: list[dict]) -> dict:
     return a
 
 
-def _figures(a: dict, *, cells_total: int, area_ha_total: float | None, ha_override: dict | None = None) -> dict:
+def kg_trees_owned(kg: str, wait_s: float = 3.0) -> int | None:
+    """Apices (as served, tree QA applied) in the cells KG *kg*'s product wins — /kg/<code>
+    vegetation.tree_apices and trees_owned_n; None = unknown / still computing."""
+    kg = str(kg).zfill(5)
+    if kg not in ca._files():
+        return None
+    r = _kg_acc(kg, wait_s)
+    return None if r is None else r[0].get('trees_own')
+
+
+def _figures(a: dict, *, cells_total: int, area_ha_total: float | None, ha_override: dict | None = None,
+             tree_win: tuple[int, int] | None = None) -> dict:
     """Accumulator → flat dotted figures (scalar values only)."""
     kn = a['kn']
     cell_ha = (a['area_m2'] / kn / 1e4) if kn else 0.0
@@ -167,7 +236,9 @@ def _figures(a: dict, *, cells_total: int, area_ha_total: float | None, ha_overr
     f['cells_n'] = int(cells_total)
     f['area_ha'] = round(area_ha_total if area_ha_total is not None else a['area_m2'] / 1e4, 2)
     f['cells_observed_n'] = int(a['obs'])
-    f['trees_n'] = int(a['trees'])
+    f.update(tree_figures(a.get('th') or [], tree_win))
+    if a.get('trees_own') is not None and tree_win is None:
+        f['trees_owned_n'] = int(a['trees_own'])
     f['structures_n'] = int(a['bld'])
     f['structures.cover_pct'] = round(100.0 * a['sc_s'] / a['sc_n'], 2) if a['sc_n'] else None
     cov_ha = (ha_override or {}).get('cover_ha') or {g: round(a['cov'][i] * cell_ha, 2) for i, g in enumerate(GROUPS)}
@@ -364,6 +435,14 @@ def _kg_acc_compute(kg: str) -> dict:
     t = ca.gather(chunks, None)
     a = _acc_from_table(t, {kg: h})
     a['kgs'] = [kg]
+    # trees in the cells this product WINS in the cross-product de-duplication (ca.gather rule, as served:
+    # rb1 + tree QA) — the per-KG figure that sums to /trees/stats over all KGs
+    try:
+        t2, _h2, _m2 = ca.select(np.sort(t.ids), None)
+        own = t2.kg_idx == t2.kgs.index(kg) if kg in t2.kgs else np.zeros(len(t2), bool)
+        a['trees_own'] = int(t2.obs['tn'][own].sum())
+    except Exception as ex:  # noqa: BLE001
+        log.warning('stats: owned trees %s: %s', kg, ex)
     a['summary'] = {k: (h.get('summary') or {}).get(k) for k in ('cover_ha', 'consistency_ha', 'cells_observed')}
     a['want'] = int(h.get('cells_n') or len(t))
     a['pfiles'] = [kg] if h.get('partial_cells') else []
@@ -374,6 +453,9 @@ def _kg_acc_compute(kg: str) -> dict:
 def _kg_acc(kg: str, wait_s: float) -> tuple[dict, float] | None:
     f = ca._files().get(kg)
     fp = hashlib.sha256(f"{ALGO}{ca._green_fix.FIX_ID}|{kg}:{int(float(f.get('mtime') or 0))}{ca._tree_qa.kg_tok(kg)}{ca._tree_qa.THX_ID}".encode()).hexdigest()[:16]
+    bb = ca._kg_bbox(kg)
+    if bb:                      # trees_owned_n depends on the neighbour products sharing border cells
+        fp = hashlib.sha256((fp + _fingerprint_bbox(*bb)[0]).encode()).hexdigest()[:16]
     return _get_or_compute(f'kg:{kg}', fp, lambda: _kg_acc_compute(kg), wait_s=wait_s)
 
 
@@ -387,11 +469,11 @@ def _iso(ts: float) -> str:
 
 
 def _envelope(unit: dict, acc: dict | None, ts: float | None, *, cells_total: int, area_ha: float | None,
-              note: str | None = None, ha_override: dict | None = None) -> dict:
+              note: str | None = None, ha_override: dict | None = None, tree_win=None) -> dict:
     now = time.time()
     if acc is None:
         acc = _acc_empty()
-    fig = _figures(acc, cells_total=cells_total, area_ha_total=area_ha, ha_override=ha_override)
+    fig = _figures(acc, cells_total=cells_total, area_ha_total=area_ha, ha_override=ha_override, tree_win=tree_win)
     kn = int(acc['kn'])
     want = int(acc.get('want') or cells_total or 0)
     complete = bool(kn and kn >= want and not acc.get('miss') and not acc.get('pfiles'))
@@ -410,6 +492,8 @@ def _envelope(unit: dict, acc: dict | None, ts: float | None, *, cells_total: in
     if notes:
         cov['note'] = '; '.join(notes)
     unit = dict(unit); unit['res'] = ca.RES; unit['cells_n'] = int(cells_total); unit['area_ha'] = fig['area_ha']
+    if tree_win is not None:                # echo of min_height= / max_height= as applied (inclusive, 0.25 m steps)
+        unit['tree_height_m'] = [tree_win[0] / TREE_Q, tree_win[1] / TREE_Q if tree_win[1] < 255 else None]
     if acc.get('kgs'):
         unit['kgs'] = acc['kgs']
     return {'schema': SCHEMA, 'service': SERVICE, 'unit': unit,
@@ -418,7 +502,7 @@ def _envelope(unit: dict, acc: dict | None, ts: float | None, *, cells_total: in
             'computed_at': _iso(ts or now), 'age_s': int(max(0.0, now - (ts or now)))}
 
 
-def unit_h3(h: str, wait_s: float) -> dict | None:
+def unit_h3(h: str, wait_s: float, tree_win=None) -> dict | None:
     try:
         cid = int(h.strip(), 16)
         import h3
@@ -435,10 +519,10 @@ def unit_h3(h: str, wait_s: float) -> dict | None:
     acc, ts = r
     area_ha = ca._h3n().cell_area(cid, unit='m^2') / 1e4
     unit = {'kind': 'h3', 'key': f'{cid:x}', 'bbox': list(_h3_bbox(cid)), 'h3_res': res}
-    return _envelope(unit, acc, ts, cells_total=7 ** (ca.RES - res), area_ha=area_ha)
+    return _envelope(unit, acc, ts, cells_total=7 ** (ca.RES - res), area_ha=area_ha, tree_win=tree_win)
 
 
-def unit_kg(code: str, wait_s: float) -> dict | None:
+def unit_kg(code: str, wait_s: float, tree_win=None) -> dict | None:
     kg = code.strip().zfill(5)
     if not (kg.isdigit() and len(kg) == 5):
         raise StatsError(400, 'kg codes must be 5 digits', kg=code)
@@ -457,12 +541,12 @@ def unit_kg(code: str, wait_s: float) -> dict | None:
     cons_ha = s.get('consistency_ha') or {}
     area_ha = round(sum(v or 0 for v in cons_ha.values()), 2) if cons_ha else None
     return _envelope(unit, acc, ts, cells_total=int(acc.get('want') or acc['kn']), area_ha=area_ha,
-                     ha_override={'cover_ha': s.get('cover_ha'), 'consistency_ha': cons_ha},
+                     ha_override={'cover_ha': s.get('cover_ha'), 'consistency_ha': cons_ha}, tree_win=tree_win,
                      note='area_ha / cover_ha / consistency_ha weight border cells by this KG\'s share (as /kgs/summary); '
                           'counts and means are over every cell of the product')
 
 
-def unit_bbox(raw: str, wait_s: float) -> dict | None:
+def unit_bbox(raw: str, wait_s: float, tree_win=None) -> dict | None:
     try:
         w, s, e, n = [float(x) for x in raw.split(',')]
     except Exception:
@@ -483,7 +567,7 @@ def unit_bbox(raw: str, wait_s: float) -> dict | None:
     c12 = int(hn.latlng_to_cell((s + n) / 2, (w + e) / 2, ca.RES))
     area_ha = ids.size * hn.cell_area(c12, unit='m^2') / 1e4
     unit = {'kind': 'bbox', 'key': [w, s, e, n], 'bbox': [w, s, e, n]}
-    return _envelope(unit, acc, ts, cells_total=int(ids.size), area_ha=area_ha)
+    return _envelope(unit, acc, ts, cells_total=int(ids.size), area_ha=area_ha, tree_win=tree_win)
 
 
 # === SECTION: cell lists (POST unit=cells, stats-envelope §6) ===
@@ -551,7 +635,7 @@ def _scale_figures(fig: dict, scale: int) -> dict:
     for k, v in fig.items():
         if k in ('cells_n', 'area_ha'):          # already n × scale / Σ areas × scale from the caller
             out[k] = v
-        elif k.endswith(('_ha', '_n')) or k.startswith(('cover_ha.', 'consistency_ha.', 'consistency_n.')):
+        elif k.endswith(('_ha', '_n')) or k.startswith(('cover_ha.', 'consistency_ha.', 'consistency_n.', 'trees_height_n.')):
             if isinstance(v, bool) or not isinstance(v, (int, float)):
                 out[k] = v
             else:
@@ -570,10 +654,38 @@ def _scale_figures(fig: dict, scale: int) -> dict:
 # green-ground override once over the collected rows and never touches the LRU.
 
 class _R10Ref:
-    __slots__ = ('r10', 'cells')
+    __slots__ = ('r10', 'cells', 'kg', 'row')
 
-    def __init__(self, r10: int, cells: int):
-        self.r10 = r10; self.cells = cells
+    def __init__(self, r10: int, cells: int, kg: str = '', row: dict | None = None):
+        self.r10 = r10; self.cells = cells; self.kg = kg; self.row = row
+
+
+def _trees_served(ids: np.ndarray, src_chunk: np.ndarray, refs: list, hdrs: dict) -> tuple[int, np.ndarray]:
+    """(trees_n, th[256]) of the selected cells from their chunks AS SERVED.  The raw NEO1 rows the
+    streaming reader collects carry the *stored* tree_n — before the position fix, the apex → cell
+    rule (rb1) and tree QA — so tree figures come from ``ca._load_chunk`` like every other read path."""
+    th = np.zeros(256, np.int64); n_trees = 0
+    order = np.argsort(src_chunk, kind='stable')
+    sc = src_chunk[order]; sid = ids[order]
+    cuts = np.flatnonzero(np.concatenate([[True], sc[1:] != sc[:-1], [True]]))
+    for a, b in zip(cuts[:-1].tolist(), cuts[1:].tolist()):
+        ref = refs[int(sc[a])]
+        try:
+            ch = ca._load_chunk(ref.kg, ref.row, hdrs[ref.kg])
+        except Exception as ex:  # noqa: BLE001
+            log.warning('stats: chunk %s/%x unreadable: %s', ref.kg, ref.r10, ex)
+            continue
+        if not len(ch.trees):
+            continue
+        tn = ch.obs['tn'].astype(np.int64)
+        if b - a == ch.cells:
+            w = ch.trees
+        else:
+            w = ch.trees[np.repeat(np.isin(ch.ids, sid[a:b]), tn)]
+        n_trees += int(w.size)
+        if w.size:
+            th += _th_of_words(w)
+    return n_trees, th
 
 
 def _rows_wanted(kg: str, hdr: dict, fh, rows: list[dict], want_by_r10: dict) -> list[tuple]:
@@ -649,7 +761,7 @@ def _acc_for_cells_fast(ids: np.ndarray) -> dict:
                 for i in range(0, len(krows), CELLS_BATCH_ROWS):
                     for row, o, c, rid, n in _rows_wanted(kg, h, fh, krows[i:i + CELLS_BATCH_ROWS], want_by_r10):
                         ci = len(chunk_refs)
-                        chunk_refs.append(_R10Ref(int(row['r10']), n))
+                        chunk_refs.append(_R10Ref(int(row['r10']), n, kg, row))
                         obs_parts.append(o); ctx_parts.append(c)
                         src_chunk_parts.append(np.full(rid.size, ci, np.int64))
                         kg_parts.append(np.full(rid.size, kg_rank[kg], np.int64))
@@ -658,7 +770,7 @@ def _acc_for_cells_fast(ids: np.ndarray) -> dict:
     if not obs_parts:
         t = ca.Table(np.zeros(0, np.uint64), np.zeros(0, ca.OBS_DT), np.zeros(0, np.int64), kgs,
                      np.zeros(0, np.int64), np.zeros(0, np.int64), [])
-        return _acc_from_table(t, hdrs), hdrs
+        return _acc_from_table(t, hdrs, trees=False), hdrs
     obs_raw = b''.join(obs_parts); ctx_raw = b''.join(ctx_parts)
     obs_raw, _ = ca._green_fix.fix_rows(obs_raw, ctx_raw)
     obs = np.frombuffer(obs_raw, ca.OBS_DT)
@@ -671,7 +783,10 @@ def _acc_for_cells_fast(ids: np.ndarray) -> dict:
     first = np.concatenate([[True], ids_s[1:] != ids_s[:-1]])
     sel = order[first]
     t = ca.Table(cid[sel], obs[sel], krank[sel], kgs, src_chunk[sel], np.zeros(sel.size, np.int64), chunk_refs)
-    return _acc_from_table(t, hdrs), hdrs
+    a = _acc_from_table(t, hdrs, trees=False)
+    a['trees'], th = _trees_served(t.ids, t.src_chunk, chunk_refs, hdrs)
+    a['th'] = _th_list(th)
+    return a, hdrs
 
 
 # --- job registry: cheap polls (repeat POST / GET key=) ----------------------
@@ -746,20 +861,20 @@ def _cells_compute(ids: np.ndarray, n: int, bbox) -> dict:
     return a
 
 
-def cells_envelope(h: str, n: int, bbox, fp: str, acc: dict, ts: float, scale: int, year: str | None) -> dict:
+def cells_envelope(h: str, n: int, bbox, fp: str, acc: dict, ts: float, scale: int, year: str | None, tree_win=None) -> dict:
     unit = {'kind': 'cells', 'key': h, 'bbox': [round(x, 6) for x in bbox] if n else None, 'n': n, 'scale': scale}
     if year:
         unit['year'] = year
     area_ha = (acc.get('list_area_m2') or 0.0) / 1e4 * scale
     note = f'{n} listed cells × {scale}' if scale != 1 else None
-    env = _envelope(unit, acc, ts, cells_total=n * scale, area_ha=area_ha, note=note)
+    env = _envelope(unit, acc, ts, cells_total=n * scale, area_ha=area_ha, note=note, tree_win=tree_win)
     if scale != 1:
         env['figures'] = _scale_figures(env['figures'], scale)
         env['coverage']['cells_known'] = int(acc['kn']) * scale
     return env
 
 
-def unit_cells_by_key(h: str, scale: int, wait_s: float, year: str | None = None) -> dict | None:
+def unit_cells_by_key(h: str, scale: int, wait_s: float, year: str | None = None, tree_win=None) -> dict | None:
     """GET key= poll: finished envelope, None = still computing. Raises 404 when
     no job for the key is known (or it expired without a result)."""
     meta = _job_get(h)
@@ -780,7 +895,7 @@ def unit_cells_by_key(h: str, scale: int, wait_s: float, year: str | None = None
             if time.time() - float(meta.get('started_at') or 0) > CELLS_JOB_TTL_S:
                 raise StatsError(404, 'cell-list key expired — POST the list again', key=h)
             return None                 # computing on another worker (or stale: the next POST recomputes)
-    return cells_envelope(h, n, bbox, fp, hit[0], hit[1], scale, year)
+    return cells_envelope(h, n, bbox, fp, hit[0], hit[1], scale, year, tree_win)
 
 
 class NeedIds(Exception):
@@ -788,7 +903,7 @@ class NeedIds(Exception):
 
 
 def unit_cells(ids: np.ndarray | None, scale: int, wait_s: float, year: str | None = None,
-               meta: tuple | None = None) -> dict | None:
+               meta: tuple | None = None, tree_win=None) -> dict | None:
     """Envelope over a cell list, None = computing.  ``meta`` = (h, n, bbox, fp)
     from ``cells_meta_for_body``; ``ids`` may be None for a repeat POST whose
     body this worker already parsed (raises ``NeedIds`` if it must compute)."""
@@ -810,7 +925,7 @@ def unit_cells(ids: np.ndarray | None, scale: int, wait_s: float, year: str | No
         if r is None:
             return None
     acc, ts = r
-    return cells_envelope(h, n, bbox, fp, acc, ts, scale, year)
+    return cells_envelope(h, n, bbox, fp, acc, ts, scale, year, tree_win)
 
 
 # === SECTION: route ===
@@ -881,6 +996,14 @@ def stats_unit_route():
         raise StatsError(400, f'format must be one of {FORMATS}')
     keys = [k.strip() for k in (a.get('keys') or '').split(',') if k.strip()] or None
     pretty = (a.get('pretty') or '') in ('1', 'true')
+    try:
+        mn = float(a['min_height']) if a.get('min_height') not in (None, '') else None
+        mx = float(a['max_height']) if a.get('max_height') not in (None, '') else None
+        if any(v is not None and not 0 <= v <= 1000 for v in (mn, mx)) or (mn is not None and mx is not None and mn > mx):
+            raise ValueError
+    except ValueError:
+        raise StatsError(400, 'min_height / max_height are metres (inclusive), 0 <= min_height <= max_height')
+    tw = tree_window(mn, mx)
     t0 = time.time()
     deadline = t0 + BUDGET_S
     envs: list[dict] = []
@@ -893,21 +1016,21 @@ def stats_unit_route():
         if len(codes) > MAX_KG:
             raise StatsError(400, f'more than {MAX_KG} kg codes', max=MAX_KG, n=len(codes))
         for c in codes:
-            env = unit_kg(c, max(0.0, deadline - time.time()))
+            env = unit_kg(c, max(0.0, deadline - time.time()), tw)
             if env is None:
                 pending += 1
             else:
                 envs.append(env)
         multi = len(codes) > 1
     elif kind == 'h3':
-        env = unit_h3(a['h3'], BUDGET_S)
+        env = unit_h3(a['h3'], BUDGET_S, tw)
         multi = False
         if env is None:
             pending = 1
         else:
             envs.append(env)
     elif kind == 'bbox':
-        env = unit_bbox(a['bbox'], BUDGET_S)
+        env = unit_bbox(a['bbox'], BUDGET_S, tw)
         multi = False
         if env is None:
             pending = 1
@@ -926,16 +1049,16 @@ def stats_unit_route():
             h = a['key'].strip().lower()
             if not re.fullmatch(r'[0-9a-f]{16}', h):
                 raise StatsError(400, 'key must be the 16-hex unit.key of a POSTed cell list', key=h)
-            env = unit_cells_by_key(h, scale, CELLS_POLL_WAIT_S, year=year)
+            env = unit_cells_by_key(h, scale, CELLS_POLL_WAIT_S, year=year, tree_win=tw)
         else:
             raw = request.get_data(cache=False)
             enc = request.headers.get('Content-Encoding')
             h, n, bbox, fp, ids = cells_meta_for_body(raw, enc)
             meta = (h, n, bbox, fp)
             try:                        # repeat POST (body seen before) → cheap poll; first POST waits BUDGET_S
-                env = unit_cells(ids, scale, BUDGET_S if ids is not None else CELLS_POLL_WAIT_S, year=year, meta=meta)
+                env = unit_cells(ids, scale, BUDGET_S if ids is not None else CELLS_POLL_WAIT_S, year=year, meta=meta, tree_win=tw)
             except NeedIds:
-                env = unit_cells(parse_cells_body(raw, enc), scale, BUDGET_S, year=year, meta=meta)
+                env = unit_cells(parse_cells_body(raw, enc), scale, BUDGET_S, year=year, meta=meta, tree_win=tw)
         pending_unit = {'kind': 'cells', 'key': h, 'scale': scale}
         if env is None:
             pending = 1
@@ -947,6 +1070,7 @@ def stats_unit_route():
         if kind in ('cells', 'cells_key'):
             body['unit'] = pending_unit
             body['poll'] = f'/api/v1/stats/unit?unit=cells&key={pending_unit["key"]}&scale={scale}'
+            body['poll'] += ''.join(f'&{k}={request.args[k]}' for k in ('min_height', 'max_height') if request.args.get(k))
         r = Response(ca._dumps(body, pretty), status=202, mimetype='application/json')
         r.headers['Retry-After'] = str(RETRY_AFTER_S); r.headers['Cache-Control'] = 'no-store'
         return r

@@ -254,7 +254,9 @@ STATS_TXT = """## Stats envelope — one flat JSON per spatial unit          #st
           ("srtm-lidar-at@2.4"), epoch ("2026-10"), coverage{{complete, cells_known, cells_total, note?}},
           figures{{…flat…}}, attribution, license:"CC-BY-4.0", computed_at, age_s}}
   figures (flat, dotted, scalar; unit in the suffix _ha _n _m _deg _pct _year):
-          cells_n, area_ha, cells_observed_n, trees_n, structures_n, structures.cover_pct,
+          cells_n, area_ha, cells_observed_n, trees_n, trees_owned_n (kg units), trees.height_mean_m, trees.tallest_m,
+          trees_height_n.<3_5|5_10|10_15|15_20|20_25|25_30|30_35|35_40|40_45|45_50|50_55|55_up>,
+          structures_n, structures.cover_pct,
           cover_ha.<geb|bau|acker|gruen|wald|wasser|verkehr|alpen|sonst>
           consistency_ha.<consistent|forest_loss|forest_gain|sealed_new|structure_new|green_new|unknown>,
           consistency_n.<same>, terrain.elev_min_m / elev_max_m / elev_mean_m / slope_mean_deg,
@@ -263,6 +265,30 @@ STATS_TXT = """## Stats envelope — one flat JSON per spatial unit          #st
           kg units: area_ha / cover_ha / consistency_ha are the product-header figures (border cells weighted
           by the KG's share, identical to /kgs/summary); counts and means are over every cell of the product.
           h3 / bbox units: whole cells, de-duplicated across KG products, ha = cells × cell area.
+  trees (every unit kind, same cells as trees_n — the apices /trees/bbox returns by default, each counted in
+          the res-12 cell of its served position; exact stored heights, 0.25 m steps, all ≥ 3 m):
+          trees.height_mean_m = Σ heights / trees_n, 1 decimal, half up · trees.tallest_m = tallest apex (0.25 m
+          steps, null without trees) · trees_height_n.<lo>_<hi> = apices with lo ≤ h < hi m (55_up: h ≥ 55);
+          the 12 bands always sum to trees_n. Bands = tree_hh on /cells/national = bands on /trees/hexes.
+          &min_height= / &max_height= (m, both inclusive, exact heights): trees_n, mean, tallest and the bands then
+          count only apices inside the window (echoed as unit.tree_height_m [min, max|null]); nothing else moves.
+          With scale=: trees_n and the bands × scale (they still sum), mean and tallest unscaled.
+  Which tree count is "the" count of a KG — one rule per endpoint (KG 63330 on 2026-11-23):
+          /stats/unit?kg=            141,314  every res-12 cell stored in the KG's cell product (= every cell the KG
+                                     has a share in), each cell WHOLE and unweighted — a border cell's trees count
+                                     in full in every KG that touches it, so KG figures do not add up to Austria.
+                                     Not owner-only, not share-weighted. Reproduce: sum tree_n over the cells of
+                                     /kg/63330/cells (or your KG-share>0 list POSTed as unit=cells) at the same
+                                     X-Cells-Gen; a difference of a few apices = tree-QA moved between two reads.
+          /trees/summary?kg=         142,634  res-10 hexagons whose serving KG is this code (hexagon → ONE KG, the
+                                     highest code among the products storing it): whole 1.5 ha hexagons, a
+                                     partition of Austria — sums to /trees/stats, edges follow hexagons, not the KG.
+          /kg/<code> vegetation.tree_apices  138,991  only the cells this KG's product WINS in the cross-product
+                                     de-duplication (border cells owned by a neighbour excluded), tree QA applied.
+                                     Same number as trees_owned_n on /stats/unit?kg= (kg units only, absent with
+                                     a height window): owner-KG-only, sums to /trees/stats over all KGs.
+          Canonical for "trees of a KG" in a unit table: /stats/unit?kg= (it is the only one on the KG's own
+          cell set). Canonical for sums over many KGs / Austria: /trees/stats, /trees/hexes, /cells/national.
   format=flat → figures only (array of flat objects with "unit" for several codes);
   format=csv  → header row + one row per unit (text/csv UTF-8, no BOM; first columns unit, coverage_complete)
           → Google Sheets =IMPORTDATA("{BASE}/api/v1/stats/unit?kg=63330&format=csv"), Excel Power Query.
@@ -698,6 +724,18 @@ GET|POST /api/v1/trees/hexes                 tree columns per H3 hexagon (res 5.
     /trees/hexes?[res=10][&min_height=3][&max_height=…][&bands=1] + AREA   (≤ 20,000 hexagons per call)
       {{hex_res, count, trees, columns{{h3[], trees[], trees_all[], tallest_m[], mean_height_m[], elev_m[],
         stocked_ha[] (res < 10), bands[][12]?}}}}   sorted by H3 id; res 5..9 = exact roll-up of the res-10 rows.
+    /trees/hexes?res=9&format=bin      ALL of Austria in one body (no area, no cap; ~770 k rows, 12 MB gzip):
+      NEX1 exactly like /cells/national — "NEX1" · u32 header length · JSON header · columns back to back:
+        id       u64  delta-coded (header.ids = "delta_u64": cumulative sum → ascending res-9 ids)
+        trees    u32  apices h ≥ 3 m
+        tallest  u8   × 0.25 m (the stored apex step — equals trees.tallest_m of /stats/unit?h3=<id>)
+        h_sum    u32  × 0.25 m, Σ of the exact apex heights → mean_m = h_sum × 0.25 / trees (exact; round to
+                      1 decimal half up = trees.height_mean_m)
+        bands    u16 × 12  apices per band, header.bands = ["3_5", … "55_up"], sum = trees
+      header: {{kind:"tree_hexes", res, n, gen, built_at, columns[{{name, dtype, bytes, scale?, shape?}}], edges_m,
+      bands, trees_total, h_sum_total, bands_saturated}}. ETag + X-Stands-Gen (= X-Cells-Gen of /cells/national
+      of the same build: bands == tree_hh there, row for row); If-None-Match → 304; rebuilt once a day.
+      res=10 is not offered as one body (55 MB) — use the JSON form per area.
 
 GET /api/v1/trees/bbox?bbox=…[&min_height=3][&max_height=…][&limit=2000][&realistic=1][&objects=trees|structures][&types=…][&format=json|geojson|columns][&fields=…]
     Tree apices, tallest first, from the NE cells corpus (EVERY apex h ≥ 3 m — a full inventory,
@@ -808,7 +846,7 @@ GET /api/v1/kg/{{kg_code}}                  one KG's landscape dossier:
     …heights/storeys/pitched…}}, change{{net_volume_change_m3, …}}, forest_loss, quality,
     grid25, links}}. 202 + retry_after_s while the KG is unprocessed.
     tree_apices = LiDAR crown tops h ≥ 3 m in the cells this KG product serves (cells owned by a
-    neighbour product excluded) — the number of trees. tree_segments = segmentation objects of type
+    neighbour product excluded), tree QA applied = trees_owned_n of /stats/unit?kg= — the number of trees. tree_segments = segmentation objects of type
     tree (crown clumps / stands, several apices each; canopy_sqm / mean_height / stem_volume describe
     these). tree_count = deprecated alias of tree_segments (it never counted trees); will be removed.
     Aliases for sibling services: /llm/kg/{{code}}, /llm/kgs, /llm/manifest.json, /llm.txt.

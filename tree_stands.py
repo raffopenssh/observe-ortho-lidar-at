@@ -126,6 +126,118 @@ class StandAcc:
         return self.parts[0]
 
 
+# --- national hexagon table, one body (GET /api/v1/trees/hexes?res=9&format=bin) --------------
+# NEX1 like /cells/national (``cells_national.decode`` reads it), written next to the store from the
+# very sums of the build pass: h_sum is the exact Σ apex height (0.25 m units = the stored NET1 step),
+# so trees / h_sum / tallest / bands equal /stats/unit over the same hexagon, apex for apex.
+
+HEX_RESES = (9,)                 # res 10 = 55 MB gzip per download: not offered (metered host); areas → JSON form
+HEX_MAGIC = b'NEX1'
+HEX_COLS = (('trees', 'u32', 'count', None), ('tallest', 'u8', 'm', 0.25), ('h_sum', 'u32', 'm', 0.25),
+            ('bands', 'u16', 'count', None))
+BAND_NAMES = tuple(f'{a}_{b}' for a, b in zip(EDGES, EDGES[1:])) + (f'{EDGES[-1]}_up',)
+
+
+def _hex_blob(res: int, ids, hist, top, hsum, gen: str, built_at: str) -> tuple[bytes, dict]:
+    """gzip'd NEX1 of one resolution; res < 10 = roll-up of the res-10 sums (ids ascending)."""
+    import gzip
+    import struct
+    import cells_api as ca
+    import cells_national as cn
+    q = np.rint(np.asarray(hsum, np.float64) * 4.0).astype(np.int64)      # exact: heights are k × 0.25 m
+    tq = np.rint(np.asarray(top, np.float64) * 4.0).astype(np.int64)
+    if res < RES:
+        par, inv = np.unique(cn.parent_ids(ids, res, RES), return_inverse=True)
+        o = np.argsort(inv, kind='stable'); st = np.searchsorted(inv[o], np.arange(len(par)))
+        ids = par; hist = np.add.reduceat(hist[o], st, axis=0)
+        q = np.add.reduceat(q[o], st); tq = np.maximum.reduceat(tq[o], st)
+    n = len(ids)
+    trees = hist.sum(1, dtype=np.int64)
+    sat = int((hist > 65535).sum())
+    cols = [np.diff(ids.astype(np.int64), prepend=0).astype('<u8'), trees.astype('<u4'),
+            np.clip(tq, 0, 255).astype(np.uint8), q.astype('<u4'), np.minimum(hist, 65535).astype('<u2')]
+    specs = [{'name': 'id', 'dtype': 'u64', 'bytes': cols[0].nbytes, 'unit': 'h3', 'agg': 'key'}]
+    for (nm, dt, unit, scale), a in zip(HEX_COLS, cols[1:]):
+        d = {'name': nm, 'dtype': dt, 'bytes': int(a.nbytes), 'unit': unit, 'agg': 'max' if nm == 'tallest' else 'sum'}
+        if scale:
+            d['scale'] = scale
+        if a.ndim == 2:
+            d['shape'] = [int(a.shape[1])]
+        specs.append(d)
+    hdr = {'algo': ALGO, 'kind': 'tree_hexes', 'res': res, 'n': int(n), 'gen': gen, 'built_at': built_at,
+           'ids': 'delta_u64', 'columns': specs, 'fields': [c[0] for c in HEX_COLS], 'edges_m': list(EDGES),
+           'bands': list(BAND_NAMES), 'trees_total': int(trees.sum()), 'h_sum_total': int(q.sum()),
+           'bands_saturated': sat,
+           'semantics': 'one row per hexagon holding >= 1 apex (h >= 3 m, default /trees/bbox set, counted in the '
+                        'cell of its served position, border cells deduplicated across products); '
+                        'mean height m = h_sum * 0.25 / trees; sum(bands) = trees',
+           'attribution': ca.ATTRIBUTION, 'license': 'CC-BY-4.0', 'license_url': ca.LICENSE_URL,
+           'source_service': 'srtm-lidar-at'}
+    hb = json.dumps(hdr, separators=(',', ':'), ensure_ascii=False).encode()
+    blob = gzip.compress(HEX_MAGIC + struct.pack('<I', len(hb)) + hb + b''.join(np.ascontiguousarray(c).tobytes() for c in cols), 6)
+    return blob, {'n': int(n), 'bytes_gz': len(blob), 'trees': hdr['trees_total'], 'h_sum': hdr['h_sum_total'],
+                  'tallest_q': int(tq.max()) if n else 0}
+
+
+def write_hex_blobs(d: Path, ids, hist, top, hsum, gen: str, built_at: str) -> dict:
+    out = {}
+    for res in HEX_RESES:
+        blob, info = _hex_blob(res, ids, hist, top, hsum, gen, built_at)
+        tmp = d / f'hex{res}.tmp'
+        tmp.write_bytes(blob); os.replace(tmp, d / f'hex{res}.nex.gz')
+        out[str(res)] = info
+    return out
+
+
+def backfill_hex_blobs(verbose: bool = True) -> dict:
+    """Write hex9.nex.gz for the store ON DISK from the ``cells_national`` unit partials (no chunk
+    is read, nothing is rebuilt).  Refused unless the partials reproduce the store exactly."""
+    import cells_national as cn
+    t = table()
+    if t is None:
+        raise RuntimeError('no stand store')
+    ids = np.asarray(t['ids']); n = len(ids)
+    hist = np.zeros((n, NB), np.uint32); top = np.zeros(n, np.float32); hsum = np.zeros(n, np.float64)
+    files = sorted(cn.PARTS_DIR.glob('*/*.npz'))
+    for i, p in enumerate(files):
+        _, st = cn._load_unit(p.stem)
+        if st is None or not len(st[0]):
+            continue
+        idx = np.searchsorted(ids, st[0])
+        if idx.max(initial=0) >= n or not np.array_equal(ids[idx], st[0]):
+            raise RuntimeError(f'unit {p.stem} holds hexagons the store does not — run the national build')
+        hist[idx] += st[1]; top[idx] = np.maximum(top[idx], st[2]); hsum[idx] += st[3]
+        if verbose and i % 2000 == 0:
+            print(f'  {i}/{len(files)} units', flush=True)
+    tot = np.zeros(n, np.int64); same = True
+    for b in range(NB - 1, -1, -1):
+        tot += hist[:, b]
+        same = same and np.array_equal(np.minimum(tot, 65535), t['cum'][b])
+    if not (same and np.array_equal(np.clip(np.rint(top * 2.0), 1, 255).astype(np.uint8), np.asarray(t['top']))):
+        raise RuntimeError('unit partials do not reproduce the stand store — run the national build')
+    m = t['meta']
+    info = write_hex_blobs(_dir(), ids, hist, top, hsum, m['gen'], m['built_at'])
+    meta = dict(m, hex=info)
+    tmp = _dir() / 'meta.tmp'
+    tmp.write_text(json.dumps(meta, indent=1)); os.replace(tmp, _dir() / 'meta.json')
+    return info
+
+
+def hex_blob(res: int) -> tuple[bytes, str, dict] | None:
+    """(gzip'd NEX1, etag, meta) of the national hexagon table; None = not built for this store."""
+    m = read_meta()
+    if not m or str(res) not in (m.get('hex') or {}):
+        return None
+    try:
+        return (_dir() / f'hex{res}.nex.gz').read_bytes(), hex_etag(m, res), m
+    except OSError:
+        return None
+
+
+def hex_etag(m: dict, res: int) -> str:
+    return f'"sx-r{res}-{m.get("gen")}"'
+
+
 def write_store(red: tuple, gen: str, built_at: str, extra: dict | None = None) -> dict:
     import h3.api.numpy_int as h3n
     t0 = time.time()
@@ -154,12 +266,17 @@ def write_store(red: tuple, gen: str, built_at: str, extra: dict | None = None) 
     shutil.rmtree(tmp, ignore_errors=True); tmp.mkdir(parents=True)
     for k, v in out.items():
         np.save(tmp / f'{k}.npy', v)
+    try:
+        hexinfo = write_hex_blobs(tmp, ids, hist, top, hsum, gen, built_at)
+    except Exception as e:  # noqa: BLE001 — the stand store must not be lost over the export files
+        log.warning('tree_stands: hex blobs not written: %s', e)
+        hexinfo = {}
     meta = {
         'algo': ALGO, 'gen': gen, 'source': 'cells_national build pass', 'res': RES, 'built_at': built_at,
         'hexes': int(n), 'apices': int(tot.sum()), 'edges_m': list(EDGES),
         'at_least': [int(x) for x in hist.sum(0, dtype=np.int64)[::-1].cumsum()[::-1]],
         'cum_saturated': int((tot > 65535).sum()),
-        'bytes': int(sum(v.nbytes for v in out.values())), 'write_s': round(time.time() - t0, 1), **(extra or {}),
+        'hex': hexinfo, 'bytes': int(sum(v.nbytes for v in out.values())), 'write_s': round(time.time() - t0, 1), **(extra or {}),
     }
     (tmp / 'meta.json').write_text(json.dumps(meta, indent=1))
     shutil.rmtree(oldd, ignore_errors=True)
@@ -592,10 +709,14 @@ if __name__ == '__main__':
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument('--status', action='store_true')
+    ap.add_argument('--hex-blobs', action='store_true',
+                    help='write hex9.nex.gz for the current store from the national unit partials')
     ap.add_argument('--top', type=float, default=None, metavar='MIN_HEIGHT_M')
     a = ap.parse_args()
     logging.basicConfig(level=logging.WARNING)
-    if a.top is not None:
+    if a.hex_blobs:
+        print(json.dumps(backfill_hex_blobs(), indent=1))
+    elif a.top is not None:
         for s in stands(min_height=a.top, limit=10)['stands']:
             print(f"{s['rank']:>2} {s['h3']} {s['lat']:.5f},{s['lon']:.5f} {s['trees']:>4} trees {s['per_ha']:>6}/ha "
                   f"tallest {s['tallest_m']} m  {s.get('kg', '')} {s.get('kg_name', '')} ({s.get('state', '')})")

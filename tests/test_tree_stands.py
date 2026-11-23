@@ -100,6 +100,22 @@ def test_http():
     assert c.get('/api/v1/trees/summary?bbox=1,2').status_code == 400
 
 
+def test_hex_blob_exact():
+    """NEX1 national table: res-9 roll-up, exact h_sum / tallest (0.25 m), bands sum to trees."""
+    import gzip
+    import cells_national as cn
+    ids = np.array([0x8a1e15b0000ffff, 0x8a1e15b0008ffff, 0x8a1e15b2000ffff], np.uint64)   # 2 share a res-9 parent?
+    par = cn.parent_ids(ids, 9, 10)
+    hist = np.zeros((3, ts.NB), np.uint32); hist[0, 0] = 2; hist[1, 5] = 1; hist[2, 11] = 3
+    top = np.array([4.25, 27.5, 60.75], np.float32); hsum = np.array([7.75, 27.5, 180.25])
+    blob, info = ts._hex_blob(9, ids, hist, top, hsum, 'g', 't')
+    hdr, c = cn.decode(gzip.decompress(blob))
+    assert hdr['kind'] == 'tree_hexes' and hdr['n'] == len(np.unique(par)) == info['n']
+    assert c['id'].tolist() == np.unique(par).tolist()
+    assert int(c['trees'].sum()) == 6 and (c['bands'].sum(1) == c['trees']).all()
+    assert int(c['h_sum'].sum()) == round((7.75 + 27.5 + 180.25) * 4) and int(c['tallest'].max()) == 243
+
+
 if __name__ == '__main__':
     if _t() is None:
         print('SKIP: stand index not built'); sys.exit(0)

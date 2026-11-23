@@ -78,6 +78,40 @@ def test_h3_unit_exact_children():
     assert b['unit']['kind'] == 'bbox' and b['figures']['cells_n'] >= 49
 
 
+def test_tree_figures_exact():
+    """trees.* / trees_height_n.* come from the exact apex heights of the cells behind trees_n; the fast
+    cell-list reader, the chunk path and a height window all agree apex for apex."""
+    import numpy as np
+    import stats_unit as su
+    kg = _first_kg()
+    if kg is None:
+        return
+    f = C.get(f'/api/v1/stats/unit?kg={kg}').get_json()['figures']
+    bands = [f[f'trees_height_n.{k}'] for k in su.TREE_BAND_KEYS]
+    assert len(bands) == 12 and sum(bands) == f['trees_n']
+    h = cells_api.header(kg, with_chunks=True)
+    t = cells_api.gather([cells_api._load_chunk(kg, dict(r, r10=int(str(r['r10']), 16)), h) for r in h['chunks']], None)
+    hm = cells_api.decode_trees(t.gather_trees()[1])['h_m']
+    assert len(hm) == f['trees_n']
+    if len(hm):
+        assert f['trees.tallest_m'] == hm.max() and abs(f['trees.height_mean_m'] - hm.mean()) <= 0.05 + 1e-9
+        assert bands[0] == int((hm < 5).sum()) and bands[4] == int(((hm >= 20) & (hm < 25)).sum())
+    w = C.get(f'/api/v1/stats/unit?kg={kg}&min_height=20&max_height=30').get_json()
+    assert w['unit']['tree_height_m'] == [20.0, 30.0]
+    wf = w['figures']
+    assert wf['trees_n'] == int(((hm >= 20) & (hm <= 30)).sum()) == sum(wf[f'trees_height_n.{k}'] for k in su.TREE_BAND_KEYS)
+    assert wf['cells_n'] == f['cells_n'] and wf['structures_n'] == f['structures_n']
+    assert C.get(f'/api/v1/stats/unit?kg={kg}&min_height=30&max_height=20').status_code == 400
+    ids = np.sort(t.ids)
+    fast, _ = su._acc_for_cells_fast(ids)
+    t2, hd, _ = cells_api.select(ids, None)
+    slow = su._acc_from_table(t2, hd)
+    assert fast['trees'] == slow['trees'] == sum(fast['th']) and fast['th'] == slow['th']
+    sc = su._scale_figures(su._figures(slow, cells_total=len(ids), area_ha_total=None), 49)
+    assert sum(sc[f'trees_height_n.{k}'] for k in su.TREE_BAND_KEYS) == sc['trees_n'] == slow['trees'] * 49
+    assert su.tree_figures([0] * 12 + [1, 0, 1])['trees.height_mean_m'] == 3.3     # 3.25 → half up
+
+
 if __name__ == '__main__':
     for name, fn in list(globals().items()):
         if name.startswith('test_'):
