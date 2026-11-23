@@ -385,6 +385,11 @@ computation; the only epoch/version signal is the existing `X-Cells-Epoch`
 * **Test**: `python3 tests/test_cells_blocks.py` (centre-child rule vs h3,
   v2 codec + xor checksum vs v1 frames, routes incl. 304 / gzip fallback /
   ids=1 / manifest / sample).
+  **Disk bound (2026-11-23):** a seen set is remembered / prebuilt nationally
+  only when it has a column outside every base set (`cells_blocks._covered`) —
+  subsets are sliced per requested block from the stored superset; at most
+  `MAX_FIELDSETS = 4` remembered sets; `gc_blocks()` (end of every prewarm)
+  drops blocks of non-registry sets untouched for 3 days.
 
 ## 7. National aggregate `/api/v1/cells/national` (`cells_national.py`)
 
@@ -445,7 +450,7 @@ reached the block phase *after* all bins were current).
 * **Builder = block units in spawned processes** (`cb.build_block_unit`,
   `--jobs 2` → 2 processes, not threads — the build is GIL-bound python):
   one unit = the stale bins of a block + every `prewarm_fieldsets()` set
-  (glyph + tree_h first, glyph, defaults, ≤ 8 seen sets). A rebuilt block is
+  (glyph + tree_h first, glyph, defaults, ≤ 4 seen sets). A rebuilt block is
   servable at once. tree-QA phase 0 gets 20 % of the budget (not 50 %) while
   > 1000 bins are stale. Phase 2 (blocks whose bins were already current)
   and phase 3 (sample) unchanged.

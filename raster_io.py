@@ -98,6 +98,52 @@ GRID_ANCHOR = {
 def _cache_path(key: str) -> Path:
     return BEV_CACHE_DIR / f"{key}.npz"
 
+
+# Self-bounding: the processor's disk-pressure LRU never runs on the primary, where
+# the weekly grid25 / ne_pos_fix verify scans added 4 GB in two days (2026-11-21).
+BEV_CACHE_MAX_BYTES = int(float(os.environ.get("BEV_CACHE_MAX_GB", "2")) * 1e9)
+_BEV_PRUNE_EVERY = 400
+_bev_writes = 0
+
+
+def prune_bev_cache(max_bytes: int | None = None) -> tuple[int, int]:
+    """Oldest-first (mtime) delete down to 80 % of the cap → (files, bytes) removed."""
+    cap = BEV_CACHE_MAX_BYTES if max_bytes is None else max_bytes
+    files = []; total = 0
+    try:
+        for e in os.scandir(BEV_CACHE_DIR):
+            try:
+                st = e.stat()
+            except OSError:
+                continue
+            if e.name.endswith(".tmp.npz") and st.st_mtime > time.time() - 3600:
+                continue
+            files.append((st.st_mtime, st.st_size, e.path)); total += st.st_size
+    except OSError:
+        return 0, 0
+    if total <= cap:
+        return 0, 0
+    files.sort(); n = 0; freed = 0
+    for _, sz, path in files:
+        if total - freed <= cap * 0.8:
+            break
+        try:
+            os.unlink(path); n += 1; freed += sz
+        except OSError:
+            pass
+    log.info("bev_tile_cache: pruned %d files, %.0f MB (cap %.1f GB)", n, freed / 1e6, cap / 1e9)
+    return n, freed
+
+
+def _bev_cache_wrote() -> None:
+    global _bev_writes
+    _bev_writes += 1
+    if _bev_writes % _BEV_PRUNE_EVERY == 0:
+        try:
+            prune_bev_cache()
+        except Exception as e:  # noqa: BLE001
+            log.debug("bev_tile_cache prune: %s", e)
+
 # GDAL env settings for efficient remote reads
 GDAL_ENV = {
     "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
@@ -208,6 +254,7 @@ def _read_single_tile(
             try:
                 np.savez_compressed(tmp_path, data=data, transform=tf_arr)
                 _os.replace(tmp_path, str(cp))
+                _bev_cache_wrote()
             finally:
                 if _os.path.exists(tmp_path):
                     try: _os.unlink(tmp_path)

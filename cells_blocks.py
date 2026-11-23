@@ -81,7 +81,8 @@ ZSTD_LEVEL = 9                   # one level everywhere → strong ETag = byte-i
 SAMPLE_ZSTD_LEVEL = 19
 SAMPLE_RES = (9, 10, 11)
 SAMPLE_DEFAULT_RES = 10
-MAX_FIELDSETS = 8
+MAX_FIELDSETS = 4                # remembered non-base sets, each prebuilt nationally (0.2–2 GB) → disk bound
+GC_AGE_S = 3 * 86400             # blocks of a field set outside the registry (on-demand slices, dropped sets)
 SAMPLE_CACHE_FILES = 16
 
 # the nine columns a downstream glyph filter uses
@@ -385,13 +386,25 @@ def quick_etag(bi: int, bj: int, fields) -> tuple[str, str, list[dict]]:
 
 # === SECTION: field-set registry (what to prewarm) ===
 
+def _base_fieldsets() -> list[list[str]]:
+    return [list(GLYPH_TREE_FIELDS), list(GLYPH_FIELDS), list(cb.DEFAULT_FIELDS)]
+
+
+def _covered(fields) -> bool:
+    """Columns all inside ONE base set → ``serve_block`` slices the block from that stored
+    superset on demand; never prebuilt nationally (2026-11-23: two orderings of
+    ``elev_mean,slope_mean`` had cost 0.8 GB)."""
+    want = set(fields)
+    return any(want <= set(cb.with_ragged_counts(b)) for b in _base_fieldsets())
+
+
 def prewarm_fieldsets() -> list[list[str]]:
     """Default + glyph field sets + every set a block request used (≤ 8)."""
-    out = [list(GLYPH_TREE_FIELDS), list(GLYPH_FIELDS), list(cb.DEFAULT_FIELDS)]   # superset first: the base set is sliced from it
+    out = _base_fieldsets()                     # superset first: the base set is sliced from it
     try:
         for fs in json.loads(FIELDSETS_PATH.read_text()).get('fieldsets') or []:
             fs = [f for f in fs if f in cb.FIELDS and f != 'id']
-            if fs and fs not in out:
+            if fs and fs not in out and not _covered(fs):
                 out.append(fs)
     except (OSError, ValueError):
         pass
@@ -400,7 +413,7 @@ def prewarm_fieldsets() -> list[list[str]]:
 
 def remember_fieldset(fields) -> None:
     fields = [f for f in fields if f != 'id']
-    if fields in (list(cb.DEFAULT_FIELDS), list(GLYPH_FIELDS), list(GLYPH_TREE_FIELDS)):
+    if _covered(fields):
         return
     with _meta_lock:
         try:
@@ -503,6 +516,29 @@ def blocks_status(fields=None) -> dict:
 
 # === SECTION: prewarm (called from cells_bins.prewarm) ===
 
+def gc_blocks(max_age_s: float | None = None) -> dict:
+    """Drop stored blocks whose field-set hash is not a prewarm set and that nobody rewrote
+    for ``GC_AGE_S`` (on-demand slices of a base set, sets that fell out of the registry).
+    A later request re-slices / rebuilds them, so this only bounds the directory."""
+    keep = {fields_hash(cb.with_ragged_counts(fs)) for fs in prewarm_fieldsets()}
+    cut = time.time() - (GC_AGE_S if max_age_s is None else max_age_s); n = 0; freed = 0
+    try:
+        it = list(os.scandir(BLOCK_DIR))
+    except OSError:
+        return {'files': 0, 'bytes': 0}
+    for e in it:
+        parts = e.name.split('.')
+        if not (e.name.endswith(('.nexb.zst', '.json')) and len(parts) >= 3 and '_' in parts[0]) or parts[1] in keep:
+            continue
+        try:
+            st = e.stat()
+            if e.is_file() and st.st_mtime < cut:
+                os.unlink(e.path); n += 1; freed += st.st_size
+        except OSError:
+            pass
+    return {'files': n, 'bytes': freed}
+
+
 def prewarm_blocks(budget_s: float | None = None, limit: int | None = None, verbose: bool = True,
                    jobs: int = 1) -> dict:
     """Build / refresh every manifest block whose stored blob (per prewarm
@@ -552,7 +588,8 @@ def prewarm_blocks(budget_s: float | None = None, limit: int | None = None, verb
                 break
     with _manifest_guard:
         _manifest_cache.pop('manifest', None)
-    return {'blocks': len(gens), 'fieldsets': len(prewarm_fieldsets()), 'built': n_built, 'errors': n_err,
+    gc = gc_blocks()
+    return {'blocks': len(gens), 'fieldsets': len(prewarm_fieldsets()), 'built': n_built, 'errors': n_err, 'gc': gc,
             'current_before': n_ok, 'missing_before': len(todo_missing), 'stale_before': len(todo_stale),
             'remaining': len(todo_missing) + len(todo_stale) - n_built, 'stopped_on_budget': bool(stop),
             'seconds': round(time.time() - t0, 1)}
