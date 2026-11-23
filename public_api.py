@@ -581,6 +581,103 @@ def trees_stats():
     return _json(st, max_age=3600, etag=etag)
 
 
+# === SECTION: tree stands (national res-10 index, tree_stands.py) ===
+
+def _stands_area(src) -> dict:
+    """Area spec from query args / a JSON object: h3 (comma list or array), bbox, kg, state, geometry."""
+    a = {}
+    h = src.get('h3')
+    if h:
+        a['h3'] = [x.strip() for x in h.split(',') if x.strip()] if isinstance(h, str) else list(h)
+    b = src.get('bbox')
+    if b:
+        try:
+            bb = [float(x) for x in (b.split(',') if isinstance(b, str) else b)]
+        except (TypeError, ValueError):
+            bb = []
+        if len(bb) != 4 or bb[0] >= bb[2] or bb[1] >= bb[3]:
+            raise ValueError('bbox=west,south,east,north')
+        a['bbox'] = bb
+    for k in ('kg', 'state', 'geometry'):
+        if src.get(k) not in (None, ''):
+            a[k] = src[k]
+    return a
+
+
+def _stands_args():
+    """Merged GET args + optional POST JSON body (body wins)."""
+    src = dict(request.args.items())
+    if request.method == 'POST':
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            raise ValueError('POST body must be a JSON object')
+        src.update(body)
+    return src
+
+
+def _num(src, k, cast=float):
+    v = src.get(k)
+    return None if v in (None, '') else cast(v)
+
+
+def _truthy(v) -> bool:
+    return str(v).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _stands_reply(fn):
+    import tree_stands as ts
+    try:
+        src = _stands_args()
+        out = fn(ts, src)
+    except (ts.BadQuery, ValueError, TypeError) as e:
+        return _err(str(e), 400, docs='/api/v1/docs/llm.txt')
+    if out is None:
+        return _err('tree stand index not built yet', 503, retry_after_s=3600)
+    out = dict(out, meta=_meta())
+    # ETag = store generation + request (the body carries duration_ms): revalidation is free until a rebuild
+    tag = 'W/"st-%s-%s"' % (out.get('gen'), hashlib.md5(request.full_path.encode()).hexdigest()[:12])
+    r = _json(out, max_age=3600, etag=tag) if request.method == 'GET' else _json(out)
+    r.headers['X-Stands-Gen'] = out.get('gen') or ''
+    return r
+
+
+@app.route('/api/v1/trees/stands', methods=['GET', 'POST'])
+def trees_stands():
+    """Ranked tree stands (H3 res-10 hexagons, ~1.5 ha): densest / tallest for a height window, anywhere
+    in Austria or inside an area (h3 cells, bbox, kg, state, POSTed polygon)."""
+    return _stands_reply(lambda ts, s: ts.stands(
+        min_height=_num(s, 'min_height') or 3, max_height=_num(s, 'max_height'), area=_stands_area(s),
+        elev_min=_num(s, 'elev_min'), elev_max=_num(s, 'elev_max'), sort=str(s.get('sort') or 'density'),
+        limit=_num(s, 'limit', int) or ts.DEFAULT_LIMIT, separation_m=_num(s, 'separation_m'),
+        min_trees=_num(s, 'min_trees', int), bands=_truthy(s.get('bands', '')), geometry=_truthy(s.get('boundary', ''))))
+
+
+@app.route('/api/v1/trees/summary', methods=['GET', 'POST'])
+def trees_summary():
+    """Height-band tree summary for one area (GET) or up to 500 areas in one call (POST {areas: [...]}):
+    H3 cell sets of any resolution, polygons (Natura 2000 sites, municipalities), bbox, kg, state."""
+    def run(ts, s):
+        areas = s.get('areas')
+        if areas is None:
+            a = _stands_area(s)
+            areas = [a] if a else None
+        elif not isinstance(areas, list) or len(areas) > 500:
+            raise ValueError('areas must be a list of at most 500 area objects')
+        else:
+            areas = [dict(a, **_stands_area(a)) if isinstance(a, dict) else a for a in areas]
+        return ts.summary(areas, top=_num(s, 'top', int) or 0, min_height=_num(s, 'min_height') or 3,
+                          sort=str(s.get('sort') or 'density'))
+    return _stands_reply(run)
+
+
+@app.route('/api/v1/trees/hexes', methods=['GET', 'POST'])
+def trees_hexes():
+    """Tree columns per H3 hexagon (res 5..10, coarser = roll-up) for an area — the map / join form."""
+    return _stands_reply(lambda ts, s: ts.hexes(
+        _stands_area(s), res=_num(s, 'res', int) or ts.RES, min_height=_num(s, 'min_height') or 3,
+        max_height=_num(s, 'max_height'), bands=_truthy(s.get('bands', ''))))
+
+
 @app.route('/api/v1/landmarks/bbox')
 def landmarks_bbox():
     bb, err = _bbox_or_err()

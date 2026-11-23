@@ -164,6 +164,7 @@ class Acc:
         self.res = res
         self.parts: list[dict] = []
         self.cells = 0
+        self.stands = None           # tree_stands.StandAcc: res-10 tree sums from the same apices
 
     def add_table(self, t: ca.Table) -> None:
         n = len(t)
@@ -232,6 +233,8 @@ class Acc:
         out['tree_hh'] = np.zeros((m, TREE_HH_BANDS), np.int64)
         if words.size:
             h = ca.decode_trees(words)['h_m']
+            if self.stands is not None:
+                self.stands.add(t, observed, ci, h)
             band = tree_hh_band(h)
             out['tree_hh'] = np.bincount(inv[ci] * TREE_HH_BANDS + band, minlength=m * TREE_HH_BANDS).reshape(m, TREE_HH_BANDS).astype(np.int64)
             hx, c50, c90, _ = cb._per_cell_stats(ci, h, n)
@@ -457,6 +460,9 @@ def build(verbose: bool = True, force: bool = False) -> dict:
     gen = current_gen()
     meta = read_meta()
     have = all((NAT_DIR / f'r{r}.nex.gz').exists() for r in RESES)
+    import tree_stands
+    sm = tree_stands.read_meta()         # the res-10 stand store must be of this very build
+    have = have and bool(sm and meta and sm.get('algo') == tree_stands.ALGO and sm.get('gen') == meta.get('gen'))
     if meta and meta.get('gen') == gen and not force and have:
         return {'skipped': True, 'gen': gen}
     files = ca._files()
@@ -468,7 +474,7 @@ def build(verbose: bool = True, force: bool = False) -> dict:
                     'corpus_gen': gen, **d, 'rebuild_by_d': MAX_DEFER_D}
     kgs = sorted(files)
     dup = _dup_r10s(); dup_set = set(dup.tolist())
-    acc = Acc(9)
+    acc = Acc(9); acc.stands = tree_stands.StandAcc()
     n_chunks = 0
     # pass A — chunks unique to one product, per KG
     for k, kg in enumerate(kgs):
@@ -509,6 +515,13 @@ def build(verbose: bool = True, force: bool = False) -> dict:
                 'green_fix': _green_fix.FIX_ID, 'build_started': round(t0, 1), 'corpus': _corpus_sig(files),
                 'tree_qa': {k: tq_sig[k] for k in ('id', 'kgs', 'hidden')}}
     reds = {9: red9, 8: rollup(red9, 9, 8)}
+    try:                                # res-10 stand index: same pass, same apices, same gen
+        sred = acc.stands.reduce()
+        if sred is not None:
+            sm = tree_stands.write_store(sred, gen, built_at)
+            out_meta['stands'] = {k: sm[k] for k in ('hexes', 'apices', 'bytes')}
+    except Exception as e:  # noqa: BLE001 — never lose the national table over the add-on
+        log.warning('national: tree stand store not written: %s', e)
     for res in RESES:
         cols = finalise(reds[res])
         hdr = header_for(res, cols['id'].size, gen, epoch, {'built_at': built_at, 'kgs': len(kgs), 'cells_total': acc.cells})

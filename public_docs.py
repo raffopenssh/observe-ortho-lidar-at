@@ -663,6 +663,42 @@ GET /api/v1/trees/stats                      how many trees: the national summar
     (live numbers: the endpoint). tree_segments (163 M) is NOT a tree count: segmentation polygons,
     summed over overlapping KG product bboxes.
 
+GET|POST /api/v1/trees/stands                ranked tree stands: "where are the densest stands of trees ≥ 40 m"
+GET|POST /api/v1/trees/summary               height-band tree summary of any area — or 500 areas in one POST
+GET|POST /api/v1/trees/hexes                 tree columns per H3 hexagon (res 5..10) of an area, for maps / joins
+    One national index: every H3 **res-10** hexagon (~1.5 ha, a forestry stand; 4.75 M of them) holding ≥ 1
+    realistic apex, with its apex count per 5 m height band, tallest / mean height, mean elevation, KG.
+    Built in the same pass as /api/v1/cells/national from the same apices (the default /trees/bbox set,
+    each apex once, exact heights) — band totals equal /api/v1/trees/stats apex for apex, same `gen`;
+    rebuilt with it (daily when the corpus moved); ETag changes with `gen`. Answers in 5–150 ms, max-age 3600.
+    Heights: band edges 3, 5, 10, 15 … 55 m (the tree_hh bands); min_height / max_height snap down to an edge.
+    AREA (all three endpoints, AND-combined; none = Austria). Query args or the same keys in a POST JSON body:
+      h3=<cell>,<cell>…   H3 cells of ANY resolution, mixed / compacted sets welcome (≤ 20,000). Res ≤ 10:
+                          exact hierarchy roll-up (two binary searches per cell — the fast path; use it when
+                          your own layer is H3). Res 11–15: the res-10 parent.
+      geometry={{GeoJSON Polygon|MultiPolygon}}   POST only; hexagon centre inside (≤ 50,000 vertices) —
+                          Natura 2000 sites, municipalities, catchments.
+      bbox=w,s,e,n · kg=<5-digit code> · state=<1..9>   (kg/state = the KG whose product serves the hexagon)
+    /trees/stands?[min_height=40][&max_height=…][&sort=density|count|tallest|mean_height|share][&limit=20 ≤500]
+                 [&separation_m=262][&elev_min=…][&elev_max=…][&min_trees=…][&bands=1][&boundary=1] + AREA
+      {{min_height_m, max_height_m, sort, separation_m, matched{{hexes, trees, area_ha}}, count, gen, built_at,
+       stands[{{rank, h3, lat, lon, trees, per_ha, trees_all, tallest_m, mean_height_m, elev_m, area_ha, kg,
+               kg_name, gemeinde, state, ring{{trees, per_ha, tallest_m}}, bands?[12], boundary?}}]}}
+      trees = apices in the height window, trees_all = all apices ≥ 3 m; share = trees / trees_all
+      (share / mean_height default to min_trees=30). ring = the hexagon + its 6 neighbours (≈ 10 ha):
+      high ring.per_ha = a stand, low = an isolated clump. separation_m: a hexagon closer than this to a
+      better-ranked one is skipped, so the list is N distinct places (0 = raw ranking).
+      Drill down: /api/v1/trees/bbox or /api/v1/cells with the stand's h3 / lat, lon.
+    /trees/summary?[top=0 ≤50][&min_height=3][&sort=…] + AREA      one area
+    POST /trees/summary {{"areas":[{{"id":…, "h3":[…] | "geometry":{{…}} | "bbox":[…] | "kg":… | "state":…}}, … ≤500], "top":3, "min_height":30}}
+      {{edges_m, areas[{{id, hexes, stocked_ha, trees, per_stocked_ha, at_least[12], bands[12], mean_height_m,
+        tallest{{h3, lat, lon, tallest_m, kg, kg_name}}, elev_m{{min, mean, max}}, top_stands?[…]}}]}}
+      stocked_ha = area of the hexagons holding trees (not the area of your polygon). at_least[b] = apices
+      ≥ edges_m[b]. An empty area answers {{hexes: 0, trees: 0}}. ~1 ms per H3 cell set, ~10 ms per polygon.
+    /trees/hexes?[res=10][&min_height=3][&max_height=…][&bands=1] + AREA   (≤ 20,000 hexagons per call)
+      {{hex_res, count, trees, columns{{h3[], trees[], trees_all[], tallest_m[], mean_height_m[], elev_m[],
+        stocked_ha[] (res < 10), bands[][12]?}}}}   sorted by H3 id; res 5..9 = exact roll-up of the res-10 rows.
+
 GET /api/v1/trees/bbox?bbox=…[&min_height=3][&max_height=…][&limit=2000][&realistic=1][&objects=trees|structures][&types=…][&format=json|geojson|columns][&fields=…]
     Tree apices, tallest first, from the NE cells corpus (EVERY apex h ≥ 3 m — a full inventory,
     meta.complete=true; ≤ limit, truncated:true when more exist). min_height / max_height form a
@@ -959,6 +995,7 @@ GET /api/v1/cells?lon=15.0857&amp;lat=47.0665&amp;k=1</pre>
 <table><tr><th>Need</th><th>Call</th></tr>
 <tr><td>Everything about a bbox / point</td><td><code>/api/v1/landscape?bbox=</code> (alias <code>/context</code>)</td></tr>
 <tr><td>Realistic tall trees</td><td><code>/api/v1/trees/bbox?bbox=</code></td></tr>
+<tr><td>Densest / tallest tree stands; tree summary of any H3 cell set or polygon</td><td><code>/api/v1/trees/stands</code>, <code>/trees/summary</code>, <code>/trees/hexes</code></td></tr>
 <tr><td>How many trees (Austria: 549 M apices ≥ 3 m, by height band / elevation / state)</td><td><code>/api/v1/trees/stats</code></td></tr>
 <tr><td>Towers, masts, wind turbines</td><td><code>/api/v1/landmarks/bbox?bbox=</code></td></tr>
 <tr><td>Measured building heights</td><td><code>/api/v1/buildings/bbox?bbox=</code></td></tr>
