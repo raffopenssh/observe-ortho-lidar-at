@@ -311,7 +311,7 @@ def scan_kg(kg: str, con=None) -> dict:
                           r['v0'], r['tw_d'], r['tw_dh'], r['tw_kg'], r['nb'], r['nbk']) for r in rows])
         con.execute('INSERT INTO kgs(kg, token, deps, stored, served, off, capped, outside, ts, err) VALUES (?,?,?,?,?,?,?,?,?,NULL) '
                     'ON CONFLICT(kg) DO UPDATE SET token=excluded.token, deps=excluded.deps, stored=excluded.stored, served=excluded.served, '
-                    'off=excluded.off, capped=excluded.capped, outside=excluded.outside, ts=excluded.ts, err=NULL',
+                    'off=excluded.off, capped=excluded.capped, outside=excluded.outside, ts=excluded.ts, err=NULL, ok=NULL',
                     (int(kg), tok, json.dumps(sorted(ev['deps'])), st['stored'], st['apices'], st['off_file'], st['capped'],
                      st['outside'], int(time.time())))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('resolved', '0')")
@@ -384,7 +384,7 @@ def scan_lost_kg(kg: str, con=None) -> dict:
                         'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                         [(r['kg'], _i64(r['r10']), r['idx'], _i64(r['cell']), r['x'], r['y'], r['hq'], r['word'], r['reason'], r['okg'],
                           r['v0'], r['tw_d'], r['tw_dh'], r['tw_kg'], r['nb'], r['nbk']) for r in keep])
-        n = con.execute('UPDATE kgs SET ltoken=?, ldeps=?, lost=?, ldup=?, lqa=? WHERE kg=? AND token IS NOT NULL',
+        n = con.execute('UPDATE kgs SET ltoken=?, ldeps=?, lost=?, ldup=?, lqa=?, ok=NULL WHERE kg=? AND token IS NOT NULL',
                         (tok, json.dumps(sorted(ev['deps'])), st['lost'], ndup, nqa, int(kg))).rowcount
         if not n:
             raise RuntimeError(f'{kg}: off-file part not scanned')
@@ -604,19 +604,24 @@ def totals(con=None) -> dict:
 
 
 def kg_counts(kg) -> dict | None:
-    """Store view of one KG for ``ne_rebin.check`` (None = not scanned / stale rule)."""
+    """Store view of one KG for ``ne_rebin.check`` (None = not scanned / stale rule / rescanned and
+    waiting for ``resolve``)."""
     con = _conn()
     if con is None:
         return None
     r = con.execute('SELECT * FROM kgs WHERE kg=?', (int(kg),)).fetchone()
     if r is None or r['token'] is None or r['added'] is None or not r['token'].startswith(RULE + '|'):
         return None
+    # added / dup / qa (and `ok`) are folded per KG by resolve() over BOTH parts.  A (re)scan of this KG
+    # clears `ok` until the next resolve: its row then mixes fresh stored / served / lost with counts
+    # of the previous fold → no store view.  Every other KG stays folded and checkable while a scan of
+    # the corpus is running (the global `resolved` marker alone used to void all 7 850 rows, and their
+    # folded counts were then compared without `lost`: a false invariant alarm for the whole window).
+    m = {k: v for k, v in con.execute("SELECT k, v FROM meta WHERE k IN ('resolved', 'resolved_ts')")}
+    if r['ok'] is None or (m.get('resolved') != RULE and (r['ts'] or 0) > int(m.get('resolved_ts') or 0)):
+        return None
     out = {k: r[k] for k in ('stored', 'served', 'off', 'capped', 'added', 'no_row', 'other_file', 'dup', 'qa', 'ok')}
     lost_ok = r['ltoken'] is not None and r['ltoken'].startswith(f'{LOST_ID}.')
-    # the lost-cell part is only folded into added / dup / qa by resolve(): between a (re)scan and the next
-    # resolve the per-KG counts are the off-file part alone, so `lost` must not enter the invariant yet
-    m = con.execute("SELECT v FROM meta WHERE k='resolved'").fetchone()
-    lost_ok = lost_ok and m is not None and m[0] == RULE
     out.update(lost=r['lost'] if lost_ok else None, lost_cell=r['lost_cell'] or 0, lost_dup=r['ldup'] or 0, lost_qa=r['lqa'] or 0)
     return out
 
