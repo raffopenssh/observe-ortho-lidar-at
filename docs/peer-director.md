@@ -139,6 +139,7 @@ Symptoms and what they really mean:
 | Peer log ends mid-step with no error, `processor_state=stopped`, `Received SIGTERM — will finish current KG then exit` 10–15 min earlier | Graceful update escalated / process killed before the KG boundary. Tile checkpoints survive (`tile N restored from checkpoint`, chkpt registry) → the retry is cheap. | Nothing — the block is re-picked by the next idle peer in the cell. |
 | `copernicus: NDVI <month>: month too heavy … skipping month`, `copernicus (2700s) completed with warnings`, `ndvi_harmonics: No monthly NDVI data retrieved` | openEO degraded; harmonics come out partial. The product still uploads (`-partial` label) and lands in `repair: pending[harmonics]` → re-upgraded later when cells are cached. | Nothing. Don't touch timeouts (`docs/copernicus-throttle.md`). |
 | Same block `Starting KG` on 2–3 peers within one minute | Dispatch-claim race (150 s window). The dup-KG reconciler keeps the furthest-along peer. | Nothing; `?q=dup-kg` to audit. |
+| A force-requeued code is rebuilt twice | The primary's manifest lags the peer's fresh `_json`; the code is still queued while nobody is "in progress". `_claim_dispatch` holds back a tombstoned code a peer reports as finished after the tombstone (`_finished_requeues`, ≤ 1 h). Log `dispatch: holding back …`; test `tests/test_dispatch_finished_requeue.py`. |
 
 Do **not** hand-start processors or `update_peers` across the fleet to
 "unstick" the endgame — one stale claim + one quarantined cell is the

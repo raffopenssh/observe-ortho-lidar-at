@@ -2690,6 +2690,84 @@ _RECENT_DISPATCH_TTL = 150.0       # seconds; covers status-visibility lag
 _DISPATCH_LOCK = threading.Lock()
 
 
+# --- Finished force-requeues (duplicate re-run guard, 2026-11-23) ---------
+# A force-requeued code (``<code>_requeue`` / ``<code>_fresh`` tombstone)
+# stays in the primary's retry queue until the primary's manifest shows the
+# fresh ``_json`` (peer-sync lag, minutes).  In that window the code is no
+# longer "in progress" anywhere and its dispatch claim has lapsed, so the
+# next queue sync handed it out again: the finishing peer had already
+# dropped its tombstones, a different peer never had them — either way the
+# push stamped a brand-new requeue there and the KG was rebuilt a second
+# time (47011-north, 67106-southwest-1 on the qc_reprocess list).  A peer's
+# status reports its last completed code + time at once, so: a tombstoned
+# code some peer finished AFTER the tombstone is held back from dispatch
+# until the manifest catches up (the drain then drops it from the queue).
+# The hold lapses after ``_FINISHED_HOLD_S`` in case the upload record never
+# arrives, and a later operator requeue (newer tombstone) is never held.
+_FINISHED_KG: dict = {}            # code -> epoch of the newest completion a peer reported
+_FINISHED_HOLD_S = 3600.0
+
+
+def _iso_epoch(s) -> float:
+    """ISO timestamp → epoch; naive stamps are UTC (the tombstone writer)."""
+    try:
+        from datetime import datetime as _dtm, timezone as _tzm
+        d = _dtm.fromisoformat(str(s).replace('Z', '+00:00'))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=_tzm.utc)
+        return d.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _note_finished_kg(ps) -> None:
+    """Record ``last_kg_code`` / ``last_kg_uploaded_at`` of one peer status."""
+    try:
+        code = ps.get('last_kg_code'); at = _iso_epoch(ps.get('last_kg_uploaded_at'))
+        if code and at:
+            with _DISPATCH_LOCK:
+                if at > _FINISHED_KG.get(str(code), 0.0):
+                    _FINISHED_KG[str(code)] = at
+    except Exception:
+        pass
+
+
+def _note_peer_finished(peer_url: str) -> None:
+    """The dispatch target itself (``_in_progress_kgs`` only probes the OTHER
+    peers): its pushed status is < 60 s old, so this costs no request."""
+    try:
+        if peer_url:
+            _note_finished_kg(get_peer_status(peer_url))
+    except Exception:
+        pass
+
+
+def _finished_requeues(codes, tombstones: dict | None = None, now: float | None = None) -> set:
+    """Subset of *codes* that carry a requeue / fresh-run tombstone and were
+    completed by some peer after it (within the hold window)."""
+    out: set = set()
+    if not codes or not _FINISHED_KG:
+        return out
+    if tombstones is None:
+        try:
+            tombstones = json.loads((DATA_DIR / 'manifest_tombstones.json').read_text())
+        except Exception:
+            tombstones = {}
+    if not isinstance(tombstones, dict):
+        return out
+    now = time.time() if now is None else now
+    with _DISPATCH_LOCK:
+        fin = dict(_FINISHED_KG)
+    for c in codes:
+        done_at = fin.get(str(c), 0.0)
+        if not done_at or now - done_at > _FINISHED_HOLD_S:
+            continue
+        ref = max(_iso_epoch(tombstones.get(f'{c}_requeue')), _iso_epoch(tombstones.get(f'{c}_fresh')))
+        if ref and done_at > ref:
+            out.add(c)
+    return out
+
+
 def _claim_dispatch(codes: list, peer_url: str) -> list:
     """Return the subset of *codes* not recently claimed by another peer,
     recording the survivors as claimed by *peer_url*.
@@ -2700,6 +2778,13 @@ def _claim_dispatch(codes: list, peer_url: str) -> list:
     """
     if not codes:
         return codes
+    _held = _finished_requeues(codes)
+    if _held:
+        log.info('dispatch: holding back %s — force-requeued and already re-completed by a peer; '
+                 'waiting for the manifest', ','.join(sorted(_held)))
+        codes = [c for c in codes if c not in _held]
+        if not codes:
+            return codes
     now = time.time()
     out: list = []
     with _DISPATCH_LOCK:
@@ -2796,6 +2881,7 @@ def sync_queue_to_peer(peer_url: str, exclude: set | None = None) -> dict:
     # KG until the peer's current_kg becomes visible). Prevents two peers
     # racing the same KG — e.g. at100 (cache-only whitelist) + at102
     # (frontier queue) both starting 40318 15s apart.
+    _note_peer_finished(peer_url)
     queue = _claim_dispatch(queue, peer_url)
     _drop = sorted(exclude) if exclude else []
     if not queue:
@@ -2927,6 +3013,7 @@ def _push_queue_to_peer(peer_url: str, codes: list) -> dict:
     # handed to another peer this tick (via the frontier queue or another
     # cache-only slice) isn't re-dispatched here. Same-peer re-syncs refresh
     # the claim and are never blocked.
+    _note_peer_finished(peer_url)
     codes = _claim_dispatch(list(codes), peer_url)
     if not codes:
         return {'status': 'empty_whitelist', 'synced': 0}
@@ -2986,6 +3073,7 @@ def _in_progress_kgs(cfg: dict, exclude_peer_id: str | None = None) -> set:
                 ps = f.result()
             except Exception:
                 continue
+            _note_finished_kg(ps)
             if ps.get('state') not in ('running', 'processing'):
                 continue
             ck = ps.get('current_kg') or {}
@@ -4757,6 +4845,7 @@ class PeerDirector:
             # Refresh meta_cache from the live status (only when the peer
             # actually reported a value — never overwrite a known value
             # with an empty string from a stale/proxied response).
+            _note_finished_kg(ps)
             try:
                 _meta = meta_cache.setdefault(pid, {})
                 for _k in ('git_commit', 'region', 'last_kg_code',
