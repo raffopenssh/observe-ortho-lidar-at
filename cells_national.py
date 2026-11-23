@@ -732,7 +732,7 @@ def _hms(s) -> str:
 def progress_line(d: dict | None) -> str:
     if not d:
         return 'no build recorded'
-    s = f"{d.get('state')}"
+    s = {'units': 'computing'}.get(d.get('state'), str(d.get('state')))
     if d.get('units_total') is not None:
         s += (f" units {d.get('units_done', 0)}/{d.get('units_todo', 0)} to build ({d.get('units_cached', 0)} of "
               f"{d['units_total']} reused), chunks {d.get('chunks_done', 0)}/{d.get('chunks_todo', 0)}")
