@@ -193,6 +193,16 @@ Inputs still moving at that build: `ne_pos_fix` per-tile pass (134 KGs to do),
   `source_changed: true` on the tile, `source_changed_tiles=` on the sidecar
   summary line. "Upstream changed" is now a metadata comparison
   (`raster_io.sources_changed`).
+  **Added 2026-11-23** — `v2_verify.border_loss_explained`: a fresh run of a
+  border product *must* cover less LiDAR than its v1 (withdrawn BEV data +
+  the clip), so `segmented_area_ge_v1` / `lidar_tiles_ge_v1` rejected exactly
+  the reprocessed `grid25_stale` products (4 stuck at the primary ingest,
+  `layer_gap` blocks struck out on peers). The two gates are now warnings
+  when, on the same tile grid and without upstream-failed tiles, every tile
+  that lost pixels crosses the national outline and still holds ≥ 90 % of its
+  in-Austria pixels (outline-derived, independent of what the peer recorded);
+  one inland tile with a loss keeps them fatal. Log text: `border loss only:
+  N border tile(s) lost X km²`. Test `tests/test_run_guards.py`.
 
 ### 4. `grid25_edge` — step along an internal tile edge
 
