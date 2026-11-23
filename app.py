@@ -20570,6 +20570,12 @@ def process_txt():
             out.append(_tq.text_line())
         except Exception as _e:
             out.append(f'tree_qa: unavailable ({_e})')
+        # national_build: incremental cells_national / tree-stand build (units reused vs rebuilt, live progress)
+        try:
+            import cells_national as _cnat
+            out.append(_cnat.text_line())
+        except Exception as _e:
+            out.append(f'national_build: unavailable ({_e})')
         # cells index: corpus files newer than their index rows (served from the live header until the
         # hourly cells-bins pass re-indexes them; cells_api.lagging_files) — only shown when there are any
         try:

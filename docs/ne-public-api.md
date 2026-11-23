@@ -399,11 +399,30 @@ field is non-null (`*_top` = max), `verdict` = u16 counts per consistency
 class, `n_cells` / `n_obs`. Same container / dtypes / units / nodata as
 the 0.025° bins (`cells_bins.py`, `format=bin&fields=`).
 
-* **Build**: `python3 cells_national.py --build` (~10 min, ~1 GB RAM over
-  5.4 M chunks) → `data/ne/national/r9.nex.gz`, `r8.nex.gz`, `meta.json`.
-  `cells-national.timer` runs it daily; skipped when
-  `gen = sha(ALGO | green_fix | cells_generation())` is unchanged. **Never
-  build inside gunicorn.**
+* **Build**: `python3 cells_national.py --build` → `data/ne/national/r9.nex.gz`,
+  `r8.nex.gz`, `meta.json` + the stand store `data/ne/stands/` (`tree_stands.py`).
+  `cells-national.timer` (daily) — skipped when `current_gen()` is
+  unchanged, deferred on minor drift. **Never build inside gunicorn.**
+  **Incremental since 2026-11-23** (one pass = 6.3 M chunk reads through green fix →
+  pos fix → rebin → tree QA ≈ hours of one core; the monolithic pass outgrew its 2 h
+  timeout and 2.5 G cap):
+  * **units** on disk, `data/ne/national/parts/<xx>/<unit>.npz` (narrowed ints, deflate):
+    `k<kg>` = a product's chunks no other product stores, `g<res-6 hex>` = the
+    duplicated res-10 ids of one res-6 parent, deduplicated across products like
+    `cells_api.gather`. Each holds its res-9 partial sums + res-10 stand partial and a
+    **signature** (file digest, `ne_pos_fix.tag`, `tree_qa.kg_tok`, its duplicate set,
+    `ALGO` / stands algo / green-fix / `THX_ID`).
+  * a build recomputes only units whose signature moved (a few a day), in
+    `CELLS_NATIONAL_JOBS` spawn workers (default 2), then **scatter-adds** all partials into
+    preallocated national arrays (no concatenate / re-reduce copies; res-9 arrays freed
+    before the stand arrays). Sums are integers / exact binary fractions → the result is
+    independent of the cut (`tests/test_cells_national.py::test_units_match_single_pass`).
+  * **resumable**: a kill / timeout keeps every finished unit; a corpus that moves under
+    the build is re-planned (≤ 3 rounds), never published half-and-half.
+  * **progress**: `python3 cells_national.py --status` (`progress.json`: units, chunks,
+    rate, ETA, RSS), `--plan` (what would be rebuilt, index only), journal line every
+    5 min, `national_build:` on `/process.txt`. From scratch: `rm -r data/ne/national/parts`.
+  * rule bump (`ALGO`, `tree_stands.ALGO`, `THX_ID`, green fix) = every unit rebuilt.
 * **Serve**: no `fields=` → the stored gz as is; `fields=` → decode + slice
   + gzip once, cached under `data/ne/national/cache/` (LRU 24,
   single-flight). ETag `"n-r<res>-<gen>-<fields>"`, `X-Cells-Gen`,

@@ -108,10 +108,65 @@ def test_tree_qa_fold():
         ca._tree_qa.corpus_sig = real
 
 
-if __name__ == '__main__':
-    for n, f in list(globals().items()):
-        if n.startswith('test_'):
-            f(); print('ok', n)
+def test_units_match_single_pass():
+    """Incremental build (units on disk → scatter merge) == the one-pass reduction, bit for bit:
+    per-product units for 3 neighbouring KGs + every duplicate group touching the first one."""
+    import tempfile, shutil
+    from pathlib import Path
+    import tree_stands
+    files = ca._files()
+    if not files:
+        return
+    ca._tree_qa.sync()
+    units = cn.plan(files)
+    groups = [u for u in units if u['kind'] == 'g']
+    g0 = min(groups, key=lambda u: u['chunks'] if u['chunks'] > 30 else 10 ** 9)
+    kgs = sorted(g0['kgsigs'])[:3]
+    sel = [u for u in units if u['kind'] == 'k' and u['kg'] in kgs] + \
+          sorted([u for u in groups if kgs[0] in u['kgsigs']], key=lambda u: u['chunks'])[:3]
+    if g0['id'] not in {u['id'] for u in sel}:
+        sel.append(g0)
+    # reference: the pre-incremental algorithm
+    acc = cn.Acc(9); acc.stands = tree_stands.StandAcc()
+    for u in sel:
+        if u['kind'] == 'k':
+            h = ca.header(u['kg'], with_chunks=True); dup = set(u['dup'].tolist())
+            ch = [ca._load_chunk(u['kg'], dict(r, r10=int(r['r10'], 16)), h) for r in h['chunks'] if int(r['r10'], 16) not in dup]
+        else:
+            ch, _ = ca.chunks_for_r10(u['r10s'])
+        if ch:
+            acc.add_table(ca.gather(ch, None))
+    ref = acc.reduce(); sref = acc.stands.reduce()
+    d = Path(tempfile.mkdtemp(prefix='nat_parts_'))
+    try:
+        st = cn.run_units(sel, jobs=1, d=d)
+        assert st['done'] == len(sel) and st['stale'] == 0 and st['cells'] == acc.cells
+        assert all(cn._unit_sig(u['id'], d) == u['sig'] for u in sel)           # resumable: nothing left to do
+        out = dict(cn.merge_units(sel, d=d))
+        red = out['red9']
+        assert set(red) == set(ref) and red['parents'].size > 0
+        for k in ref:
+            assert np.array_equal(red[k], ref[k]), k
+        assert sref is not None and all(np.array_equal(a, b) for a, b in zip(out['stands'], sref))
+        assert int(out['stands'][1].sum()) == int(red['tree_hh'].sum())         # stands == tree_hh, apex for apex
+        # a second, parallel run over the same units reproduces the stored partials
+        d2 = d / 'par'
+        cn.run_units(sel, jobs=2, d=d2)
+        red2 = dict(cn.merge_units(sel, d=d2))['red9']
+        assert all(np.array_equal(red2[k], ref[k]) for k in ref)
+        # a signature that moved is rebuilt; a unit that fell out of the plan is pruned
+        assert cn._prune_parts({u['id'] for u in sel[1:]}, d) == 1 and cn._unit_sig(sel[0]['id'], d) is None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_pack_lossless():
+    for a in (np.array([0., 3., 65536.]), np.array([0.25, 1.5]), np.array([-3, 200], np.int64), np.zeros((2, 3), np.int64),
+              np.array([2 ** 63 + 5], np.uint64), np.zeros(0)):
+        b = cn._pack(a)
+        assert np.array_equal(b.astype(a.dtype), a) and b.nbytes <= a.nbytes
+    assert cn._pack(np.array([0., 3.])).dtype == np.uint8 and cn._pack(np.array([0.25])).dtype == np.float64
+
 
 
 def test_tree_hh_band():
@@ -119,3 +174,9 @@ def test_tree_hh_band():
     h = np.array([3.0, 4.75, 5.0, 9.9, 10.0, 34.9, 35.0, 54.9, 55.0, 63.75])
     assert cn.tree_hh_band(h).tolist() == [0, 0, 1, 1, 2, 6, 7, 10, 11, 11]
     assert cn.TREE_HH_BANDS == 12 and cn.FIELDS['tree_hh']['shape'] == [12]
+
+
+if __name__ == '__main__':
+    for n, f in list(globals().items()):
+        if n.startswith('test_'):
+            f(); print('ok', n)

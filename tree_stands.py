@@ -131,8 +131,11 @@ def write_store(red: tuple, gen: str, built_at: str, extra: dict | None = None) 
     t0 = time.time()
     ids, hist, top, hsum, nobs, esum, en, kg = red
     n = len(ids)
-    tot = hist.sum(1)
-    cum = np.ascontiguousarray(np.minimum(hist[:, ::-1].cumsum(1)[:, ::-1], 65535).T.astype('<u2'))
+    tot = np.zeros(n, np.int64)                      # running reverse-cumulative count: no [n, 12] temporaries
+    cum = np.empty((NB, n), '<u2')
+    for b in range(NB - 1, -1, -1):
+        tot += hist[:, b]
+        np.minimum(tot, 65535, out=cum[b], casting='unsafe')
     lat = np.empty(n, np.float32); lng = np.empty(n, np.float32); area = np.empty(n, np.uint16)
     a = 0.0
     for i, c in enumerate(ids.tolist()):
@@ -153,9 +156,9 @@ def write_store(red: tuple, gen: str, built_at: str, extra: dict | None = None) 
         np.save(tmp / f'{k}.npy', v)
     meta = {
         'algo': ALGO, 'gen': gen, 'source': 'cells_national build pass', 'res': RES, 'built_at': built_at,
-        'hexes': int(n), 'apices': int(hist.sum()), 'edges_m': list(EDGES),
-        'at_least': [int(x) for x in hist[:, ::-1].sum(0).cumsum()[::-1]],
-        'cum_saturated': int((hist.sum(1) > 65535).sum()),
+        'hexes': int(n), 'apices': int(tot.sum()), 'edges_m': list(EDGES),
+        'at_least': [int(x) for x in hist.sum(0, dtype=np.int64)[::-1].cumsum()[::-1]],
+        'cum_saturated': int((tot > 65535).sum()),
         'bytes': int(sum(v.nbytes for v in out.values())), 'write_s': round(time.time() - t0, 1), **(extra or {}),
     }
     (tmp / 'meta.json').write_text(json.dumps(meta, indent=1))

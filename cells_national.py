@@ -25,8 +25,9 @@ u8 degrees, u16 m a.s.l. …) so one decoder serves both.
 Build = ``python3 cells_national.py --build`` (systemd ``cells-national.timer``,
 daily; skipped when the stored generation is current).  Output
 ``data/ne/national/r{8,9}.nex.gz`` + ``meta.json``; the request path only
-serves (and slices) those files.  Never build inside gunicorn: one pass
-over 5.4 M chunks takes ~10 min and ~1 GB.
+serves (and slices) those files.  Never build inside gunicorn.  The build is
+incremental, resumable and parallel (section "incremental build"): only
+units whose inputs changed are re-read; ``--status`` shows progress.
 """
 from __future__ import annotations
 
@@ -453,93 +454,538 @@ def minor_drift(meta: dict | None, files: dict, now: float | None = None) -> dic
             'tree_qa_hidden_delta': int(tq['hidden']) - int(tq0.get('hidden') or 0)}
 
 
-def build(verbose: bool = True, force: bool = False) -> dict:
+# === SECTION: incremental build — units on disk, parallel workers, scatter merge ===
+#
+# One national pass is ~6.3 M chunk reads through the full read-time stack (green fix →
+# position frames → ne_rebin → tree QA): hours of one core.  So the build is cut into
+# **units**, each reduced to its partial sums once and kept on disk under
+# ``data/ne/national/parts/``:
+#
+#   k<kg>   the chunks of one product file whose res-10 id no other product stores
+#   g<hex>  the res-10 ids stored by several products inside one res-6 parent, deduplicated
+#           across those products exactly like ``cells_api.gather``
+#
+# A unit carries a signature of everything its sums depend on (file digest, position
+# frame, per-KG tree-QA token, its duplicate-chunk set, rule ids).  A build recomputes only
+# the units whose signature moved — a handful per day — and then scatter-adds all partials
+# into the national arrays.  Consequences: a killed build resumes where it stopped, the
+# daily build is minutes, workers run in parallel (``CELLS_NATIONAL_JOBS``), memory is one
+# unit per worker + the final arrays (no concatenate / re-reduce copies), and progress is a
+# file (``progress.json``, ``--status``, ``national_build:`` on /process.txt).
+# All partial sums are integers or exact binary fractions, so the result does not depend on
+# how the corpus is cut.
+
+PARTS_ALGO = 'p1'
+PARTS_DIR = NAT_DIR / 'parts'
+PROGRESS = NAT_DIR / 'progress.json'
+GROUP_RES = 6                    # duplicate res-10 ids are batched per res-6 parent (<= ~750 ids)
+JOBS = max(1, int(os.environ.get('CELLS_NATIONAL_JOBS', min(2, os.cpu_count() or 1))))
+MAX_ROUNDS = 3                   # re-plan rounds when the corpus moves under a running build
+_MAX_KEYS = ('bld_h_top', 'canopy_h_top')
+_STAND_DT = ('<u8', '<u4', '<f4', '<f8', '<u4', '<f8', '<u4', '<u4')   # tree_stands.StandAcc part tuple
+_STAND_MAX = (2, 7)
+
+
+def _base_sig() -> str:
+    import tree_stands
+    return f'{PARTS_ALGO}|{ALGO}|{tree_stands.ALGO}|{_green_fix.FIX_ID}|{ca._tree_qa.THX_ID}|{ca.RES}'
+
+
+def _kg_sig(kg: str, digest) -> str:
+    """Everything ``cells_api._load_chunk`` reads for one product file, as a token."""
+    return f'{digest}{ca._pos_fix.tag(kg)}|{ca._tree_qa.kg_tok(kg, digest)}'
+
+
+def _sha(*parts) -> str:
+    h = hashlib.sha1()
+    for p in parts:
+        h.update(p if isinstance(p, (bytes, bytearray, memoryview)) else str(p).encode()); h.update(b'\0')
+    return h.hexdigest()[:20]
+
+
+def plan(files: dict | None = None) -> list[dict]:
+    """Every unit of the current corpus with its signature and size (index only, no chunk read)."""
+    from array import array
+    files = ca._files() if files is None else files
+    c = ca._idx_conn()
+    base = _base_sig()
+    kgs = sorted(files)
+    kidx = {k: i for i, k in enumerate(kgs)}
+    ksig = {k: _kg_sig(k, files[k].get('neo1_digest')) for k in kgs}
+    n_chunks = dict(c.execute('SELECT kg, COUNT(*) FROM chunk GROUP BY kg'))
+    r = array('Q'); ki = array('I')
+    for r10, kg in c.execute('SELECT r10, kg FROM chunk WHERE r10 IN '
+                             '(SELECT r10 FROM chunk GROUP BY r10 HAVING COUNT(*) > 1)'):
+        if kg in kidx:
+            r.append(int(r10)); ki.append(kidx[kg])
+    r = np.frombuffer(r, np.uint64) if len(r) else np.zeros(0, np.uint64)
+    ki = np.frombuffer(ki, np.uint32).astype(np.int64) if len(ki) else np.zeros(0, np.int64)
+    units = []
+    # per product: its unique chunks (signature folds WHICH of its chunks are duplicates)
+    o = np.lexsort((r, ki)); rk, kk = r[o], ki[o]
+    b = np.searchsorted(kk, np.arange(len(kgs) + 1))
+    for i, kg in enumerate(kgs):
+        d = np.ascontiguousarray(rk[b[i]:b[i + 1]])
+        units.append({'id': f'k{kg}', 'kind': 'k', 'kg': kg, 'dup': d, 'kgsigs': {kg: ksig[kg]},
+                      'chunks': max(0, int(n_chunks.get(kg, 0)) - d.size),
+                      'sig': _sha(base, ksig[kg], d.tobytes())})
+    # duplicated res-10 ids, per res-6 parent
+    if r.size:
+        g = parent_ids(r, GROUP_RES, child_res=10)
+        o = np.lexsort((ki, r, g)); gg, rg, kg_ = g[o], r[o], ki[o]
+        ug, st = np.unique(gg, return_index=True)
+        en = np.append(st[1:], gg.size)
+        for gid, s, e in zip(ug.tolist(), st.tolist(), en.tolist()):
+            inv = sorted({kgs[j] for j in np.unique(kg_[s:e]).tolist()})
+            sigs = {k: ksig[k] for k in inv}
+            units.append({'id': f'g{gid:x}', 'kind': 'g', 'r10s': np.unique(rg[s:e]), 'kgsigs': sigs, 'chunks': e - s,
+                          'sig': _sha(base, rg[s:e].tobytes(), kg_[s:e].tobytes(), json.dumps(sigs, sort_keys=True))})
+    return units
+
+
+def _pack(a: np.ndarray) -> np.ndarray:
+    """Narrowest lossless integer dtype (sums of small integers stored as f64 / i64 compress ~10x)."""
+    a = np.asarray(a)
+    if a.size == 0 or a.dtype == np.uint64:
+        return a
+    if a.dtype.kind == 'f':
+        if not (np.isfinite(a).all() and np.array_equal(a, np.rint(a)) and np.abs(a).max() < 2 ** 52):
+            return a
+        a = a.astype(np.int64)
+    lo, hi = int(a.min()), int(a.max())
+    for dt in (np.uint8, np.uint16, np.uint32) if lo >= 0 else (np.int8, np.int16, np.int32):
+        if np.iinfo(dt).min <= lo and hi <= np.iinfo(dt).max:
+            return a.astype(dt)
+    return a
+
+
+def _unit_path(uid: str, d: Path | None = None) -> Path:
+    return (d or PARTS_DIR) / uid[1:3] / f'{uid}.npz'
+
+
+def _save_unit(uid: str, sig: str, red: dict | None, stand: tuple | None, d: Path | None = None) -> None:
+    out = {'sig': np.array(sig)}
+    for k, v in (red or {}).items():
+        out[f'{k}~{v.dtype.str}'] = _pack(v)
+    for i, v in enumerate(stand or ()):
+        out[f's{i}'] = _pack(v)
+    p = _unit_path(uid, d); p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f'{p.stem}.tmp{os.getpid()}.npz')
+    np.savez_compressed(tmp, **out); os.replace(tmp, p)
+
+
+def _unit_sig(uid: str, d: Path | None = None) -> str | None:
+    try:
+        with np.load(_unit_path(uid, d)) as z:
+            return str(z['sig'])
+    except Exception:  # noqa: BLE001 - missing / torn file = not built
+        return None
+
+
+def _load_unit(uid: str, d: Path | None = None, what: str = 'all'):
+    """→ (res-9 partial dict | None, stand part tuple | None); ``what='ids'`` → ids only."""
+    with np.load(_unit_path(uid, d)) as z:
+        names = z.files
+        red = None; stand = None
+        if 'parents~<u8' in names:
+            if what == 'ids':
+                red = {'parents': z['parents~<u8']}
+            else:
+                red = {}
+                for nm in names:
+                    if '~' in nm:
+                        k, dt = nm.split('~')
+                        red[k] = z[nm].astype(dt, copy=False)
+        if 's0' in names:
+            if what == 'ids':
+                stand = (z['s0'],)
+            else:
+                stand = tuple(z[f's{i}'].astype(_STAND_DT[i], copy=False) for i in range(8))
+    return red, stand
+
+
+_worker_ready = False
+
+
+def _worker_init() -> None:
+    global _worker_ready
+    if _worker_ready:
+        return
+    ca._rebin._lru.max_bytes = max(ca._rebin._lru.max_bytes, 48 << 20)   # a KG's chunks are assigned once
+    _worker_ready = True
+
+
+def compute_unit(u: dict, d: Path | None = None) -> dict:
+    """Read one unit's chunks as served, reduce, store.  Runs in a worker process."""
+    import tree_stands
+    _worker_init()
     t0 = time.time()
+    ca._tree_qa.sync()
+
+    def live() -> bool:
+        for kg, s in u['kgsigs'].items():
+            h = ca.header(kg)
+            if h is None or _kg_sig(kg, h.get('neo1_digest')) != s:
+                return False
+        return True
+
+    ok = live()
+    acc = Acc(9); acc.stands = tree_stands.StandAcc()
+    chunks: list = []
+    if u['kind'] == 'k':
+        kg = u['kg']
+        h = ca.header(kg, with_chunks=True)
+        if h is not None:
+            h = dict(h)
+            h['_r10map'] = rmap = {}
+            for row in h['chunks']:
+                r10 = int(row['r10'], 16)
+                rmap[r10] = {'r10': r10, 'kg': kg, 'off': int(row['off']), 'len': int(row['len']),
+                             'raw_len': int(row.get('raw_len') or 0), 'cells': int(row['cells']),
+                             'trees': int(row.get('trees') or 0), 'bld': int(row.get('bld') or 0)}
+            dup = set(u['dup'].tolist())
+            for r10, row in rmap.items():
+                if r10 in dup:
+                    continue
+                try:
+                    chunks.append(ca._load_chunk(kg, row, h))
+                except Exception as e:  # noqa: BLE001
+                    log.warning('national: chunk %s/%x unreadable: %s', kg, r10, e)
+    else:
+        chunks, _h = ca.chunks_for_r10(u['r10s'])
+    if chunks:
+        acc.add_table(ca.gather(chunks, None))
+    red = acc.parts[0] if acc.parts else None
+    stand = acc.stands.parts[0] if acc.stands.parts else None
+    ok = ok and live()
+    _save_unit(u['id'], u['sig'] if ok else 'stale', red, stand, d)
+    return {'id': u['id'], 'ok': ok, 'chunks': len(chunks), 'cells': acc.cells, 'planned': u['chunks'],
+            's': round(time.time() - t0, 2)}
+
+
+def _rss_mb() -> int:
+    """This process + its children (the workers), MB."""
+    tot = 0
+    try:
+        me = os.getpid()
+        for p in os.listdir('/proc'):
+            if not p.isdigit():
+                continue
+            try:
+                st = open(f'/proc/{p}/stat').read().rsplit(')', 1)[1].split()
+                if int(p) == me or int(st[1]) == me:
+                    tot += int(st[21]) * os.sysconf('SC_PAGE_SIZE')
+            except (OSError, IndexError, ValueError):
+                pass
+    except OSError:
+        pass
+    return tot >> 20
+
+
+class Progress:
+    """``progress.json`` (atomic, every few seconds) + one journal line per LOG_S."""
+    LOG_S = 300.0
+
+    def __init__(self, path: Path | None = None, verbose: bool = True):
+        self.path = path or PROGRESS; self.verbose = verbose
+        self.d = {'state': 'plan', 'pid': os.getpid(), 'started_at': _iso_now(), 'started': round(time.time(), 1), 'jobs': JOBS}
+        self._t = 0.0; self._tl = time.time(); self._tp = 0.0
+
+    def set(self, force: bool = False, **kw) -> None:
+        self.d.update(kw)
+        now = time.time()
+        if not force and now - self._t < 5:
+            return
+        self._t = now
+        d = self.d
+        d['updated'] = round(now, 1); d['elapsed_s'] = round(now - d['started'])
+        if d.get('chunks_todo'):
+            run_s = max(1e-6, now - d.get('units_started', now))
+            d['chunks_per_s'] = round(d.get('chunks_done', 0) / run_s, 1)
+            left = d['chunks_todo'] - d.get('chunks_done', 0)
+            d['eta_s'] = round(left / d['chunks_per_s']) if d['chunks_per_s'] > 0 and d['state'] == 'units' else None
+        d['rss_mb'] = _rss_mb()
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix('.tmp'); tmp.write_text(json.dumps(d, indent=1)); os.replace(tmp, self.path)
+        except OSError:
+            pass
+        if force or now - self._tl >= self.LOG_S:
+            self._tl = now
+            log.info('national: %s', progress_line(d))
+        if self.verbose and (force or now - self._tp >= 30):
+            self._tp = now
+            print('  ' + progress_line(d), flush=True)
+
+
+def _iso_now() -> str:
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+def _hms(s) -> str:
+    if s is None:
+        return '-'
+    s = int(s)
+    return f'{s // 3600}h{s % 3600 // 60:02d}m' if s >= 3600 else f'{s // 60}m{s % 60:02d}s'
+
+
+def progress_line(d: dict | None) -> str:
+    if not d:
+        return 'no build recorded'
+    s = f"{d.get('state')}"
+    if d.get('units_total') is not None:
+        s += (f" units {d.get('units_done', 0)}/{d.get('units_todo', 0)} to build ({d.get('units_cached', 0)} of "
+              f"{d['units_total']} reused), chunks {d.get('chunks_done', 0)}/{d.get('chunks_todo', 0)}")
+        if d.get('chunks_todo'):
+            s += f" ({100.0 * d.get('chunks_done', 0) / d['chunks_todo']:.1f}%) @{d.get('chunks_per_s', 0)}/s eta {_hms(d.get('eta_s'))}"
+    if d.get('merge_done') is not None:
+        s += f", merge {d['merge_done']}/{d.get('merge_total')}"
+    s += f", elapsed {_hms(d.get('elapsed_s'))}, jobs {d.get('jobs')}, rss {d.get('rss_mb', 0)} MB"
+    if d.get('round', 1) > 1:
+        s += f", round {d['round']}"
+    if d.get('error'):
+        s += f", error: {d['error']}"
+    return s
+
+
+def read_progress() -> dict | None:
+    try:
+        d = json.loads(PROGRESS.read_text())
+    except (OSError, ValueError):
+        return None
+    if d.get('state') not in ('done', 'skipped', 'failed', 'deferred'):
+        try:
+            os.kill(int(d.get('pid') or 0), 0)
+        except (OSError, ValueError):
+            d['state'] = f"dead (was {d.get('state')})"
+        except PermissionError:
+            pass
+    return d
+
+
+def text_line() -> str:
+    """``national_build:`` line of /process.txt."""
+    m = read_meta() or {}
+    p = read_progress()
+    return (f"national_build: serving gen {str(m.get('gen'))[:8]} built {m.get('built_at', '-')} "
+            f"({(m.get('rows') or {}).get('9', 0)} res-9 rows, {(m.get('stands') or {}).get('hexes', 0)} stands, "
+            f"{m.get('units_built', '-')} of {m.get('units', '-')} units rebuilt in {_hms(m.get('build_s'))}); last run: {progress_line(p)}")
+
+
+def run_units(todo: list[dict], prog: Progress | None = None, jobs: int | None = None, d: Path | None = None) -> dict:
+    """Compute + store *todo* (largest first, so the tail is short); → {'done', 'stale', 'chunks', 'cells'}."""
+    jobs = JOBS if jobs is None else jobs
+    todo = sorted(todo, key=lambda u: -u['chunks'])
+    st = {'done': 0, 'stale': 0, 'chunks': 0, 'cells': 0, 'planned': 0}
+
+    def note(r):
+        st['done'] += 1; st['stale'] += 0 if r['ok'] else 1; st['chunks'] += r['chunks']; st['cells'] += r['cells']
+        st['planned'] += r['planned']
+        if prog is not None:
+            prog.set(units_done=st['done'], chunks_done=st['planned'], cells_read=st['cells'], last_unit=r['id'])
+
+    if jobs <= 1 or len(todo) < 4:
+        for u in todo:
+            note(compute_unit(u, d))
+        return st
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
+    # spawn: no forked sqlite handles / LRUs; each worker loads its own read-time snapshots once
+    with ProcessPoolExecutor(max_workers=jobs, mp_context=mp.get_context('spawn'), initializer=_worker_init) as ex:
+        it = iter(todo); pend = set()
+        while True:
+            while len(pend) < jobs * 4:                  # bounded backlog: no 10 k pickled futures
+                u = next(it, None)
+                if u is None:
+                    break
+                pend.add(ex.submit(compute_unit, u, d))
+            if not pend:
+                break
+            fin, pend = wait(pend, return_when=FIRST_COMPLETED)
+            for f in fin:
+                note(f.result())
+    return st
+
+
+def merge_units(units: list[dict], prog: Progress | None = None, d: Path | None = None):
+    """Scatter-add every unit's partial into the national arrays → generator of
+    ('red9', dict) then ('stands', tuple | None).  Two sweeps so the res-9 arrays are freed
+    (by the caller) before the stand arrays are allocated."""
+    ids = [u['id'] for u in units]
+    n = len(ids)
+    P = []; S = []
+    for i, uid in enumerate(ids):
+        red, stand = _load_unit(uid, d, 'ids')
+        if red is not None:
+            P.append(red['parents'])
+        if stand is not None:
+            S.append(stand[0].astype(np.uint64, copy=False))
+        if prog is not None:
+            prog.set(merge_done=i, merge_total=3 * n)
+    up = np.unique(np.concatenate(P)) if P else np.zeros(0, np.uint64)
+    us = np.unique(np.concatenate(S)) if S else np.zeros(0, np.uint64)
+    del P, S
+    out: dict = {'parents': up}
+    for i, uid in enumerate(ids):
+        red, _ = _load_unit(uid, d)
+        if red is not None:
+            idx = np.searchsorted(up, red['parents'])
+            for k, a in red.items():
+                if k == 'parents':
+                    continue
+                dst = out.get(k)
+                if dst is None:
+                    dst = out[k] = np.zeros((up.size, *a.shape[1:]), a.dtype)
+                if k in _MAX_KEYS:
+                    dst[idx] = np.maximum(dst[idx], a)
+                else:
+                    dst[idx] += a                        # parents are unique inside one unit
+        if prog is not None:
+            prog.set(merge_done=n + i, merge_total=3 * n)
+    yield 'red9', out
+    del out
+    so = None
+    if us.size:
+        so = [us] + [None] * 7
+        for i, uid in enumerate(ids):
+            _, stand = _load_unit(uid, d)
+            if stand is not None:
+                idx = np.searchsorted(us, stand[0])
+                for j in range(1, 8):
+                    a = stand[j]
+                    if so[j] is None:
+                        so[j] = np.zeros((us.size, *a.shape[1:]), a.dtype)
+                    if j in _STAND_MAX:
+                        so[j][idx] = np.maximum(so[j][idx], a)
+                    else:
+                        so[j][idx] += a
+            if prog is not None:
+                prog.set(merge_done=2 * n + i, merge_total=3 * n)
+    yield 'stands', (tuple(so) if so is not None else None)
+
+
+def _prune_parts(keep: set, d: Path | None = None) -> int:
+    n = 0
+    d = d or PARTS_DIR
+    if d.exists():
+        for p in d.glob('*/*.npz'):
+            if p.stem not in keep:
+                p.unlink(missing_ok=True); n += 1
+    return n
+
+
+def build(verbose: bool = True, force: bool = False, jobs: int | None = None, merge_only: bool = False) -> dict:
+    """``force`` = build even when the generation is current / the drift is minor (units whose
+    signature is unchanged are still reused — delete ``parts/`` for a from-scratch pass)."""
+    import fcntl
+    import tree_stands
+    t0 = time.time()
+    NAT_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(NAT_DIR / 'build.lock', 'w')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return {'skipped': True, 'reason': 'another build is running', 'progress': read_progress()}
+    try:
+        ca.reindex_lagging()                 # the plan reads the chunk index: bring it up to the files first
+    except Exception as e:  # noqa: BLE001
+        log.warning('national: reindex_lagging: %s', e)
     ca._tree_qa.sync()
     tq_sig = ca._tree_qa.corpus_sig()
     gen = current_gen()
     meta = read_meta()
     have = all((NAT_DIR / f'r{r}.nex.gz').exists() for r in RESES)
-    import tree_stands
     sm = tree_stands.read_meta()         # the res-10 stand store must be of this very build
     have = have and bool(sm and meta and sm.get('algo') == tree_stands.ALGO and sm.get('gen') == meta.get('gen'))
+    prog = Progress(verbose=verbose)
+    if jobs is not None:
+        prog.d['jobs'] = jobs
     if meta and meta.get('gen') == gen and not force and have:
+        prog.set(force=True, state='skipped', gen=gen)
         return {'skipped': True, 'gen': gen}
     files = ca._files()
     if have and not force:
         d = minor_drift(meta, files)
         if d is not None:
             log.info('national: build deferred, minor corpus drift %s (serving gen %s)', d, meta.get('gen'))
+            prog.set(force=True, state='deferred', gen=meta.get('gen'))
             return {'skipped': True, 'deferred': 'minor corpus drift', 'serving_gen': meta.get('gen'),
                     'corpus_gen': gen, **d, 'rebuild_by_d': MAX_DEFER_D}
-    kgs = sorted(files)
-    dup = _dup_r10s(); dup_set = set(dup.tolist())
-    acc = Acc(9); acc.stands = tree_stands.StandAcc()
-    n_chunks = 0
-    # pass A — chunks unique to one product, per KG
-    for k, kg in enumerate(kgs):
-        h = ca.header(kg, with_chunks=True)
-        if h is None:
-            continue
-        chunks = []
-        for row in h['chunks']:
-            r10 = int(row['r10'], 16)
-            if r10 in dup_set:
-                continue
-            try:
-                chunks.append(ca._load_chunk(kg, dict(row, r10=r10), h))
-            except Exception as e:  # noqa: BLE001
-                log.warning('national: chunk %s/%s unreadable: %s', kg, row.get('r10'), e)
-        n_chunks += len(chunks)
-        if chunks:
-            acc.add_table(ca.gather(chunks, None))
-        if verbose and (k + 1) % 500 == 0:
-            print(f'  pass A {k + 1}/{len(kgs)} kgs, {n_chunks} chunks, {acc.cells} cells, {time.time() - t0:.0f}s', flush=True)
-        if (k + 1) % 1000 == 0:
-            acc.reduce()
-    # pass B — duplicated res-10 chunks, batched across products (dedupe inside gather)
-    dup.sort()
-    for b in range(0, dup.size, BATCH_R10):
-        chunks, _h = ca.chunks_for_r10(dup[b:b + BATCH_R10])
-        n_chunks += len(chunks)
-        if chunks:
-            acc.add_table(ca.gather(chunks, None))
-        if verbose and (b // BATCH_R10) % 50 == 0:
-            print(f'  pass B {b}/{dup.size} dup r10s, {acc.cells} cells, {time.time() - t0:.0f}s', flush=True)
-    red9 = acc.reduce()
-    epoch = ca._epoch_pin()
-    built_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    NAT_DIR.mkdir(parents=True, exist_ok=True)
-    out_meta = {'algo': ALGO, 'gen': gen, 'epoch': epoch, 'built_at': built_at, 'kgs': len(kgs), 'chunks': n_chunks,
-                'cells': acc.cells, 'dup_r10s': int(dup.size), 'rows': {}, 'bytes_gz': {}, 'fields': [f for f in FIELDS if f != 'id'],
-                'green_fix': _green_fix.FIX_ID, 'build_started': round(t0, 1), 'corpus': _corpus_sig(files),
-                'tree_qa': {k: tq_sig[k] for k in ('id', 'kgs', 'hidden')}}
-    reds = {9: red9, 8: rollup(red9, 9, 8)}
-    try:                                # res-10 stand index: same pass, same apices, same gen
-        sred = acc.stands.reduce()
-        if sred is not None:
-            sm = tree_stands.write_store(sred, gen, built_at)
-            out_meta['stands'] = {k: sm[k] for k in ('hexes', 'apices', 'bytes')}
-    except Exception as e:  # noqa: BLE001 — never lose the national table over the add-on
-        log.warning('national: tree stand store not written: %s', e)
-    for res in RESES:
-        cols = finalise(reds[res])
-        hdr = header_for(res, cols['id'].size, gen, epoch, {'built_at': built_at, 'kgs': len(kgs), 'cells_total': acc.cells})
-        blob = encode(hdr, cols)
-        gz = gzip.compress(blob, 6)
-        p = NAT_DIR / f'r{res}.nex.gz'; tmp = p.with_suffix('.tmp')
-        tmp.write_bytes(gz); os.replace(tmp, p)
-        out_meta['rows'][str(res)] = int(cols['id'].size); out_meta['bytes_gz'][str(res)] = len(gz)
-        if verbose:
-            print(f'  res {res}: {cols["id"].size} rows, raw {len(blob) // 1024} KB, gz {len(gz) // 1024} KB', flush=True)
-    out_meta['build_s'] = round(time.time() - t0, 1)
-    tmp = NAT_DIR / 'meta.tmp'
-    tmp.write_text(json.dumps(out_meta, indent=1)); os.replace(tmp, NAT_DIR / 'meta.json')
-    for p in CACHE_DIR.glob('*.nex.gz') if CACHE_DIR.exists() else []:
-        if f'-{gen}-' not in p.name:
-            p.unlink(missing_ok=True)
-    log.info('national: built gen %s in %.0fs (%s)', gen, out_meta['build_s'], out_meta['rows'])
-    return out_meta
+    built = 0; chunks_read = 0; cells_read = 0
+    try:
+        for rnd in range(1, MAX_ROUNDS + 2):
+            files = ca._files()
+            ca._tree_qa.sync(); tq_sig = ca._tree_qa.corpus_sig(); gen = current_gen()
+            units = plan(files)
+            todo = [u for u in units if _unit_sig(u['id']) != u['sig']]
+            prog.set(force=True, state='units' if todo else 'merge', round=rnd, gen=gen, units_total=len(units),
+                     units_cached=len(units) - len(todo), units_todo=len(todo), units_done=0,
+                     chunks_todo=sum(u['chunks'] for u in todo), chunks_done=0, units_started=round(time.time(), 1))
+            if not todo:
+                break
+            if rnd > MAX_ROUNDS:
+                # the corpus kept moving (ingest wave / tree-QA refresh): everything computed is kept,
+                # the next run finishes — never publish a table mixed from two corpus states
+                prog.set(force=True, state='deferred', error='corpus changed during every round')
+                return {'skipped': True, 'deferred': 'corpus changing during the build', 'units_built': built}
+            if merge_only:
+                raise RuntimeError(f'{len(todo)} units not built (merge_only)')
+            st = run_units(todo, prog, jobs)
+            built += st['done']; chunks_read += st['chunks']; cells_read += st['cells']
+            prog.set(force=True)
+        kgs = sorted(files)
+        epoch = ca._epoch_pin()
+        built_at = _iso_now()
+        out_meta = {'algo': ALGO, 'gen': gen, 'epoch': epoch, 'built_at': built_at, 'kgs': len(kgs),
+                    'units': len(units), 'units_built': built, 'chunks': sum(u['chunks'] for u in units),
+                    'chunks_read': chunks_read, 'dup_r10s': int(sum(u['r10s'].size for u in units if u['kind'] == 'g')),
+                    'rows': {}, 'bytes_gz': {}, 'fields': [f for f in FIELDS if f != 'id'],
+                    'green_fix': _green_fix.FIX_ID, 'build_started': round(t0, 1), 'corpus': _corpus_sig(files),
+                    'tree_qa': {k: tq_sig[k] for k in ('id', 'kgs', 'hidden')}, 'jobs': prog.d['jobs']}
+        prog.set(force=True, state='merge')
+        blobs = {}
+        for what, val in merge_units(units, prog):
+            if what == 'red9':
+                red9 = val
+                out_meta['cells'] = int(red9['n_cells'].sum()) if 'n_cells' in red9 else 0
+                reds = {9: red9, 8: rollup(red9, 9, 8)}
+                del red9, val
+                for res in RESES:
+                    cols = finalise(reds.pop(res))
+                    hdr = header_for(res, cols['id'].size, gen, epoch,
+                                     {'built_at': built_at, 'kgs': len(kgs), 'cells_total': out_meta['cells']})
+                    blobs[res] = gzip.compress(encode(hdr, cols), 6)
+                    out_meta['rows'][str(res)] = int(cols['id'].size); out_meta['bytes_gz'][str(res)] = len(blobs[res])
+                    if verbose:
+                        print(f'  res {res}: {cols["id"].size} rows, gz {len(blobs[res]) // 1024} KB', flush=True)
+                    del cols
+            else:
+                prog.set(force=True, state='stands')
+                try:                        # res-10 stand index: same units, same apices, same gen
+                    if val is not None:
+                        sm = tree_stands.write_store(val, gen, built_at)
+                        out_meta['stands'] = {k: sm[k] for k in ('hexes', 'apices', 'bytes')}
+                except Exception as e:  # noqa: BLE001 — never lose the national table over the add-on
+                    log.warning('national: tree stand store not written: %s', e)
+                del val
+        # publish: table files, then meta (readers key on meta.gen; the stand store is already in place)
+        for res in RESES:
+            p = NAT_DIR / f'r{res}.nex.gz'; tmp = p.with_suffix('.tmp')
+            tmp.write_bytes(blobs[res]); os.replace(tmp, p)
+        out_meta['build_s'] = round(time.time() - t0, 1)
+        tmp = NAT_DIR / 'meta.tmp'
+        tmp.write_text(json.dumps(out_meta, indent=1)); os.replace(tmp, NAT_DIR / 'meta.json')
+        for p in CACHE_DIR.glob('*.nex.gz') if CACHE_DIR.exists() else []:
+            if f'-{gen}-' not in p.name:
+                p.unlink(missing_ok=True)
+        out_meta['parts_pruned'] = _prune_parts({u['id'] for u in units})
+        log.info('national: built gen %s in %.0fs (%s; %d of %d units rebuilt)', gen, out_meta['build_s'],
+                 out_meta['rows'], built, len(units))
+        prog.set(force=True, state='done', gen=gen)
+        return out_meta
+    except BaseException as e:
+        prog.set(force=True, state='failed', error=f'{type(e).__name__}: {e}'[:300])
+        raise
 
 
 def read_meta() -> dict | None:
@@ -649,9 +1095,21 @@ if __name__ == '__main__':
     ap.add_argument('--build', action='store_true'); ap.add_argument('--force', action='store_true')
     ap.add_argument('--quiet', action='store_true')
     ap.add_argument('--check', help='compare N random res-9 rows against cells_api (res=9 rollup)', type=int)
+    ap.add_argument('--jobs', type=int, help=f'worker processes (default {JOBS}, env CELLS_NATIONAL_JOBS)')
+    ap.add_argument('--merge-only', action='store_true', help='fail instead of computing missing units')
+    ap.add_argument('--status', action='store_true', help='progress of the running / last build + serving meta')
+    ap.add_argument('--plan', action='store_true', help='units to build right now (no chunk read)')
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
-    if a.build:
-        print(json.dumps(build(verbose=not a.quiet, force=a.force), indent=1))
+    if a.status:
+        print(text_line())
+        print(json.dumps({'progress': read_progress(), 'meta': {k: v for k, v in (read_meta() or {}).items() if k != 'fields'}}, indent=1))
+    elif a.plan:
+        ca._tree_qa.sync()
+        us = plan(); todo = [u for u in us if _unit_sig(u['id']) != u['sig']]
+        print(json.dumps({'units': len(us), 'todo': len(todo), 'chunks_todo': sum(u['chunks'] for u in todo),
+                          'chunks': sum(u['chunks'] for u in us), 'first': [u['id'] for u in todo[:20]]}, indent=1))
+    elif a.build:
+        print(json.dumps(build(verbose=not a.quiet, force=a.force, jobs=a.jobs, merge_only=a.merge_only), indent=1))
     else:
         print(json.dumps(read_meta(), indent=1))
