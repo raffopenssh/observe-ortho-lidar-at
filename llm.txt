@@ -1046,6 +1046,8 @@ kg table columns (all indexed): kg_code, kg_name, gemeinde_code, gemeinde_name,
   aspect_dominant, roughness_mean, steepness_max_deg, elevation_range_m,
   tri_mean, terrain_class, ndvi_mean,
   tree_count, tree_canopy_sqm, tree_mean_height_m, tree_stem_volume_m3,
+  (tree_count = TREE SEGMENTS: segmentation objects of type tree, several apices each — not a
+   tree count; apices: public /api/v1/trees/stats, vegetation.tree_apices on /api/v1/kg/<code>)
   net_volume_change_m3, temporal_stability,
   new_building_count, infrastructure_count,
   building_mean_height_m, building_max_height_m,

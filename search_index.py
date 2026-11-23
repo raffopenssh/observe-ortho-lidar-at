@@ -2046,6 +2046,8 @@ class SearchIndex:
             ('total_area_km2', 'SELECT COALESCE(SUM(total_area_sqm),0)/1e6 FROM kg'),
             ('processed_area_km2', 'SELECT COALESCE(SUM(total_area_sqm),0)/1e6 FROM kg WHERE processed=1'),
             ('total_buildings', 'SELECT COALESCE(SUM(building_count),0) FROM kg'),
+            # kg.tree_count = tree SEGMENTS (objects of type tree), not trees; apices: tree_stats.py
+            ('total_tree_segments', 'SELECT COALESCE(SUM(tree_count),0) FROM kg WHERE processed=1'),
             ('total_tree_count', 'SELECT COALESCE(SUM(tree_count),0) FROM kg WHERE processed=1'),
             ('total_new_buildings', 'SELECT COALESCE(SUM(new_building_count),0) FROM kg WHERE processed=1'),
             ('zenodo_kgs', 'SELECT COUNT(*) FROM kg WHERE zenodo_json_url IS NOT NULL'),
@@ -2384,6 +2386,7 @@ class SearchIndex:
                    SUM(CASE WHEN processed=1 THEN 1 ELSE 0 END) as processed_kgs,
                    ROUND(SUM(total_area_sqm)/1e6, 2) as total_area_km2,
                    SUM(building_count) as total_buildings,
+                   SUM(tree_count) as total_tree_segments,
                    SUM(tree_count) as total_trees,
                    ROUND(SUM(tree_canopy_sqm)/1e6, 2) as tree_canopy_km2,
                    ROUND(SUM(tree_stem_volume_m3), 0) as total_stem_volume_m3,

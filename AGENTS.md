@@ -11,6 +11,7 @@ and setup: `README.md`. Security model: `SECURITY.md`.
 | public read API, resource limits | `docs/public-api.md` | `public_api.py`, `public_docs.py`, `service_guard.py`, `mem_lru.py` |
 | NE cells (H3) — records, container, endpoints | `docs/ne-v24-design.md`, `docs/ne-public-api.md` | `ne_h3.py`, `cells_api.py`, `ne_ingest.py`, `cells_national.py` |
 | NE view-fill (every cell of the NE server's `/declared` view observed: corpus borrow → own-product union → sweep units on the view) | `docs/ne-viewfill.md` | `ne_viewfill.py`, `ne_ingest.consume_viewfill`, `sliver_sweep.plan_cells` |
+| tree counts (`/api/v1/trees/stats`: national realistic apices ≥ 3 m, height bands / elevation / state; `kg.tree_count` = tree segments, not trees) | `tree_stats.py` docstring | `tree_stats.py`, `tests/test_tree_stats.py` |
 | QC ledger (one row per product × tile × fault class over all detectors, `qc:` line, lessons for the next run) | `docs/qc-lessons.md` | `qc_ledger.py`, `tests/test_qc_ledger.py` |
 | Product generations / QC reprocess / run history (fresh generation retires read-time fixes, operator reprocess list, sweep-unit keep cells, `qc_reprocess:` line) | `docs/qc-lessons.md` → Run history, Generations | `qc_generation.py`, `ne_pos_fix.py`, `tests/test_qc_generation.py` |
 | tree QA in cell products (cell tree fields = the default `/trees/bbox` apex set) | `docs/ne-public-api.md` → 12e | `tree_qa.py`, `cells_api._load_chunk`, `cells_bins.patch_tree_cols`, `tests/test_tree_qa.py` |

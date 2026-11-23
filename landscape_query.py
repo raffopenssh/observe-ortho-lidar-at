@@ -750,6 +750,14 @@ def _bilinear(grid, a, E, N):
 # --------------------------------------------------------------------------
 # per-KG summary
 # --------------------------------------------------------------------------
+def _kg_apices(code: str):
+    try:
+        import tree_stats
+        return tree_stats.kg_apices(code)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def kg_summary(code: str) -> dict | None:
     k = kg_row(code)
     if not k:
@@ -784,7 +792,10 @@ def kg_summary(code: str) -> dict | None:
         'vegetation': {
             'ndvi_mean': r(k['ndvi_mean'], 3), 'ndvi_harm_amplitude': r(k['ndvi_harm_amplitude'], 3),
             'phenology_dominant': k['phenology_dominant'],
-            'tree_count': k['tree_count'], 'tree_canopy_sqm': r(k['tree_canopy_sqm'], 0),
+            'tree_apices': _kg_apices(code),
+            'tree_segments': k['tree_count'],
+            'tree_count': k['tree_count'],        # deprecated alias of tree_segments (segments, not trees)
+            'tree_canopy_sqm': r(k['tree_canopy_sqm'], 0),
             'tree_mean_height_m': r(k['tree_mean_height_m'], 1),
             'tree_stem_volume_m3': r(k['tree_stem_volume_m3'], 0),
         },

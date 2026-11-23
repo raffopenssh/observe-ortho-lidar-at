@@ -645,6 +645,24 @@ HTTP 202 with retry_after_s — repeat later, don't poll in a loop. Coverage: /a
 
 ## Trees, landmarks, buildings (points in a bbox)
 
+GET /api/v1/trees/stats                      how many trees: the national summary (≈2 KB gz, max-age 3600)
+    {{apices, height_bands[{{band, min_m, max_m, apices, share}}], at_least[{{min_height_m, apices}}],
+     area_km2, apices_per_ha, forest_cover_km2, by_elevation[{{elev_min_m, elev_max_m, area_km2, apices,
+     apices_per_ha, share_ge_30m, height_mean_m_approx}}], by_state[{{state_code, state_name, kgs, apices}}],
+     accounting{{stored_raw, border_duplicates, hidden_by_realistic_filter, added_trees}}, tree_segments,
+     gen, built_at, definitions}}
+    apices = realistic apices h ≥ 3 m = exactly what /trees/bbox returns by default, every apex counted
+    once (border cells deduplicated). A summary of /api/v1/cells/national (tree_n / tree_hh), same gen —
+    nothing stored twice. For any other area use the same columns: res-8/9 rows of /cells/national, or
+    tree_h lists of the cells bins; per KG: vegetation.tree_apices on /api/v1/kg/{{code}}.
+    AUSTRIA, generation 2026-11-18: 549,015,476 apices on 83,686 km² observed (65.6 / ha; one apex per
+    dominant or co-dominant crown — a canopy-tree count, understorey stems are not seen by ALS).
+      height m   3–5    5–10   10–15  15–20  20–25   25–30  30–35  35–40  40–45  45–50   50+
+      million    38.8   75.2   87.3   96.2   104.2   89.5   41.9   13.6   2.22   0.19    0.045
+      ≥ 5 m 510.2 M · ≥ 10 m 435.1 M · ≥ 20 m 251.6 M · ≥ 30 m 57.9 M · ≥ 40 m 2.46 M
+    (live numbers: the endpoint). tree_segments (163 M) is NOT a tree count: segmentation polygons,
+    summed over overlapping KG product bboxes.
+
 GET /api/v1/trees/bbox?bbox=…[&min_height=3][&max_height=…][&limit=2000][&realistic=1][&objects=trees|structures][&types=…][&format=json|geojson|columns][&fields=…]
     Tree apices, tallest first, from the NE cells corpus (EVERY apex h ≥ 3 m — a full inventory,
     meta.complete=true; ≤ limit, truncated:true when more exist). min_height / max_height form a
@@ -749,10 +767,14 @@ GET /api/v1/kgs?fields=codes,als&processed_only=0 bulk ALS flight years, one row
     manifest_generation + cells_generation (change whenever cells go live) and kgs_ne_served.
 GET /api/v1/kg/{{kg_code}}                  one KG's landscape dossier:
     {{terrain, landcover{{fractions, by_type[{{type, fraction, n_objects, height_mean_m,
-    height_p90_m}}], …}}, vegetation{{ndvi_mean, phenology_dominant, tree_count,
-    tree_canopy_sqm, tree_mean_height_m, tree_stem_volume_m3}}, built{{building_count,
+    height_p90_m}}], …}}, vegetation{{ndvi_mean, phenology_dominant, tree_apices,
+    tree_segments, tree_canopy_sqm, tree_mean_height_m, tree_stem_volume_m3}}, built{{building_count,
     …heights/storeys/pitched…}}, change{{net_volume_change_m3, …}}, forest_loss, quality,
     grid25, links}}. 202 + retry_after_s while the KG is unprocessed.
+    tree_apices = LiDAR crown tops h ≥ 3 m in the cells this KG product serves (cells owned by a
+    neighbour product excluded) — the number of trees. tree_segments = segmentation objects of type
+    tree (crown clumps / stands, several apices each; canopy_sqm / mean_height / stem_volume describe
+    these). tree_count = deprecated alias of tree_segments (it never counted trees); will be removed.
     Aliases for sibling services: /llm/kg/{{code}}, /llm/kgs, /llm/manifest.json, /llm.txt.
 GET /api/v1/status                           kgs_processed / kgs_total, universe_hash, product versions, grid25 count, cells{{…}}
 
@@ -937,6 +959,7 @@ GET /api/v1/cells?lon=15.0857&amp;lat=47.0665&amp;k=1</pre>
 <table><tr><th>Need</th><th>Call</th></tr>
 <tr><td>Everything about a bbox / point</td><td><code>/api/v1/landscape?bbox=</code> (alias <code>/context</code>)</td></tr>
 <tr><td>Realistic tall trees</td><td><code>/api/v1/trees/bbox?bbox=</code></td></tr>
+<tr><td>How many trees (Austria: 549 M apices ≥ 3 m, by height band / elevation / state)</td><td><code>/api/v1/trees/stats</code></td></tr>
 <tr><td>Towers, masts, wind turbines</td><td><code>/api/v1/landmarks/bbox?bbox=</code></td></tr>
 <tr><td>Measured building heights</td><td><code>/api/v1/buildings/bbox?bbox=</code></td></tr>
 <tr><td>Per-cell observations (H3 res 12, ~300 m²)</td><td><code>/api/v1/cells?bbox=</code> · <code>/api/v1/cells?lon=&amp;lat=&amp;k=1</code> · <code>/api/v1/cells/{{h3}}</code></td></tr>

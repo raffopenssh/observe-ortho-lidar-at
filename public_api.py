@@ -564,6 +564,23 @@ def trees_bbox():
     return resp
 
 
+@app.route('/api/v1/trees/stats')
+def trees_stats():
+    """National tree statistics (realistic apices h >= 3 m, height bands, by elevation / state) from the
+    national cells rollup (/cells/national) — a summary of that table, no store of its own, a few KB.
+    Per KG: ``vegetation.tree_apices`` on /api/v1/kg/<code>; any other area: the cells bins."""
+    import tree_stats
+    try:
+        st = tree_stats.national()
+    except Exception as e:  # noqa: BLE001
+        return _err(str(e), 500)
+    if st is None:
+        return _err('national aggregate not built yet', 404, retry_after_s=3600)
+    etag = 'W/"ts-' + hashlib.md5(json.dumps(st, sort_keys=True).encode()).hexdigest()[:20] + '"'
+    st['meta'] = _meta()
+    return _json(st, max_age=3600, etag=etag)
+
+
 @app.route('/api/v1/landmarks/bbox')
 def landmarks_bbox():
     bb, err = _bbox_or_err()

@@ -10595,7 +10595,8 @@ def _compute_insights():
         'kg_processed': int(one('SELECT COUNT(*) FROM kg WHERE processed=1')),
         'area_km2': round(one('SELECT COALESCE(SUM(total_area_sqm),0)/1e6 FROM kg WHERE processed=1'), 1),
         'segments': int(one('SELECT COALESCE(SUM(n_objects),0) FROM kg_landcover')),
-        'tree_count': int(one('SELECT COALESCE(SUM(tree_count),0) FROM kg WHERE processed=1')),
+        'tree_segments': int(one('SELECT COALESCE(SUM(tree_count),0) FROM kg WHERE processed=1')),
+        'tree_count': int(one('SELECT COALESCE(SUM(tree_count),0) FROM kg WHERE processed=1')),  # deprecated alias of tree_segments
         'tree_volume_m3': int(one('SELECT COALESCE(SUM(tree_stem_volume_m3),0) FROM kg WHERE processed=1')),
         'buildings': int(one('SELECT COALESCE(SUM(building_count),0) FROM kg WHERE processed=1')),
         'new_buildings': int(one('SELECT COALESCE(SUM(new_building_count),0) FROM kg WHERE processed=1')),
