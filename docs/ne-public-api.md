@@ -171,7 +171,8 @@ values come from the `20240915` mosaic → `als_year_newest`; `dh_m` /
 20240915 range block (`2010-11`) over a 20220915 single year inside the range
 is the same scan → `als_year_newest = als_year_oldest`
 (`als_years.cell_years_3035`; only the bins in `range_fix_bins` get a new
-generation). Write-up: `/api/v1/docs/method`.
+generation). Write-up: `/api/v1/docs/method`. Heal state + measured figures for
+clients: `GET /api/v1/cells/als` (≈ 2 KB, ETag, max-age 300).
 
 | surface | field |
 |---|---|

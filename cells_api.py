@@ -2166,7 +2166,9 @@ def cells_als():
         'source': als_years.SOURCE, 'method': '/api/v1/docs/method',
     }
     tag = hashlib.sha256(json.dumps([st['rule'], st['bins_pending'], st['manifest_generation'], meta.get('gen')]).encode()).hexdigest()[:16]
-    return _resp(d, etag=f'"als-{tag}"')
+    r = _resp(d, etag=f'"als-{tag}"')
+    r.headers['Cache-Control'] = 'public, max-age=300'      # heal state moves hourly — not the 24 h of cell data
+    return r
 
 
 @cells_bp.route('/api/v1/cells/dict')

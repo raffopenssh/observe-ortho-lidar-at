@@ -673,7 +673,7 @@ cells, 2026-11-24):
     block with a year range ("2010-11", "2008-12", "2019-2020"), the older list names single years. We took
     the last year of the range, so 8.7 % of cells (7 400 km²) showed a 1–4 year gap although both editions
     hold the same scan (dh_m 0 in 99.4 %). Now als_year_newest = als_year_oldest when the old year lies
-    inside the range. Only the 1 915 bins (0.025°) this touches get a new generation; reflown_share per KG
+    inside the range. Only the 1 889 bins (0.025°) this touches get a new generation; reflown_share per KG
     is recomputed. Until your copy of a bin has the new generation, treat newest − oldest = 1 and the pair
     2008 / 2012 as not re-flown.
   Machine-readable (≈ 2 KB, ETag): GET /api/v1/cells/als → {{gate, measured{{not_reflown, reflown}}, range_rule{{id,
