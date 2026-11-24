@@ -1022,6 +1022,25 @@ INDEX_HTML = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 realistic tree apices, structure heights, landmarks, forest loss. Austria-wide, 7 850 Katastralgemeinden,
 served from a pre-built index. JSON, CORS, no key.</p>
 @@COVERAGE@@
+<p><strong>How the data was made.</strong> For each of Austria's 7 850 cadastral municipalities we combine
+the national airborne laser scan (terrain and surface models at 1 m, three editions), the 0.2 m aerial
+orthophoto in colour and near-infrared, and satellite time series from Sentinel-2, Sentinel-1, ESA WorldCover
+and Hansen forest change. The area is processed in overlapping 1.5 km tiles, where a graph-based segmentation
+(Felzenszwalb, followed by region merging) groups neighbouring pixels of similar height, colour and texture
+into objects. A machine-learning classifier (gradient-boosted trees) then assigns each object one of about 30
+landscape types, such as tree, grass, crop, roof, road, water or rock. Individual trees are found as local
+maxima of the canopy height model (surface minus terrain, lightly smoothed, search window growing with tree
+height, minimum 3 m); each treetop then gets a crown outline by watershed segmentation, and a surface test
+removes roofs, masts and other man-made peaks. The colour-infrared (CIR) orthophoto adds a greenness index
+(NDVI) per crown, giving a vitality class and a coarse conifer species hint, and because laser scans and
+photos were flown in different years, we record the real flight year of the newest and the oldest scan for
+every cell and report their difference twice: as change in object height above ground (surface minus terrain)
+and as change in the terrain itself. From these differences objects are labelled tree loss (canopy gone,
+terrain unchanged), construction (a new non-vegetated height gain) or excavation / fill (the terrain itself
+was lowered or raised); where a cell was not re-flown between editions, the difference is noise.
+Land-cover shares, heights and
+every tree apex are summarised on H3 hexagons of about 300 m², and live BEV cadastre tiles are used only as
+context while the model runs.</p>
 <p><strong>Landscape only.</strong> Everything is keyed by bbox, point or KG code; no property-register
 identifiers or vector outlines are served. Clients hold their own geometry and ask us about the bbox
 of each feature.</p>
