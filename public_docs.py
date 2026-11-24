@@ -1023,24 +1023,29 @@ realistic tree apices, structure heights, landmarks, forest loss. Austria-wide, 
 served from a pre-built index. JSON, CORS, no key.</p>
 @@COVERAGE@@
 <p><strong>How the data was made.</strong> For each of Austria's 7 850 cadastral municipalities we combine
-the national airborne laser scan (terrain and surface models at 1 m, three editions), the 0.2 m aerial
-orthophoto in colour and near-infrared, and satellite time series from Sentinel-2, Sentinel-1, ESA WorldCover
-and Hansen forest change. The area is processed in overlapping 1.5 km tiles, where a graph-based segmentation
-(Felzenszwalb, followed by region merging) groups neighbouring pixels of similar height, colour and texture
-into objects. A machine-learning classifier (gradient-boosted trees) then assigns each object one of about 30
-landscape types, such as tree, grass, crop, roof, road, water or rock. Individual trees are found as local
-maxima of the canopy height model (surface minus terrain, lightly smoothed, search window growing with tree
-height, minimum 3 m); each treetop then gets a crown outline by watershed segmentation, and a surface test
-removes roofs, masts and other man-made peaks. The colour-infrared (CIR) orthophoto adds a greenness index
-(NDVI) per crown, giving a vitality class and a coarse conifer species hint, and because laser scans and
-photos were flown in different years, we record the real flight year of the newest and the oldest scan for
-every cell and report their difference twice: as change in object height above ground (surface minus terrain)
-and as change in the terrain itself. From these differences objects are labelled tree loss (canopy gone,
-terrain unchanged), construction (a new non-vegetated height gain) or excavation / fill (the terrain itself
-was lowered or raised); where a cell was not re-flown between editions, the difference is noise.
-Land-cover shares, heights and
-every tree apex are summarised on H3 hexagons of about 300 m², and live BEV cadastre tiles are used only as
-context while the model runs.</p>
+three kinds of public data: the national airborne laser scan (LiDAR; terrain and surface models at 1 m, three
+editions), the 0.2 m aerial orthophoto in colour and near-infrared, and satellite time series (Sentinel-2
+greenness, Sentinel-1 radar, ESA WorldCover, Hansen forest change). Each municipality is processed in
+overlapping 1.5 km tiles: a graph-based segmentation (Felzenszwalb, followed by region merging) groups
+neighbouring pixels of similar height, colour and texture into objects, and a machine-learning classifier
+(gradient-boosted decision trees) assigns each object one of about 30 landscape types, such as tree, grass,
+crop, roof, road, water or rock.</p>
+<p><strong>Trees.</strong> Individual trees are detected as local maxima of the canopy height model (surface
+minus terrain, lightly smoothed); the search window widens with tree height and the minimum height is 3 m.
+Each apex is placed at the centre of the highest 1 m pixel of its crown, so within about half a metre of the
+true top, and tops that the laser model blurs together inside closed canopy are added from bright spots in
+the near-infrared photo. A watershed segmentation then gives every apex its crown, and a surface test removes
+roofs, masts and other man-made peaks. The crown is reported as a surface, the area of its watershed region in
+m²; a crown ring drawn from the crown diameter is therefore the circle of equal area, not the real outline.
+The colour-infrared (CIR) orthophoto adds a greenness index (NDVI) per crown, from which we derive a vitality
+class and a coarse conifer species hint.</p>
+<p><strong>Cells and change over time.</strong> Land-cover shares, heights and every tree apex are summarised
+on H3 hexagons (cells) of about 300 m², and live BEV cadastre tiles are used only as context while the model
+runs. Laser scans and photos were flown in different years, so every cell carries the real flight year of its
+newest and its oldest scan. Their difference is reported twice: as change in object height above ground and
+as change in the terrain itself. From it, objects are labelled tree loss (canopy gone, terrain unchanged),
+construction (a new non-vegetated height gain) or excavation / fill (terrain lowered or raised); where a
+place was not re-flown between editions, the difference is only measurement noise.</p>
 <p><strong>Landscape only.</strong> Everything is keyed by bbox, point or KG code; no property-register
 identifiers or vector outlines are served. Clients hold their own geometry and ask us about the bbox
 of each feature.</p>
