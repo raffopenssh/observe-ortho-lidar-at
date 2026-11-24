@@ -605,7 +605,7 @@ alpha = field names and limits may still move between epochs; read meta.* and /a
 
 We segment the whole of Austria (7 850 Katastralgemeinden, KGs — see §KG universe) from BEV airborne-laser
 DTM/DSM 1 m, BEV orthophotos 0.2 m, Sentinel-2 NDVI/phenology, Sentinel-1 SAR, ESA WorldCover
-and Hansen forest change into 25 object types (tree, shrub, grass, hedge, water, roof, road,
+and Hansen forest change into about 30 object types (tree, shrub, grass, hedge, water, roof, road,
 parking, crop, orchard, vineyard, garden, bare_soil, rock, glacier, mast, wind_turbine, …).
 This API answers "what is the landscape like HERE?" for a bbox, a point or a KG code:
   · terrain: elevation, slope, aspect, terrain class (25 m DTM grid)
@@ -624,6 +624,35 @@ geometry ask us about the bbox / representative point of each feature.
 Everything is served from a pre-built index + 25 m grids on this host (5–150 ms). There is no
 on-demand raster access: a KG that the fleet has not processed yet answers ready:false /
 HTTP 202 with retry_after_s — repeat later, don't poll in a loop. Coverage: /api/v1/status.
+
+## How the data was made
+
+For each of Austria's 7 850 cadastral municipalities we combine three kinds of public data: the national
+airborne laser scan (LiDAR; terrain and surface models at 1 m, three editions), the 0.2 m aerial
+orthophoto in colour and near-infrared, and satellite time series (Sentinel-2 greenness, Sentinel-1
+radar, ESA WorldCover, Hansen forest change). Each municipality is processed in overlapping 1.5 km tiles:
+a graph-based segmentation (Felzenszwalb, followed by region merging) groups neighbouring pixels of
+similar height, colour and texture into objects, and a machine-learning classifier (gradient-boosted
+decision trees) assigns each object one of about 30 landscape types, such as tree, grass, crop, roof,
+road, water or rock.
+
+Trees. Individual trees are detected as local maxima of the canopy height model (surface minus terrain,
+lightly smoothed); the search window widens with tree height and the minimum height is 3 m. Each apex is
+placed at the centre of the highest 1 m pixel of its crown, so within about half a metre of the true top,
+and tops that the laser model blurs together inside closed canopy are added from bright spots in the
+near-infrared photo. A watershed segmentation then gives every apex its crown, and a surface test removes
+roofs, masts and other man-made peaks. The crown is reported as a surface, the area of its watershed
+region in m²; a crown ring drawn from the crown diameter is therefore the circle of equal area, not the
+real outline. The colour-infrared (CIR) orthophoto adds a greenness index (NDVI) per crown, from which we
+derive a vitality class and a coarse conifer species hint.
+
+Cells and change over time. Land-cover shares, heights and every tree apex are summarised on H3 hexagons
+(cells) of about 300 m², and live BEV cadastre tiles are used only as context while the model runs. Laser
+scans and photos were flown in different years, so every cell carries the real flight year of its newest
+and its oldest scan. Their difference is reported twice: as change in object height above ground and as
+change in the terrain itself. From it, objects are labelled tree loss (canopy gone, terrain unchanged),
+construction (a new non-vegetated height gain) or excavation / fill (terrain lowered or raised); where a
+place was not re-flown between editions, the difference is only measurement noise.
 
 ## Keys and conventions
 
