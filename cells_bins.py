@@ -60,6 +60,7 @@ import cells_api as ca
 import ne_h3
 import ne_green_fix as _green_fix
 import tree_qa as _tree_qa
+import als_years as _als_years
 import ne_pos_fix as _pos_fix
 import mem_lru as _mem_lru
 
@@ -254,7 +255,9 @@ def _gen_prev(i: int, j: int, parts: list, stamps: list) -> str:
     its generation, bytes and ETag."""
     base = _base_gen(i, j, parts, stamps)
     t = _tree_qa.bin_tok(i, j)
-    return hashlib.sha256(f'{base}|tq|{t}'.encode()).hexdigest()[:24] if t else base
+    g = hashlib.sha256(f'{base}|tq|{t}'.encode()).hexdigest()[:24] if t else base
+    a = _als_years.bin_tok(i, j)     # Flugjahr-range rule (als_years.cell_years_3035): only the bins it can change
+    return hashlib.sha256(f'{g}|als|{a}'.encode()).hexdigest()[:24] if a else g
 
 
 def _base_gen(i: int, j: int, parts: list, stamps: list) -> str:

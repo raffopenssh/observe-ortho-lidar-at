@@ -37,6 +37,29 @@ def test_header_block_shape():
     assert set(h) >= {'newest', 'oldest', 'source', 'coverage', 'years', 'mosaics'}
 
 
+def test_range_rule():
+    """A 20240915 block with a Flugjahr range over a 20220915 single year inside
+    it is the same scan: newest == oldest; a range the old year is outside of
+    ('2022-23' over 2010) stays re-flown."""
+    import als_acquisition as aa
+    rn, _ = aa._load(A.NEWEST_DATASET)
+    if not rn:
+        return
+    seen = 0
+    for r in rn:
+        if r['year_from'] == r['year_to']:
+            continue
+        p = r['geom'].representative_point()
+        new, old = A.cell_years_3035(np.array([p.x]), np.array([p.y]))
+        n, o = int(new[0]), int(old[0])
+        if A.NULL in (n, o):
+            continue
+        seen += 1
+        assert n == o or not (r['year_from'] <= o <= r['year_to']) or n > r['year_to'], (r['flugjahr_raw'], n, o)
+    assert seen
+    assert len(A.range_fix_bins()) > 100 and A.bin_tok(0, 0) == ''
+
+
 if __name__ == '__main__':
     for k, f in list(globals().items()):
         if k.startswith('test_'):

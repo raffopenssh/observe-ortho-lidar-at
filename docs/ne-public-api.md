@@ -166,7 +166,12 @@ per block; series `5ce253fc-b7c5-4362-97af-6556c18a45d9` on data.gv.at) is
 therefore evaluated **at read time, at the cell centre**. v2.4 observed
 values come from the `20240915` mosaic → `als_year_newest`; `dh_m` /
 `dtm_m` are newest − oldest (`20220915`) → `als_year_oldest`. Equal years
-⇒ not re-flown, `dh_m` is noise (`reflown_share` per KG).
+⇒ not re-flown: both mosaics hold the same scan and `dh_m` is exactly 0
+(`reflown_share` per KG). Flugjahr-range rule (`als-years-3`, `ar3`): a
+20240915 range block (`2010-11`) over a 20220915 single year inside the range
+is the same scan → `als_year_newest = als_year_oldest`
+(`als_years.cell_years_3035`; only the bins in `range_fix_bins` get a new
+generation). Write-up: `/api/v1/docs/method`.
 
 | surface | field |
 |---|---|

@@ -104,9 +104,10 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
 
   ALS acquisition year (real BEV Flugjahr, not the mosaic date): als_years in the row is a bitmask
     (bit i = 2020+i) and is 0 for everything last flown ≤ 2019. The read-time fields als_year_newest /
-    als_year_oldest (u16, 65535 = null; json/columns/csv, not bin/h3b) carry the flight year of the
+    als_year_oldest (u16, 65535 = null; json/columns/csv, bins / blocks / sample columns; not format=bin rows / h3b) carry the flight year of the
     20240915 mosaic block (= the year every observed value was flown) and of the 20220915 block
-    (= the "oldest" side of dh_m / dtm_m; equal years ⇒ dh_m is noise). Roll-up: max / min.
+    (= the "oldest" side of dh_m / dtm_m; equal years ⇒ same scan, dh_m is 0 and says nothing — gate
+    rule and measured figures: /api/v1/docs/method). Roll-up: max / min.
     Per KG: /api/v1/kg/<code> → als{{years, newest, oldest, dominant, coverage (share of cells under
     newest), reflown_share, source "data.gv.at 5ce253fc-…", mosaics}}. Source: BEV flight-block
     polygons ("Aktualität DGM - ALS", Flugjahr per block, DSM year), evaluated at the cell centre.
@@ -596,7 +597,7 @@ IDENTITY — say which tree you mean, in this order of preference:
 """
 
 LLM_TXT = f"""# srtm-lidar-at — what the LiDAR + satellite segmentation learned about any place in Austria (public API)
-base: {BASE}      docs: /api/v1/docs/llm.txt (this file)      licence: /api/v1/license      stage: alpha
+base: {BASE}      docs: /api/v1/docs/llm.txt (this file)      method: /api/v1/docs/method      licence: /api/v1/license      stage: alpha
 JSON, CORS *, gzip, ETag + Cache-Control. No key, no login. Please keep ≤ 5 req/s sustained per client.
 alpha = field names and limits may still move between epochs; read meta.* and /api/v1/status rather than hard-coding.
 @@COVERAGE@@
@@ -651,8 +652,56 @@ Cells and change over time. Land-cover shares, heights and every tree apex are s
 scans and photos were flown in different years, so every cell carries the real flight year of its newest
 and its oldest scan. Their difference is reported twice: as change in object height above ground and as
 change in the terrain itself. From it, objects are labelled tree loss (canopy gone, terrain unchanged),
-construction (a new non-vegetated height gain) or excavation / fill (terrain lowered or raised); where a
-place was not re-flown between editions, the difference is only measurement noise.
+construction (a new non-vegetated height gain) or excavation / fill (terrain lowered or raised). Where a
+place was not re-flown between editions, both editions hold the same scan and the difference is zero: that
+is no evidence of change, not evidence of no change.
+
+Using the height change (dh_m, dtm_m). The row value is never zeroed, null-coded or flagged where a place
+was not re-flown; the gate is the pair of flight years: a change can only show where
+als_year_newest > als_year_oldest (both != 65535). Measured on the national res-10 sample (5.6 M observed
+cells, 2026-11-24):
+  not re-flown (75 % of cells): dh_m is exactly 0 in 99.3 %, p95 = p99 = 0 m, beyond ±2 m in 0.08 %
+    (3 428 sampled cells: 32 % lie within 300 m and 67 % within 1 km of a flight-block edge, against 6 %
+    and 20 % of all such cells, and 85 % sit in blocks flown 2016–2020 — consistent with generalised
+    block outlines giving a re-flown cell the neighbour block's year; the rest is unexplained).
+    dtm_m: p99 = 0 m; the same holds in the blocks BEV lists as "DTM 2019, DSM older". A ±2 m threshold is far above this; but 0 here means "not measured again".
+  re-flown (25 %; years apart: median 12, 5th–95th percentile 6–15): p95 |dh_m| = 7.5 m; 25 % of cells
+    rise >= 2 m and 8 % drop >= 2 m. Under canopy (crown cover >= 25 %) 55 % rise >= 2 m: that is tree
+    growth, so a rise alone does not show a new structure; outside canopy 4.7 % rise, 6.4 % drop.
+  Flight-year ranges (fixed 2026-11-24, rule ar3): BEV's newer block list merges some campaigns into one
+    block with a year range ("2010-11", "2008-12", "2019-2020"), the older list names single years. We took
+    the last year of the range, so 8.7 % of cells (7 400 km²) showed a 1–4 year gap although both editions
+    hold the same scan (dh_m 0 in 99.4 %). Now als_year_newest = als_year_oldest when the old year lies
+    inside the range. Only the 1 915 bins (0.025°) this touches get a new generation; reflown_share per KG
+    is recomputed. Until your copy of a bin has the new generation, treat newest − oldest = 1 and the pair
+    2008 / 2012 as not re-flown.
+  Bulk pull of the three columns: /api/v1/cells/sample?res=10&format=bin&fields=dh_m,als_year_newest,
+    als_year_oldest (Austria, 5.7 M rows, ≈ 1.2 MB zstd); the same fields= on the 0.1° blocks or the
+    0.025° bins for every res-12 cell; /api/v1/cells?…&format=columns|csv for a bbox.
+
+Quality control. Before upload every product passes checks of the document, the GeoPackage (integrity,
+layer inventory, no cadastre layers), label consistency and registration against its neighbours. After the
+national run, detectors compared products with each other and with the BEV source; every finding sits in
+one ledger per product, tile and fault class (build 2026-11-24: 11 765 rows handled, 1 741 open, of which
+1 369 are tiles of partly shifted municipalities not yet measured). Faults are corrected when the data is
+read; the published files stay as they are:
+  - position: rasters of some upgraded products sat 5 m off. Trees and structures of 289 municipalities
+    are moved back as a whole and of 136 tile by tile (/api/v1/trees/frame); the 25 m grid of 411 products
+    is re-registered, 161 products with mixed tiles are blended and still open;
+  - terrain: 77 stale tiles were rebuilt from the BEV source or reprocessed, 586 tile edges with a
+    terrain step were checked;
+  - straight chains of small false "trees" are hidden apex by apex in 1 755 municipalities, each run
+    with a public flag;
+  - trees: the default /trees/bbox set drops roofs, masts and implausible apices; an apex in the overlap
+    of two products is counted once; 0.35 M apices that fell outside the cells of their file were added
+    back as system-added trees;
+  - one product with mixed-up labels was reprocessed; 5 products with a missing layer were repaired
+    (such a product carries the version suffix -partial until then).
+What we do not have: field-measured ground truth. The classifier was trained on labels from the cadastre
+land-use map, OpenStreetMap and INVEKOS field parcels, and no accuracy figure per class is published.
+Stage: alpha. Report errors per cell, point or municipality with POST /api/v1/flags; reports are public.
+
+Stable links: this section = /api/v1/docs/method (text), /#how-made (HTML).
 
 ## Keys and conventions
 
@@ -710,12 +759,8 @@ GET /api/v1/trees/stats                      how many trees: the national summar
     once (border cells deduplicated). A summary of /api/v1/cells/national (tree_n / tree_hh), same gen —
     nothing stored twice. For any other area use the same columns: res-8/9 rows of /cells/national, or
     tree_h lists of the cells bins; per KG: vegetation.tree_apices on /api/v1/kg/{{code}}.
-    AUSTRIA, generation 2026-11-18: 549,015,476 apices on 83,686 km² observed (65.6 / ha; one apex per
-    dominant or co-dominant crown — a canopy-tree count, understorey stems are not seen by ALS).
-      height m   3–5    5–10   10–15  15–20  20–25   25–30  30–35  35–40  40–45  45–50   50+
-      million    38.8   75.2   87.3   96.2   104.2   89.5   41.9   13.6   2.22   0.19    0.045
-      ≥ 5 m 510.2 M · ≥ 10 m 435.1 M · ≥ 20 m 251.6 M · ≥ 30 m 57.9 M · ≥ 40 m 2.46 M
-    (live numbers: the endpoint). tree_segments (163 M) is NOT a tree count: segmentation polygons,
+@@TREES@@
+    (generated from the endpoint, refreshed ~10 min). tree_segments (163 M) is NOT a tree count: segmentation polygons,
     summed over overlapping KG product bboxes.
 
 GET|POST /api/v1/trees/stands                ranked tree stands: "where are the densest stands of trees ≥ 40 m"
@@ -1051,6 +1096,7 @@ INDEX_HTML = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 realistic tree apices, structure heights, landmarks, forest loss. Austria-wide, 7 850 Katastralgemeinden,
 served from a pre-built index. JSON, CORS, no key.</p>
 @@COVERAGE@@
+<section id="how-made">
 <p><strong>How the data was made.</strong> For each of Austria's 7 850 cadastral municipalities we combine
 three kinds of public data: the national airborne laser scan (LiDAR; terrain and surface models at 1 m, three
 editions), the 0.2 m aerial orthophoto in colour and near-infrared, and satellite time series (Sentinel-2
@@ -1073,8 +1119,21 @@ on H3 hexagons (cells) of about 300 m², and live BEV cadastre tiles are used on
 runs. Laser scans and photos were flown in different years, so every cell carries the real flight year of its
 newest and its oldest scan. Their difference is reported twice: as change in object height above ground and
 as change in the terrain itself. From it, objects are labelled tree loss (canopy gone, terrain unchanged),
-construction (a new non-vegetated height gain) or excavation / fill (terrain lowered or raised); where a
-place was not re-flown between editions, the difference is only measurement noise.</p>
+construction (a new non-vegetated height gain) or excavation / fill (terrain lowered or raised). Where a
+place was not re-flown between editions, both editions hold the same scan and the difference is zero: that
+is no evidence of change, not evidence of no change (three quarters of all cells; the flight years per cell
+tell which).</p>
+<p><strong>Quality control.</strong> Every product is checked before upload (file integrity, layers, label
+consistency, registration against neighbours). After the national run we compared neighbouring products with each other and with the BEV
+source; every finding is kept in one ledger per product, tile and fault class. Known faults are corrected
+when the data is read: positions that sat 5 m off in some upgraded products are moved back, stale terrain
+tiles are rebuilt from the source, straight chains of false "trees" along power lines and fences are hidden,
+and a tree in the overlap of two products is counted once. There is no field-measured ground truth (training labels came
+from the cadastre land-use map, OpenStreetMap and INVEKOS field parcels) and no published accuracy per class
+yet; this is an alpha. Errors can be reported per cell or point
+(<code>POST /api/v1/flags</code>), and the reports are public. Figures and the rules for using the height
+change: <a href="/api/v1/docs/method"><code>/api/v1/docs/method</code></a>.</p>
+</section>
 <p><strong>Landscape only.</strong> Everything is keyed by bbox, point or KG code; no property-register
 identifiers or vector outlines are served. Clients hold their own geometry and ask us about the bbox
 of each feature.</p>
@@ -1087,7 +1146,7 @@ GET /api/v1/cells?lon=15.0857&amp;lat=47.0665&amp;k=1</pre>
 <tr><td>Everything about a bbox / point</td><td><code>/api/v1/landscape?bbox=</code> (alias <code>/context</code>)</td></tr>
 <tr><td>Realistic tall trees</td><td><code>/api/v1/trees/bbox?bbox=</code></td></tr>
 <tr><td>Densest / tallest tree stands; tree summary of any H3 cell set or polygon</td><td><code>/api/v1/trees/stands</code>, <code>/trees/summary</code>, <code>/trees/hexes</code></td></tr>
-<tr><td>How many trees (Austria: 549 M apices ≥ 3 m, by height band / elevation / state)</td><td><code>/api/v1/trees/stats</code></td></tr>
+<tr><td>How many trees (Austria: @@TREES@@ apices ≥ 3 m, by height band / elevation / state)</td><td><code>/api/v1/trees/stats</code></td></tr>
 <tr><td>Towers, masts, wind turbines</td><td><code>/api/v1/landmarks/bbox?bbox=</code></td></tr>
 <tr><td>Measured building heights</td><td><code>/api/v1/buildings/bbox?bbox=</code></td></tr>
 <tr><td>Per-cell observations (H3 res 12, ~300 m²)</td><td><code>/api/v1/cells?bbox=</code> · <code>/api/v1/cells?lon=&amp;lat=&amp;k=1</code> · <code>/api/v1/cells/{{h3}}</code></td></tr>
@@ -1160,6 +1219,49 @@ Not operated by or affiliated with BEV, ESA or the Copernicus programme. Stage: 
 # response).  Kept here so the wording lives next to the rest of the prose.
 # --------------------------------------------------------------------------
 COVERAGE_MARK = '@@COVERAGE@@'
+TREES_MARK = '@@TREES@@'
+METHOD_HEAD = '## How the data was made'
+
+
+def method_txt(txt: str | None = None) -> str:
+    """The "How the data was made" section of the llm.txt, alone — the stable
+    /api/v1/docs/method body (HTML twin: ``/#how-made``)."""
+    t = (LLM_TXT if txt is None else txt)
+    a = t.index(METHOD_HEAD)
+    b = t.find('\n## ', a + 1)
+    return t[a:b if b > 0 else len(t)].rstrip() + '\n'
+
+
+def _m(n, digits: int | None = None) -> str:
+    """Millions, rounded DOWN (a headline must never exceed the endpoint)."""
+    v = n / 1e6
+    d = digits if digits is not None else (0 if v >= 100 else 1 if v >= 10 else 2 if v >= 1 else 3)
+    q = 10 ** d
+    return f'{int(v * q) / q:.{d}f}'
+
+
+def trees_headline(ts: dict | None) -> str:
+    """"548 M" for the landing table, from /api/v1/trees/stats."""
+    return f'{_m(ts["apices"], 0)} M' if ts and ts.get('apices') else 'see endpoint:'
+
+
+def trees_txt(ts: dict | None) -> str:
+    """The AUSTRIA figures block of the llm.txt, from /api/v1/trees/stats."""
+    if not ts or not ts.get('apices'):
+        return '    AUSTRIA: figures not built yet — ask the endpoint.'
+    bands = ts.get('height_bands') or []
+    names = [str(b['band']).replace('-', '–') for b in bands]
+    vals = [_m(b['apices']) for b in bands]
+    w = [max(len(a), len(b)) + 2 for a, b in zip(names, vals)]
+    al = [f'≥ {x["min_height_m"]:g} m {_m(x["apices"])} M' for x in (ts.get('at_least') or [])
+          if x['min_height_m'] in (5, 10, 20, 30, 40)]
+    return (f'    AUSTRIA, generation {str(ts.get("built_at") or "?")[:10]} (gen {str(ts.get("gen") or "?")[:8]}): '
+            f'{ts["apices"]:,} apices on {ts.get("area_km2", 0):,.0f} km² observed\n'
+            f'    ({ts.get("apices_per_ha", "?")} / ha; one apex per dominant or co-dominant crown — a canopy-tree count,\n'
+            f'    understorey stems are not seen by ALS).\n'
+            '      height m ' + ''.join(n.rjust(x) for n, x in zip(names, w)) + '\n'
+            '      million  ' + ''.join(v.rjust(x) for v, x in zip(vals, w)) + '\n'
+            '      ' + ' · '.join(al))
 
 
 def _fmt_n(n) -> str:

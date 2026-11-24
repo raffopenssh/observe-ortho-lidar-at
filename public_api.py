@@ -249,6 +249,13 @@ def render_docs(kind: str) -> str:
             return hit[1]
         block = ''
     body = tmpl.replace(docs.COVERAGE_MARK, block)
+    try:                                        # tree figures = /api/v1/trees/stats, never hand-typed
+        import tree_stats
+        ts = tree_stats.national()
+    except Exception as e:  # noqa: BLE001
+        log.warning('docs tree figures: %s', e)
+        ts = None
+    body = body.replace(docs.TREES_MARK, docs.trees_txt(ts) if kind == 'txt' else docs.trees_headline(ts))
     _docs_cache[kind] = (now, body)
     return body
 
@@ -265,6 +272,14 @@ def root():
 @app.route('/api/v1/docs')
 def llm_txt():
     r = Response(render_docs('txt'), mimetype='text/plain; charset=utf-8')
+    r.headers['Cache-Control'] = 'public, max-age=600'
+    return r
+
+
+@app.route('/api/v1/docs/method')
+def docs_method():
+    """Stable link target: the "How the data was made" section alone (HTML twin /#how-made)."""
+    r = Response(docs.method_txt(render_docs('txt')), mimetype='text/plain; charset=utf-8')
     r.headers['Cache-Control'] = 'public, max-age=600'
     return r
 

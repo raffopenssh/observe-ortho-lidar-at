@@ -20,7 +20,9 @@ What v2.4 actually uses (``tile_index.DATASETS``):
 * ``OLDEST_DATASET`` = oldest key of ``tile_index.DATASETS`` (20220915) —
   ``dh_m`` / ``dtm_m`` are newest − oldest mosaic, so ``als_year_oldest``
   is the Flugjahr of the 20220915 block.  ``reflown`` = newest > oldest
-  (otherwise both mosaics carry the same flight and ``dh_m`` is noise).
+  (otherwise both mosaics carry the same flight and ``dh_m`` is 0 — measured
+  2026-11-24: exactly 0 in 99.3 % of such cells; see ``cell_years_3035`` for
+  the Flugjahr-range rule).
 * The 20250915 overlay is vendored too but **not** used here: no v2.4
   product was built from it.
 
@@ -93,9 +95,10 @@ DATA_DIR = Path("data")
 NE_DIR = DATA_DIR / "ne"
 INDEX_DB = NE_DIR / "cells.sqlite"
 STATE_PATH = NE_DIR / "als_backfill.json"
-ALGO = "als-years-2"                                # bump → every cached KG block is recomputed
+ALGO = "als-years-3"                                # bump → every cached KG block is recomputed
 
 _lock = threading.Lock()
+_from: dict[str, np.ndarray] = {}                  # dataset -> first year of each block's Flugjahr range
 _trees: dict[str, tuple] = {}                      # dataset -> (STRtree | None, years u16)
 
 
@@ -108,8 +111,10 @@ def _tree(dataset: str):
     import als_acquisition as aa
     recs, tree = aa._load(dataset)
     years = np.array([(r["year_to"] or NULL) for r in recs], dtype=np.uint16) if recs else np.zeros(0, np.uint16)
+    y_from = np.array([(r["year_from"] or r["year_to"] or NULL) for r in recs], dtype=np.uint16) if recs else np.zeros(0, np.uint16)
     with _lock:
         _trees[dataset] = (tree, years)
+        _from[dataset] = y_from
     return _trees[dataset]
 
 
@@ -117,33 +122,100 @@ def available() -> bool:
     return _tree(NEWEST_DATASET)[0] is not None
 
 
-def years_at_3035(e: np.ndarray, n: np.ndarray, dataset: str = NEWEST_DATASET) -> np.ndarray:
+def years_at_3035(e: np.ndarray, n: np.ndarray, dataset: str = NEWEST_DATASET, with_from: bool = False):
     """Flugjahr (u16, NULL where no block) of *dataset*'s mosaic at EPSG:3035
-    points.  Overlapping blocks → the newer year."""
+    points.  Overlapping blocks → the newer year.  A block whose Flugjahr is a
+    range ('2010-11') yields its last year; ``with_from`` → (year, first year
+    of that block's range)."""
+    y, yf = _years_at(e, n, dataset)
+    return (y, yf) if with_from else y
+
+
+def _years_at(e, n, dataset):
     e = np.asarray(e, dtype=np.float64); n = np.asarray(n, dtype=np.float64)
-    out = np.full(e.shape, NULL, dtype=np.uint16)
+    out = np.full(e.shape, NULL, dtype=np.uint16); out_f = out.copy()
     if e.size == 0:
-        return out
+        return out, out_f
     tree, years = _tree(dataset)
     if tree is None:
-        return out
+        return out, out_f
     import shapely
     pi, gi = tree.query(shapely.points(e, n), predicate="within")
     if pi.size == 0:
-        return out
-    y = years[gi]
+        return out, out_f
+    y = years[gi]; yf = _from[dataset][gi]
     ok = y != NULL
-    pi, y = pi[ok], y[ok]
+    pi, y, yf = pi[ok], y[ok], yf[ok]
     if pi.size:
         # max per point (overlaps are rare; sort so the last write wins = max)
         order = np.lexsort((y, pi))
-        out[pi[order]] = y[order]
-    return out
+        out[pi[order]] = y[order]; out_f[pi[order]] = yf[order]
+    return out, out_f
 
 
 def cell_years_3035(e: np.ndarray, n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """→ (als_year_newest, als_year_oldest) u16 arrays for cell centres."""
-    return years_at_3035(e, n, NEWEST_DATASET), years_at_3035(e, n, OLDEST_DATASET)
+    """→ (als_year_newest, als_year_oldest) u16 arrays for cell centres.
+
+    Range rule (als-years-3, 2026-11-24): the 20240915 overlay merges some
+    campaigns into one block with a Flugjahr range ('2010-11', '2008-12',
+    '2019-2020' …) where the 20220915 overlay lists the single years.  The
+    last year of the range against the old single year looked like a re-flight
+    (7 400 km², 8 % of all cells, gap 1–4 years) although both mosaics hold
+    the same scan there (dh_m == 0 in 99.4 %).  When the oldest year lies
+    inside the newest block's range, the newest year IS the oldest year."""
+    new, new_from = _years_at(e, n, NEWEST_DATASET)
+    old, _ = _years_at(e, n, OLDEST_DATASET)
+    same = (new != NULL) & (old != NULL) & (new_from < new) & (old >= new_from) & (old <= new)
+    if same.any():
+        new = new.copy(); new[same] = old[same]
+    return new, old
+
+
+RANGE_FIX_ID = "ar3"
+_fix_bins: set | None = None
+
+
+def range_fix_bins(bin_deg: float = 0.025) -> set:
+    """(i, j) of the 0.025° bins the range rule can change: bins touching the
+    part of a range block of the newest overlay that an oldest-overlay block
+    with a year inside that range covers (+300 m)."""
+    global _fix_bins
+    if _fix_bins is None:
+        import als_acquisition as aa
+        import shapely
+        from pyproj import Transformer
+        tr = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True).transform
+        rn, _ = aa._load(NEWEST_DATASET); ro, to = aa._load(OLDEST_DATASET)
+        out: set = set()
+        for r in rn:
+            y0, y1 = r.get("year_from"), r.get("year_to")
+            if not (y0 and y1 and y0 < y1) or to is None:
+                continue
+            for k in to.query(r["geom"]):
+                yo = ro[int(k)]["year_to"]
+                if not (yo and y0 <= yo <= y1):
+                    continue
+                g = r["geom"].intersection(ro[int(k)]["geom"])
+                if g.is_empty or g.area < 1:
+                    continue
+                g = shapely.ops.transform(tr, g.buffer(300))
+                shapely.prepare(g)
+                w, s_, e, n = g.bounds
+                for i in range(int(np.floor(w / bin_deg)), int(np.floor(e / bin_deg)) + 1):
+                    for j in range(int(np.floor(s_ / bin_deg)), int(np.floor(n / bin_deg)) + 1):
+                        if g.intersects(shapely.box(i * bin_deg, j * bin_deg, (i + 1) * bin_deg, (j + 1) * bin_deg)):
+                            out.add((i, j))
+        _fix_bins = out
+    return _fix_bins
+
+
+def bin_tok(i: int, j: int) -> str:
+    """Generation token of a cells bin for the range rule ('' = bin untouched)."""
+    try:
+        return RANGE_FIX_ID if (i, j) in range_fix_bins() else ""
+    except Exception as ex:  # noqa: BLE001
+        log.warning("als range_fix_bins: %s", ex)
+        return ""
 
 
 def ids_years(ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
