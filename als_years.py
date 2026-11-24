@@ -209,6 +209,21 @@ def range_fix_bins(bin_deg: float = 0.025) -> set:
     return _fix_bins
 
 
+# Measured once on the national res-10 sample (5.6 M observed cells with both
+# years known) with the range rule applied — /api/v1/docs/method has the prose.
+DH_MEASURED = {
+    "as_of": "2026-11-24", "basis": "national res-10 sample, observed cells with both flight years known", "cells": 5625450,
+    "not_reflown": {"share": 0.747, "dh_zero_share": 0.993, "abs_dh_p95_m": 0.0, "abs_dh_p99_m": 0.0,
+                    "rise_ge_2m_share": 0.0005, "drop_ge_2m_share": 0.0003, "abs_dtm_p99_m": 0.0},
+    "reflown": {"share": 0.253, "years_apart_p05_p50_p95": [6, 12, 15], "dh_zero_share": 0.346,
+                "abs_dh_p95_m": 7.5, "abs_dh_p99_m": 15.0, "rise_ge_2m_share": 0.2525, "drop_ge_2m_share": 0.078,
+                "canopy_ge_25pct": {"share_of_cells": 0.103, "rise_ge_2m_share": 0.5517, "drop_ge_2m_share": 0.0979},
+                "canopy_lt_25pct": {"share_of_cells": 0.150, "rise_ge_2m_share": 0.0472, "drop_ge_2m_share": 0.0644}},
+}
+# (oldest, newest) pairs the range rule removes — what a copy made before ar3 still shows
+RANGE_FIX_PAIRS = [[2008, 2012], [2009, 2010], [2010, 2011], [2011, 2012], [2013, 2014], [2016, 2017], [2019, 2020]]
+
+
 def bin_tok(i: int, j: int) -> str:
     """Generation token of a cells bin for the range rule ('' = bin untouched)."""
     try:

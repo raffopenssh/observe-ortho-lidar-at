@@ -279,7 +279,7 @@ def llm_txt():
 @app.route('/api/v1/docs/method')
 def docs_method():
     """Stable link target: the "How the data was made" section alone (HTML twin /#how-made)."""
-    r = Response(docs.method_txt(render_docs('txt')), mimetype='text/plain; charset=utf-8')
+    r = Response(docs.method_txt(render_docs('txt')), content_type='text/plain; charset=utf-8')
     r.headers['Cache-Control'] = 'public, max-age=600'
     return r
 

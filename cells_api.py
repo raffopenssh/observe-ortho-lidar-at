@@ -2131,6 +2131,44 @@ def cells():
     return _render(t, hdrs, meta, fmt=fmt, res=res, layers=layers, fields=fields, centres=centres)
 
 
+@cells_bp.route('/api/v1/cells/als')
+def cells_als():
+    """Light JSON for clients gating dh_m / dtm_m on the flight years: the gate, the measured
+    figures, and the heal state of the Flugjahr-range rule (which bins still carry pre-rule years)."""
+    import cells_bins as cbn
+    import cells_blocks as cbl
+    st = cbn.als_fix_status()
+    meta = cbl.sample_meta(cbl.SAMPLE_DEFAULT_RES) or {}
+    sample_current = bool(meta) and meta.get('gen') == cbl.sample_gen()
+    healed = bool(st['healed'])
+    d = {
+        'fields': ['dh_m', 'dtm_m', 'als_year_newest', 'als_year_oldest'], 'null': {'als_year': als_years.NULL, 'dh_m_i8': -128},
+        'row_flagged': False,
+        'gate': 'a height change can show only where als_year_newest > als_year_oldest (both != 65535); elsewhere '
+                'both editions hold the same scan, dh_m / dtm_m are 0 = not measured again (not: unchanged)',
+        'measured': als_years.DH_MEASURED,
+        'range_rule': {
+            'id': st['rule'], 'since': '2026-11-24',
+            'what': 'newest block with a Flugjahr range over an oldest single year inside that range = same scan: '
+                    'als_year_newest = als_year_oldest',
+            'healed': healed and sample_current,
+            'bins': {k: st[k] for k in ('bin_deg', 'bins_touched', 'bins_current', 'bins_pending')},
+            'pending': st['pending'],
+            'pending_note': 'bins (i, j; w = i·bin_deg, s = j·bin_deg) still stored with pre-rule years; '
+                            '/api/v1/cells (json / columns / csv) and /api/v1/kg/<code> already apply the rule',
+            'sample_r10': {'gen': meta.get('gen'), 'built_at': meta.get('built_at'), 'current': sample_current},
+            'until_healed': {'treat_as_not_reflown_pairs_oldest_newest': als_years.RANGE_FIX_PAIRS,
+                             'applies_to': 'copies of pending bins / blocks and a sample that is not current'},
+        },
+        'bulk': {'sample': '/api/v1/cells/sample?res=10&format=bin&fields=dh_m,als_year_newest,als_year_oldest',
+                 'blocks': '/api/v1/cells/blocks?fields=dh_m,als_year_newest,als_year_oldest',
+                 'bins': '/api/v1/cells/bins'},
+        'source': als_years.SOURCE, 'method': '/api/v1/docs/method',
+    }
+    tag = hashlib.sha256(json.dumps([st['rule'], st['bins_pending'], st['manifest_generation'], meta.get('gen')]).encode()).hexdigest()[:16]
+    return _resp(d, etag=f'"als-{tag}"')
+
+
 @cells_bp.route('/api/v1/cells/dict')
 def cells_dict():
     d = {

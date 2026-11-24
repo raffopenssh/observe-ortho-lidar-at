@@ -963,7 +963,7 @@ def manifest() -> dict:
     files = ca._files()
     bb = _kg_bboxes()
     stamps = _store_stamps({k.split('-')[0] for k in set(files) | set(bb)})
-    key = (ca.cells_generation(), hashlib.sha256(json.dumps(stamps).encode()).hexdigest()[:16], _green_fix.FIX_ID, ALGO, _tree_qa.version())
+    key = (ca.cells_generation(), hashlib.sha256(json.dumps(stamps).encode()).hexdigest()[:16], _green_fix.FIX_ID, ALGO, _tree_qa.version(), _als_years.RANGE_FIX_ID)
     with _manifest_lock:
         if _manifest_cache['key'] == key:
             return _manifest_cache['v']
@@ -997,6 +997,32 @@ def manifest() -> dict:
              'computed_ms': int((time.time() - t0) * 1000)}
         _manifest_cache.update(key=key, v=v)
         return v
+
+
+_als_fix_cache = {'t': 0.0, 'v': None}
+
+
+def als_fix_status(max_age_s: float = 60.0) -> dict:
+    """Heal state of the Flugjahr-range rule (``als_years.RANGE_FIX_ID``): which of the bins the
+    rule touches already carry their current generation on disk.  Header reads only (memoised
+    ``stored_gen``), cached 60 s per worker."""
+    now = time.time()
+    if _als_fix_cache['v'] is not None and now - _als_fix_cache['t'] < max_age_s:
+        return _als_fix_cache['v']
+    m = manifest(); b = m['bins']
+    touched = _als_years.range_fix_bins()
+    pi = []; pj = []; n = 0
+    for i, j, g in zip(b['i'], b['j'], b['gen']):
+        if (i, j) not in touched:
+            continue
+        n += 1
+        if stored_gen(i, j) != g:
+            pi.append(i); pj.append(j)
+    v = {'rule': _als_years.RANGE_FIX_ID, 'bin_deg': BIN_DEG, 'bins_touched': n, 'bins_current': n - len(pi),
+         'bins_pending': len(pi), 'healed': not pi, 'pending': {'i': pi, 'j': pj},
+         'manifest_generation': m['generation']}
+    _als_fix_cache.update(t=now, v=v)
+    return v
 
 
 # === SECTION: request-path helpers (used by cells_api) ===

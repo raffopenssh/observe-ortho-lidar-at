@@ -79,6 +79,7 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
   GET  /api/v1/cells/<h3>                         one res-12 cell, all layers (obs + trees + structures), JSON
   GET  /api/v1/cells/chunk/<h3>                   one res-10 (or res-9 = 7 chunks) chunk for bulk clients; format=h3b|bin|json
   GET  /api/v1/cells/dict                         fields, units, code tables, group labels, limits, epoch, bins
+  GET  /api/v1/cells/als                          dh_m gate on flight years: measured figures + heal state of the range rule (≈ 2 KB)
   GET  /api/v1/cells/bins                         every 0.025° bin with a published product + its generation (see format=bin)
   GET  /api/v1/cells/national?res=9[&fields=…]    Austria-wide NEX1 table, one row per res-9 (or res-8) H3 parent (see below)
   GET  /api/v1/cells/blocks[?fields=…&epoch=…]    manifest of the prebuilt id-free zstd 0.1° blocks (bi, bj, gen, etag, bytes)
@@ -675,6 +676,10 @@ cells, 2026-11-24):
     inside the range. Only the 1 915 bins (0.025°) this touches get a new generation; reflown_share per KG
     is recomputed. Until your copy of a bin has the new generation, treat newest − oldest = 1 and the pair
     2008 / 2012 as not re-flown.
+  Machine-readable (≈ 2 KB, ETag): GET /api/v1/cells/als → {{gate, measured{{not_reflown, reflown}}, range_rule{{id,
+    healed, bins{{bins_touched, bins_current, bins_pending}}, pending{{i[], j[]}}, sample_r10{{gen, current}},
+    until_healed{{treat_as_not_reflown_pairs_oldest_newest}}}}, bulk}}. Poll it at most every 10 min while
+    healed is false; re-pull only blocks whose generation changed.
   Bulk pull of the three columns: /api/v1/cells/sample?res=10&format=bin&fields=dh_m,als_year_newest,
     als_year_oldest (Austria, 5.7 M rows, ≈ 1.2 MB zstd); the same fields= on the 0.1° blocks or the
     0.025° bins for every res-12 cell; /api/v1/cells?…&format=columns|csv for a bbox.
