@@ -323,12 +323,12 @@ def content_hash(raw: bytes) -> str:
 def backfill_chash(verbose: bool = True) -> dict:
     """One-off: add ``chash`` to stored block metas written before it existed."""
     n = 0; err = 0
-    for mp in sorted(BLOCK_DIR.glob('*.nexb.json')):
+    for zp in sorted(BLOCK_DIR.glob('*.nexb.zst')):
+        mp = zp.with_name(zp.name[:-len('.nexb.zst')] + '.json')
         try:
             m = json.loads(mp.read_text())
             if m.get('chash'):
                 continue
-            zp = mp.with_name(mp.name[:-len('.json')] + '.zst')
             raw = zdecompress(zp.read_bytes())
             m2 = json.loads(mp.read_text())
             if m2.get('gen') != m.get('gen') or m2.get('chash') or len(raw) != m.get('raw_bytes'):
