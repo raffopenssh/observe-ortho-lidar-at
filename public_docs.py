@@ -195,8 +195,18 @@ generation — revalidate on ETag and re-baseline from manifest_generation.
     Manifest state: served_gen = the generation a request gets right now (== gen when current=1, the previous one
     while rebuilding, null → 503); one stale generation per block for the glyph set and glyph + tree_h. The manifest
     ETag hashes every served_gen, so it changes whenever a block becomes current.
+    gen is INPUT-keyed (hash of the contributing KG files, grid25 docs, tree-QA and position-fix state), not
+    content-keyed: it moves whenever a contributing product is re-ingested, also when the bytes of a bin come out
+    the same. chash (manifest column, header X-Cells-Content) = hash of the body after its header (present bitmap +
+    columns) as served now for that field set — gen moved but chash equals your copy's → identical cell values,
+    skip the pull. Debounce: a block whose target gen moved is rebuilt once the target has been unchanged for
+    30 min (≤ 4 h after it went stale); until then requests get the previous generation with X-Cells-Stale: 1,
+    X-Cells-Hold: 1, Retry-After = seconds until the builder takes it; manifest hold_until (epoch s, null = not held).
+    complete=0: a contributing KG's cells file is flagged partial (a Sentinel/Hansen layer was missing at build);
+    gen moves once more when that KG is repaired.
     Manifest: GET /api/v1/cells/blocks?fields=… → columns {{bi, bj, gen, etag, bytes, stored, current, n, bins_n,
-    complete}} (bytes null until prebuilt for that field set); epoch= must equal X-Cells-Epoch (else 409).
+    complete, served_gen, chash, hold_until}} (bytes null until prebuilt for that field set); epoch= must equal
+    X-Cells-Epoch (else 409).
   /api/v1/cells/sample?res=10&format=bin[&fields=glyph|default|*|a,b,…]  → the NATIONAL SAMPLE for the glyph
     filter: one NEX1 row per res-10 cell of Austria = its res-12 centre child (cellToCenterChild(parent,12);
     parent = cellToParent(id,10)), ascending H3, every cell with DTM (terrain_src != 0), ≈ 5.6 M rows, ids

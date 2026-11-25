@@ -710,7 +710,80 @@ BUILD_RETRY_S = 120              # Retry-After of a 503 / stale answer
 STALE_MAX_AGE = 120              # Cache-Control max-age of a stale answer
 
 
+# === SECTION: rebuild debounce (hold) ===
+# A block whose inputs are still moving (a KG re-ingested as several products, each landing as 2–3
+# separate inputs: cells file, grid25 doc, tree QA) is not rebuilt per step: the builder waits until the
+# block's TARGET generation has been unchanged for HOLD_QUIET_S, at most HOLD_MAX_S after it first went
+# stale.  Meanwhile requests get the stored previous generation (X-Cells-Stale: 1, as during any
+# rebuild).  Never applies to a block with nothing servable stored (that one is built at once).
+HOLD_QUIET_S = int(os.environ.get('CELLS_HOLD_QUIET_S', 1800))
+HOLD_MAX_S = int(os.environ.get('CELLS_HOLD_MAX_S', 4 * 3600))
+HOLD_PATH = ca.NE_DIR / 'nexb' / 'hold.json'
+_hold_cache = {'mt': None, 'v': {}}
+
+
+def _hold_read() -> dict:
+    try:
+        mt = HOLD_PATH.stat().st_mtime_ns
+    except OSError:
+        return {}
+    if _hold_cache['mt'] != mt:
+        try:
+            _hold_cache.update(mt=mt, v=json.loads(HOLD_PATH.read_text()))
+        except (OSError, ValueError):
+            return {}
+    return _hold_cache['v']
+
+
+def _hold_write(d: dict) -> None:
+    try:
+        HOLD_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = HOLD_PATH.with_name(f'{HOLD_PATH.name}.{os.getpid()}.tmp'); tmp.write_text(json.dumps(d)); os.replace(tmp, HOLD_PATH)
+    except OSError as e:
+        log.debug('cells_bins: hold state: %s', e)
+
+
+def hold_until(bi: int, bj: int, now: float | None = None) -> float | None:
+    """Epoch second the builder will take this block (None = not held).  Read-only, one stat."""
+    h = _hold_read().get(f'{bi}_{bj}')
+    if not h:
+        return None
+    t = min(float(h['t_gen']) + HOLD_QUIET_S, float(h['t0']) + HOLD_MAX_S)
+    return t if t > (time.time() if now is None else now) else None
+
+
+def _block_servable(bi: int, bj: int, inps) -> bool:
+    """A previous generation of the block is stored (every bin with products + the first prewarm set)."""
+    import cells_blocks
+    if not all((not x['on_disk']) or stored_gen(x['i'], x['j']) is not None for x in inps):
+        return False
+    return cells_blocks._meta_ok(cells_blocks.stored_meta(bi, bj, cells_blocks.prewarm_fieldsets()[0]))
+
+
+def hold_update(blocks, now: float | None = None) -> set:
+    """Builder side: re-evaluate the hold of every block in ``blocks`` ∪ the held ones → the set to
+    skip in this run.  A block's quiet clock restarts whenever its target generation moved."""
+    import cells_blocks
+    now = time.time() if now is None else now
+    old = dict(_hold_read()); new = {}; held = set()
+    todo = {tuple(b) for b in blocks} | {tuple(int(x) for x in k.split('_')) for k in old}
+    for bi, bj in sorted(todo):
+        gen, inps = cells_blocks.current_gen(bi, bj)
+        stale = any(x['on_disk'] and stored_gen(x['i'], x['j']) != x['gen'] for x in inps)
+        if not stale or not _block_servable(bi, bj, inps):
+            continue
+        k = f'{bi}_{bj}'; h = old.get(k)
+        h = {'gen': gen, 't_gen': now if not h or h.get('gen') != gen else h['t_gen'], 't0': h['t0'] if h else now}
+        if min(h['t_gen'] + HOLD_QUIET_S, h['t0'] + HOLD_MAX_S) > now:
+            new[k] = h; held.add((bi, bj))
+    if new != old:
+        _hold_write(new)
+    return held
+
+
 def want_block(bi: int, bj: int) -> None:
+    if hold_until(bi, bj) is not None:              # debounced: the builder takes it when its inputs are quiet
+        return
     p = WANT_DIR / f'{bi}_{bj}'
     try:
         if not p.exists():
@@ -963,7 +1036,13 @@ def manifest() -> dict:
     files = ca._files()
     bb = _kg_bboxes()
     stamps = _store_stamps({k.split('-')[0] for k in set(files) | set(bb)})
-    key = (ca.cells_generation(), hashlib.sha256(json.dumps(stamps).encode()).hexdigest()[:16], _green_fix.FIX_ID, ALGO, _tree_qa.version(), _als_years.RANGE_FIX_ID)
+    # every per-file generation input, exactly as bin_inputs reads it (digest from the live header for a
+    # file its index row lags, partial flag, position-fix tag) — cells_generation() alone (count / newest
+    # index mtime / cell total) missed a re-merge with the same cell count and every pos-fix change, so the
+    # manifest kept the old gen while requests already answered X-Cells-Stale against the new one
+    fkey = hashlib.sha256(json.dumps(sorted((k, str(f.get('neo1_digest')) + _pos_fix.tag(k), int(f.get('partial') or 0))
+                                            for k, f in files.items())).encode()).hexdigest()[:16]
+    key = (ca.cells_generation(), fkey, len(bb), hashlib.sha256(json.dumps(stamps).encode()).hexdigest()[:16], _green_fix.FIX_ID, ALGO, _tree_qa.version(), _als_years.RANGE_FIX_ID)
     with _manifest_lock:
         if _manifest_cache['key'] == key:
             return _manifest_cache['v']
@@ -1041,8 +1120,13 @@ def _kgs_of_bin_sorted(inp):
     return inp['kgs']
 
 
-def _stale_hx(hx: dict, gen_now: str) -> dict:
-    hx['X-Cells-Stale'] = '1'; hx['X-Cells-Gen-Current'] = gen_now; hx['Retry-After'] = str(BUILD_RETRY_S)
+def _stale_hx(hx: dict, gen_now: str, block=None) -> dict:
+    ra = BUILD_RETRY_S
+    if block is not None:                           # debounced block: come back when the builder takes it
+        t = hold_until(*block)
+        if t is not None:
+            ra = max(ra, int(t - time.time()) + BUILD_RETRY_S); hx['X-Cells-Hold'] = '1'
+    hx['X-Cells-Stale'] = '1'; hx['X-Cells-Gen-Current'] = gen_now; hx['Retry-After'] = str(ra)
     return hx
 
 
@@ -1235,7 +1319,7 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
     import multiprocessing
     t00 = time.time()
     n_built = 0; n_err = 0; n_units = 0; n_blk = 0; n_wanted = 0; stop = False
-    submitted: set = set()
+    submitted: set = set(); held: set = set()
     # block units run in spawned processes (the build is pure-python heavy → threads share one core)
     ex = (ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context('spawn'))
           if jobs > 1 else ThreadPoolExecutor(max_workers=1))
@@ -1251,6 +1335,9 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
                     stop = True
                     break
                 nxt = next((w for w in wanted_blocks() if w not in submitted), None)
+                if nxt is not None and nxt in hold_update([nxt]):
+                    submitted.add(nxt); unwant_block(*nxt); held.add(nxt)      # debounced (see hold_update)
+                    continue
                 if nxt is not None:
                     n_wanted += 1
                 else:
@@ -1313,6 +1400,8 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
         else:
             n_stale += 1; blk_stale[(i // BLOCK_N, j // BLOCK_N)] = 1
     order = list(blk_missing) + [k for k in blk_stale if k not in blk_missing]
+    hl = hold_update(order); held |= hl                  # inputs still moving → next run (≤ HOLD_MAX_S)
+    order = [k for k in order if k not in hl]
     try:
         run_units(order, None if budget_s is None else t0 + budget_s)
     finally:
@@ -1320,7 +1409,7 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
     out = {'bins': m['n'], 'built': n_built, 'errors': n_err, 'current_before': n_ok,
            'missing_before': n_missing, 'stale_before': n_stale,
            'remaining': max(0, n_missing + n_stale - n_built), 'block_units': n_units, 'unit_blocks_stored': n_blk,
-           'wanted_built': n_wanted, 'wanted_open': len(wanted_blocks()),
+           'wanted_built': n_wanted, 'wanted_open': len(wanted_blocks()), 'held': len(held),
            'budget_s': budget_s, 'stopped_on_budget': bool(stop), 'seconds': round(time.time() - t0, 1),
            'finished_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'generation': m['generation']}
     # phase 2 + 3 (cells_blocks): prebuilt NEXB v2 blocks, then the national
@@ -1329,7 +1418,7 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
         import cells_blocks
         left = None if budget_s is None else max(0.0, budget_s - (time.time() - t0))
         try:
-            out['blocks'] = cells_blocks.prewarm_blocks(left, verbose=verbose, jobs=jobs)
+            out['blocks'] = cells_blocks.prewarm_blocks(left, verbose=verbose, jobs=jobs, skip=held)
             stop = bool(out['blocks'].get('stopped_on_budget'))
         except Exception as e:  # noqa: BLE001
             log.warning('cells_bins: prewarm blocks: %s', e); out['blocks'] = {'error': str(e)}

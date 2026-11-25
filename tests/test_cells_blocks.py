@@ -185,6 +185,63 @@ def test_one_stale_gen_and_manifest(monkeypatch, tmp_path):
     cbl._manifest_cache.clear()
 
 
+def test_chash_ignores_header():
+    """chash = body after the header: the same columns under another generation hash the same."""
+    import json as _j, struct as _s
+    bi, bj = _stored_block()
+    _, raw, _ = cbl.build_block(bi, bj, cbl.GLYPH_FIELDS)
+    n = _s.unpack('<I', raw[4:8])[0]; h = _j.loads(raw[8:8 + n]); h['gen'] = 'x' * 24
+    hb = _j.dumps(h).encode(); raw2 = raw[:4] + _s.pack('<I', len(hb)) + hb + raw[8 + n:]
+    assert cbl.content_hash(raw) == cbl.content_hash(raw2)
+    raw3 = bytearray(raw); raw3[-1] ^= 1
+    assert cbl.content_hash(bytes(raw3)) != cbl.content_hash(raw)
+
+
+def test_hold_debounce(monkeypatch, tmp_path):
+    """A stale block with a stored previous generation is held until its target gen was quiet for
+    HOLD_QUIET_S (≤ HOLD_MAX_S); a moving target restarts the quiet clock; held → no demand marker."""
+    bi, bj = _stored_block()
+    if cb.hold_until(bi, bj) or any(x['on_disk'] and cb.stored_gen(x['i'], x['j']) != x['gen'] for x in cbl.current_gen(bi, bj)[1]):
+        pytest.skip('block stale on disk')
+    monkeypatch.setattr(cb, 'HOLD_PATH', tmp_path / 'hold.json'); monkeypatch.setattr(cb, 'WANT_DIR', tmp_path / 'want')
+    monkeypatch.setattr(cb, '_hold_cache', {'mt': None, 'v': {}})
+    import time as _t; T0 = _t.time()
+    assert cb.hold_update([(bi, bj)], now=T0) == set()                  # current → never held
+    real = cb._gen
+    monkeypatch.setattr(cb, '_gen', lambda g: real(g + '|bump1'))
+    assert cb.hold_update([(bi, bj)], now=T0) == {(bi, bj)}
+    assert cb.hold_until(bi, bj, now=T0 + 1) == T0 + cb.HOLD_QUIET_S
+    cb.want_block(bi, bj); assert cb.wanted_blocks() == []                  # held → not queued
+    monkeypatch.setattr(cb, '_gen', lambda g: real(g + '|bump2'))           # target moved → quiet clock restarts
+    t1 = T0 + cb.HOLD_QUIET_S - 10
+    assert cb.hold_update([], now=t1) == {(bi, bj)} and cb.hold_until(bi, bj, now=t1) == t1 + cb.HOLD_QUIET_S
+    assert cb.hold_update([], now=t1 + cb.HOLD_QUIET_S + 1) == set() and cb.hold_until(bi, bj, now=t1) is None
+    # a target that never settles is taken HOLD_MAX_S after it first went stale
+    assert cb.hold_update([(bi, bj)], now=5000.0) == {(bi, bj)}
+    t = 5000.0
+    while t < 5000.0 + cb.HOLD_MAX_S - cb.HOLD_QUIET_S:
+        t += cb.HOLD_QUIET_S - 1; k = t
+        monkeypatch.setattr(cb, '_gen', lambda g, k=k: real(g + f'|{k}'))
+        if not cb.hold_update([], now=t):
+            break
+    assert 5000.0 + cb.HOLD_MAX_S <= t + cb.HOLD_QUIET_S and t <= 5000.0 + cb.HOLD_MAX_S + cb.HOLD_QUIET_S
+    # nothing servable stored → built at once
+    monkeypatch.setattr(cb, '_block_servable', lambda *a: False)
+    assert cb.hold_update([(bi, bj)], now=9e9) == set()
+
+
+def test_manifest_follows_file_inputs(monkeypatch):
+    """A position-fix change (no file mtime / cell-count change) moves the manifest gen at once."""
+    bi, bj = _stored_block()
+    kg = next(x['on_disk'][0] for x in cbl.current_gen(bi, bj)[1] if x['on_disk'])
+    g0 = cbl.block_gens()[1][(bi, bj)][0]; assert g0 == cbl.current_gen(bi, bj)[0]
+    real = cb._pos_fix.tag
+    monkeypatch.setattr(cb._pos_fix, 'tag', lambda k: '|ptest' if k == kg else real(k))
+    g1 = cbl.current_gen(bi, bj)[0]
+    assert g1 != g0 and cbl.block_gens()[1][(bi, bj)][0] == g1
+    monkeypatch.undo(); cb._manifest_cache['key'] = None
+
+
 if __name__ == '__main__':
     for n, f in list(globals().items()):
         if n.startswith('test_'):

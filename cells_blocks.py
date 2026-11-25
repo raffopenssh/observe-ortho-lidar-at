@@ -300,6 +300,7 @@ def store_block(bi: int, bj: int, fields, *, rebuild: bool = False, build: bool 
 def _write_block(bi: int, bj: int, fields, hdr: dict, raw: bytes, t0: float, **extra) -> dict:
     z = zcompress(raw)
     zp, mp = _paths(bi, bj, fields)
+    extra.setdefault('chash', content_hash(raw))
     meta = {'bi': bi, 'bj': bj, 'gen': hdr['gen'], 'etag': block_etag(hdr['gen'], fields), 'bytes': len(z),
             'raw_bytes': len(raw), 'n': hdr['n'], 'epoch': hdr.get('epoch'), 'fields': list(fields),
             'fh': fields_hash(fields), 'partial': bool(hdr.get('partial')), 'kgs': hdr.get('kgs'),
@@ -309,6 +310,37 @@ def _write_block(bi: int, bj: int, fields, hdr: dict, raw: bytes, t0: float, **e
     tmp = zp.with_name(f'{zp.name}.{os.getpid()}.tmp'); tmp.write_bytes(z); os.replace(tmp, zp)
     tmp = mp.with_name(f'{mp.name}.{os.getpid()}.tmp'); tmp.write_text(json.dumps(meta)); os.replace(tmp, mp)
     return meta
+
+
+def content_hash(raw: bytes) -> str:
+    """Hash of the block body WITHOUT its header (present bitmap + every column, in order) → equal
+    for two generations of a block + field set whose cell values are byte-identical (the header
+    differs: gen, per-bin gen, kgs).  Manifest column ``chash``, header ``X-Cells-Content``."""
+    n = struct.unpack('<I', raw[4:8])[0]
+    return hashlib.sha256(memoryview(raw)[8 + n:]).hexdigest()[:24]
+
+
+def backfill_chash(verbose: bool = True) -> dict:
+    """One-off: add ``chash`` to stored block metas written before it existed."""
+    n = 0; err = 0
+    for mp in sorted(BLOCK_DIR.glob('*.nexb.json')):
+        try:
+            m = json.loads(mp.read_text())
+            if m.get('chash'):
+                continue
+            zp = mp.with_name(mp.name[:-len('.json')] + '.zst')
+            raw = zdecompress(zp.read_bytes())
+            m2 = json.loads(mp.read_text())
+            if m2.get('gen') != m.get('gen') or m2.get('chash') or len(raw) != m.get('raw_bytes'):
+                continue                             # replaced meanwhile
+            m['chash'] = content_hash(raw)
+            tmp = mp.with_name(f'{mp.name}.{os.getpid()}.tmp'); tmp.write_text(json.dumps(m)); os.replace(tmp, mp)
+            n += 1
+            if verbose and n % 500 == 0:
+                print(' chash', n, flush=True)
+        except Exception as e:  # noqa: BLE001
+            err += 1; log.warning('cells_blocks: backfill_chash %s: %s', mp.name, e)
+    return {'filled': n, 'errors': err}
 
 
 def _bins_ready(inps) -> bool:
@@ -370,12 +402,14 @@ def serve_block(bi: int, bj: int, fields, *, rebuild: bool = False, build: bool 
           'X-Cells-Kgs': ','.join(meta.get('kgs') or []), 'X-Cells-Fields': ','.join(fields), 'X-Cells-Ids': 'bitmap',
           'X-Cells-Layout': 'nexb2=' + ','.join(str(x) for x in meta.get('bins_n') or []),
           'X-Cells-Built': meta.get('built_at'), 'X-Cells-Raw-Bytes': str(meta.get('raw_bytes'))}
+    if meta.get('chash'):
+        hx['X-Cells-Content'] = meta['chash']
     hx = ca._with_epoch(hx, meta.get('epoch'))
     if meta.get('partial'):
         hx['X-Cells-Partial'] = '1'
     if stale and meta.get('gen') != gen:
         meta = dict(meta, stale=True)
-        cb._stale_hx(hx, gen)
+        cb._stale_hx(hx, gen, (bi, bj))
     return body, hx, etag, meta
 
 
@@ -483,7 +517,7 @@ def manifest(fields) -> dict:
         if hit and hit[0] == ck:
             return hit[1]
     t0 = time.time()
-    BI = []; BJ = []; G = []; ET = []; BY = []; ST = []; CU = []; N = []; BN = []; C = []; SG = []
+    BI = []; BJ = []; G = []; ET = []; BY = []; ST = []; CU = []; N = []; BN = []; C = []; SG = []; CH = []; HU = []
     pf = prewarm_fieldsets(); hs = hashlib.sha256((gen_key + '|' + fh).encode())
     n_cur = 0; n_stored = 0; bytes_total = 0
     for (bi, bj), (g, nman, comp) in gens.items():
@@ -491,6 +525,10 @@ def manifest(fields) -> dict:
         ok = bool(meta and meta.get('algo') == ALGO and meta.get('zstd_level') == ZSTD_LEVEL)
         sg, cur = served_state(bi, bj, fields, g, pf)
         SG.append(sg); hs.update(f'|{bi},{bj},{sg}'.encode())
+        # content hash of the body served now (own stored build at served_gen; null when cut from a superset on demand)
+        CH.append(meta.get('chash') if ok and meta.get('gen') == sg else None)
+        hu = None if cur else cb.hold_until(bi, bj)
+        HU.append(int(hu) if hu else None)
         BI.append(bi); BJ.append(bj); G.append(g); ET.append(block_etag(g, fields))
         BY.append(int(meta['bytes']) if ok else None); ST.append(int(ok)); CU.append(int(cur))
         N.append(int(meta['n']) if ok else None); BN.append(nman); C.append(int(comp))
@@ -499,7 +537,7 @@ def manifest(fields) -> dict:
          'epoch': ca.epoch_hdr(None), 'generation': hs.hexdigest()[:16],
          'n': len(BI), 'prebuilt_current': n_cur, 'prebuilt_any': n_stored, 'bytes_total': bytes_total,
          'blocks': {'bi': BI, 'bj': BJ, 'gen': G, 'etag': ET, 'bytes': BY, 'stored': ST, 'current': CU, 'n': N,
-                    'bins_n': BN, 'complete': C, 'served_gen': SG},
+                    'bins_n': BN, 'complete': C, 'served_gen': SG, 'chash': CH, 'hold_until': HU},
          'bbox_of': 'w = bi·block_deg, s = bj·block_deg, e = w + block_deg, n = s + block_deg (half-open)',
          'request': 'GET /api/v1/cells?bbox=w,s,e,n&format=bin&block=1&fields=' + ','.join(fields),
          'computed_ms': int((time.time() - t0) * 1000)}
@@ -540,7 +578,7 @@ def gc_blocks(max_age_s: float | None = None) -> dict:
 
 
 def prewarm_blocks(budget_s: float | None = None, limit: int | None = None, verbose: bool = True,
-                   jobs: int = 1) -> dict:
+                   jobs: int = 1, skip=()) -> dict:
     """Build / refresh every manifest block whose stored blob (per prewarm
     field set) is missing or stale.  Missing first, then stale."""
     from concurrent.futures import ThreadPoolExecutor
@@ -549,6 +587,8 @@ def prewarm_blocks(budget_s: float | None = None, limit: int | None = None, verb
     todo_missing = []; todo_stale = []; n_ok = 0
     for fs in prewarm_fieldsets():
         for (bi, bj), (g, _, _) in gens.items():
+            if (bi, bj) in skip:                     # debounced by the builder (cb.hold_update)
+                continue
             meta = stored_meta(bi, bj, fs)
             ok = bool(meta and meta.get('algo') == ALGO and meta.get('zstd_level') == ZSTD_LEVEL)
             if ok and meta.get('gen') == g:
@@ -866,13 +906,20 @@ def dict_block() -> dict:
                                          '(never built inside the request): X-Cells-Gen / ETag are those of the served body, '
                                          'X-Cells-Gen-Current the generation under way, Retry-After + max-age = 120 s',
                         'Retry-After': 'on a stale 200/304 and on 503 {building:true} (nothing stored yet for this block + field set)'},
+            'chash': 'manifest column chash / header X-Cells-Content = sha256 over the body after the header (present bitmap + '
+                     'columns) of the body served now for this field set: gen moved but chash equal to the one of your copy → '
+                     'cell values are byte-identical, skip the pull (gen is input-keyed per KG file, not content-keyed). null → unknown',
+            'debounce': 'a block whose target gen moved is rebuilt once the target has been unchanged for 30 min (at most 4 h '
+                        'after it went stale); until then requests get the previous generation with X-Cells-Stale: 1, '
+                        'X-Cells-Hold: 1 and Retry-After = seconds until the builder takes it; manifest column hold_until '
+                        '(epoch s, null = not held). A block with nothing stored is never held',
             'manifest_state': 'gen = the target generation; current = 1 → a request is answered with gen now; served_gen = '
                               'the generation a request gets right now (== gen when current, the previous one while '
                               'rebuilding = X-Cells-Gen of the stale 200, null → 503). One stale generation per block: '
                               'the base set is cut from the stored base + tree_h body. ETag "blocks-<hash(bin generation, '
                               'fields, every served_gen)>" → changes whenever a block flips',
             'manifest': 'GET /api/v1/cells/blocks[?fields=…][&epoch=…] → columns {bi, bj, gen, etag, bytes, stored, current, n, '
-                        'bins_n, complete, served_gen} for every block touching a published product (bytes/n null until prebuilt for that '
+                        'bins_n, complete, served_gen, chash, hold_until} for every block touching a published product (bytes/n null until prebuilt for that '
                         'field set); epoch= must equal the current X-Cells-Epoch or you get 409 with the current one',
             'precompute': 'cells-bins.timer (hourly, 50 min budget, nice 15) builds bins → blocks (default + glyph field sets + '
                           'any field set a block request used) → the national sample; a block that is requested before it is '
@@ -906,10 +953,13 @@ if __name__ == '__main__':
     ap.add_argument('--prewarm', action='store_true'); ap.add_argument('--budget-s', type=float); ap.add_argument('--jobs', type=int, default=1)
     ap.add_argument('--sample', type=int, nargs='?', const=SAMPLE_DEFAULT_RES, help='build the national sample at res (default 10)')
     ap.add_argument('--force', action='store_true'); ap.add_argument('--status', action='store_true'); ap.add_argument('--quiet', action='store_true')
+    ap.add_argument('--backfill-chash', action='store_true', help='one-off: content hash for block metas stored before it existed')
     a = ap.parse_args()
     logging.basicConfig(level=logging.WARNING if a.quiet else logging.INFO)
     fs = list(GLYPH_FIELDS) if a.fields == 'glyph' else (cb.parse_fields(a.fields) if a.fields else list(cb.DEFAULT_FIELDS))
-    if a.block:
+    if a.backfill_chash:
+        print(json.dumps(backfill_chash(not a.quiet)))
+    elif a.block:
         bi, bj = (int(x) for x in a.block.split(','))
         t = time.time(); meta = store_block(bi, bj, fs, rebuild=a.force); print(json.dumps(meta, indent=1)); print('ms', int((time.time() - t) * 1000))
         body, _, _, _ = serve_block(bi, bj, fs); hdr, present, cols = decode_block(zdecompress(body))
