@@ -65,6 +65,11 @@ PAD_M = 130.0                   # unit bbox padding around the unseen cells (con
 CELL_R_M = 12.0                 # res-12 cell circumradius-ish
 GAP_M = 1500.0                  # split a side's cells into clusters at gaps wider than this
 MAX_UNITS_PER_PARENT = 8
+MAX_UNIT_M = 6000.0             # a view-fill cluster wider/taller than this is cut on a grid of this pitch (≈ 25 tiles
+                                # of 1.5 km per unit): 80110-sw13 was ONE 361-tile unit — worker OOM at ~tile 105, 43 GB
+                                # of raster sidecars on a 24 GB disk, > DISPATCH_STALE_S of work (2026-11-26)
+MAX_UNITS_SPLIT = 24            # units per planning pass when a cluster had to be cut (else MAX_UNITS_PER_PARENT)
+REVALIDATE_MIN_CELLS = 1        # open view-fill units are re-checked against the parent file before they are (re)run
 MAX_ATTEMPTS = 3
 DISPATCH_STALE_S = 8 * 3600     # no result from the peer → back to pending
 RESWEEP_COOLDOWN_S = 6 * 3600   # a done parent with struck-out (failed) units gets its units re-opened after this
@@ -333,6 +338,18 @@ def _cluster_cells(ll: np.ndarray, lat0: float) -> list[np.ndarray]:
     return out
 
 
+def _split_group(g: np.ndarray, ll: np.ndarray, m_lat: float, m_lon: float) -> list[np.ndarray]:
+    """Cut one cluster on a ``MAX_UNIT_M`` grid when it is larger than that
+    in either direction (index arrays into *ll*); small clusters pass."""
+    lat, lon = ll[g, 0], ll[g, 1]
+    if (lat.max() - lat.min()) / m_lat <= MAX_UNIT_M and (lon.max() - lon.min()) / m_lon <= MAX_UNIT_M:
+        return [g]
+    bi = np.floor((lat - lat.min()) / (MAX_UNIT_M * m_lat)).astype(np.int64)
+    bj = np.floor((lon - lon.min()) / (MAX_UNIT_M * m_lon)).astype(np.int64)
+    key = bi * 100_000 + bj
+    return [g[key == k] for k in np.unique(key)]
+
+
 def plan_cells(parent: str, ids: np.ndarray, source: str = "viewfill", bbox_fallback: list | None = None) -> dict:
     """Queue sweep units over arbitrary unobserved cells of *parent* (not
     only the bbox-revision strip): cluster → ≤ ``MAX_UNITS_PER_PARENT`` padded
@@ -390,6 +407,11 @@ def plan_cells(parent: str, ids: np.ndarray, source: str = "viewfill", bbox_fall
         # re-plan its deferred cells (6 parents stuck with plan_deferred>0,
         # 2026-11-06 — blocks the swept-coverage flag, docs/ne-viewfill.md)
         room = MAX_UNITS_PER_PARENT
+        n_clusters = len(groups)
+        groups = [sg for g in groups for sg in _split_group(g, ll, m_lat, m_lon)]
+        if len(groups) > n_clusters:
+            groups.sort(key=lambda g: -len(g))
+            room = MAX_UNITS_SPLIT
         planned, deferred = 0, 0
         for g in groups:
             if planned >= room:
@@ -1146,6 +1168,113 @@ def integrate(idx: dict, entries: dict | None = None, max_n: int = INTEGRATE_PER
     return done
 
 
+def _open_view_cells(parent: str) -> tuple[np.ndarray, np.ndarray] | None:
+    """``(ids, lat/lon rows)`` of the view cells of *parent* nobody observed:
+    stored ``/declared`` view (else the file's own cell list) − observed in
+    the parent file − observed in another product.  No network."""
+    import h3.api.numpy_int as h3n
+    import ne_h3
+    import ne_viewfill
+    p = _parent_path(parent)
+    if not p.exists():
+        return None
+    ids, seen, _dg = ne_viewfill._ids_observed(p)
+    vids = ids
+    try:
+        bp = ne_h3.DECLARED_DIR / f"{parent}.nec1"
+        if bp.exists():
+            vids = ne_viewfill._view_ids(ne_h3._declared_parse(parent, bp.read_bytes(), ne_h3.declared_stored_etag(parent)))
+    except Exception as ex:  # noqa: BLE001
+        log.debug("sliver_sweep: stored view %s unreadable (%s) — file cells used", parent, ex)
+    gap = np.setdiff1d(np.unique(vids), seen)
+    if gap.size:
+        gap = gap[~observed_elsewhere(gap)]
+    ll = np.array([h3n.cell_to_latlng(int(c)) for c in gap], dtype=float).reshape(-1, 2)
+    return gap, ll
+
+
+def revalidate_open(max_n: int = 6, only: list[str] | None = None, dry: bool = False) -> list[dict]:
+    """Re-check open view-fill units against the parent file as it is NOW.
+
+    A unit is planned over the cells a walk found unobserved.  When the
+    parent file changes afterwards (blocks restored from the archive and
+    re-merged, a regenerated block ingested, a neighbour's cells borrowed)
+    those cells may be observed already: the unit is then *obsolete* and is
+    dropped instead of being run — 2026-11-24: 14 parents of the QC reprocess
+    list were walked between a 2-of-4-block partial merge and the complete
+    one; 12 units of 40-170 tiles re-observed whole blocks (10 GB of
+    duplicate add-on products) and five more (130-361 tiles) only ever
+    crashed their peers.  A unit that kept < half of its cells is re-planned
+    over the remainder (``plan_cells``, grid-cut).  One check per parent file
+    digest (``reval_digest``)."""
+    import ne_viewfill
+    out = []
+    replan: dict = {}
+    with _Locked(write=not dry) as st:
+        for code, k in st["kgs"].items():
+            if only is not None and code not in only:
+                continue
+            if len(out) >= max_n:
+                break
+            if k.get("state") not in ("pending", "dispatched", "failed", "done"):
+                continue
+            open_u = [u for u in (k.get("units") or []) if u.get("source") == "viewfill"
+                      and u.get("state") in ("pending", "dispatched", "failed", "hold")
+                      and int(u.get("cells") or 0) >= REVALIDATE_MIN_CELLS]
+            if not open_u:
+                continue
+            dg = ne_viewfill._file_digest(code)
+            if not dg or (k.get("reval_digest") == dg and only is None):
+                continue
+            try:
+                r = _open_view_cells(code)
+            except Exception as ex:  # noqa: BLE001
+                log.warning("sliver_sweep: revalidate %s: %s", code, ex)
+                k["reval_digest"] = dg
+                continue
+            if r is None:
+                continue
+            gap, ll = r
+            row = {"parent": code, "open_cells": int(gap.size), "dropped": [], "replanned": [], "kept": []}
+            for u in open_u:
+                w, s_, e, n = u["bbox"]
+                sel = (ll[:, 1] >= w) & (ll[:, 1] <= e) & (ll[:, 0] >= s_) & (ll[:, 0] <= n) if len(ll) else np.zeros(0, bool)
+                left = int(sel.sum())
+                if left == 0:
+                    row["dropped"].append({"id": u["id"], "cells": u.get("cells"), "state": u.get("state")})
+                elif left * 2 < int(u.get("cells") or 0):
+                    row["replanned"].append({"id": u["id"], "cells": u.get("cells"), "left": left})
+                    replan.setdefault(code, []).append(gap[sel])
+                else:
+                    u["cells_open"] = left
+                    row["kept"].append({"id": u["id"], "cells": u.get("cells"), "left": left})
+            gone = {x["id"] for x in row["dropped"] + row["replanned"]}
+            k["reval_digest"] = dg; k["reval_at"] = _now()
+            if gone:
+                k["units"] = [u for u in k.get("units") or [] if u.get("id") not in gone]
+                st["stats"]["obsolete"] = int(st["stats"].get("obsolete") or 0) + len(gone)
+                if not any(u.get("state") in ("pending", "dispatched") for u in k["units"]):
+                    # settled: integrate() recomputes unswept / nodata and closes the parent
+                    k.update(state="received", received_at=_now(), attempts=0)
+                    k.pop("error", None); k.pop("resweep_after", None)
+                log.info("sliver_sweep: %s revalidated — %d unit(s) obsolete (cells observed since the plan): %s%s",
+                         code, len(gone), ", ".join(f"{x['id']}({x['cells']}c)" for x in row["dropped"]),
+                         "".join(f", {x['id']} re-planned over {x['left']} of {x['cells']}c" for x in row["replanned"]))
+            out.append(row)
+    if not dry:
+        for code, parts in replan.items():
+            try:
+                with _Locked() as st:
+                    k = st["kgs"][code]
+                    if k.get("state") in ("pending", "dispatched", "received"):
+                        k["state"] = "done"       # plan_cells refuses a parent in flight
+                r = plan_cells(code, np.concatenate(parts), source="viewfill")
+                log.info("sliver_sweep: %s re-plan after revalidation: %s", code, r)
+            except Exception as ex:  # noqa: BLE001
+                log.warning("sliver_sweep: re-plan %s: %s", code, ex)
+    return out
+
+
 def tick(idx: dict, entries: dict) -> dict:
     """Primary-side periodic work (called from ``ne_ingest.run_tick``)."""
     if not enabled():
@@ -1160,6 +1289,12 @@ def tick(idx: dict, entries: dict) -> dict:
         out["scan"] = scan(entries=entries, idx=idx)
     except Exception as ex:  # noqa: BLE001
         log.warning("sliver_sweep: scan failed: %s", ex)
+    try:
+        rv = [r for r in revalidate_open() if r.get("dropped") or r.get("replanned")]
+        if rv:
+            out["revalidated"] = rv
+    except Exception as ex:  # noqa: BLE001
+        log.warning("sliver_sweep: revalidate failed: %s", ex)
     try:
         out["integrated"] = integrate(idx, entries)
     except Exception as ex:  # noqa: BLE001

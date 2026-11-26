@@ -84,3 +84,14 @@ assert cands(aged(dict(r7, error="x"))) != []
 OM["00001"] = {"blank_n": 1, "missing_n": 0}
 c = cands(aged(r7)); assert c and c[0][2] == "NE server", c
 print("ok")
+# 6. split parent whose union is not settled (blocks being restored / partial merge) is never walked
+ne_ingest._live_blocks = lambda kg, entries=None: ["00001-north", "00001-south"]
+for ps in ({"dirty": True, "complete": True}, {"restore_wait": 2, "complete": True}, {"complete": False}):
+    r6 = vf.process("00001", entries={}, idx={"files": {}, "parents": {"00001": ps}}, st={"kgs": {}})
+    assert r6.get("skip") == "merge pending", (ps, r6)
+r6 = vf.process("00001", entries={}, idx={"files": {}, "parents": {"00001": {"complete": True}}}, st={"kgs": {}})
+assert r6.get("skip") != "merge pending", r6
+ne_ingest._live_blocks = lambda kg, entries=None: []      # stale parents row of a now-unsplit KG: walked
+r6 = vf.process("00001", entries={}, idx={"files": {}, "parents": {"00001": {"complete": False}}}, st={"kgs": {}})
+assert r6.get("skip") != "merge pending", r6
+print("ok merge-pending gate")

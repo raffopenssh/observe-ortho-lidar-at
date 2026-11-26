@@ -372,6 +372,14 @@ def process(kg: str, entries: dict | None = None, idx: dict | None = None, *, st
         row.update(skip="no file"); return row
     if not ne_ingest._coverage_complete(kg, entries):
         row.update(skip="incomplete"); return row
+    # A split parent whose union is not settled (blocks being restored from
+    # the archive, re-merge pending, merged from a subset) is not walked:
+    # its "unobserved" cells are the missing blocks, not a gap (84005,
+    # 2026-11-24 — a whole block's area went to the sweepers).
+    ps = (idx.get("parents") or {}).get(kg)
+    if ps and (ps.get("dirty") or ps.get("restore_wait")
+               or (not ps.get("complete") and ne_ingest._live_blocks(kg, entries))):
+        row.update(skip="merge pending"); return row
     prev = (st or {}).get("kgs", {}).get(kg) or {}
     ids, seen, digest = _ids_observed(p)
     # Nothing moved since the last walk (same view ETag, same file digest, no

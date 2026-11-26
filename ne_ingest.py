@@ -730,6 +730,9 @@ def heal_incomplete_merges(idx: dict, entries: dict, max_n: int = 10) -> list[st
     return out
 
 
+RESTORE_WAIT_MAX_S = 24 * 3600   # merge_dirty_parents: how long a parent waits for archived blocks to come back
+
+
 def merge_dirty_parents(idx: dict, entries: dict, max_n: int = 10) -> list[dict]:
     out = []
     try:
@@ -750,7 +753,24 @@ def merge_dirty_parents(idx: dict, entries: dict, max_n: int = 10) -> list[dict]
             log.info("ne_ingest: %s dirty but %d merged block(s) evicted — restoring from archive before the merge",
                      parent, len(evicted))
             continue
-        st.pop("restore_wait", None)
+        # Un-evicted above on an earlier tick but not pulled back yet
+        # (inbound budget hold, Zenodo slow): still not mergeable.  Until
+        # 2026-11-26 the next tick saw "no evicted block" and merged the
+        # subset on disk as ``partial`` — 84005 lost 2 of 4 blocks for 2 h
+        # (2026-11-24 00:06 → 01:58), the view-fill walk in between planned
+        # 139 223 "unobserved" cells as a sweep unit and umfeld got
+        # blank=139 476.  Bounded: a block that cannot be restored within
+        # RESTORE_WAIT_MAX_S no longer blocks the merge.
+        absent = [b for b in live if idx["files"].get(b) and not path_for(b).exists()
+                  and _committed(entries.get(f"{b}_ne_h3b"))]
+        if absent and path_for(parent).exists():
+            since = float(st.setdefault("restore_wait_since", time.time()))
+            if time.time() - since < RESTORE_WAIT_MAX_S:
+                st["restore_wait"] = len(absent)
+                continue
+            log.warning("ne_ingest: %s — %d block(s) not restored after %.0f h, merging without: %s",
+                        parent, len(absent), (time.time() - since) / 3600, ", ".join(absent[:6]))
+        st.pop("restore_wait", None); st.pop("restore_wait_since", None)
         have = [b for b in live if (idx["files"].get(b) and path_for(b).exists())]
         if not have:
             # older layout on disk only (blocks no longer live) — use whatever is on disk
