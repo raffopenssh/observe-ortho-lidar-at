@@ -54,4 +54,9 @@ assert s.revalidate_open() == []                                        # same f
 # a late result of a dropped unit is accepted as stale, never an error
 rr = s.accept_result(us[0]["id"], "00001", "p1", 0, "failed", None, error="x")
 assert rr.get("stale"), rr
+# ids of dropped units are never reused
+with s._Locked() as _st:
+    _st["kgs"]["00001"]["state"] = "done"
+r3 = s.plan_cells("00001", ids[:1])
+assert s.load_state()["kgs"]["00001"]["units"][-1]["id"] == f"00001-sw{len(us) + 1}", r3
 print("ok revalidate")

@@ -400,7 +400,10 @@ def plan_cells(parent: str, ids: np.ndarray, source: str = "viewfill", bbox_fall
                 if not len(ll):
                     return {"planned": 0, "held": len(held)}
                 groups = _cluster_cells(ll, lat0)
-        nxt = 1 + max([int(u["id"].rsplit("-sw", 1)[1]) for u in (k.get("units") or []) if "-sw" in str(u.get("id"))] or [0])
+        # ``unit_seq`` = highest ``-sw<k>`` ever handed out: a dropped unit's
+        # id is never reused (its tile checkpoints may still sit on a peer)
+        nxt = 1 + max([int(u["id"].rsplit("-sw", 1)[1]) for u in (k.get("units") or []) if "-sw" in str(u.get("id"))]
+                      + [int(k.get("unit_seq") or 0)])
         # the cap bounds one planning pass (peer work per dispatch), not the
         # parent's lifetime: integrated ``ok`` units are kept for the merge but
         # must not eat the room, else a parent with 8 ok units could never
@@ -425,7 +428,7 @@ def plan_cells(parent: str, ids: np.ndarray, source: str = "viewfill", bbox_fall
             nxt += 1; planned += 1
         if not planned:
             return {"planned": 0, "deferred_cells": deferred}
-        k.update(units=units, state="pending", attempts=0, plan_source=source, planned_at=_now(),
+        k.update(units=units, state="pending", attempts=0, plan_source=source, planned_at=_now(), unit_seq=nxt - 1,
                  unseen_out=int(ids.size), plan_cells=int(ids.size), plan_deferred=deferred)
         k.pop("error", None)
         st["stats"]["planned_cells"] = int(st["stats"].get("planned_cells") or 0) + int(ids.size) - deferred
@@ -1251,6 +1254,8 @@ def revalidate_open(max_n: int = 6, only: list[str] | None = None, dry: bool = F
             gone = {x["id"] for x in row["dropped"] + row["replanned"]}
             k["reval_digest"] = dg; k["reval_at"] = _now()
             if gone:
+                k["unit_seq"] = max([int(k.get("unit_seq") or 0)] + [int(u["id"].rsplit("-sw", 1)[1])
+                                                                     for u in k.get("units") or [] if "-sw" in str(u.get("id"))])
                 k["units"] = [u for u in k.get("units") or [] if u.get("id") not in gone]
                 st["stats"]["obsolete"] = int(st["stats"].get("obsolete") or 0) + len(gone)
                 if not any(u.get("state") in ("pending", "dispatched") for u in k["units"]):
