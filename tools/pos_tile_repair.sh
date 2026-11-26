@@ -11,6 +11,7 @@ LOG=data/pos_tile_repair.log
 MAX_MB=${MAX_MB:-10000}; MB_H=${MB_H:-700}
 say() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
 say "start: terrain check, cap ${MAX_MB} MB at ${MB_H} MB/h"
+python3 ne_pos_fix.py --reset-keep-windows 2>/dev/null | cut -c1-300 >> "$LOG"   # tiles "kept" by sweep-unit apices: measure again
 python3 ne_pos_fix.py --verify-tiles --terrain --budget-mb-h "$MB_H" --max-mb "$MAX_MB" >> "$LOG" 2>&1 || say "verify-tiles rc=$?"
 say "ledger build"
 python3 qc_ledger.py --build --force >> "$LOG" 2>&1 || say "ledger rc=$?"

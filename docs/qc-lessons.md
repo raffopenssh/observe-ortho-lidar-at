@@ -150,6 +150,17 @@ the measured tiles in the same KGs are shifted.
 * **Calibration** (`--dtm-calibrate 160`, tiles the tree windows decided): 131 agree,
   27 unclear, 2 disagree (terrain `shift`, trees `zero` — both in products whose grid is
   known shifted/mixed). No moved tile was called kept.
+* **The 2 disagreements, resolved (rule 2, same day)** — neither was a terrain-rule error:
+  * 82114 tile 20: eclipsed by a twin tile of another block (owns 69 of 344 505 apices); the
+    tree window measured the twin's trees. Rule 2 (`dtm_cell_mask`, window field `r`) counts
+    only grid cells the tile **owns** among all parent tiles and that no other tile of the
+    same product covers → such a tile stays unmeasured (`no own cells`).
+  * 62202 tile 1: 436 of its 494 apices came from fresh sweep units (keep cells, true frame)
+    — the tree window said `zero` over a product tile that *is* shifted. Tree windows now
+    ignore keep-cell apices (`kf` on the window); `ne_pos_fix.py --reset-keep-windows`
+    sends tiles "kept" only by such a window (≥ 20 % keep apices, 33 tiles in 29 KGs) back
+    to unmeasured for the terrain pass. Serving is unchanged by the reset (kept = unmeasured
+    = not moved; keep cells never move).
 * **Repair** (`tools/pos_tile_repair.sh`, batch unit `pos-tile-repair`, log
   `data/pos_tile_repair.log`): terrain pass (10 GB cap, one-off), ledger rebuild, then
   `qc_generation.py --enroll-fault pos_shift --verdict moved` — every product holding a

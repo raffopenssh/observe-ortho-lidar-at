@@ -881,6 +881,57 @@ def _clean(w: dict) -> str | None:
     return None
 
 
+KEEP_SHARE = 0.2                # keep-cell apices in a pre-filter window above this share: verdict not trusted
+
+
+def _keep_share(w, x, y, h, kx, ky) -> float:
+    """Share of keep-cell apices (*kx*, *ky*) among all apices of window *w* (x / y / h = the others)."""
+    nk = int(((np.abs(kx - w['c'][0]) <= WINDOW_M / 2) & (np.abs(ky - w['c'][1]) <= WINDOW_M / 2)).sum())
+    n = int(((np.abs(x - w['c'][0]) <= WINDOW_M / 2) & (np.abs(y - w['c'][1]) <= WINDOW_M / 2) & (h >= 3.0)).sum())
+    return nk / max(nk + n, 1)
+
+
+def reset_keep_windows(dry: bool = False) -> dict:
+    """Partial KGs with keep cells: a tile flagged kept (0) only by tree windows measured before the
+    keep filter and holding >= KEEP_SHARE sweep-unit apices goes back to unmeasured (-1) — served the
+    same (not moved), decided again by the next ``--verify-tiles --terrain`` pass.  No BEV read."""
+    doc = json.loads(PATH.read_text()); keep = _load()['keep']; out = {}
+    for kg in sorted(keep):
+        v = (doc.get('kgs') or {}).get(kg) or {}
+        if v.get('verdict') != 'partial' or not v.get('tiles'):
+            continue
+        ws = v.get('windows') or []
+        if not any(w.get('src') is None and w.get('c') and not w.get('kf') for w in ws):
+            continue
+        a = _raw_apices(kg)
+        if a is None:
+            continue
+        x, y, h = a; ik = in_keep(keep[kg], x, y)
+        if not ik.any():
+            continue
+        kx, ky = x[ik], y[ik]; x, y, h = x[~ik], y[~ik], h[~ik]
+        bad = [i for i, w in enumerate(ws) if w.get('src') is None and w.get('c') and not w.get('kf')
+               and _keep_share(w, x, y, h, kx, ky) >= KEEP_SHARE]
+        if not bad:
+            continue
+        good = {w.get('t') for i, w in enumerate(ws) if i not in bad and (w.get('v') == 'zero' if w.get('src') else _clean(w) == 'zero')}
+        ts_ = sorted({ws[i].get('t') for i in bad if isinstance(ws[i].get('t'), int) and ws[i]['t'] < len(v['tiles'])
+                      and v['tiles'][ws[i]['t']][4] == 0 and ws[i]['t'] not in good})
+        out[kg] = ts_
+        if dry:
+            continue
+
+        def put(doc, kg=kg, bad=set(bad), ts_=ts_):
+            e = doc['kgs'][kg]
+            e['windows'] = [w for i, w in enumerate(e.get('windows') or []) if i not in bad]
+            for t in ts_:
+                e['tiles'][t][4] = -1
+            fl = [t[4] for t in e['tiles']]
+            e['tiles_n'] = [fl.count(1), fl.count(0), fl.count(-1)]
+        _update(put)
+    return {'kgs': len(out), 'tiles': sum(len(t) for t in out.values()), 'reset': out}
+
+
 def _tile_cells(x, y, h):
     """Candidate 250 m window cells of one tile's core apices, densest first."""
     for hmin in (8.0, 3.0):
@@ -904,6 +955,13 @@ def _tile_cells(x, y, h):
 DTM_FIT_M = 0.60                # median |stored - BEV| of the matching frame (flat 0.02-0.05, steep up to 0.5)
 DTM_RATIO = 4.0; DTM_OTHER_M = 0.15   # the other frame must be this much worse
 DTM_INSET = 5                   # cells off the tile envelope (feather blend ~4 cells)
+DTM_RULE = 2                    # window field `r`; windows of an older rule are measured again.
+# Rule 2 (2026-11-26, the two calibration disagreements of rule 1): a cell counts only where
+#   (a) the tile OWNS the position among all tiles of the parent (tile_owner) — the verdict moves
+#       exactly the apices owned, so a tile eclipsed by a twin of another block (82114 tile 20: 69 of
+#       344 505 apices) is not decided from ground whose trees belong to the twin, and
+#   (b) no other tile of the SAME product covers it (one cell margin) — there the product grid is
+#       the neighbour's data or a blend (62202 tile 1: both strips lay in the overlap with a moved tile).
 
 
 def kg_tile_codes(kg) -> list:
@@ -939,8 +997,22 @@ def dtm_fit(a, e0, es) -> dict:
     return {'v': v, 'n': int(k.sum()), 'src': 'dtm', 'med': [round(m0, 3), round(ms, 3)]}
 
 
-def dtm_tile_verdict(code, tile_doc, grids: dict | None = None) -> dict:
-    """One processing tile of one product against BEV DTM (see section comment)."""
+def dtm_cell_mask(g, r0, r1, c0, c1, T, t, same) -> np.ndarray:
+    """(r1-r0, c1-c0) bool: grid cells tile *t* owns among *T* and no other tile of *same* covers."""
+    C = 25.0
+    X, Y = np.meshgrid(g['x0'] + (np.arange(c0, c1) + 0.5) * C, g['y0'] - (np.arange(r0, r1) + 0.5) * C)
+    T = np.asarray(T, np.float64).reshape(-1, 4)
+    m = (tile_owner(T, X, Y) == t).reshape(X.shape)
+    for j in same:
+        if j != t:
+            e = T[j]
+            m &= ~((X >= e[0] - C) & (X <= e[2] + C) & (Y >= e[1] - C) & (Y <= e[3] + C))
+    return m
+
+
+def dtm_tile_verdict(code, tile_doc, grids: dict | None = None, T=None, t=None, same=None) -> dict:
+    """One processing tile of one product against BEV DTM (see section comment).  *T* / *t* / *same*:
+    all tile envelopes of the parent, this tile's row, rows of the same product (rule 2 cell mask)."""
     import austria_mask
     import grid25_patch as gp
     import grid25_sample as g25
@@ -964,6 +1036,10 @@ def dtm_tile_verdict(code, tile_doc, grids: dict | None = None) -> dict:
     a = g['elev']; C = gp.CELL
     ins = austria_mask.grid_mask(g['x0'], g['y0'], a.shape[0], a.shape[1], C, -C)
     ok = ins & np.isfinite(a) & (a != 0)
+    if T is not None and r1 > r0 and c1 > c0:
+        ok = ok.copy(); ok[r0:r1, c0:c1] &= dtm_cell_mask(g, r0, r1, c0, c1, T, t, same if same is not None else [t])
+        if int(ok[r0:r1, c0:c1].sum()) < 24:
+            return {'v': 'unclear', 'src': 'dtm', 'why': 'no own cells', 'r': DTM_RULE}
     # the rows with most relief decide best
     rel = [(float(np.nanstd(np.diff(np.where(ok[r, c0:c1], a[r, c0:c1], np.nan)))) if ok[r, c0:c1].sum() >= 12 else -1.0, r) for r in range(r0, r1)]
     picked = []
@@ -997,7 +1073,7 @@ def dtm_tile_verdict(code, tile_doc, grids: dict | None = None) -> dict:
     if not A:
         return {'v': 'unclear', 'src': 'dtm', 'why': 'no relief / no cells'}
     w = dtm_fit(np.concatenate(A), np.concatenate(E0), np.concatenate(ES))
-    w['code'] = code
+    w['code'] = code; w['r'] = DTM_RULE
     return w
 
 
@@ -1014,10 +1090,21 @@ def verify_tiles_kg(kg, prev: dict | None = None, tries: int = 2, read: bool = T
     if not len(T):
         return {'verdict': 'unclear', 'why': 'tile list unknown', 'windows': (prev or {}).get('windows') or [], 'ts': now, 'tv': TILE_RULE}
     x, y, h = a
+    # apices a fresh sweep unit supplied (keep cells) are in the true frame whatever the product's tile
+    # did — they must not vote on the tile (62202 tile 1: 436 of its 494 apices, tree window `zero`
+    # over a shifted product tile).  Windows measured before this filter (`kf` unset) are reused
+    # only when no keep apex lay inside.
+    kp = _load()['keep'].get(str(kg).zfill(5))
+    kx = ky = None
+    if kp:
+        ik = in_keep(kp, x, y)
+        if ik.any():
+            kx, ky = x[ik], y[ik]
+            x, y, h = x[~ik], y[~ik], h[~ik]
     own = tile_owner(T, x, y); core = _core(T, x, y) & (h >= 3.0)
     wins = []; tv = {}
     for w in (prev or {}).get('windows') or []:              # terrain verdicts are kept across passes
-        if w.get('src') == 'dtm' and isinstance(w.get('t'), int) and w['t'] < len(T):
+        if w.get('src') == 'dtm' and w.get('r') == DTM_RULE and isinstance(w.get('t'), int) and w['t'] < len(T):
             wins.append(w)
             if w.get('v') in ('shift', 'zero'):
                 tv.setdefault(w['t'], set()).add(w['v'])
@@ -1027,13 +1114,15 @@ def verify_tiles_kg(kg, prev: dict | None = None, tries: int = 2, read: bool = T
         v = _clean(w)
         if v is None or not w.get('c'):
             continue
+        if kx is not None and not w.get('kf') and _keep_share(w, x, y, h, kx, ky) >= KEEP_SHARE:
+            continue
         m = (np.abs(x - w['c'][0]) <= WINDOW_M / 2) & (np.abs(y - w['c'][1]) <= WINDOW_M / 2) & (h >= 3.0)
         if m.sum() < MIN_TREES:
             continue
         ts_, cn = np.unique(own[m & core], return_counts=True)
         if ts_.size and cn.max() >= 0.8 * m.sum() and ts_[int(np.argmax(cn))] >= 0:
             t = int(ts_[int(np.argmax(cn))])
-            wins.append(dict(w, t=t, reused=1))
+            wins.append(dict(w, t=t, reused=1, kf=1))
             tv.setdefault(t, set()).add(v)
     for t in range(len(T)):
         if t in tv or not read:
@@ -1051,7 +1140,7 @@ def verify_tiles_kg(kg, prev: dict | None = None, tries: int = 2, read: bool = T
                 continue
             done.append(c)
             w = window_verdict(x[k], y[k], h[k], (c[0] + 0.5) * WINDOW_M, (c[1] + 0.5) * WINDOW_M)
-            w['t'] = t
+            w['t'] = t; w['kf'] = 1
             wins.append(w)
             v = _clean(w)
             if v:
@@ -1094,9 +1183,9 @@ def verify_tiles_kg(kg, prev: dict | None = None, tries: int = 2, read: bool = T
             if any(w.get('src') == 'dtm' and w.get('t') == t for w in wins):
                 continue                    # measured by this rule already
             try:
-                w = dtm_tile_verdict(tc[t][0], tc[t][1], grids)
+                w = dtm_tile_verdict(tc[t][0], tc[t][1], grids, T, t, [j for j in range(len(T)) if tc[j][0] == tc[t][0]])
             except Exception as e:  # noqa: BLE001
-                w = {'v': 'unclear', 'src': 'dtm', 'err': repr(e)[:120]}
+                w = {'v': 'unclear', 'src': 'dtm', 'err': repr(e)[:120], 'r': DTM_RULE}
             w['t'] = t
             wins.append(w)
             if w['v'] in ('shift', 'zero'):
@@ -1424,6 +1513,8 @@ if __name__ == '__main__':
         print(json.dumps(verify_tiles(_arg('--budget-mb-h', 150.0, float), _arg('--max-kgs', None, int),
                                       _arg('--kgs', None, lambda s: s.split(',')), dry='--dry' in sys.argv,
                                       terrain='--terrain' in sys.argv, max_mb=_arg('--max-mb', None, float))))
+    elif '--reset-keep-windows' in sys.argv:
+        print(json.dumps(reset_keep_windows(dry='--dry' in sys.argv)))
     elif '--dtm-calibrate' in sys.argv:
         # the terrain rule on tiles the tree windows decided: agreement table, nothing stored
         import random
@@ -1436,7 +1527,7 @@ if __name__ == '__main__':
             tc = kg_tile_codes(k)
             if len(tc) != len(kgs[k]['tiles']):
                 continue
-            w = dtm_tile_verdict(tc[t][0], tc[t][1])
+            w = dtm_tile_verdict(tc[t][0], tc[t][1], None, kg_tiles(k), t, [j for j in range(len(tc)) if tc[j][0] == tc[t][0]])
             key = ('moved' if f else 'kept') + ' -> ' + w['v']
             tab[key] = tab.get(key, 0) + 1
             print(k, t, tc[t][0], key, w.get('med'), w.get('why', ''), flush=True)

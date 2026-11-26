@@ -384,7 +384,9 @@ def scan_lost_kg(kg: str, con=None) -> dict:
                         'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                         [(r['kg'], _i64(r['r10']), r['idx'], _i64(r['cell']), r['x'], r['y'], r['hq'], r['word'], r['reason'], r['okg'],
                           r['v0'], r['tw_d'], r['tw_dh'], r['tw_kg'], r['nb'], r['nbk']) for r in keep])
-        n = con.execute('UPDATE kgs SET ltoken=?, ldeps=?, lost=?, ldup=?, lqa=?, ok=NULL WHERE kg=? AND token IS NOT NULL',
+        # a good lost scan clears the error of a failed one (81123: stale row in the qc ledger)
+        n = con.execute("UPDATE kgs SET ltoken=?, ldeps=?, lost=?, ldup=?, lqa=?, ok=NULL, err=CASE WHEN err LIKE 'lost:%' THEN NULL ELSE err END "
+                        'WHERE kg=? AND token IS NOT NULL',
                         (tok, json.dumps(sorted(ev['deps'])), st['lost'], ndup, nqa, int(kg))).rowcount
         if not n:
             raise RuntimeError(f'{kg}: off-file part not scanned')
