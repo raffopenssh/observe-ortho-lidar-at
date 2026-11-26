@@ -896,7 +896,112 @@ def _tile_cells(x, y, h):
     return []
 
 
-def verify_tiles_kg(kg, prev: dict | None = None, tries: int = 2, read: bool = True) -> dict:
+# === SECTION: terrain measurement of tiles without a usable tree window ===
+# A tile's 25 m terrain grid (``grid25``, block mean of the same DTM read the apices came from)
+# carries the tile's frame as well: stored cell at X holds ground at X (true frame) or X + SHIFT.
+# Two 25 m strips of BEV DTM through the tile's interior, each read ONCE with a SHIFT margin,
+# give both hypotheses.  Needs relief: on flat ground both fit and the tile stays unmeasured.
+DTM_FIT_M = 0.60                # median |stored - BEV| of the matching frame (flat 0.02-0.05, steep up to 0.5)
+DTM_RATIO = 4.0; DTM_OTHER_M = 0.15   # the other frame must be this much worse
+DTM_INSET = 5                   # cells off the tile envelope (feather blend ~4 cells)
+
+
+def kg_tile_codes(kg) -> list:
+    """Parallel to :func:`kg_tiles`: (product code, tile document) of every row."""
+    import kg_splitter
+    import kg_v2_store as kvs
+    kg = str(kg).zfill(5)
+    out = []
+    for code in [kg] + sorted(c for c in kvs.codes_for_parent(kg) if c != kg):
+        if kg_splitter.is_sweep_code(code):
+            continue
+        try:
+            d = kvs.get(code) or {}
+        except Exception:  # noqa: BLE001
+            d = {}
+        out += [(code, t) for t in (d.get('data_quality') or {}).get('tiles') or [] if t.get('bbox_wgs')]
+    return out
+
+
+def dtm_fit(a, e0, es) -> dict:
+    """Verdict from stored cells *a* and the BEV block means in both frames (1-d, same cells)."""
+    k = np.isfinite(a) & np.isfinite(e0) & np.isfinite(es) & (a != 0)
+    if int(k.sum()) < 12:
+        return {'v': 'unclear', 'n': int(k.sum()), 'src': 'dtm'}
+    m0 = float(np.median(np.abs(a[k] - e0[k]))); ms = float(np.median(np.abs(a[k] - es[k])))
+    v = 'unclear'
+    if ms <= DTM_FIT_M and m0 >= max(DTM_OTHER_M, DTM_RATIO * ms):
+        v = 'shift'
+    elif m0 <= DTM_FIT_M and ms >= max(DTM_OTHER_M, DTM_RATIO * m0):
+        v = 'zero'
+    elif min(m0, ms) > DTM_FIT_M:
+        v = 'unclear'               # neither frame fits (stale terrain, steep rock): a ratio alone decides nothing here
+    return {'v': v, 'n': int(k.sum()), 'src': 'dtm', 'med': [round(m0, 3), round(ms, 3)]}
+
+
+def dtm_tile_verdict(code, tile_doc, grids: dict | None = None) -> dict:
+    """One processing tile of one product against BEV DTM (see section comment)."""
+    import austria_mask
+    import grid25_patch as gp
+    import grid25_sample as g25
+    import raster_io
+    grids = grids if grids is not None else {}
+    if code not in grids:
+        g = gp._raw_grid(code)
+        if g is not None:
+            g25._drop_zero_fill(g)
+        grids[code] = g
+    g = grids[code]
+    if g is None:
+        return {'v': 'unclear', 'src': 'dtm', 'why': 'no grid25'}
+    tl = gp.tiles_of_doc({'data_quality': {'tiles': [tile_doc]}}, g)
+    if not tl:
+        return {'v': 'unclear', 'src': 'dtm', 'why': 'tile outside grid'}
+    _, r0, c0, r1, c1 = tl[0]
+    r0 += DTM_INSET; c0 += DTM_INSET; r1 -= DTM_INSET; c1 -= DTM_INSET
+    if r1 - r0 < 4 or c1 - c0 < 12:
+        return {'v': 'unclear', 'src': 'dtm', 'why': 'tile too small'}
+    a = g['elev']; C = gp.CELL
+    ins = austria_mask.grid_mask(g['x0'], g['y0'], a.shape[0], a.shape[1], C, -C)
+    ok = ins & np.isfinite(a) & (a != 0)
+    # the rows with most relief decide best
+    rel = [(float(np.nanstd(np.diff(np.where(ok[r, c0:c1], a[r, c0:c1], np.nan)))) if ok[r, c0:c1].sum() >= 12 else -1.0, r) for r in range(r0, r1)]
+    picked = []
+    for s_, r in sorted(rel, reverse=True):
+        if s_ <= 0:
+            break
+        if all(abs(r - p) >= max(4, (r1 - r0) // 4) for p in picked):
+            picked.append(r)
+        if len(picked) == 2:
+            break
+    A = []; E0 = []; ES = []
+    m = int(max(abs(SHIFT[0]), abs(SHIFT[1])))
+    for r in picked:
+        x0 = g['x0'] + c0 * C; y0 = g['y0'] - r * C; n = c1 - c0
+        dtm, tf, _ = raster_io.read_window_bbox('DTM', x0 - m, y0 - C - m, x0 + n * C + m, y0 + m, pad=0.0)
+        full = np.full((int(C) + 2 * m, int(n * C) + 2 * m), np.nan, np.float32)
+        co = int(round(tf.c - (x0 - m))); ro = int(round((y0 + m) - tf.f))
+        hh = min(dtm.shape[0], full.shape[0] - ro); ww = min(dtm.shape[1], full.shape[1] - co)
+        if hh > 0 and ww > 0 and ro >= 0 and co >= 0:
+            full[ro:ro + hh, co:co + ww] = dtm[:hh, :ww]
+
+        def blk(dx, dy):
+            w = full[m - int(dy):m - int(dy) + int(C), m + int(dx):m + int(dx) + int(n * C)].reshape(int(C), n, int(C))
+            with np.errstate(all='ignore'):
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore')
+                    return np.where(np.isfinite(w).mean(axis=(0, 2)) >= 0.2, np.nanmean(w, axis=(0, 2)), np.nan)
+        k = ok[r, c0:c1]
+        A.append(np.where(k, a[r, c0:c1], np.nan)); E0.append(blk(0, 0)); ES.append(blk(*SHIFT))
+    if not A:
+        return {'v': 'unclear', 'src': 'dtm', 'why': 'no relief / no cells'}
+    w = dtm_fit(np.concatenate(A), np.concatenate(E0), np.concatenate(ES))
+    w['code'] = code
+    return w
+
+
+def verify_tiles_kg(kg, prev: dict | None = None, tries: int = 2, read: bool = True, terrain: bool = False, skip_tiles=None) -> dict:
     """One verdict per processing tile → ``shift`` (every measured tile shifted), ``zero``,
     ``partial`` (both kinds: ``tiles`` rows [x0, y0, x1, y1, 1 moved | 0 kept | -1 unmeasured]) or
     ``unclear``.  Windows of an earlier run that lie in one tile's core are reused (no BEV read);
@@ -911,7 +1016,14 @@ def verify_tiles_kg(kg, prev: dict | None = None, tries: int = 2, read: bool = T
     x, y, h = a
     own = tile_owner(T, x, y); core = _core(T, x, y) & (h >= 3.0)
     wins = []; tv = {}
+    for w in (prev or {}).get('windows') or []:              # terrain verdicts are kept across passes
+        if w.get('src') == 'dtm' and isinstance(w.get('t'), int) and w['t'] < len(T):
+            wins.append(w)
+            if w.get('v') in ('shift', 'zero'):
+                tv.setdefault(w['t'], set()).add(w['v'])
     for w in (prev or {}).get('windows') or []:              # free evidence first
+        if w.get('src') == 'dtm':
+            continue
         v = _clean(w)
         if v is None or not w.get('c'):
             continue
@@ -972,6 +1084,23 @@ def verify_tiles_kg(kg, prev: dict | None = None, tries: int = 2, read: bool = T
                 wins.append({'t': t, 'v': v or 'unclear', 'src': 'pair', 'other': ok, 'n': ns_ + nz_, 'pair': [ns_, nz_]})
             if v:
                 tv.setdefault(t, set()).add(v)
+    if terrain:
+        # still undecided (no trees / unclear windows): the tile's own terrain grid against BEV DTM
+        tc = kg_tile_codes(kg); grids = {}
+        skip = set(skip_tiles or ())
+        for t in range(len(T)):
+            if t in tv or t in skip or len(tc) != len(T):
+                continue
+            if any(w.get('src') == 'dtm' and w.get('t') == t for w in wins):
+                continue                    # measured by this rule already
+            try:
+                w = dtm_tile_verdict(tc[t][0], tc[t][1], grids)
+            except Exception as e:  # noqa: BLE001
+                w = {'v': 'unclear', 'src': 'dtm', 'err': repr(e)[:120]}
+            w['t'] = t
+            wins.append(w)
+            if w['v'] in ('shift', 'zero'):
+                tv.setdefault(t, set()).add(w['v'])
     flag = [(1 if tv[t] == {'shift'} else 0 if tv[t] == {'zero'} else -1) if t in tv else -1 for t in range(len(T))]
     ns = flag.count(1); nz = flag.count(0)
     if ns and nz:
@@ -1033,7 +1162,8 @@ def tile_candidates(doc: dict | None = None) -> dict:
     return {'todo': list(dict.fromkeys(todo)), 'review': sorted(set(review)), 'pairs': len(pairs)}
 
 
-def verify_tiles(budget_mb_h: float = 150.0, max_kgs: int | None = None, only=None, quiet=False, dry=False) -> dict:
+def verify_tiles(budget_mb_h: float = 150.0, max_kgs: int | None = None, only=None, quiet=False, dry=False,
+                 terrain: bool = False, max_mb: float | None = None) -> dict:
     """The per-tile pass over :func:`tile_candidates` — throttled on host RX like :func:`verify`,
     resumable (a measured KG carries ``tv``).  A KG that becomes ``shift`` / ``partial`` is served
     moved from the next read on; its user reports follow in the same step."""
@@ -1044,6 +1174,10 @@ def verify_tiles(budget_mb_h: float = 150.0, max_kgs: int | None = None, only=No
         doc = {}
     kgs = doc.get('kgs') or {}
     todo = [str(k).zfill(5) for k in only] if only else tile_candidates(doc)['todo']
+    if terrain and not only:
+        # every KG with tiles no tree window could decide (partial: fill only; unclear: full pass)
+        todo = list(dict.fromkeys(todo + [k for k, v in sorted(kgs.items())
+                                          if v.get('verdict') in ('partial', 'unclear') and (v.get('tiles_n') or [0, 0, 1])[2] > 0]))
     if max_kgs:
         todo = todo[:max_kgs]
     t0 = time.time(); done = 0; own = 0.0
@@ -1056,7 +1190,11 @@ def verify_tiles(budget_mb_h: float = 150.0, max_kgs: int | None = None, only=No
             continue
         b0 = psutil.net_io_counters().bytes_recv; new = None
         try:
-            r = verify_tiles_kg(kg, prev, read=not dry and not fill)
+            if max_mb is not None and own >= max_mb:
+                if not quiet:
+                    print(f'stopped: {own:.0f} MB read, cap {max_mb:.0f} MB', flush=True)
+                break
+            r = verify_tiles_kg(kg, prev, read=not dry and not fill, terrain=terrain and not dry)
             if fill:
                 # a partial KG is served moved already: decided tiles are final, only unmeasured ones
                 # may still become moved (their reports follow now — same frame token, new tile digest)
@@ -1284,7 +1422,25 @@ if __name__ == '__main__':
         def _arg(n, d, t):
             return t(sys.argv[sys.argv.index(n) + 1]) if n in sys.argv else d
         print(json.dumps(verify_tiles(_arg('--budget-mb-h', 150.0, float), _arg('--max-kgs', None, int),
-                                      _arg('--kgs', None, lambda s: s.split(',')), dry='--dry' in sys.argv)))
+                                      _arg('--kgs', None, lambda s: s.split(',')), dry='--dry' in sys.argv,
+                                      terrain='--terrain' in sys.argv, max_mb=_arg('--max-mb', None, float))))
+    elif '--dtm-calibrate' in sys.argv:
+        # the terrain rule on tiles the tree windows decided: agreement table, nothing stored
+        import random
+        n = int(sys.argv[sys.argv.index('--dtm-calibrate') + 1])
+        kgs = json.loads(PATH.read_text())['kgs']
+        pool = [(k, t, r[4]) for k, v in sorted(kgs.items()) if v.get('verdict') == 'partial' for t, r in enumerate(v['tiles']) if r[4] >= 0]
+        random.Random(7).shuffle(pool)
+        tab = {}
+        for k, t, f in pool[:n]:
+            tc = kg_tile_codes(k)
+            if len(tc) != len(kgs[k]['tiles']):
+                continue
+            w = dtm_tile_verdict(tc[t][0], tc[t][1])
+            key = ('moved' if f else 'kept') + ' -> ' + w['v']
+            tab[key] = tab.get(key, 0) + 1
+            print(k, t, tc[t][0], key, w.get('med'), w.get('why', ''), flush=True)
+        print(json.dumps(tab, sort_keys=True))
     elif '--verify' in sys.argv:
         def _arg(n, d, t):
             return t(sys.argv[sys.argv.index(n) + 1]) if n in sys.argv else d

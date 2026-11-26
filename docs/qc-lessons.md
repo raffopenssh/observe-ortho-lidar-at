@@ -137,6 +137,26 @@ from BEV with no restored tile — the same edges the old generation had.
   - `gpkg_streamed` had its own `_read_dtm_for_tile` with the old `pad=5`
     (the > 100 Mpx path) — now the shared reader.
 
+#### Terrain rule + auto repair (2026-11-26)
+
+1245 tiles of 118 partly shifted KGs stayed `unmeasured`: no 250 m window with 40 trees
+(940), or windows without a clear verdict. They hold 2.4 M served apices, and about 39 % of
+the measured tiles in the same KGs are shifted.
+
+* **Terrain rule** (`ne_pos_fix.dtm_tile_verdict`, `--verify-tiles --terrain [--max-mb N]`):
+  the tile's own `grid25` cells against two 25 m strips of BEV DTM, read once, compared in
+  both frames (`dtm_fit`: matching frame median ≤ 0.6 m, the other ≥ 4× worse). Flat tiles
+  stay unmeasured. Windows carry `src: "dtm"` and are kept across passes.
+* **Calibration** (`--dtm-calibrate 160`, tiles the tree windows decided): 131 agree,
+  27 unclear, 2 disagree (terrain `shift`, trees `zero` — both in products whose grid is
+  known shifted/mixed). No moved tile was called kept.
+* **Repair** (`tools/pos_tile_repair.sh`, batch unit `pos-tile-repair`, log
+  `data/pos_tile_repair.log`): terrain pass (10 GB cap, one-off), ledger rebuild, then
+  `qc_generation.py --enroll-fault pos_shift --verdict moved` — every product holding a
+  moved tile of a partial KG goes on the reprocess list. `keep_products`: the old product
+  and its read-time move are served until the fresh one is ingested, then
+  `ne_pos_fix.regenerated` retires the move for that block.
+
 ### 2. `pos_sweep_unit` — fresh strip inside a moved KG (found by the ledger)
 
 * **Symptom (suspected)**: cells of a sweep unit 5 m off the *other* way.

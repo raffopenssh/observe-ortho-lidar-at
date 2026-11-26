@@ -37,7 +37,7 @@ this one regenerates a product *of the same version* in place.
 
     python3 qc_generation.py --status
     python3 qc_generation.py --edges              # fill missing edge counts of fresh generations (local)
-    python3 qc_generation.py --enroll-fault grid25_stale [--dry]
+    python3 qc_generation.py --enroll-fault grid25_stale [--verdict V] [--dry]
     python3 qc_generation.py --enroll 92116 84114 --why 'operator'
     python3 qc_generation.py --cancel 92116
     python3 qc_generation.py --bootstrap          # once: one row per stored product, no actions
@@ -327,13 +327,16 @@ def _save(d: dict) -> None:
     os.replace(tmp, STATE)
 
 
-def ledger_codes(fault: str) -> list:
+def ledger_codes(fault: str, verdict: str | None = None) -> list:
     """Product codes with a not-ok row of *fault* in the QC ledger (sweep units excluded: they are
     not queueable products — the sliver sweep owns them)."""
     import kg_splitter
     c = sqlite3.connect(f'file:{LEDGER}?mode=ro', uri=True, timeout=5)
     try:
-        rows = c.execute("SELECT DISTINCT code FROM row WHERE fault=? AND verdict NOT IN ('ok','zero','regenerated') ORDER BY 1", (fault,)).fetchall()
+        if verdict:     # one verdict only, e.g. pos_shift/moved = products holding a 5 m-shifted tile of a partly shifted KG
+            rows = c.execute("SELECT DISTINCT code FROM row WHERE fault=? AND verdict=? AND tile>=0 ORDER BY 1", (fault, verdict)).fetchall()
+        else:
+            rows = c.execute("SELECT DISTINCT code FROM row WHERE fault=? AND verdict NOT IN ('ok','zero','regenerated') ORDER BY 1", (fault,)).fetchall()
     finally:
         c.close()
     return [r[0] for r in rows if not kg_splitter.is_sweep_code(r[0])]
@@ -574,7 +577,8 @@ if __name__ == '__main__':
         print(json.dumps(bootstrap()))
     elif '--enroll-fault' in a:
         f = a[a.index('--enroll-fault') + 1]
-        print(json.dumps(enroll(ledger_codes(f), why or f'qc ledger: {f}', dry=dry), indent=1))
+        vd = a[a.index('--verdict') + 1] if '--verdict' in a else None
+        print(json.dumps(enroll(ledger_codes(f, vd), why or f'qc ledger: {f}' + (f'/{vd}' if vd else ''), dry=dry), indent=1))
     elif '--enroll' in a:
         cs = [x for x in a[a.index('--enroll') + 1:] if not x.startswith('--') and x != why]
         print(json.dumps(enroll(cs, why or 'operator', dry=dry), indent=1))
