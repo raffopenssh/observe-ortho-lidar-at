@@ -157,6 +157,41 @@ the sweep side:
   (`docs/product-repair.md → Repair probe`) — one idle peer every 6 h —
   since no frontier exists any more to piggyback on.
 
+## Obsolete and oversize units (2026-11-26)
+
+*What happened.* The QC reprocess list (`docs/qc-lessons.md → Generations`)
+regenerated blocks of 40 border parents on 2026-11-23/24. Each fresh block
+made its parent `dirty`; the parent's other blocks had been evicted, and
+`ne_ingest.merge_dirty_parents` un-evicted them but merged the subset on
+disk one tick later (the restore was still in the inbound-budget queue) —
+84005: 2 of 4 blocks, 00:06 → 01:58 UTC. The view-fill walk in between saw
+the missing blocks as unobserved view cells and planned them as **one**
+sweep unit per parent: 17 parents, 35 k – 888 k cells. Twelve units
+(40–170 tiles) ran and uploaded 10 GB of add-on products that re-observe
+cells the blocks already hold (84005-sw7: 10 of 148 602 cells are its
+own); five (130–361 tiles: 80110-sw13, 84006-sw3, 84110-sw11, 85106-sw9,
+plus the 1-cell 84005-sw8) never finished — worker OOM near tile 105,
+raster sidecars > the 24 GB disk, > `DISPATCH_STALE_S` of work — and
+ended as `failed: no result within 8 h`.
+
+*Guards.*
+
+* `ne_ingest.merge_dirty_parents` waits for every live block that has an
+  ingest row and a committed `_ne_h3b` but no file (`restore_wait`, bounded
+  by `RESTORE_WAIT_MAX_S` = 24 h) — a subset is never merged over the union.
+* `ne_viewfill.process` skips a split parent whose union is not settled
+  (`dirty` / `restore_wait` / not `complete`) with `skip: merge pending`.
+* `sliver_sweep.revalidate_open` (every tick, once per parent file digest):
+  open view-fill units are checked against the parent file as it is now —
+  no unobserved view cell left in the unit bbox → the unit is **dropped**
+  (`stats.obsolete`; a late peer result is answered `stale`); fewer than
+  half left → re-planned over the remainder.
+* `plan_cells` cuts a cluster larger than `MAX_UNIT_M` (6 km) on a grid —
+  ≈ 25 tiles per unit, up to `MAX_UNITS_SPLIT` (24) units per pass.
+
+`python3 -c 'import sliver_sweep as s; print(s.revalidate_open(dry=True))'`
+shows what the next tick would drop. Test: `python3 tests/test_sweep_revalidate.py`.
+
 ## Invariants
 
 * Sweep units never touch the retry queue, strikes, completed sets or
