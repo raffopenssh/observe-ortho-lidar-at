@@ -1373,6 +1373,7 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
             log.warning('cells_bins: sweep_keep %s', {k: v for k, v in sk.items()})
             import rebin_added
             rebin_added.scan(120, sk.get('kg_list'))
+            rebin_added.resolve(); rebin_added.sync()      # a scan alone leaves RESOLVE PENDING
     except Exception as e:  # noqa: BLE001
         log.warning('cells_bins: sweep_keep: %s', e)
     m = manifest(); b = m['bins']
