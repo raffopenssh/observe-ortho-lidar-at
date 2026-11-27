@@ -20573,6 +20573,12 @@ def process_txt():
                 out.append(_line)
         except Exception as _e:
             out.append(f'v2_regen: unavailable ({_e})')
+        # tree_mod: contributors of the public tree reports (counts only; handles stay on the CLI)
+        try:
+            import tree_mod as _tm
+            out.append(_tm.text_line())
+        except Exception as _e:
+            out.append(f'tree_mod: unavailable ({_e})')
         # tree_qa: apices hidden from the cell products (= /trees/bbox default set)
         try:
             import tree_qa as _tq

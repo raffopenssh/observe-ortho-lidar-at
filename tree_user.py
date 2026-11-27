@@ -242,8 +242,15 @@ def system_reporter(source: str) -> bytes:
     return _sys_rep[k]
 
 
-def _derive(rows) -> dict:
-    """rows of ONE tree in rev order → its current answer."""
+MASK_SPECIES, MASK_ALL = 1, 2        # tree_mod.py (rmod.mask): species votes ignored / every statement ignored
+_SYS_NOTE = re.compile(r'(h_m|crown_m2|class|vitality|ndsm_only)=(\S+)')
+
+
+def _derive(rows, machine=frozenset(), masks=None) -> dict:
+    """rows of ONE tree in rev order → its current answer.  ``machine`` = reporter hashes of the
+    system writers (their add is a measured apex, ``sys``, never a person's ``added``); ``masks`` =
+    {reporter: bits} of moderated contributors (tree_mod.py) — their rows stay stored and in the
+    history, they just do not vote."""
     hidden = {r['ref'] for r in rows if r['op'] == OP_MODERATE}
     votes: dict = {}         # reporter -> (rev, sp)
     adds: set = set()        # reporters who added the tree
@@ -264,6 +271,9 @@ def _derive(rows) -> dict:
         if r['op'] == OP_MODERATE or r['rev'] in hidden:
             continue
         rep = bytes(r['reporter'])
+        mk = masks.get(rep, 0) if masks else 0
+        if mk & MASK_ALL:
+            continue
         if r['op'] == OP_RETRACT:
             votes.pop(rep, None); adds.discard(rep); uh.pop(rep, None); dbh.pop(rep, None); stv.pop(rep, None); nt.pop(rep, None)
             continue
@@ -286,8 +296,16 @@ def _derive(rows) -> dict:
             uh[rep] = r['uh_dm']
         if r['dbh_mm'] is not None:
             dbh[rep] = r['dbh_mm']
-        if r['sp'] is not None:
+        if r['sp'] is not None and not mk & MASK_SPECIES:
             votes[rep] = (r['rev'], r['sp'])
+    # a system writer's add is a measured apex: its height / note are the apex record, not a person's statement
+    sysm = adds & machine
+    sys_h = sys_note = None
+    for rep in machine:
+        if rep in sysm:
+            sys_h = uh.get(rep); sys_note = (nt.get(rep) or (0, None))[1]
+        uh.pop(rep, None); nt.pop(rep, None)
+    adds -= machine
     sp = None; n = 0
     if votes:
         cnt: dict = {}
@@ -306,9 +324,26 @@ def _derive(rows) -> dict:
             sk = 0
         else:
             sdate = next((v[2] for v in sorted(stv.values(), reverse=True) if v[1] == sk and v[2]), 0)
-    return {'note': max(nt.values())[1] if nt else None, 'state': sk, 'sdate': sdate, 'sp': sp, 'n': n, 'added': bool(adds), 'h_dm': hs[len(hs) // 2] if hs else None,
+    return {'note': max(nt.values())[1] if nt else None, 'state': sk, 'sdate': sdate, 'sp': sp, 'n': n, 'added': bool(adds) and not sysm, 'sys': bool(sysm), 'sys_h': sys_h, 'sys_note': sys_note, 'h_dm': hs[len(hs) // 2] if hs else None,
             'dbh_mm': ds[len(ds) // 2] if ds else None, 'apex_h': apex_h, 'tid': tid, 'pos': pos, 'cid': cid,
             'v': len(rows), 'rev': rows[-1]['rev'], 'reporters': len(set(votes) | adds | set(uh) | set(dbh) | set(stv) | set(nt))}
+
+
+def _code(names, v) -> int:
+    try:
+        return list(names).index(v) if v else list(names).index('unknown')
+    except ValueError:
+        return 0
+
+
+def _masks(c) -> dict:
+    """{reporter hash: mask bits} of moderated contributors (table ``rmod``, written by tree_mod.py).
+    Every mask change appends a touch row per affected tree, so the per-KG state (validated on
+    MAX(rev)) reloads in every worker."""
+    try:
+        return {bytes(r[0]): int(r[1]) for r in c.execute('SELECT reporter, mask FROM rmod WHERE mask != 0')}
+    except Exception:  # noqa: BLE001  (no rmod table yet)
+        return {}
 
 
 def _load(c, kg: int) -> dict:
@@ -320,11 +355,13 @@ def _load(c, kg: int) -> dict:
     for r in rows:
         by.setdefault((r['x'], r['y']), []).append(r)
     xy = np.array(list(by), dtype=np.int64).reshape(-1, 2)
-    cur = [_derive(v) for v in by.values()]
-    machine = {system_reporter(s) for s in SYSTEM_SOURCES}
+    machine = frozenset(system_reporter(s) for s in SYSTEM_SOURCES)
+    masks = _masks(c)
+    cur = [_derive(v, machine, masks) for v in by.values()]
+    hum = np.array([any(bytes(r['reporter']) not in machine for r in v) for v in by.values()], bool)
     hrev = max((r['rev'] for r in rows if bytes(r['reporter']) not in machine), default=0)
     # exact position where we know it: the inventory id of an apex, the reporter's point of an added tree
-    ex = [(d['tid'] if not d['added'] else None) or d['pos'] or d['tid'] for d in cur]
+    ex = [(d['tid'] if not (d['added'] or d['sys']) else None) or d['pos'] or d['tid'] for d in cur]
     e = np.array([p[0] / 10.0 if p else float(k[0]) for p, k in zip(ex, by)], np.float64)
     n = np.array([p[1] / 10.0 if p else float(k[1]) for p, k in zip(ex, by)], np.float64)
     lon, lat = _tf('EPSG:3035', 'EPSG:4326').transform(e, n)
@@ -340,11 +377,33 @@ def _load(c, kg: int) -> dict:
     st['state'] = np.array([d['state'] for d in cur], np.int8)
     st['sdate'] = [d['sdate'] for d in cur]
     st['note'] = [d['note'] for d in cur]
-    st['live'] = (st['sp'] > 0) | st['added'] | np.isfinite(st['h']) | np.isfinite(st['dbh']) | (st['state'] > 0) \
+    # machine-added trees (rebin_added.py) = measured apices: ordinary rows of /trees/bbox (system_rows), never
+    # in the `added` block; `hlive` = a person said something about the tree, `hum` = a person ever wrote on it
+    st['sys'] = np.array([d['sys'] for d in cur], bool)
+    st['hum'] = hum
+    if st['sys'].any():
+        import cells_api as ca
+        k = len(cur)
+        st['sys_h'] = np.full(k, np.nan, np.float32); st['sys_crown'] = np.zeros(k, np.float32)
+        st['sys_sp'] = np.zeros(k, np.uint8); st['sys_vit'] = np.zeros(k, np.uint8); st['sys_nd'] = np.zeros(k, bool)
+        for i, d in enumerate(cur):
+            if not d['sys']:
+                continue
+            a = dict(_SYS_NOTE.findall(d['sys_note'] or ''))
+            try:
+                st['sys_h'][i] = float(a['h_m']) if 'h_m' in a else (d['sys_h'] or 0) / 10.0
+                st['sys_crown'][i] = float(a.get('crown_m2') or 0)
+            except ValueError:
+                st['sys_h'][i] = (d['sys_h'] or 0) / 10.0
+            st['sys_sp'][i] = _code(ca.SPECIES, a.get('class')); st['sys_vit'][i] = _code(ca.VITALITY, a.get('vitality'))
+            st['sys_nd'][i] = a.get('ndsm_only') == '1'
+    st['hlive'] = (st['sp'] > 0) | st['added'] | np.isfinite(st['h']) | np.isfinite(st['dbh']) | (st['state'] > 0) \
+        | np.array([t is not None for t in st['note']], bool)
+    st['live'] = st['sys'] | (st['sp'] > 0) | st['added'] | np.isfinite(st['h']) | np.isfinite(st['dbh']) | (st['state'] > 0) \
         | np.array([t is not None for t in st['note']], bool)
     st['has_id'] = np.array([t is not None for t in st['tid']], bool)
     # inventory trees reported by id that the corpus had no apex for (apex-bound versions store the apex height)
-    st['idonly'] = st['has_id'] & ~st['added'] & ~np.isfinite(st['apex_h'])
+    st['idonly'] = st['has_id'] & ~st['added'] & ~st['sys'] & ~np.isfinite(st['apex_h'])
     return st
 
 
@@ -483,10 +542,13 @@ def annotate(x: np.ndarray, y: np.ndarray, h: np.ndarray, kgs) -> dict | None:
         out_h.append(_num(suh[j])); out_d.append(_num(sdb[j])); out_t.append(stid[j]); out_nt.append(snt[j])
 
     for s in sts:
-        m = s['live'] & ~s['added']
+        m = s['hlive'] & ~s['added']
         if not m.any():
             continue
-        sk = s['key'][m]; ssp = s['sp'][m]; scn = s['cnt'][m]; sv = s['v'][m]; suh = s['h'][m]; sdb = s['dbh'][m]
+        sk = s['key'][m]
+        if s['sys'].any():          # the row of a machine-added tree carries its measured position, not the store key
+            sk = np.where(s['sys'][m], (np.rint(s['e'][m]).astype(np.int64) << 32) | np.rint(s['n_'][m]).astype(np.int64), sk)
+        ssp = s['sp'][m]; scn = s['cnt'][m]; sv = s['v'][m]; suh = s['h'][m]; sdb = s['dbh'][m]
         stid = [t for t, k_ in zip(s['tid'], m.tolist()) if k_]
         slg = s['state'][m]; sld = [t for t, k_ in zip(s['sdate'], m.tolist()) if k_]
         snt = [t for t, k_ in zip(s['note'], m.tolist()) if k_]
@@ -532,6 +594,45 @@ def reported(w, s, e, n, kgs, min_h: float = 0.0, max_h: float | None = None) ->
     ``{tree_id, lon, lat, h_m, taxon, n, v[, dbh_cm]}``, same height window rule
     as :func:`added`."""
     return added(w, s, e, n, kgs, min_h, max_h, which='idonly')
+
+
+def system_rows(w, s, e, n, kgs, min_h: float = 0.0, max_h: float | None = None) -> dict | None:
+    """Machine-added trees of a bbox (rebin_added.py: measured apices of a KG file that fall outside
+    its cell set and are no twin of a served tree) as the columns of a decoded chunk — ne_trees.collect
+    serves them as ordinary rows.  ``kg`` = the KG file that measured the apex."""
+    g = global_rev()
+    if not g:
+        return None
+    parts = []; seen = set()
+    for k in kgs:
+        st = state(k, g)
+        if not st['n'] or not st['sys'].any():
+            continue
+        h = st['sys_h']
+        m = st['sys'] & (st['lon'] >= w) & (st['lon'] <= e) & (st['lat'] >= s) & (st['lat'] <= n) & (h >= min_h)
+        if max_h is not None:
+            m &= h < max_h
+        j = [i for i in np.nonzero(m)[0].tolist() if not (int(st['key'][i]) in seen or seen.add(int(st['key'][i])))]
+        if j:
+            parts.append((st, np.array(j), int(k)))
+    if not parts:
+        return None
+    cat = lambda f, dt: np.concatenate([f(st, j) for st, j, _ in parts]).astype(dt)   # noqa: E731
+    lon = cat(lambda st, j: st['lon'][j], np.float64); lat = cat(lambda st, j: st['lat'][j], np.float64)
+    import h3
+    kg = np.concatenate([np.array([_src_kg(st['cid'][i], k) for i in j.tolist()], dtype=object) for st, j, k in parts])
+    return {'n': int(lon.size), 'lon': lon, 'lat': lat,
+            'x': cat(lambda st, j: np.rint(st['e'][j]), np.int32), 'y': cat(lambda st, j: np.rint(st['n_'][j]), np.int32),
+            'h': cat(lambda st, j: st['sys_h'][j], np.float32),
+            'cell': np.array([h3.str_to_int(h3.latlng_to_cell(float(b), float(a), 12)) for a, b in zip(lon, lat)], np.uint64),
+            'crown_m2': cat(lambda st, j: st['sys_crown'][j], np.float32), 'species': cat(lambda st, j: st['sys_sp'][j], np.uint8),
+            'vitality': cat(lambda st, j: st['sys_vit'][j], np.uint8), 'ndsm_only': cat(lambda st, j: st['sys_nd'][j], bool),
+            'kg': kg}
+
+
+def _src_kg(cid, k) -> str:
+    p = (cid or '').split(':')
+    return p[1] if len(p) > 1 and p[1].isdigit() else f'{int(k):05d}'
 
 
 def added(w, s, e, n, kgs, min_h: float = 0.0, max_h: float | None = None, which: str = 'added') -> dict | None:
@@ -586,7 +687,8 @@ def _apices_near(lon, lat, r_m=SEARCH_M) -> dict | None:
     dlat = r_m / 110_540.0; dlon = r_m / (111_320.0 * math.cos(math.radians(lat)))
     try:
         import ne_trees
-        r = ne_trees.collect(lon - dlon, lat - dlat, lon + dlon, lat + dlat, 'trees', realistic=False, limit=2000)
+        r = ne_trees.collect(lon - dlon, lat - dlat, lon + dlon, lat + dlat, 'trees', realistic=False, limit=2000,
+                              off_file=False)       # machine-added trees come from the state (_candidates)
         return r['cols'] if r['n'] else None
     except Exception as e:  # noqa: BLE001
         log.debug('tree_user apices near %.5f,%.5f: %s', lon, lat, e)
@@ -630,6 +732,13 @@ def _candidates(lon, lat, px, py) -> list:
         d = np.hypot(st['e'] - px, st['n_'] - py)
         for i in np.nonzero(d <= SEARCH_M)[0].tolist():
             x, y = int(st['x'][i]), int(st['y'][i])
+            if st['sys'][i]:
+                if (x, y) in seen:
+                    continue
+                out.append({'kind': 'apex', 'x': x, 'y': y, 'kg': kg, 'd': float(d[i]), 'h': float(st['sys_h'][i]),
+                            'reach': float(_reach(st['sys_crown'][i])), 'tid': None, 'live': bool(st['hlive'][i]),
+                            'lon': float(st['lon'][i]), 'lat': float(st['lat'][i])})
+                continue
             if st['added'][i]:
                 kind, reach = 'added', ADDED_NAME_M
             elif st['idonly'][i] and (x, y) not in seen:
@@ -836,6 +945,9 @@ def record(body: dict, subj: dict, claim: str, rep: bytes, source_id, epoch: str
                 raise pf.FlagError(404, 'unknown client_id — add the tree first (claim "missing")',
                                    hint={'layer': 'trees', 'claim': 'missing'})
             m = {'kind': 'added', 'kg': t[0], 'x': t[1], 'y': t[2], 'd': 0.0, 'h': None}
+            sst = state(t[0]); si = _state_idx(sst, t[1], t[2])
+            if si is not None and sst['sys'][si]:      # a machine-added tree is a measured apex
+                m.update(kind='apex', h=float(sst['sys_h'][si]))
         else:
             cs = _candidates(lon, lat, px, py)
             m = None
@@ -1089,7 +1201,7 @@ def _public(st: dict, j: int) -> dict:
         d['dbh_cm'] = round(float(st['dbh'][j]), 1)
     if st['tid'][j] and not st['added'][j]:
         d['tree_id'] = st['tid'][j]
-    if st['cid'][j]:
+    if st['cid'][j] and not st['sys'][j]:
         d['client_id'] = st['cid'][j]
     if st['state'][j]:
         d['state'] = _state_name(st['state'][j])
@@ -1120,7 +1232,7 @@ LIST_FIELDS = ('lon', 'lat', 'taxon', 'n', 'v', 'rev', 'added', 'h_m', 'dbh_cm',
 
 
 def listing(bbox=None, kg=None, since: int = 0, limit: int = LIST_LIMIT, only: int | None = None,
-            notes: bool = True) -> dict:
+            notes: bool = True, machine: bool = False) -> dict:
     """Current answers as columns, oldest change first.  ``since`` = only trees
     changed after that revision (a tree that lost its last live version comes
     back once with taxon null, added 0 → drop it)."""
@@ -1136,15 +1248,20 @@ def listing(bbox=None, kg=None, since: int = 0, limit: int = LIST_LIMIT, only: i
         import cells_api as ca
         kgs = [int(k) for k in ca._kgs_intersecting(*bbox)]
     else:
-        kgs = [r[0] for r in _conn().execute('SELECT DISTINCT kg FROM tree_ver WHERE rev > ?', (since,))]
+        mach = [system_reporter(s_) for s_ in SYSTEM_SOURCES]
+        kgs = [r[0] for r in _conn().execute(
+            'SELECT DISTINCT kg FROM tree_ver WHERE rev > ?' + ('' if machine else f" AND reporter NOT IN ({','.join('?' * len(mach))})"),
+            (since, *([] if machine else mach)))]
     rows = []
     for k in kgs:
         st = state(k, g)
         if not st['n']:
             continue
         m = st['trev'] > since
+        if not machine:                             # machine-added trees are apices (/trees/bbox rows), not reports
+            m &= st['hum']
         if not since:
-            m &= st['live']
+            m &= st['live'] if machine else st['hlive']
         if only is not None:                        # one state (0 = any)
             m &= (st['state'] == only) if only else (st['state'] > 0)
         if bbox is not None:
@@ -1160,7 +1277,7 @@ def listing(bbox=None, kg=None, since: int = 0, limit: int = LIST_LIMIT, only: i
         cols['taxon'].append(_taxon(st['sp'][j])); cols['n'].append(int(st['cnt'][j])); cols['v'].append(int(st['v'][j]))
         cols['rev'].append(int(st['trev'][j])); cols['added'].append(int(st['added'][j]))
         cols['h_m'].append(_num(st['h'][j])); cols['dbh_cm'].append(_num(st['dbh'][j]))
-        cols['tree_id'].append(None if st['added'][j] else st['tid'][j]); cols['client_id'].append(st['cid'][j])
+        cols['tree_id'].append(None if st['added'][j] else st['tid'][j]); cols['client_id'].append(st['cid'][j] if machine or not st['sys'][j] else None)
         cols['state'].append(_state_name(st['state'][j])); cols['state_date'].append(date_str(st['sdate'][j]) if st['state'][j] else None)
         cols['note'].append(st['note'][j] if notes else None)
     out['count'] = len(rows)
@@ -1209,10 +1326,11 @@ def history(lon: float | None = None, lat: float | None = None, tree_id=None, cl
         return None
     d, st, j, kg = best
     rows = _conn().execute('SELECT rev, ts, op, sp, uh_dm, dbh_mm, source, epoch, ref, e_dm, n_dm, mts, meta, org, sdate, note, '
-                           'length(reporter) AS rl FROM tree_ver '
+                           'length(reporter) AS rl, reporter FROM tree_ver '
                            'WHERE kg=? AND x=? AND y=? ORDER BY rev', (kg, int(st['x'][j]), int(st['y'][j]))).fetchall()
     hidden = {r['ref'] for r in rows if r['op'] == OP_MODERATE}
     vs = []
+    masks = _masks(_conn())
     for i, r in enumerate(rows, 1):
         v = {'v': i, 'rev': r['rev'], 'ts': r['ts'],
              'op': 'undo' if r['op'] == OP_MODERATE and r['rl'] else OP_NAMES[r['op']]}
@@ -1242,6 +1360,11 @@ def history(lon: float | None = None, lat: float | None = None, tree_id=None, cl
             v['hides_rev'] = r['ref']
         elif r['rev'] in hidden:
             v['hidden'] = True
+        mk = masks.get(bytes(r['reporter']), 0) if masks else 0     # moderated contributor (tree_mod.py): kept, not counted
+        if mk & MASK_ALL:
+            v['hidden'] = True
+        elif mk & MASK_SPECIES and r['sp'] is not None:
+            v['masked'] = 'taxon'
         vs.append(v)
     tree = _public(st, j)
     if not notes:
@@ -1444,7 +1567,7 @@ def taxa_get():
             raise pf.FlagError(400, 'kg must be a 5-digit code')
     sf = a.get('state')
     out = listing(bbox, kg, since, limit, only=None if not sf else 0 if sf in ('1', 'any') else state_id(sf),
-                  notes=_notes_arg(a))
+                  notes=_notes_arg(a), machine=a.get('machine') in ('1', 'true'))
     out['meta'] = _meta()
     fr = frames_rev()
     if fr:      # changes when tree positions of a KG were corrected: rows moved WITHOUT a new rev → re-read from since=0

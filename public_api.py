@@ -420,6 +420,7 @@ def trees_bbox():
         types = {t.strip().lower() for t in request.args['types'].split(',') if t.strip()}
     realistic = _flag_arg('realistic', True)
     notes = _flag_arg('notes', True)
+    off_file = _flag_arg('off_file', True)      # 0 = exactly the apex set of the cell figures (no off-file apices)
     import ne_trees
     fmt = (request.args.get('format') or 'json').strip().lower()
     if fmt not in ('json', 'geojson', 'columns'):
@@ -460,7 +461,7 @@ def trees_bbox():
         except Exception:  # noqa: BLE001
             urev = hrev = 0
     if urev:
-        state += f'\nu={urev}'
+        state += f'\nu2={urev}'      # u2: machine-added trees are rows, not an `added` block (2026-11-27)
     if kind == 'trees' and st.get('linear'):
         state += '\nl=' + st['linear']       # linear-noise runs (ne_linear.py) of these KGs changed
     # reader flags (spurious / same-tree …) of these KGs: their state joins the ETag — again only where
@@ -504,10 +505,10 @@ def trees_bbox():
     try:
         if fmt == 'columns':
             t = ne_trees.columns_bbox(*bb, kind, fields=fields, min_height=min_h, max_height=max_h, limit=limit,
-                                      realistic=realistic, types=types, notes=notes)
+                                      realistic=realistic, types=types, notes=notes, off_file=off_file)
         else:
             t = lq.trees_bbox(*bb, min_height=min_h, max_height=max_h, limit=limit,
-                              realistic=realistic, kind=kind, types=types, notes=notes)
+                              realistic=realistic, kind=kind, types=types, notes=notes, off_file=off_file)
     except ValueError as e:
         return _err(str(e), 400)
     except Exception as e:  # noqa: BLE001

@@ -71,6 +71,72 @@ sqlite3 data/public_flags.sqlite 'SELECT op, COUNT(*) FROM tree_ver GROUP BY 1'
 Not done yet: feeding confirmed taxa (n ≥ 2) into RF / species-model training labels; a picker in our
 own `/segmentation` UI (map clients are the UI).
 
+## Moderation by contributor (`tree_mod.py`, 2026-11-27)
+
+Anybody can report; the only thing we know of a contributor is the 8-byte salted `reporter` hash
+(unchanged). `tree_mod.py` reads the reports **by that hash** — internal, CLI only, no route returns a
+handle or a label. Test: `python3 tests/test_tree_mod.py`. `/process.txt`: `tree_mod:` (counts only).
+
+```bash
+python3 tree_mod.py --list [--days 30]     # one line per contributor: versions, trees, species, measures, adds,
+                                           # flags, conflicts (another reporter named the tree differently),
+                                           # burst (most versions in 5 min), KGs, taxa, key holder, `near` =
+                                           # other hashes reporting ≤ 300 m and ≤ 48 h away (same person, new browser?)
+python3 tree_mod.py --show 1a2b3c4d        # every version of a contributor / group, with lon/lat + what is shown now
+python3 tree_mod.py --group grp-1 1a2b3c4d 5e6f7a8b      # internal label over several hashes
+python3 tree_mod.py --mask grp-1 --note "…" [--all] [--dry]   # species votes (default) or everything stops counting
+python3 tree_mod.py --unmask grp-1
+```
+
+* **Store**: table `rmod(reporter PK, grp, mask, ts, note, acct)` in `public_flags.sqlite` — one row per
+  moderated / labelled contributor, nothing per report. `mask` bits: 1 = species votes ignored
+  (`tree_user.MASK_SPECIES`; measures, notes, states, added trees stay), 2 = every tree statement ignored.
+* **Nothing is lost**: `tree_ver` rows are untouched; `_derive(rows, machine, masks)` skips the masked votes;
+  `/trees/taxa/history` marks them `masked: "taxon"` / `hidden: true`. A mask also covers what the
+  contributor sends later (stored, not counted). Unmask = everything counts again.
+* **Propagation without a new mechanism**: each mask change appends one op-3 row with no `ref` (hides nothing by
+  itself) per tree the contributor wrote on → new `rev` → per-KG state in every worker, `/trees/bbox` ETag
+  (`u2=<rev>`) and `/trees/taxa?since=` readers (row comes back with `taxon: null`) follow. ~65 B per touched tree.
+* Single versions are still moderated with `POST /trees/taxa/<rev>/moderate`; flag rows with `/flags/<id>/status`.
+
+### Accounts (prepared, nothing collected yet)
+
+The NE server will tie its users to an **e-mail key** and an **export subscription key** (the accounting product).
+The link lives in `rmod.acct`, built so that neither side can name a contributor alone:
+
+* We never receive an address or a key. the NE server sends a **pseudonym** of its key id (its own keyed hash, one
+  constant per account); we keep only `HMAC(our salt, "a:" + pseudonym)[:12]` (`tree_mod.acct_hash`). A join needs
+  the NE server to present the pseudonym — accounting asks "usage of account X", we hash X and look it up.
+* A keyed caller's reporter hash is `HMAC(salt, "k:<holder>:<reporter>")` and the NE server keeps sending the same
+  per-browser `reporter`, so ONE link row attaches everything that browser reported before and after — no report
+  is rewritten or annotated, the NE server re-sends nothing. Several browsers of one account → same `acct`.
+* Erasure: `--unlink` drops the link (reports stay as anonymous as before); `rmod` rows carrying nothing are deleted.
+  `note` is the operator's reason — no names in it. Handles, labels and `acct` are returned by no route.
+* `--list`, `--group`, `--mask` take a pseudonym like a group label (shown as `a:<6 hex>` of our hash).
+
+Today: `python3 tree_mod.py --link <pseudonym> <handle…>` / `--unlink <handle…>` by hand.
+Planned wire (NOT read by any route yet): keyed callers add one optional field next to `reporter` on
+`POST /api/v1/flags` — `"account": "<pseudonym>"` (body or `X-Reporter-Account`), once or on every call; we upsert
+`rmod.acct` for that hash. That is all the NE server has to do; usage per account = `contributors()` grouped by `acct`.
+
+## Machine-added trees are apices, not reports (2026-11-27)
+
+`rebin_added.py` writes off-file apices through the add path (`reporter = system_reporter('auto-rebin')`,
+356 k rows). They used to come back in the `/trees/bbox` `added` block and in `/trees/taxa` — clients drew every
+one as an edited tree. Now:
+
+* `_derive`: a system writer's add is `sys` (not `added`); its height / note are the apex record, not a
+  statement. `_load` parses the note (`h_m= crown_m2= class= vitality=`) into `sys_h / sys_crown / sys_sp / sys_vit`.
+* `/trees/bbox`: `tree_user.system_rows` → `ne_trees.collect` appends them as **ordinary rows** (kg_code = the file
+  that measured the apex, exact h_m / crown / class / vitality; same limit and height window). `off_file=0` leaves
+  them out = exactly the apex set of the cell figures (`tests/test_tree_cell_rule.py`). ~7 B/apex instead of
+  ~100 B in `added`. ETag token `u2=`.
+* `added` = trees people added, only. `/trees/taxa` lists a machine tree only once a person wrote on it (then as a
+  named apex: `added 0`, no `client_id`); `machine=1` lists all (national since=0: 151 trees instead of 356 k).
+* A report on one binds like on any apex (`matched: "apex"`, crown reach, `height_m`), by point or by its
+  `auto-rebin:…` client_id; it shows in the `user` block at the row. `history?client_id=auto-rebin:…` still works.
+* Not applied to these rows: reader `spurious` flags / linear-noise hiding (they are keyed on file chunks).
+
 ## Undo (`"retract": "last"`)
 
 Hides only the reporter's latest live version of the tree; stored as an

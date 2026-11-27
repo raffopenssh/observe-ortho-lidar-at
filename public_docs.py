@@ -565,7 +565,8 @@ IDENTITY — say which tree you mean, in this order of preference:
        (a row with taxon, h_m, dbh_cm, state, note all null and added 0 = drop it). ETag → 304, max-age 30.
   3. GET /api/v1/trees/taxa/history?tree_id= | client_id= | lon=&lat= → {{tree, kg, dist_m, versions:[{{v, rev, ts,
        op: species | add | retract | moderated, taxon?, h_m?, dbh_cm?, measured_at?, dbh_method?, h_method?,
-       vitality?, status?, note?, tree_id?, by?, source?, epoch?, hidden?}}]}} — every version of one tree, with its metadata.
+       vitality?, status?, note?, tree_id?, by?, source?, epoch?, hidden?, masked?}}]}} — every version of one tree, with its metadata
+       (hidden / masked:"taxon" = kept, set aside by moderation: it does not count in the current answer).
   GET /api/v1/trees/taxa/dict → {{rev, fields:[taxon, de, en, class, rank, codes, alt], taxa:[[…]…], classes, accepts,
        limits, match, metadata}}   (~280 trees of Austria: forest, street / park, orchard; max-age 1 d, ETag, ~11 kB gzip)
        Columns are only ever appended — read by index 0–3 or by `fields`. `rev` changes with any dictionary change.
@@ -857,8 +858,11 @@ GET /api/v1/trees/bbox?bbox=…[&min_height=3][&max_height=…][&limit=2000][&re
       shared by all bands / concurrent calls (server ms ≈ 10 for a warm 0.025° tile band).
     User-reported species + user-added trees ride along sparsely ("user" / "added" blocks, row keys
     taxon / taxon_n / taxon_v / height_user_m / dbh_cm) only where someone reported one — see #tree-species.
-    "added" also holds measured apices that fall just outside their file's cell set and are no twin of a
-    served tree (client_id "auto-rebin:…", source auto-rebin; in no cell figure) — nothing is dropped at a file edge.
+    Measured apices that fall just outside their file's cell set and are no twin of a served tree are
+    ordinary rows here (kg_code = the file that measured them; in no cell figure — off_file=0 leaves them out,
+    = exactly the apex set behind the cells' tree_n / tree_h) — nothing is dropped at
+    a file edge, and they are not reports: never in "added", not in /trees/taxa (machine=1 lists them,
+    client_id "auto-rebin:…"). "added" holds only trees people added.
     realistic=1 (default) removes what the height distribution says are not trees: the saturated
     ≥ 60 m bin, local spikes ≥ 45 m (masts, wind turbines, cranes), flagged cells (dropped_qa) and
     the apices of machine-detected linear noise (straight chains of small "trees"; each run carries a

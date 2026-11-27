@@ -57,6 +57,19 @@ def _cand(con, kg, r10, idx, x, y, h, reason='no_row', v0='add', okg=None, nb=b'
                 (kg, r10, idx, 1, x, y, int(h * 4), (int(h * 4) << 10) | (50 << 18), reason, okg, v0, nb, nbk))
 
 
+def _sys(tu, kgs):
+    """the machine-added trees of the store: served as ordinary /trees/bbox rows (tree_user.system_rows),
+    never in the `added` block"""
+    out = {'h_m': [], 'client_id': [], 'note': []}
+    for k in kgs:
+        st = tu.state(k)
+        for i in (st['sys'].nonzero()[0].tolist() if st['n'] else ()):
+            out['h_m'].append(float(st['sys_h'][i])); out['client_id'].append(st['cid'][i])
+            out['note'].append(tu._conn().execute('SELECT note FROM tree_ver WHERE cid=? AND op=1 ORDER BY rev DESC', (st['cid'][i],)).fetchone()[0])
+            assert st['note'][i] is None and not st['added'][i] and not st['hum'][i]
+    return out
+
+
 def test_store_round_trip():
     pf, tu = _tmp_stores()
     ra._store_kg = lambda r: int(r['kg'])                 # no search index needed
@@ -80,13 +93,17 @@ def test_store_round_trip():
     assert {k: kc[k] for k in ('stored', 'served', 'off', 'capped', 'added', 'no_row', 'other_file', 'dup', 'qa', 'ok')} == {
         'stored': 100, 'served': 96, 'off': 4, 'capped': 0, 'added': 2, 'no_row': 1, 'other_file': 1, 'dup': 1, 'qa': 1, 'ok': 1}
     assert kc['lost'] is None and kc['lost_cell'] == 0          # lost-cell part not scanned: the off-file invariant alone
-    # read back through the added-tree path, exactly like a `missing` report
+    # read back: ordinary apex rows (system_rows), nothing in the `added` block, nothing in the report feed
     lon, lat = tu._tf('EPSG:3035', 'EPSG:4326').transform(X, Y)
-    a = tu.added(lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01, [92124, 92125])
-    assert sorted(a['h_m']) == [4.0, 22.2, 31.0], a
+    assert tu.added(lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01, [92124, 92125]) is None
+    sr = tu.system_rows(lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01, [92124, 92125])
+    assert sorted(sr['h'].tolist()) == [4.0, 22.25, 31.0] and set(sr['kg'].tolist()) == {'92124', '92125'}, sr
+    assert tu.listing()['count'] == 0 and tu.listing(machine=True)['count'] == 3
+    a = _sys(tu, [92124, 92125])
+    assert sorted(a['h_m']) == [4.0, 22.25, 31.0], a
     cid = next(c for c, h in zip(a['client_id'], a['h_m']) if h == 31.0)
     assert cid.startswith('auto-rebin:92124:rb1:other_file:7:1:') and tu.parse_client_id(cid) == cid
-    note = next(n for n, h in zip(a['note'], a['h_m']) if h == 22.2)
+    note = next(n for n, h in zip(a['note'], a['h_m']) if h == 22.25)
     assert note.startswith(f'auto-rebin {ra.RULE} no_row kg=92124 h_m=22.25 crown_m2='), note
     # machine rows do not count as a human revision (cache lifetime), but they are in the ETag revision
     assert tu.kgs_rev([92124]) > 0 and tu.kgs_rev([92124], human=True) == 0
@@ -104,14 +121,21 @@ def test_store_round_trip():
         con.execute('UPDATE kgs SET stored=99, off=3 WHERE kg=92124')
     r = ra.sync(verbose=False)
     assert r['sync']['retract'] == 2 and r['sync']['add'] == 2, r      # 92125's twin comes back: its partner moved away
-    a = tu.added(lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01, [92124, 92125])
-    assert sorted(a['h_m']) == [4.0, 22.2, 22.5], a
+    a = _sys(tu, [92124, 92125])
+    assert sorted(a['h_m']) == [4.0, 22.25, 22.5], a
     # a person names a machine-added tree: it stays a tree, and now counts as a human revision
     assert r['invariant_ok'] == 2, r
     cid = next(c for c, h in zip(a['client_id'], a['h_m']) if h == 4.0)
     out = tu.record({'client_id': cid, 'species': 'Picea abies'}, {'lon': lon, 'lat': lat, 'kg': '92125'}, 'species',
                     pf._reporter_hash('someone', 'x'), None, None)
-    assert out['matched'] == 'added' and out['taxon'] == 'Picea abies', out
+    assert out['matched'] == 'apex' and out['taxon'] == 'Picea abies' and out['added'] is False and 'client_id' not in out, out
+    assert out['height_m'] == 4.0, out
+    li = tu.listing()                                      # now a report: in the feed, as a named apex (not `added`)
+    assert li['count'] == 1 and li['columns']['added'] == [0] and li['columns']['client_id'] == [None], li
+    sr = tu.system_rows(lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01, [92124, 92125])
+    u = tu.annotate(sr['x'], sr['y'], sr['h'], [92124, 92125])
+    assert u and u['taxon'] == ['Picea abies'] and float(sr['h'][u['i'][0]]) == 4.0 and 'note' not in u, u
+    assert tu.added(lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01, [92124, 92125]) is None
     assert tu.kgs_rev([92125], human=True) > 0
     assert ra.sync(verbose=False)['sync'] == {'kgs': 0, 'add': 0, 'retract': 0}
 
@@ -155,8 +179,8 @@ def test_lost_cell_part():
     assert (kc['lost'], kc['lost_cell'], kc['added'], kc['dup'], kc['qa'], kc['ok']) == (10, 2, 3, 7, 1, 1), kc
     assert ra.kg_counts(92125)['dup'] == 4 and ra.kg_counts(92125)['added'] == 0
     lon, lat = tu._tf('EPSG:3035', 'EPSG:4326').transform(X, Y)
-    a = tu.added(lon - 0.02, lat - 0.02, lon + 0.02, lat + 0.02, [92124, 92125])
-    assert sorted(a['h_m']) == [9.0, 18.0, 22.2], a
+    a = _sys(tu, [92124, 92125])
+    assert sorted(a['h_m']) == [9.0, 18.0, 22.25], a
     cids = sorted(a['client_id'])
     assert [c.split(':')[3] for c in cids] == ['lost_cell', 'lost_cell', 'no_row'] and len(set(cids)) == 3, cids
     assert any(n.startswith(f'auto-rebin {ra.RULE} lost_cell kg=92124 h_m=18') for n in a['note'])

@@ -82,7 +82,7 @@ def test_live_report_and_products_agree():
     import h3
     import ne_trees as nt
     w, s, e, n = 9.575, 47.210, 9.592, 47.219
-    r = nt.columns_bbox(w, s, e, n, limit=200000, fields=('lon', 'lat', 'h_m', 'cell'))   # the default (QA'd) apex set
+    r = nt.columns_bbox(w, s, e, n, limit=200000, fields=('lon', 'lat', 'h_m', 'cell'), off_file=False)   # the (QA'd) apex set of the cell figures
     c = r.get('columns') or r
     lon = np.array(c['lon']); lat = np.array(c['lat']); h = np.array(c['h_m']); cell = list(c['cell'])
     # /trees: the cell field IS latLngToCell of the published position

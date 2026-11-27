@@ -60,9 +60,10 @@ Invariant per KG file, asserted by `ne_rebin.check()` and `tests/test_rebin_adde
 **stored == served + added + dup + qa (+ capped)**.
 
 **Decision (Check B): Option 1.** Added trees stay out of every cell figure — `tree_h` / `tree_n` /
-`canopy_h_p*` remain the measured apex set of the cell's own file. An `add` appears only in the
-`/trees/bbox` `added` block, written through the same path as a `missing` report (`tree_user`, op add,
-reporter = `tree_user.system_reporter('auto-rebin')`). No new public field: `h_m` (1 dp) is public, the
+`canopy_h_p*` remain the measured apex set of the cell's own file. An `add` is stored through the same path as a `missing` report (`tree_user`, op add,
+reporter = `tree_user.system_reporter('auto-rebin')`) and — since 2026-11-27 — served as an **ordinary
+`/trees/bbox` row** (not in the `added` block, not in `/trees/taxa`; `off_file=0` leaves them out;
+`docs/tree-user.md → Machine-added trees are apices`). The
 exact measured attributes are in `note` (`auto-rebin rb1.tw1 <reason> kg=<src> h_m= crown_m2= class=
 vitality=`), provenance in `client_id` = `auto-rebin:<kg>:rb1:<no_row|other_file>:<r10 hex>:<idx>:<v>`.
 `reason`: `no_row` = the target cell is in no file, `other_file` = another file serves it. The twin rule

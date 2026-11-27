@@ -635,7 +635,7 @@ def chunk_keep(ch, q: dict, hdr: dict | None = None):
 
 def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int = DEFAULT_LIMIT,
             realistic: bool = True, types: set | None = None, max_height: float | None = None,
-            max_limit: int = MAX_LIMIT, notes: bool = True) -> dict:
+            max_limit: int = MAX_LIMIT, notes: bool = True, off_file: bool = True) -> dict:
     """Column arrays (numpy) of all objects of ``kind`` in bbox, tallest first,
     ≤ limit (+1 row when more exist, so the caller can set ``truncated``).
 
@@ -750,6 +750,23 @@ def collect(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int
             ki = kg_ix[kg] = len(kg_names); kg_names.append(kg)
         parts.append((d, sel, ki, ns))
         n_acc += ns
+    if kind == 'trees' and off_file:
+        # measured apices that fall outside their own file's cell set and are no twin of a served tree
+        # (rebin_added.py → tree_user.system_rows): ordinary rows, the KG file that measured them as kg_code
+        try:
+            import tree_user as tu
+            sy = tu.system_rows(w, s, e, n, st['kgs'], min_h, max_h)
+        except Exception as ex:  # noqa: BLE001
+            log.warning('ne_trees: system rows: %s', ex); sy = None
+        if sy:
+            skg = sy.pop('kg')
+            for kg in sorted(set(skg.tolist())):
+                sel = np.flatnonzero(skg == kg)
+                ki = kg_ix.get(kg)
+                if ki is None:
+                    ki = kg_ix[kg] = len(kg_names); kg_names.append(kg)
+                parts.append((sy, sel, ki, int(sel.size)))
+                n_acc += int(sel.size)
     out: dict = {}
     if n_acc:
         cols = [k for k in parts[0][0] if k not in ('n', 'ok', 'ext')]
@@ -899,11 +916,12 @@ def columns_bbox(w, s, e, n, kind: str = 'trees', fields: tuple | None = None, *
 
 
 def points_bbox(w, s, e, n, kind: str = 'trees', min_height: float = 0.0, limit: int = DEFAULT_LIMIT,
-                realistic: bool = True, types: set | None = None, max_height: float | None = None, notes: bool = True) -> dict:
+                realistic: bool = True, types: set | None = None, max_height: float | None = None, notes: bool = True,
+                off_file: bool = True) -> dict:
     """All objects of ``kind`` in bbox as row dicts, tallest first, ≤ limit
     (see :func:`collect` for the scan semantics)."""
     r = collect(w, s, e, n, kind, min_height=min_height, limit=limit, realistic=realistic, types=types,
-                max_height=max_height, notes=notes)
+                max_height=max_height, notes=notes, off_file=off_file)
     c = r['cols']; out = []
     if r['n']:
         lon = np.round(c['lon'], 7).tolist(); lat = np.round(c['lat'], 7).tolist()
