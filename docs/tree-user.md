@@ -114,10 +114,19 @@ The link lives in `rmod.acct`, built so that neither side can name a contributor
   `note` is the operator's reason — no names in it. Handles, labels and `acct` are returned by no route.
 * `--list`, `--group`, `--mask` take a pseudonym like a group label (shown as `a:<6 hex>` of our hash).
 
-Today: `python3 tree_mod.py --link <pseudonym> <handle…>` / `--unlink <handle…>` by hand.
-Planned wire (NOT read by any route yet): keyed callers add one optional field next to `reporter` on
-`POST /api/v1/flags` — `"account": "<pseudonym>"` (body or `X-Reporter-Account`), once or on every call; we upsert
-`rmod.acct` for that hash. That is all the NE server has to do; usage per account = `contributors()` grouped by `acct`.
+**Wire (live 2026-11-27, verified key holders only — `reporter_keys.json` holders without `~`):**
+
+* `POST /api/v1/flags` + header `X-Reporter-Account: <pseudonym>` or top-level body `"account"` (16–80 chars
+  `[A-Za-z0-9_.:-]`), next to the usual `reporter` → `tree_mod.link_wire` upserts `rmod.acct =
+  acct_hash(pseudonym, holder)` for the reporter hashes of the call. Hash is scoped by holder (one holder cannot
+  read / claim / erase another's accounts). Response: `account: "linked"` | `"not_linked"` + `account_warning`
+  (no `reporter`, bad value, no verified key) — **the report is always stored**. In-process seen-cache: one small
+  write the first time a browser is seen, none afterwards.
+* `GET /api/v1/flags/account?account=<pseudonym>[&since=&until=]` → counts only (`tree_mod.usage`): `linked,
+  reporters, reports, tree_versions, species, measures, added, retracted, trees, flags, first_ts, last_ts`.
+* `DELETE /api/v1/flags/account?account=<pseudonym>` → `{unlinked}` (account deleted at the holder).
+* By hand: `python3 tree_mod.py --link <pseudonym> <handle…> [--holder ne-server]` / `--unlink <handle…>`.
+* Prompt for the the NE server side: `docs/tree-accounts-client-prompt.md`. Test: `tests/test_tree_mod.py::test_account_wire`.
 
 ## Machine-added trees are apices, not reports (2026-11-27)
 

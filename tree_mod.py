@@ -51,13 +51,34 @@ import tree_user as tu
 SCHEMA = ('CREATE TABLE IF NOT EXISTS rmod (reporter BLOB PRIMARY KEY, grp TEXT, mask INTEGER NOT NULL DEFAULT 0, '
           'ts INTEGER NOT NULL, note TEXT, acct BLOB) WITHOUT ROWID')
 ACCT_MAX = 80
+DEFAULT_HOLDER = 'ne-server'             # the verified key holder that sends account pseudonyms
 
 
-def acct_hash(pseudonym: str) -> bytes:
-    """What we keep of an NE-server account: a salted hash of the pseudonym the NE server sends (never the value)."""
+ACCT_RE = None
+
+
+def valid_acct(p) -> bool:
+    """A pseudonym: 16–80 chars of [A-Za-z0-9_.:-] — long enough to be a hash, cannot be an address."""
+    global ACCT_RE
+    if ACCT_RE is None:
+        import re
+        ACCT_RE = re.compile(r'[A-Za-z0-9_.:\-]{16,%d}' % ACCT_MAX)
+    return isinstance(p, str) and ACCT_RE.fullmatch(p) is not None
+
+
+def acct_hash(pseudonym: str, holder: str | None = None) -> bytes:
+    """What we keep of an account: a salted hash of the pseudonym the key holder sends (never the value).
+    Scoped by the key holder, so one holder cannot read, claim or erase another holder's accounts."""
     import hashlib
     import hmac
-    return hmac.new(pf._salt(), ('a:' + pseudonym).encode(), hashlib.blake2s).digest()[:12]
+    v = f'a:{holder}:{pseudonym}' if holder else 'a:' + pseudonym
+    return hmac.new(pf._salt(), v.encode(), hashlib.blake2s).digest()[:12]
+
+
+def _holders() -> list:
+    return [None] + sorted({DEFAULT_HOLDER} | {v for v in pf.reporter_keys().values() if pf.SELF_MARK not in v})
+
+
 MASK_NAMES = {0: '-', tu.MASK_SPECIES: 'species', tu.MASK_ALL: 'all', tu.MASK_SPECIES | tu.MASK_ALL: 'all'}
 NEAR_M, NEAR_S = 300, 48 * 3600          # "possibly the same person": other hashes reporting this close in space and time
 
@@ -97,7 +118,8 @@ def resolve(c, names) -> list:
         | {bytes(r[0]) for r in c.execute('SELECT reporter FROM rmod')}
     known -= _machine()
     for n in names:
-        g = [bytes(r[0]) for r in c.execute('SELECT reporter FROM rmod WHERE grp=? OR acct=?', (n, acct_hash(n)))]
+        g = [bytes(r[0]) for r in c.execute('SELECT reporter FROM rmod WHERE grp=? OR acct IN (%s)'
+                                                  % ','.join('?' * len(_holders())), (n, *(acct_hash(n, h) for h in _holders())))]
         if not g:
             p = n.lower()
             g = [k for k in known if len(p) >= 6 and k.hex().startswith(p)]
@@ -244,20 +266,83 @@ def set_group(name: str | None, names, note: str | None = None) -> dict:
     return {'group': name, 'contributors': [r.hex()[:8] for r in reps]}
 
 
-def link(acct: str | None, names) -> dict:
-    """Attach reporter hashes to an NE-server account pseudonym (stored as a salted hash; None = erase the link)."""
-    if acct is not None and (not 8 <= len(acct) <= ACCT_MAX or '@' in acct or not acct.isprintable()):
-        raise SystemExit(f'acct: a pseudonymous key id, 8–{ACCT_MAX} printable characters, never an address')
+def link(acct: str | None, names, holder: str | None = DEFAULT_HOLDER) -> dict:
+    """By hand: attach reporter hashes to an account pseudonym of ``holder`` (None = erase the link)."""
+    if acct is not None and not valid_acct(acct):
+        raise SystemExit(f'acct: a pseudonymous key id, 16–{ACCT_MAX} chars of [A-Za-z0-9_.:-], never an address')
     c = _conn()
     reps = resolve(c, names)
-    now = int(time.time())
-    h = acct_hash(acct) if acct is not None else None
+    h = acct_hash(acct, holder) if acct is not None else None
+    _set_acct(c, reps, h)
+    return {'acct': ('a:' + h.hex()[:6]) if h else None, 'contributors': [r.hex()[:8] for r in reps]}
+
+
+def _set_acct(c, reps, h) -> int:
+    now = int(time.time()); n = 0
     with pf._LOCK:
         for r in reps:
-            c.execute('INSERT INTO rmod(reporter, acct, ts) VALUES (?,?,?) ON CONFLICT(reporter) DO UPDATE SET acct=excluded.acct', (r, h, now))
+            n += c.execute('INSERT INTO rmod(reporter, acct, ts) VALUES (?,?,?) ON CONFLICT(reporter) DO UPDATE SET '
+                           'acct=excluded.acct WHERE rmod.acct IS NOT excluded.acct', (r, h, now)).rowcount
         c.execute('DELETE FROM rmod WHERE acct IS NULL AND grp IS NULL AND mask = 0')      # nothing left to remember
         c.commit()
-    return {'acct': ('a:' + h.hex()[:6]) if h else None, 'contributors': [r.hex()[:8] for r in reps]}
+    return n
+
+
+# === SECTION: the wire (POST /flags "account", GET|DELETE /flags/account — verified key holders only) ===
+
+_seen: dict = {}                              # (reporter hash) -> acct hash already stored: no DB touch per report
+_SEEN_MAX = 50_000
+
+
+def link_wire(holder: str, pseudonym: str, reps) -> int:
+    """Called by POST /api/v1/flags for a verified key holder: the reporters of this call belong to
+    the holder's account ``pseudonym``.  Idempotent; one tiny write the first time a browser is seen."""
+    h = acct_hash(pseudonym, holder)
+    todo = [r for r in set(reps) if _seen.get(r) != h]
+    if not todo:
+        return 0
+    c = _conn()
+    have = {bytes(r[0]) for r in c.execute('SELECT reporter FROM rmod WHERE acct=?', (h,))}
+    n = _set_acct(c, [r for r in todo if r not in have], h) if any(r not in have for r in todo) else 0
+    if len(_seen) > _SEEN_MAX:
+        _seen.clear()
+    for r in todo:
+        _seen[r] = h
+    return n
+
+
+def usage(holder: str, pseudonym: str, since: int | None = None, until: int | None = None) -> dict:
+    """Counts of what the account's linked browsers reported (accounting).  No positions, no handles."""
+    c = _conn()
+    reps = [bytes(r[0]) for r in c.execute('SELECT reporter FROM rmod WHERE acct=?', (acct_hash(pseudonym, holder),))]
+    out = {'linked': bool(reps), 'reporters': len(reps), 'tree_versions': 0, 'species': 0, 'measures': 0, 'added': 0,
+           'retracted': 0, 'trees': 0, 'flags': 0, 'reports': 0, 'first_ts': None, 'last_ts': None,
+           'since': since, 'until': until}
+    if not reps:
+        return out
+    lo, hi = int(since or 0), int(until or 1 << 40)
+    q = ','.join('?' * len(reps))
+    r = c.execute('SELECT COUNT(*) FILTER (WHERE op IN (0,1)), COUNT(*) FILTER (WHERE op IN (0,1) AND sp IS NOT NULL), '
+                  'COUNT(*) FILTER (WHERE op IN (0,1) AND (uh_dm IS NOT NULL OR dbh_mm IS NOT NULL)), '
+                  'COUNT(*) FILTER (WHERE op = 1), COUNT(*) FILTER (WHERE op = 2), '
+                  "COUNT(DISTINCT kg || ':' || x || ':' || y), MIN(ts), MAX(ts) "
+                  f'FROM tree_ver WHERE reporter IN ({q}) AND op IN (0,1,2) AND ts >= ? AND ts < ?', (*reps, lo, hi)).fetchone()
+    f = c.execute(f'SELECT COUNT(*), MIN(ts), MAX(ts_last) FROM report WHERE reporter IN ({q}) AND ts >= ? AND ts < ?',
+                  (*reps, lo, hi)).fetchone()
+    ts = [t for t in (r[6], r[7], f[1], f[2]) if t is not None]
+    out.update(tree_versions=r[0], species=r[1], measures=r[2], added=r[3], retracted=r[4], trees=r[5], flags=f[0],
+               reports=r[0] + r[4] + f[0], first_ts=min(ts) if ts else None, last_ts=max(ts) if ts else None)
+    return out
+
+
+def unlink_wire(holder: str, pseudonym: str) -> int:
+    """Erase an account link (account deleted at the key holder).  Reports stay, as anonymous as before."""
+    c = _conn()
+    h = acct_hash(pseudonym, holder)
+    reps = [bytes(r[0]) for r in c.execute('SELECT reporter FROM rmod WHERE acct=?', (h,))]
+    for r in reps:
+        _seen.pop(r, None)
+    return _set_acct(c, reps, None) if reps else 0
 
 
 def status() -> dict:
@@ -289,7 +374,8 @@ def main(argv) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--list', action='store_true'); ap.add_argument('--days', type=float)
     ap.add_argument('--show', nargs='+'); ap.add_argument('--group', nargs='+', metavar=('NAME', 'H'))
-    ap.add_argument('--link', nargs='+', metavar=('ACCT', 'H')); ap.add_argument('--unlink', nargs='+')
+    ap.add_argument('--link', nargs='+', metavar=('ACCT', 'H')); ap.add_argument('--holder', default=DEFAULT_HOLDER)
+    ap.add_argument('--unlink', nargs='+')
     ap.add_argument('--ungroup', nargs='+'); ap.add_argument('--mask', nargs='+'); ap.add_argument('--unmask', nargs='+')
     ap.add_argument('--all', action='store_true', help='mask everything the contributor said about trees, not only species')
     ap.add_argument('--note'); ap.add_argument('--dry', action='store_true'); ap.add_argument('--status', action='store_true')
@@ -297,7 +383,7 @@ def main(argv) -> int:
     if a.group:
         print(set_group(a.group[0], a.group[1:], a.note))
     if a.link:
-        print(link(a.link[0], a.link[1:]))
+        print(link(a.link[0], a.link[1:], a.holder))
     if a.unlink:
         print(link(None, a.unlink))
     if a.ungroup:

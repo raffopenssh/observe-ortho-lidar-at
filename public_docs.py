@@ -523,6 +523,17 @@ IDENTITY — say which tree you mean, in this order of preference:
        `reporter` ids are namespaced to the key and no longer depend on the network you post from, daily cap
        4 500 per key, as without one. Holders without "~" are organisations we verified (cap 20 000 —
        ask us). Wrong key → 401. The key works for every POST /api/v1/flags, not only trees.
+  Accounts (verified holders only — keys without "~"): link your users' reports to YOUR account id without
+       telling us who they are. Send a pseudonym (a keyed hash of your account / subscription key id, constant per
+       account, 16–80 chars [A-Za-z0-9_.:-], never an e-mail) as header `X-Reporter-Account` or top-level body
+       "account" on POST /api/v1/flags, next to the usual "reporter". We keep only a salted hash of it, scoped to
+       your key; the response carries account: "linked" (or "not_linked" + account_warning — the report is stored
+       either way). One call links everything that reporter id sent before and sends later; repeat freely.
+         GET    /api/v1/flags/account?account=<pseudonym>[&since=<unix>&until=<unix>]   (X-Reporter-Key)
+              → {{linked, reporters, reports, tree_versions, species, measures, added, retracted, trees, flags,
+                 first_ts, last_ts}} — counts only (reports = tree_versions + retracted + flags), no-store
+         DELETE /api/v1/flags/account?account=<pseudonym>  → {{unlinked: n}} — erases the link; reports stay, anonymous
+       Without a verified key: POST ignores the field (account_warning), GET / DELETE → 403.
 
   Position frames (KGs whose tree positions we corrected after you downloaded them)        #position-frames
        /trees/bbox carries top-level "frames": {{"<kg>": "p-5+5"}} ONLY for such KGs (absent = never moved). Keep it

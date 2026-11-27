@@ -390,7 +390,7 @@ def _clean_note(s) -> str | None:
 _KNOWN = {'cell', 'lon', 'lat', 'kg', 'kg_code', 'layer', 'claim', 'observed', 'expected', 'note', 'source',
           'reporter', 'epoch', 'species', 'taxon', 'h_m', 'dbh_cm', 'tree_id', 'tree_id_v2', 'client_id', 'force',
           'retract', 'measured_at', 'dbh_method', 'h_method', 'vitality', 'status', 'reporter_key',
-          'state', 'date', 'state_date', 'logged_at', 'felled_at', 'frame', 'as_of', '_fr', '_frame'}
+          'state', 'date', 'state_date', 'logged_at', 'felled_at', 'frame', 'as_of', '_fr', '_frame', 'account'}
 # what can have happened to a tree since our flight (stored index + 1 in 4 bits — append only, max 14)
 TREE_STATES = ('standing',    # still there, alive (also: contradicts somebody's report)
                'logged',      # cut down / harvested
@@ -1256,6 +1256,8 @@ def flags_post():
         r.headers['Retry-After'] = str(int(86400 - time.time() % 86400))
         return r
     need_key = not org and KEY_REQUIRED_PATH.exists()
+    acct, acct_warn = _request_account(body, org)
+    acct_reps = []
     results = []
     for it in items:
         try:
@@ -1266,18 +1268,94 @@ def flags_post():
             if need_key and not it_org and _is_tree_report(it):
                 raise FlagError(401, 'tree reports need a reporter_key: POST /api/v1/flags/token {"name": "…"}')
             r = record(it, client, it_org)
+            if acct and it_org == org and it.get('reporter') not in (None, ''):
+                acct_reps.append(_reporter_hash(str(it['reporter'])[:120], client, org))
             r['http'] = 201 if (r.get('tree', {}).get('written', True) and not (r.get('retracted') and r['folded'])) else 200
             results.append(r)
         except FlagError as e:
             if batch is None:
                 raise
             results.append({'error': e.msg, 'http': e.status, **e.extra})
+    extra = {}
+    if acct:
+        if acct_reps:
+            try:
+                import tree_mod
+                tree_mod.link_wire(org, acct, acct_reps)
+                extra['account'] = 'linked'
+            except Exception as e:  # noqa: BLE001 — never lose a report over the accounting link
+                log.warning('account link: %s', e)
+                extra['account'] = 'not_linked'; acct_warn = 'account link failed, report stored; send it again later'
+        else:
+            extra['account'] = 'not_linked'; acct_warn = 'account needs a "reporter" on the report to link to'
+    if acct_warn:
+        extra['account_warning'] = acct_warn
     if batch is None:
         out = results[0]
+        out.update(extra)
         out['meta'] = _meta()
         return _resp(out, out.pop('http'))
     return _resp({'results': results, 'count': len(results),
-                  'errors': sum(1 for r in results if 'error' in r), 'meta': _meta()}, 201)
+                  'errors': sum(1 for r in results if 'error' in r), **extra, 'meta': _meta()}, 201)
+
+
+# === SECTION: accounts (verified key holders: link reporters to their account pseudonym, usage, erase) ===
+
+def _request_account(body, org):
+    """(pseudonym | None, warning | None).  Only a verified key holder can link; a bad value never fails the report."""
+    a = body.get('account') if isinstance(body, dict) else None
+    if a in (None, ''):
+        a = request.headers.get('X-Reporter-Account')
+    if a in (None, ''):
+        return None, None
+    if not org or SELF_MARK in org:
+        return None, 'account ignored: needs an assigned (not self-issued) reporter key'
+    import tree_mod
+    if not tree_mod.valid_acct(a):
+        return None, 'account ignored: a pseudonym of 16–80 chars [A-Za-z0-9_.:-] (a keyed hash of your key id, never an e-mail)'
+    return a, None
+
+
+def _account_call():
+    org = _org_for(_request_key(None))
+    if not org or SELF_MARK in org:
+        raise FlagError(403, 'needs an assigned reporter key (X-Reporter-Key)')
+    a = request.args.get('account') or request.headers.get('X-Reporter-Account')
+    import tree_mod
+    if not tree_mod.valid_acct(a):
+        raise FlagError(400, 'account: the pseudonym you send with reports (16–80 chars [A-Za-z0-9_.:-])')
+    return org, a, tree_mod
+
+
+@flags_bp.route('/api/v1/flags/account', methods=['GET'])
+def flags_account_get():
+    lim = _limited(_get_limit)
+    if lim is not None:
+        return lim
+    org, a, tm = _account_call()
+
+    def _ts(k):
+        v = request.args.get(k)
+        if v in (None, ''):
+            return None
+        try:
+            return int(float(v))
+        except ValueError:
+            raise FlagError(400, f'{k}: unix seconds') from None
+    r = _resp(tm.usage(org, a, _ts('since'), _ts('until')))
+    r.headers['Cache-Control'] = 'private, no-store'
+    return r
+
+
+@flags_bp.route('/api/v1/flags/account', methods=['DELETE'])
+def flags_account_delete():
+    lim = _limited(_post_limit)
+    if lim is not None:
+        return lim
+    org, a, tm = _account_call()
+    r = _resp({'unlinked': tm.unlink_wire(org, a)})
+    r.headers['Cache-Control'] = 'private, no-store'
+    return r
 
 
 @flags_bp.route('/api/v1/flags', methods=['GET'])
