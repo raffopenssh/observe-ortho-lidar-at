@@ -178,6 +178,11 @@ log), leaving 138 public `auto-shift` records with a stale tile list — fixed, 
 BEV source stamp are checkpoints of the same requeued run after an interruption (06301-north:
 tiles 1–2 built 11:30, peer re-planned 11:39, resumed 12:46), not the old foreign-checkpoint
 fault; only `(N OLD checkpoint)` needs a rerun.
+Unmeasured tiles (410 in 126 products after the pass): 62 products not yet listed were enrolled
+(`keep_products` + `fresh_run` — old product and read-time fix stay served until the new one is
+ingested). Circle guard: a block regenerated while its KG was still `zero` left no `regen` record,
+so the later per-tile pass listed its fresh tiles as unmeasured (84006-southwest-2) —
+`ne_pos_fix.reapply_regen` marks them kept, called whenever a pass writes a `partial` verdict.
 
 ### 2. `pos_sweep_unit` — fresh strip inside a moved KG (found by the ledger)
 

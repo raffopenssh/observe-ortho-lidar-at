@@ -348,6 +348,35 @@ def _code_tiles(code) -> list:
     return out
 
 
+def reapply_regen(kg) -> list:
+    """Products of *kg* that were regenerated fresh BEFORE the KG had a moved verdict (``regenerated``
+    was a no-op on ``zero`` then): the per-tile pass later made the KG ``partial`` and listed their
+    tiles as unmeasured — a product already on the true grid, queued for one more rerun
+    (84006-southwest-2, regenerated 11-23, KG partial since 11-26).  Marks them kept.  Idempotent."""
+    kg = str(kg).zfill(5); out = []
+    try:
+        import sqlite3
+        import qc_generation
+        v = (json.loads(PATH.read_text()).get('kgs') or {}).get(kg) or {}
+        if v.get('verdict') != 'partial' or not qc_generation.DB.exists():
+            return out
+        c = sqlite3.connect(str(qc_generation.DB), timeout=30)
+        try:
+            codes = [r[0] for r in c.execute(
+                "SELECT g.code FROM gen g WHERE g.parent=? AND g.fresh=1 AND g.quality NOT LIKE '%bootstrap%' "
+                "AND g.generated_at=(SELECT MAX(generated_at) FROM gen WHERE code=g.code)", (kg,))]
+        finally:
+            c.close()
+        for code in codes:
+            if code in (v.get('regen') or {}):
+                continue
+            if regenerated(code).get('action'):
+                out.append(code)
+    except Exception as e:  # noqa: BLE001
+        print('reapply_regen', kg, e, file=sys.stderr)
+    return out
+
+
 def regenerated(code, tiles=None, all_tiles=None) -> dict:
     """A product was REGENERATED on the true grid (fresh run, no ``upgraded_from``) — the generic
     hook of every new product generation (``qc_generation.on_ingest``; a v2.5 roll-out walks through
@@ -1335,6 +1364,8 @@ def verify_tiles(budget_mb_h: float = 150.0, max_kgs: int | None = None, only=No
         _update(put)
         if PATH.parent == DATA:
             try:
+                if r['verdict'] == 'partial' and reapply_regen(kg):
+                    r = json.loads(PATH.read_text())['kgs'][kg]
                 _flag(kg, r)
             except Exception as e:  # noqa: BLE001
                 print('auto-shift flag', kg, e, file=sys.stderr)
