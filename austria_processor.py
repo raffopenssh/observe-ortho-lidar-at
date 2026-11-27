@@ -11357,16 +11357,27 @@ def _load_failed_kgs() -> set:
     """Load permanently-failed KG codes from file."""
     try:
         if FAILED_KGS_FILE.exists():
-            return set(json.loads(FAILED_KGS_FILE.read_text()))
+            return _drop_sweep_codes(json.loads(FAILED_KGS_FILE.read_text()))
     except Exception:
         pass
     return set()
 
 
+def _drop_sweep_codes(codes) -> set:
+    """Sweep units (``<parent>-sw<k>``) never enter the permanent-failure registry.
+
+    They have no ``_json`` completion marker, so nothing ever cleared them again
+    (a unit that later succeeded, or was planned away, stayed "permanently
+    failed" on the dashboard and fleet-wide via the peer-sync union).  Their
+    retry state lives in ``sliver_sweep`` (unit ``attempts`` / ``failed``)."""
+    from kg_splitter import is_sweep_code
+    return {str(c) for c in (codes or []) if c and not is_sweep_code(str(c))}
+
+
 def _save_failed_kgs(codes: set):
     """Save permanently-failed KG codes."""
     try:
-        FAILED_KGS_FILE.write_text(json.dumps(sorted(codes), indent=2))
+        FAILED_KGS_FILE.write_text(json.dumps(sorted(_drop_sweep_codes(codes)), indent=2))
     except Exception:
         pass
 

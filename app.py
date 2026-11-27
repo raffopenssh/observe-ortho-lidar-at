@@ -1525,6 +1525,11 @@ def _sync_peer_data():
                         except Exception:
                             _done_now = set()
                         _merged -= _done_now
+                        # Sweep units have no ``_json`` marker, so the line
+                        # above can never clear them: keep them out
+                        # (sliver_sweep owns their retry state).
+                        from kg_splitter import is_sweep_code as _isw_f
+                        _merged = {c for c in _merged if not _isw_f(c)}
                         if _merged != set(_cur_failed):
                             _fpath.parent.mkdir(parents=True, exist_ok=True)
                             _fpath.write_text(json.dumps(
@@ -4027,7 +4032,9 @@ def processing_peers_status():
     failed_path = data_dir / 'failed_kgs.json'
     if failed_path.exists():
         try:
-            result['failed'] = json.loads(failed_path.read_text())
+            from kg_splitter import is_sweep_code as _isw_f
+            result['failed'] = [c for c in (json.loads(failed_path.read_text()) or [])
+                                if not _isw_f(str(c))]   # sweep units: sliver_sweep owns their retries
         except Exception:
             result['failed'] = []
     else:
@@ -6242,7 +6249,9 @@ def processing_queue_get():
     if failed_path.exists():
         try:
             all_failed = json.loads(failed_path.read_text())
-            perm_failed = [c for c in all_failed if c not in completed]
+            from kg_splitter import is_sweep_code as _isw_f
+            perm_failed = [c for c in all_failed
+                           if c not in completed and not _isw_f(str(c))]
             if len(perm_failed) < len(all_failed):
                 failed_path.write_text(json.dumps(sorted(perm_failed), indent=2))
         except Exception:

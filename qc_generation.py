@@ -433,6 +433,27 @@ def _retry_queue() -> set:
         return set()
 
 
+def _replaced_by_blocks(code: str, e: dict, ent: dict) -> list:
+    """A requeued PARENT whose fresh run was split: its own ``_json`` is gone and every block
+    ``_json`` is newer than the enrolment → [(block, uploaded_at)], else [].  Without this the
+    parent never gets the fresh ``_json`` the tick waits for and ends up ``stuck`` (84114)."""
+    import label_mix as lm
+    import kg_splitter
+    if '-' in code or lm._live(ent.get(f'{code}_json')):
+        return []
+    pre = code + '-'; out = []
+    for k, j in ent.items():
+        if not (k.startswith(pre) and k.endswith('_json')):
+            continue
+        b = k[:-5]
+        if kg_splitter.is_sweep_code(b) or not lm._live(j):
+            continue
+        if str(j.get('uploaded_at') or '') <= str(e.get('enrolled_at') or ''):
+            return []                       # an old block survives: not a full fresh generation
+        out.append((b, str(j.get('uploaded_at'))))
+    return sorted(out)
+
+
 def _post_requeue(code: str) -> bool:
     try:
         import requests
@@ -464,6 +485,16 @@ def sweep(requeue: bool = True) -> dict:
     queue = _retry_queue()
     now = time.time(); events = []; changed = False
     for code, e in sorted(codes.items()):
+        if e.get('state') in ('requeued', 'stuck'):
+            blocks = _replaced_by_blocks(code, e, ent)
+            if blocks:
+                e.update(state='done', done_at=_now(), new_generated_at=max(b[1] for b in blocks),
+                         replaced_by=[b[0] for b in blocks], retired=[],
+                         note=f'fresh run split the parent: replaced by {len(blocks)} blocks')
+                changed = True
+                events.append((f"qc_reprocess: {code} done — fresh run split it into {len(blocks)} blocks "
+                               f"({', '.join(b[0] for b in blocks)})", code, 'info'))
+                continue
         if e.get('state') != 'requeued':
             continue
         j = ent.get(f'{code}_json')
