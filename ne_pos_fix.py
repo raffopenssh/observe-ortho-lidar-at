@@ -504,6 +504,7 @@ def sweep_keep(only=None, max_units: int = 200, quiet: bool = True) -> dict:
             except Exception as e:  # noqa: BLE001
                 print('sweep_keep migrate', kg, repr(e)[:120], file=sys.stderr)
         out['kgs'] += 1; out['units'] += len(units); out['cells'] += len(add)
+        out.setdefault('kg_list', []).append(kg)
         if not quiet:
             print(kg, units, len(add), flush=True)
     return out

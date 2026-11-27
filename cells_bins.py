@@ -1363,6 +1363,18 @@ def prewarm(limit: int | None = None, verbose: bool = True, budget_s: float | No
 
     # phase W: blocks a request is waiting for (cells-want.path started us) — before anything else
     run_units([], None if budget_s is None else t00 + budget_s, wanted_only=True)
+    # phase K (ne_pos_fix.sweep_keep): sweep units that landed in a KG moved as a whole since the last
+    # run — their cells are exempt from the move (else the ledger shows `pos_sweep open`, 14184-sw2).
+    # Before the manifest: a new keep set changes the file tag.  Local when the merged file carries
+    # attribution (NEA1), else one ~100 KB archive per unit; then the rebin store of those KGs.
+    try:
+        sk = _pos_fix.sweep_keep(max_units=20)
+        if sk.get('units'):
+            log.warning('cells_bins: sweep_keep %s', {k: v for k, v in sk.items()})
+            import rebin_added
+            rebin_added.scan(120, sk.get('kg_list'))
+    except Exception as e:  # noqa: BLE001
+        log.warning('cells_bins: sweep_keep: %s', e)
     m = manifest(); b = m['bins']
     n_todo0 = sum(1 for i, j, g in zip(b['i'], b['j'], b['gen']) if stored_gen(i, j) != g)
     # phase 0 (tree_qa): re-evaluate the default tree filter where its inputs changed and patch

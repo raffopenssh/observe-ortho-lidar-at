@@ -353,7 +353,9 @@ corrected **at read time**, each fix keyed to the generation it was measured on:
   the position. The file tag gets `~k<crc>`, so bins / blocks / rebin store /
   linear runs of the KG recompute. `ne_pos_fix.py --sweep-keep [--only kg,…]`
   is idempotent (seen units are skipped) — rerun it after new sweep units land
-  in a moved KG (not on a timer).
+  in a moved KG. Since 2026-11-27 the hourly `cells-bins.service` does that itself
+  (phase K of `cells_bins.prewarm`: ≤ 20 units per run, then `rebin_added.scan` of those KGs) —
+  sweep units kept landing in moved KGs (view-fill, per-tile pass) and sat `pos_sweep open`.
 * **Same version only**: this path regenerates v2.4 in place. A v2.5 kept
   next to v2.4 needs its own manifest keys / filenames; the hook
   (`on_ingest`) and the retire calls are version-agnostic and are what every
