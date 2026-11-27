@@ -94,6 +94,13 @@ def _conn() -> sqlite3.Connection:
     return c
 
 
+def _restored_txt(q: dict) -> str:
+    n = q.get('restored')
+    if not n or 'restored_old' not in q:
+        return str(n)
+    return f"{n} (same run resumed)" if not q['restored_old'] else f"{n} ({q['restored_old']} OLD checkpoint)"
+
+
 def quality(code: str, doc: dict, version_label: str = '') -> dict:
     """What the document itself says about this generation (cheap, local)."""
     dq = doc.get('data_quality') or {}
@@ -101,6 +108,12 @@ def quality(code: str, doc: dict, version_label: str = '') -> dict:
     src = dq.get('v2_source') or {}
     q = {'tiles': len(tiles), 'restored': sum(1 for t in tiles if t.get('restored')),
          'fresh': not doc.get('upgraded_from'), 'label': version_label or ''}
+    if q['restored']:
+        # a restored tile is a FAULT only when it predates the run guards: no BEV source stamp
+        # (checkpoint written before 2026-11-22) or a source that changed by stitch time.  Stamped
+        # ones are the same run resumed after an interruption (06301-north, 84110-west, 11-27).
+        q['restored_old'] = sum(1 for t in tiles if t.get('restored') and int(t.get('valid_pixels') or 0) > 0
+                                and (not t.get('bev_source') or t.get('source_changed')))
     if doc.get('upgraded_from'):
         q['v1_generated_at'] = str((doc.get('upgraded_from') or {}).get('v1_generated_at') or '')[:19]
         q['bev_reread_tiles'] = len(src.get('fallback_tiles') or [])
@@ -210,7 +223,7 @@ def on_ingest(code: str, doc: dict, uploaded_at: str = '', version_label: str = 
             if retired or before:
                 _event(f"qc_generation: {code} new {'fresh' if fresh else 'upgraded'} generation {gen[:16]} — "
                        f"was {_brief_before(before)}; retired {', '.join(sorted(retired)) or 'nothing'}; "
-                       f"now tiles={q.get('tiles')} restored={q.get('restored')} edges={q.get('edges')}"
+                       f"now tiles={q.get('tiles')} restored={_restored_txt(q)} edges={q.get('edges')}"
                        + (f" label={q['label']}" if q.get('label') else ''), code)
         return row
     except Exception as e:  # noqa: BLE001 — documentation must never break an ingest
@@ -596,7 +609,7 @@ def status_line(max_rows: int = 8) -> str | None:
     for r in sorted(done, key=lambda r: r.get('done_at') or '', reverse=True)[:3]:
         q = r.get('quality') or {}
         out.append(f"  qc_reprocess {r['code']}: done {str(r.get('done_at') or '')[:16]} — retired {','.join(r.get('retired') or []) or 'nothing'}; "
-                   f"now tiles={q.get('tiles')} restored={q.get('restored')} edges={q.get('edges')} {q.get('label') or ''}".rstrip())
+                   f"now tiles={q.get('tiles')} restored={_restored_txt(q)} edges={q.get('edges')} {q.get('label') or ''}".rstrip())
     return '\n'.join(out)
 
 

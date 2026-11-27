@@ -543,6 +543,7 @@ def _flag(kg, v: dict) -> None:
     w = [x for x in v.get('windows') or [] if x.get('v') in ('shift', 'zero', 'unclear')]
     exp = {'hint': 'shift', 'applied': vd in ('shift', 'partial'), 'moved_m': [int(o[0]), int(o[1])], 'crs': 'EPSG:3035',
            'layers': ['trees', 'structures'], 'frame': _tok(o) if vd in ('shift', 'partial', 'retired') else FRAME_STALE, 'verdict': vd}
+    we = [x for x in w if 'shift' in x and 'zero' in x]     # tree windows only: terrain / pair windows carry no error pair
     tl = v.get('tiles') or v.get('was_tiles')
     if tl:      # partly shifted product: the processing tiles (EPSG:3035 x0 y0 x1 y1) whose content moved / stayed
         exp['partial'] = True
@@ -552,8 +553,9 @@ def _flag(kg, v: dict) -> None:
         exp['since'] = int(v.get('ts') or 0)
     if vd == 'rejected':
         exp['until'] = int(v.get('rejected_ts') or 0)
-    obs = {'windows': len(w), 'shifted': sum(x['v'] == 'shift' for x in w),
-           'err_m': {'moved': round(float(np.median([x['shift'] for x in w])), 2), 'stored': round(float(np.median([x['zero'] for x in w])), 2)}} if w else None
+    obs = {'windows': len(w), 'shifted': sum(x['v'] == 'shift' for x in w)} if w else None
+    if we:
+        obs['err_m'] = {'moved': round(float(np.median([x['shift'] for x in we])), 2), 'stored': round(float(np.median([x['zero'] for x in we])), 2)}
     pf.auto_kg(kg, SOURCE, 'trees', 'misplaced', json.dumps(exp, separators=(',', ':')),
                json.dumps(obs, separators=(',', ':')) if obs else None)
 
@@ -1151,7 +1153,12 @@ def verify_tiles_kg(kg, prev: dict | None = None, tries: int = 2, read: bool = T
     # trees, same height, at offset 0 or at SHIFT (what rebin_added reports as a `dup_shift` pair)
     miss = [t for t in range(len(T)) if t not in tv]
     others = sorted({str(q[1] if str(q[0]).zfill(5) == str(kg).zfill(5) else q[0]).zfill(5) for q in _rebin_pairs()
-                     if str(kg).zfill(5) in (str(q[0]).zfill(5), str(q[1]).zfill(5))}) if miss else []
+                     if str(kg).zfill(5) in (str(q[0]).zfill(5), str(q[1]).zfill(5))})
+    # partners compared — also when no unmeasured tile overlaps them (no window to show for it), and
+    # when every tile has windows of its own (conflicting ones stay `unclear`: nothing a pair decides)
+    tried = [] if miss else list(others)
+    if not miss:
+        others = []
     for ok in others:
         try:
             b = _raw_apices(ok, raw=False)
@@ -1159,6 +1166,7 @@ def verify_tiles_kg(kg, prev: dict | None = None, tries: int = 2, read: bool = T
             b = None
         if b is None:
             continue
+        tried.append(ok)
         from scipy.spatial import cKDTree
         tr = cKDTree(np.c_[b[0], b[1]])
         hit = []
@@ -1202,6 +1210,9 @@ def verify_tiles_kg(kg, prev: dict | None = None, tries: int = 2, read: bool = T
     else:
         verdict = 'unclear'
     out = {'verdict': verdict, 'windows': wins, 'ts': now, 'tv': TILE_RULE, 'tiles_n': [ns, nz, len(T) - ns - nz], 'flags': flag}
+    pd = sorted(set((prev or {}).get('pairs_done') or []) | set(tried))
+    if pd:
+        out['pairs_done'] = pd
     if prev and prev.get('verdict'):
         out['was_verdict'] = prev['verdict']
     if verdict in ('shift', 'partial'):
@@ -1241,9 +1252,12 @@ def tile_candidates(doc: dict | None = None) -> dict:
         for k in (str(q[0]).zfill(5), str(q[1]).zfill(5)):
             v = kgs.get(k) or {}
             if v.get('tv') == TILE_RULE:
-                # measured before this pair was known: its unmeasured tiles can still be decided by it
+                # measured before this pair was known: its unmeasured tiles can still be decided by it.
+                # `pairs_done` = partners already compared: a pair whose overlap holds none of the
+                # unmeasured tiles leaves no window, and listed the KG as todo forever (43 KGs, 11-27)
                 o = str(q[1] if k == str(q[0]).zfill(5) else q[0]).zfill(5)
                 if v.get('verdict') in ('partial', 'unclear', 'zero') and (v.get('tiles_n') or [0, 0, 0])[2] > 0 \
+                        and o not in (v.get('pairs_done') or ()) \
                         and not any(w.get('src') == 'pair' and w.get('other') == o for w in v.get('windows') or []):
                     todo.append(k)
                 continue

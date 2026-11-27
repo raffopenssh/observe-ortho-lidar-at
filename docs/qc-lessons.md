@@ -168,6 +168,17 @@ the measured tiles in the same KGs are shifted.
   and its read-time move are served until the fresh one is ingested, then
   `ne_pos_fix.regenerated` retires the move for that block.
 
+**2026-11-27 follow-up.** `per_tile.todo` stayed at 43 after the pass had visited every KG: a
+rebin pair whose overlap holds none of the unmeasured tiles (or a KG whose only tile has
+conflicting windows) left no `pair` window, so `tile_candidates` listed it again for ever. The
+compared partners are now recorded (`pairs_done`) → `todo 0`. Same pass: `_flag` raised
+`KeyError('shift')` on any KG with terrain / pair windows (`auto-shift flag <kg> 'shift'` in the
+log), leaving 138 public `auto-shift` records with a stale tile list — fixed, `--sync` re-ran.
+`qc_reprocess … restored=N (same run resumed)`: restored tiles of a fresh generation that carry the
+BEV source stamp are checkpoints of the same requeued run after an interruption (06301-north:
+tiles 1–2 built 11:30, peer re-planned 11:39, resumed 12:46), not the old foreign-checkpoint
+fault; only `(N OLD checkpoint)` needs a rerun.
+
 ### 2. `pos_sweep_unit` — fresh strip inside a moved KG (found by the ledger)
 
 * **Symptom (suspected)**: cells of a sweep unit 5 m off the *other* way.

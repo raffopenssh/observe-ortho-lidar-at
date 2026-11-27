@@ -59,6 +59,20 @@ def main() -> int:
     n._flag('00002', json.loads((tmp / 'pos.json').read_text())['kgs']['00002'])
     assert exp['partial'] and exp['applied'] and exp['tiles'] == {'moved': 1, 'kept': 1, 'unmeasured': 1} \
         and exp['moved_tiles'] == [[0, 0, 1600, 1600]] and exp['frame'] == 'p-5+5', exp
+    # terrain / pair windows carry no error pair: the flag must still be written (138 KGs kept a stale one)
+    ob = {}
+    public_flags.auto_kg = lambda kg, src, lay, claim, expected, observed=None: ob.update(json.loads(observed)) or {'written': 1}
+    v2 = dict(json.loads((tmp / 'pos.json').read_text())['kgs']['00002'], windows=[{'v': 'shift', 'src': 'dtm', 't': 0}, {'v': 'unclear', 'src': 'pair', 'other': '00003', 't': 2}])
+    n._flag('00002', v2)
+    assert ob == {'windows': 2, 'shifted': 1}, ob
+    # a compared partner without overlap on the unmeasured tiles is done, not todo for ever
+    pr = n._rebin_pairs
+    n._rebin_pairs = lambda: [['00002', '00009', 5, -5, 40, 50]]
+    d2 = {'kgs': {'00002': dict(v2, tv=n.TILE_RULE, tiles_n=[1, 1, 1])}}
+    assert n.tile_candidates(d2)['todo'] == ['00002', '00009']
+    d2['kgs']['00002']['pairs_done'] = ['00009']; d2['kgs']['00009'] = {'verdict': 'zero', 'tv': n.TILE_RULE, 'tiles_n': [0, 3, 0]}
+    assert n.tile_candidates(d2)['todo'] == [], n.tile_candidates(d2)
+    n._rebin_pairs = pr
     assert n.retire('00002')
     v = json.loads((tmp / 'pos.json').read_text())['kgs']['00002']
     assert v['verdict'] == 'retired' and v['was_tiles'] == T and n.any_offset('00002') is None and n.frames('00002')['partial']
